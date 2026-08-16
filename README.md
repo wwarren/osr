@@ -4,7 +4,7 @@ A Proxmox LXC that fronts a small Ollama cluster with complexity-based model
 routing, load balancing, a chat UI, and health alerting. Provisioned by
 `ollama-smart-router-install.sh` (run as root on the Proxmox host).
 
-## ALL comments, .md's and unit tests written with Qwen3.8:27B-FP8
+## ALL comments, .md's, and unit tests written with Qwen3.8:27B-FP8
 
 ## What gets deployed
 
