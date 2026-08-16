@@ -1,0 +1,822 @@
+#!/usr/bin/env bash
+# Unit tests for the functions in ollama-smart-router-install.sh
+#
+# Functions are extracted (heredoc-aware) and sourced in isolation, so no
+# container is created and no Proxmox host is required.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="${1:-${HERE}/../ollama-smart-router-install.sh}"
+# shellcheck source=lib/assert.sh
+source "${HERE}/lib/assert.sh"
+# shellcheck source=lib/mocks.sh
+source "${HERE}/lib/mocks.sh"
+
+[[ -f "$SCRIPT" ]] || { echo "installer not found: $SCRIPT" >&2; exit 1; }
+
+FUNCS="$(mktemp)"
+python3 "${HERE}/lib/extract-functions.py" "$SCRIPT" > "$FUNCS" || exit 1
+bash -n "$FUNCS" || { echo "extracted functions do not parse" >&2; exit 1; }
+
+mocks_init
+trap 'mocks_cleanup; rm -f "$FUNCS"' EXIT
+
+# Defaults the functions expect to exist (normally set at the top of the script).
+NONINTERACTIVE=false
+OLLAMA_PORT=11434
+MODEL_SERVER_COUNT=3
+MODEL_SERVER_MIN=1
+MODEL_SERVER_MAX=20
+STORAGE_CFG=""
+GITEA_VERIFY_TLS=false
+GITEA_SERVER_URL="https://git.example.net"
+GITEA_ADMIN_USER="tester"
+GITEA_OWNER="tester"
+GITEA_REPO_NAME="ollama-smart-router"
+GITEA_REPO_OWNER=""
+GITEA_REPO_PRIVATE=true
+MODEL_SERVERS=()
+STORAGE_QUERY_ERROR=""
+GITEA_CURL_OPTS=(--location)
+CT_ID=100
+TEMPLATE_STORAGE="local"
+TEMPLATE_NAME=""
+# shellcheck source=/dev/null
+source "$FUNCS"
+
+echo "Testing $(basename "$SCRIPT") — $(python3 "${HERE}/lib/extract-functions.py" "$SCRIPT" --list | wc -l) functions extracted"
+
+# ── validators ────────────────────────────────────────────────────────────────
+describe valid_ipv4
+assert_ok   "accepts 1.2.3.4"            valid_ipv4 1.2.3.4
+assert_ok   "accepts 255.255.255.255"    valid_ipv4 255.255.255.255
+assert_ok   "accepts 0.0.0.0"            valid_ipv4 0.0.0.0
+assert_ok   "accepts leading zeros"      valid_ipv4 010.1.1.1
+assert_fail "rejects octet > 255"        valid_ipv4 256.1.1.1
+assert_fail "rejects 3 octets"           valid_ipv4 1.2.3
+assert_fail "rejects 5 octets"           valid_ipv4 1.2.3.4.5
+assert_fail "rejects empty"              valid_ipv4 ""
+assert_fail "rejects hostname"           valid_ipv4 example.com
+
+describe valid_cidr
+assert_ok   "accepts 10.0.0.5/24"        valid_cidr 10.0.0.5/24
+assert_ok   "accepts /32"                valid_cidr 10.0.0.5/32
+assert_ok   "accepts /1"                 valid_cidr 10.0.0.5/1
+assert_fail "rejects /0"                 valid_cidr 10.0.0.5/0
+assert_fail "rejects /33"                valid_cidr 10.0.0.5/33
+assert_fail "rejects missing prefix"     valid_cidr 10.0.0.5
+assert_fail "rejects bad address"        valid_cidr 999.0.0.1/24
+assert_fail "rejects non-numeric prefix" valid_cidr 10.0.0.5/ab
+
+describe valid_hostname_or_ip
+assert_ok   "accepts hostname"           valid_hostname_or_ip ollama1.lan
+assert_ok   "accepts single label"       valid_hostname_or_ip ollama1
+assert_ok   "accepts ip"                 valid_hostname_or_ip 10.0.0.5
+assert_fail "rejects leading dash"       valid_hostname_or_ip -bad.lan
+assert_fail "rejects trailing dot"       valid_hostname_or_ip bad.lan.
+assert_fail "rejects spaces"             valid_hostname_or_ip "a b"
+assert_fail "rejects empty"              valid_hostname_or_ip ""
+
+describe valid_http_url
+assert_ok   "accepts http"               valid_http_url http://h
+assert_ok   "accepts https with port"    valid_http_url https://h:8443
+assert_ok   "accepts path"               valid_http_url https://h/api/v1
+assert_fail "rejects ftp"                valid_http_url ftp://h
+assert_fail "rejects bare host"          valid_http_url example.com
+assert_fail "rejects empty"              valid_http_url ""
+
+describe valid_optional_url
+assert_ok   "accepts blank"              valid_optional_url ""
+assert_ok   "accepts valid url"          valid_optional_url https://mm/hooks/x
+assert_fail "rejects junk"               valid_optional_url not-a-url
+
+describe valid_optional_ipv4
+assert_ok   "accepts blank"              valid_optional_ipv4 ""
+assert_ok   "accepts ip"                 valid_optional_ipv4 10.0.0.1
+assert_fail "rejects junk"               valid_optional_ipv4 nope
+
+describe valid_nonempty
+assert_ok   "accepts text"               valid_nonempty x
+assert_fail "rejects empty"              valid_nonempty ""
+
+describe valid_positive_int
+assert_ok   "accepts 1"                  valid_positive_int 1
+assert_ok   "accepts 64"                 valid_positive_int 64
+assert_fail "rejects 0"                  valid_positive_int 0
+assert_fail "rejects negative"           valid_positive_int -5
+assert_fail "rejects text"               valid_positive_int abc
+assert_fail "rejects empty"              valid_positive_int ""
+
+describe valid_keep_alive
+assert_ok   "accepts blank (server default)" valid_keep_alive ""
+assert_ok   "accepts -1 (never unload)"      valid_keep_alive -1
+assert_ok   "accepts 0"                      valid_keep_alive 0
+assert_ok   "accepts seconds"                valid_keep_alive 600
+assert_ok   "accepts 30m"                    valid_keep_alive 30m
+assert_ok   "accepts 2h"                     valid_keep_alive 2h
+assert_ok   "accepts compound 1h30m"         valid_keep_alive 1h30m
+assert_fail "rejects text"                   valid_keep_alive abc
+assert_fail "rejects bad unit"               valid_keep_alive 5x
+assert_fail "rejects negative duration"      valid_keep_alive -5
+
+describe valid_ollama_addr
+assert_ok   "accepts bare ip"            valid_ollama_addr 10.0.0.5
+assert_ok   "accepts ip:port"            valid_ollama_addr 10.0.0.5:11434
+assert_ok   "accepts hostname"           valid_ollama_addr ollama1.lan
+assert_ok   "accepts full url"           valid_ollama_addr http://h:11434
+assert_fail "rejects port 0"             valid_ollama_addr 10.0.0.5:0
+assert_fail "rejects port > 65535"       valid_ollama_addr 10.0.0.5:99999
+assert_fail "rejects spaces"             valid_ollama_addr "a b"
+assert_fail "rejects empty"              valid_ollama_addr ""
+
+describe normalize_ollama_url
+assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
+assert_eq "explicit port preserved"      "http://10.0.0.5:9999"  "$(normalize_ollama_url 10.0.0.5:9999)"
+assert_eq "url passes through"           "http://h:1"            "$(normalize_ollama_url http://h:1)"
+assert_eq "trailing slash stripped"      "http://h:1"            "$(normalize_ollama_url http://h:1/)"
+assert_eq "hostname gets default port"   "http://ollama1.lan:11434" "$(normalize_ollama_url ollama1.lan)"
+assert_eq "https preserved"              "https://h:8443"        "$(normalize_ollama_url https://h:8443)"
+
+describe valid_tier_selection
+MODEL_SERVER_COUNT=3
+assert_ok   "accepts single"             valid_tier_selection 1
+assert_ok   "accepts list"               valid_tier_selection 1,3
+assert_ok   "tolerates spaces"           valid_tier_selection "1, 3"
+assert_fail "rejects above count"        valid_tier_selection 4
+assert_fail "rejects zero"               valid_tier_selection 0
+assert_fail "rejects empty"              valid_tier_selection ""
+assert_fail "rejects text"               valid_tier_selection a
+
+# ── tier maths ────────────────────────────────────────────────────────────────
+describe tier_selection_to_indices
+assert_eq "1 -> 0"           "0"     "$(tier_selection_to_indices 1)"
+assert_eq "1,3 -> 0 2"       "0 2"   "$(tier_selection_to_indices 1,3)"
+assert_eq "dedupes 2,2"      "1"     "$(tier_selection_to_indices 2,2)"
+assert_eq "handles spaces"   "0 1"   "$(tier_selection_to_indices '1, 2')"
+assert_eq "preserves order"  "2 0"   "$(tier_selection_to_indices 3,1)"
+
+describe seq_csv
+assert_eq "2..5"          "2,3,4,5" "$(seq_csv 2 5)"
+assert_eq "single"        "3"       "$(seq_csv 3 3)"
+assert_eq "empty range"   ""        "$(seq_csv 3 2)"
+
+describe default_tier_selection
+for n in 1 2 3 4 5 6 9 12 20; do
+  MODEL_SERVER_COUNT=$n
+  f="$(default_tier_selection fast)"; m="$(default_tier_selection medium)"; h="$(default_tier_selection heavy)"
+  if (( n >= 3 )); then
+    all="$(printf '%s,%s,%s' "$f" "$m" "$h" | tr ',' '\n' | grep -c .)"
+    uniq="$(printf '%s,%s,%s' "$f" "$m" "$h" | tr ',' '\n' | sort -n | uniq | grep -c .)"
+    if [[ "$all" == "$n" && "$uniq" == "$n" ]]; then
+      _pass "N=${n} covers every server exactly once (${f} / ${m} / ${h})"
+    else
+      _fail "N=${n} coverage" "${n} unique assignments" "${all} total / ${uniq} unique"
+    fi
+  else
+    [[ -n "$f" && -n "$m" && -n "$h" ]] \
+      && _pass "N=${n} every tier still gets a server (${f} / ${m} / ${h})" \
+      || _fail "N=${n} tiers populated" "all non-empty" "${f}/${m}/${h}"
+  fi
+done
+MODEL_SERVER_COUNT=3
+
+describe indices_to_urls
+MODEL_SERVERS=(http://a:1 http://b:2 http://c:3)
+assert_eq "single index"   "http://a:1"             "$(indices_to_urls '0')"
+assert_eq "multiple"       "http://a:1,http://c:3"  "$(indices_to_urls '0 2')"
+assert_eq "empty"          ""                       "$(indices_to_urls '')"
+
+describe ip_in_same_subnet
+assert_ok   "gateway inside /24"   ip_in_same_subnet 192.168.11.80/24 192.168.11.1
+assert_fail "gateway outside /24"  ip_in_same_subnet 192.168.11.80/24 10.99.99.1
+assert_ok   "wide prefix contains" ip_in_same_subnet 10.0.0.5/8 10.255.0.1
+assert_ok   "unparseable is lenient" ip_in_same_subnet "garbage" "also-garbage"
+
+# ── storage discovery ─────────────────────────────────────────────────────────
+describe parse_pvesm_table
+out="$(printf '%s\n' "$PVESM_REAL_OUTPUT" | parse_pvesm_table)"
+assert_contains "reads Available despite (KiB) header tokens" "22194088960" "$out"
+assert_eq "picks the Available column, not Used" \
+  "2569773824" "$(printf '%s\n' "$PVESM_REAL_OUTPUT" | parse_pvesm_table | awk -F'\t' '$1=="vm_pool"{print $3}')"
+assert_not_contains "excludes inactive storage" "dead-store" "$out"
+assert_eq "row count (active only)" "5" "$(printf '%s\n' "$PVESM_REAL_OUTPUT" | parse_pvesm_table | grep -c .)"
+alt="$(printf '%s\n' "$PVESM_ALT_ORDER" | parse_pvesm_table | awk -F'\t' '$1=="local-lvm"{print $3}')"
+assert_eq "handles the alternate column order" "308819968" "$alt"
+
+describe kib_to_gib
+assert_eq "1 GiB"            "1"     "$(kib_to_gib 1048576)"
+assert_eq "floors partial"   "0"     "$(kib_to_gib 1048575)"
+assert_eq "large value"      "21165" "$(kib_to_gib 22194088960)"
+assert_eq "zero"             "0"     "$(kib_to_gib 0)"
+assert_eq "non-numeric -> 0" "0"     "$(kib_to_gib abc)"
+assert_eq "empty -> 0"       "0"     "$(kib_to_gib '')"
+
+describe storage_names_supporting
+cfgdir="$(mktemp -d)"; STORAGE_CFG="${cfgdir}/storage.cfg"
+cat > "$STORAGE_CFG" <<'EOF'
+dir: local
+	path /var/lib/vz
+	content iso,vztmpl,backup
+
+lvmthin: local-lvm
+	thinpool data
+	content rootdir,images
+
+rbd: vm_pool
+	pool rbd
+	content images,rootdir
+EOF
+assert_eq "finds rootdir storages" "local-lvm vm_pool" "$(storage_names_supporting rootdir | sort | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "finds vztmpl storages"  "local"             "$(storage_names_supporting vztmpl | tr -d '\n')"
+assert_eq "unknown content type"   ""                  "$(storage_names_supporting snippets)"
+STORAGE_CFG="/nonexistent"
+assert_eq "unreadable config is silent" "" "$(storage_names_supporting rootdir)"
+STORAGE_CFG="${cfgdir}/storage.cfg"
+
+describe storage_candidates
+mock_script pvesm <<'EOF'
+for a in "$@"; do [ "$prev" = "-content" ] && content="$a"; prev="$a"; done
+if [ "${content:-}" = "rootdir" ]; then
+  echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+  echo "local-lvm              lvmthin     active         8282112               0         8282112    0.00%"
+else
+  echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+  echo "local                      dir     active        20155608        10782840         8323580   53.50%"
+  echo "local-lvm              lvmthin     active         8282112               0         8282112    0.00%"
+  echo "vm_pool                    rbd     active      2888601515       318827691      2569773824   11.04%"
+fi
+exit 0
+EOF
+assert_eq "uses the server-side filter when it returns rows" \
+  "local-lvm" "$(storage_candidates rootdir | awk -F'\t' '{print $1}' | tr -d '\n')"
+
+mock_script pvesm <<'EOF'
+for a in "$@"; do [ "$prev" = "-content" ] && content="$a"; prev="$a"; done
+echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+if [ -z "${content:-}" ]; then
+  echo "local                      dir     active        20155608        10782840         8323580   53.50%"
+  echo "local-lvm              lvmthin     active         8282112               0         8282112    0.00%"
+  echo "vm_pool                    rbd     active      2888601515       318827691      2569773824   11.04%"
+fi
+exit 0
+EOF
+assert_eq "falls back to storage.cfg when the filter is empty" \
+  "local-lvm vm_pool" "$(storage_candidates rootdir | awk -F'\t' '{print $1}' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+cat > "$STORAGE_CFG" <<'EOF'
+dir: local
+	content iso,vztmpl,backup
+EOF
+assert_eq "readable config declaring none is definitive" "" "$(storage_candidates rootdir)"
+STORAGE_CFG="/nonexistent"
+assert_ne "unreadable config offers everything" "" "$(storage_candidates rootdir 2>/dev/null)"
+STORAGE_CFG="${cfgdir}/storage.cfg"
+
+describe storage_free_gib
+mock_script pvesm <<'EOF'
+echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+echo "vm_pool                    rbd     active      2888601515       318827691      2569773824   11.04%"
+exit 0
+EOF
+assert_eq "known storage"    "2450" "$(storage_free_gib vm_pool rootdir)"
+assert_eq "unknown -> -1"    "-1"   "$(storage_free_gib nope rootdir)"
+
+describe storage_supports_vztmpl
+mock_script pvesm <<'EOF'
+echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+echo "local                      dir     active        20155608        10782840         8323580   53.50%"
+exit 0
+EOF
+assert_ok   "storage present"  storage_supports_vztmpl local
+assert_fail "storage absent"   storage_supports_vztmpl vm_pool
+
+describe select_storage_with_space
+mock_script pvesm <<'EOF'
+echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+echo "local-lvm              lvmthin     active         8282112               0         8282112    0.00%"
+echo "vm_pool                    rbd     active      2888601515       318827691      2569773824   11.04%"
+exit 0
+EOF
+NONINTERACTIVE=true
+PICK=""
+assert_ok "succeeds when something fits" select_storage_with_space rootdir 64 PICK ""
+select_storage_with_space rootdir 64 PICK "" >/dev/null 2>&1
+assert_eq "picks the largest that fits" "vm_pool" "$PICK"
+PICK=""
+select_storage_with_space rootdir 4 PICK "local-lvm" >/dev/null 2>&1
+assert_eq "prefers the caller's choice when it fits" "local-lvm" "$PICK"
+PICK=""
+select_storage_with_space rootdir 4 PICK "does-not-exist" >/dev/null 2>&1
+assert_eq "falls back when preferred is unknown" "vm_pool" "$PICK"
+assert_fail "fails when nothing is big enough" select_storage_with_space rootdir 99999 PICK ""
+NONINTERACTIVE=false
+
+describe diagnose_storage
+out="$(diagnose_storage rootdir 2>&1)"
+assert_contains "reports the content type asked for" "rootdir" "$out"
+assert_contains "shows all active storages"          "all active storages" "$out"
+
+# ── template selection ────────────────────────────────────────────────────────
+describe template_storages
+TEMPLATE_STORAGE="my-tpl"
+mock_script pvesm <<'EOF'
+echo "Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %"
+echo "local                      dir     active        20155608        10782840         8323580   53.50%"
+exit 0
+EOF
+out="$(template_storages)"
+assert_contains "includes the configured storage first" "my-tpl" "$out"
+assert_contains "includes discovered storages"          "local"  "$out"
+assert_eq "deduplicates" "$(template_storages | sort -u | wc -l)" "$(template_storages | wc -l)"
+
+describe find_existing_debian_template
+mock_script pvesm <<'EOF'
+echo "Name  Type  Status  Total (KiB)  Used (KiB)  Available (KiB)  %"
+echo "local  dir  active  100  10  90  10%"
+exit 0
+EOF
+mock_script pveam <<'EOF'
+if [ "$1" = "list" ]; then
+  echo "NAME                                                         SIZE"
+  echo "local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst          120MB"
+  echo "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst          119MB"
+fi
+exit 0
+EOF
+TEMPLATE_STORAGE="local"; TEMPLATE_NAME=""
+assert_eq "picks the highest version" \
+  "local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst" "$(find_existing_debian_template)"
+TEMPLATE_NAME="debian-13-standard_13.0-1_amd64.tar.zst"
+assert_eq "honours an explicit TEMPLATE_NAME" \
+  "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst" "$(find_existing_debian_template)"
+TEMPLATE_NAME=""
+mock_command pveam 0 "NAME  SIZE"
+assert_fail "fails when no template exists" find_existing_debian_template
+
+describe select_available_debian_template
+mock_script pveam <<'EOF'
+if [ "$1" = "available" ]; then
+  echo "section  package"
+  echo "system   debian-13-standard_13.1-1_amd64.tar.zst"
+  echo "system   debian-12-standard_12.7-1_amd64.tar.zst"
+fi
+exit 0
+EOF
+assert_eq "selects the newest debian 13" \
+  "debian-13-standard_13.1-1_amd64.tar.zst" "$(select_available_debian_template)"
+mock_command pveam 0 "section  package"
+assert_fail "fails when nothing is downloadable" select_available_debian_template
+
+# ── container helpers ─────────────────────────────────────────────────────────
+describe require_command
+assert_ok   "existing command"  require_command bash
+assert_fail "missing command"   bash -c "source '$FUNCS'; require_command definitely-not-a-real-binary"
+
+describe find_next_ct_id
+mock_script pct <<'EOF'
+[ "$1" = "status" ] && { case "$2" in 100|101) exit 0;; *) exit 1;; esac; }
+exit 0
+EOF
+mock_command pvesh 0 "102"
+CT_ID=""
+assert_eq "uses pvesh nextid when free" "102" "$(find_next_ct_id)"
+CT_ID="150"
+assert_eq "honours an explicit free CT_ID" "150" "$(find_next_ct_id)"
+CT_ID="100"
+assert_fail "rejects an occupied CT_ID" find_next_ct_id
+CT_ID="abc"
+assert_fail "rejects a non-numeric CT_ID" find_next_ct_id
+CT_ID=""
+
+describe run_ct
+CT_ID=999
+mock_command pct 0
+run_ct echo hello >/dev/null 2>&1
+assert_contains "delegates to pct exec" "exec 999 -- echo hello" "$(mock_calls)"
+
+describe apt_get
+mock_reset_log
+mock_command pct 0
+assert_ok "succeeds first try" apt_get update
+mock_reset_log
+mock_command pct 1
+assert_fail "gives up after retries" apt_get update
+assert_eq "retried three times" "3" "$(mock_call_count 'apt-get update')"
+
+describe wait_for_ct_ready
+mock_script pct <<'EOF'
+# systemctl probe succeeds, DNS probe succeeds
+case "$*" in
+  *is-system-running*) echo running;;
+esac
+exit 0
+EOF
+assert_ok "returns once systemd and DNS are up" wait_for_ct_ready
+
+# ── gitea helpers ─────────────────────────────────────────────────────────────
+describe init_gitea_curl_opts
+GITEA_VERIFY_TLS=true;  init_gitea_curl_opts 2>/dev/null
+assert_not_contains "verification on omits --insecure" "--insecure" "${GITEA_CURL_OPTS[*]}"
+GITEA_VERIFY_TLS=false; init_gitea_curl_opts 2>/dev/null
+assert_contains "verification off adds --insecure" "--insecure" "${GITEA_CURL_OPTS[*]}"
+
+describe gitea_diagnose_rc
+assert_contains "6 mentions DNS"          "DNS"         "$(gitea_diagnose_rc 6 https://g 2>&1)"
+assert_contains "7 mentions the appliance" "nginx"      "$(gitea_diagnose_rc 7 https://g 2>&1)"
+assert_contains "22 mentions 401"          "401"        "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_contains "60 mentions certificate"  "certificate" "$(gitea_diagnose_rc 60 https://g 2>&1)"
+assert_contains "unknown code is reported" "99"         "$(gitea_diagnose_rc 99 https://g 2>&1)"
+
+describe gitea_probe_user
+mock_command curl 0 '{"login":"mike"}'
+assert_eq "returns the login" "mike" "$(gitea_probe_user TOKEN 2>/dev/null)"
+mock_command curl 22
+assert_fail "fails when curl fails" gitea_probe_user TOKEN
+
+describe gitea_api
+auth="Authorization: token X"
+mock_command curl 0 'body'
+out="$(gitea_api GET https://g/api 2>/dev/null)"
+assert_contains "passes the method through" "-X GET" "$(mock_calls)"
+mock_reset_log
+gitea_api POST https://g/api '{"a":1}' >/dev/null 2>&1
+assert_contains "sends a JSON body on POST" "Content-Type: application/json" "$(mock_calls)"
+
+describe resolve_gitea_repo
+GITEA_REPO_OWNER=""; GITEA_OWNER="mike"
+mock_script curl <<'EOF'
+# GET /repos/mike/... -> 200 with the trailing status line gitea_api appends
+echo '{"default_branch":"main"}'
+echo 200
+exit 0
+EOF
+assert_status "found under the token owner" 0 resolve_gitea_repo TOKEN
+GITEA_REPO_OWNER="org-team"
+mock_script curl <<'EOF'
+echo '{"message":"not found"}'
+echo 404
+exit 0
+EOF
+assert_status "explicit owner, repo missing -> 2" 2 resolve_gitea_repo TOKEN
+GITEA_REPO_OWNER=""
+
+# ── config generation ─────────────────────────────────────────────────────────
+describe push_local_config_tree
+tree="$(mktemp -d)"; mkdir -p "${tree}/env"; echo "X=1" > "${tree}/env/router.env"
+mock_reset_log; mock_command pct 0
+CT_ID=321
+push_local_config_tree "$tree" >/dev/null 2>&1
+assert_contains "pushes a tarball into the container" "push 321" "$(mock_calls)"
+assert_contains "extracts it under the config dir"    "tar -xzf"  "$(mock_calls)"
+rm -rf "$tree"
+
+describe cleanup_on_error
+CT_CREATED=""; STAGE_DIR="$(mktemp -d)"
+mock_reset_log; mock_command pct 0
+cleanup_on_error >/dev/null 2>&1 || true
+assert_eq "no container destroyed when none was created" "0" "$(mock_call_count 'destroy')"
+assert_ok "removes the staging directory" bash -c "[[ ! -d '$STAGE_DIR' ]]"
+CT_CREATED=1; STAGE_DIR=""; CT_ID=777
+mock_reset_log
+cleanup_on_error >/dev/null 2>&1 || true
+assert_contains "destroys a half-provisioned container" "destroy 777" "$(mock_calls)"
+CT_CREATED=""
+
+# ── prompts ───────────────────────────────────────────────────────────────────
+describe prompt_value
+NONINTERACTIVE=false
+RESULT=""
+prompt_value "x" RESULT "thedefault" <<< ""
+assert_eq "empty input takes the default" "thedefault" "$RESULT"
+prompt_value "x" RESULT "thedefault" <<< "typed"
+assert_eq "typed input wins" "typed" "$RESULT"
+NONINTERACTIVE=true
+RESULT=""
+prompt_value "x" RESULT "auto"
+assert_eq "non-interactive uses the default" "auto" "$RESULT"
+NONINTERACTIVE=false
+
+describe prompt_until_valid
+RESULT=""
+prompt_until_valid "ip" RESULT "10.0.0.1" valid_ipv4 <<< "" >/dev/null 2>&1
+assert_eq "accepts the default" "10.0.0.1" "$RESULT"
+prompt_until_valid "ip" RESULT "10.0.0.1" valid_ipv4 <<< $'bad\n10.0.0.9' >/dev/null 2>&1
+assert_eq "re-prompts until valid" "10.0.0.9" "$RESULT"
+NONINTERACTIVE=true
+assert_fail "non-interactive rejects an invalid preset" \
+  prompt_until_valid "ip" RESULT "not-an-ip" valid_ipv4
+NONINTERACTIVE=false
+
+describe prompt_secret
+SECRET=""
+prompt_secret "pw" SECRET <<< $'a\nb\nsame\nsame' >/dev/null 2>&1
+assert_eq "loops until both entries match" "same" "$SECRET"
+
+describe prompt_optional_secret
+SECRET="preset"
+prompt_optional_secret "tok" SECRET <<< "" >/dev/null 2>&1
+assert_eq "blank input yields empty" "" "$SECRET"
+prompt_optional_secret "tok" SECRET <<< "abc123" >/dev/null 2>&1
+assert_eq "captures the value" "abc123" "$SECRET"
+
+describe prompt_network_config
+BRIDGE=vmbr0; IP_CIDR=10.0.0.5/24; GATEWAY=10.0.0.1; NAMESERVER=""
+_pn_out="$(mktemp)"
+prompt_network_config > "$_pn_out" 2>&1 <<< $'\n\n\n\n' || true
+assert_eq "keeps defaults on empty input" "10.0.0.5/24" "$IP_CIDR"
+IP_CIDR=192.168.50.10/24; GATEWAY=10.99.99.1
+prompt_network_config > "$_pn_out" 2>&1 <<< $'\n\n\n\n' || true
+assert_contains "warns when the gateway is off-subnet" "outside" "$(cat "$_pn_out")"
+rm -f "$_pn_out"
+
+describe prompt_mattermost_config
+MATTERMOST_WEBHOOK_URL=""; MATTERMOST_CHANNEL="ollama-monitor"; MATTERMOST_MONITOR_USER="OllamaMonitor"
+_pm_out="$(mktemp)"
+prompt_mattermost_config > "$_pm_out" 2>&1 <<< $'\n' || true
+assert_contains "blank webhook disables alerting" "No webhook" "$(cat "$_pm_out")"
+rm -f "$_pm_out"
+prompt_mattermost_config <<< $'https://mm/hooks/x\nchan\nuser' >/dev/null 2>&1
+assert_eq "captures the webhook" "https://mm/hooks/x" "$MATTERMOST_WEBHOOK_URL"
+assert_eq "captures the channel"  "chan" "$MATTERMOST_CHANNEL"
+
+describe prompt_model_servers
+MODEL_SERVER_COUNT=3; MODEL_SERVER_MIN=1; MODEL_SERVER_MAX=20
+MODEL_SERVER_1=10.0.0.51; MODEL_SERVER_2=10.0.0.52; MODEL_SERVER_3=10.0.0.53
+MODEL_SERVER_4=""; MODEL_SERVER_5=""
+TIER_FAST_SERVERS=""; TIER_MEDIUM_SERVERS=""; TIER_HEAVY_SERVERS=""
+MODEL_FAST=a; MODEL_MEDIUM=b; MODEL_HEAVY=c; OLLAMA_KEEP_ALIVE=""
+MODEL_SERVERS=(); TIER_FAST_IDX=""; TIER_MEDIUM_IDX=""; TIER_HEAVY_IDX=""
+# Redirect to a file rather than $(...): command substitution runs the function
+# in a subshell, where its assignments to MODEL_SERVERS et al. are discarded.
+_pms_out="$(mktemp)"
+prompt_model_servers > "$_pms_out" 2>&1 <<< $'0\n21\nabc\n2\n10.0.0.1\n10.0.0.2\n\n\n\n\n\n\n\n' || true
+out="$(cat "$_pms_out")"
+assert_contains "rejects a count below the minimum" "too few" "$out"
+assert_contains "rejects a count above the maximum" "too many" "$out"
+assert_contains "rejects a non-numeric count"       "not a whole number" "$out"
+assert_eq "settles on the valid count" "2" "$MODEL_SERVER_COUNT"
+assert_eq "normalises entered addresses" "http://10.0.0.1:11434" "${MODEL_SERVERS[0]}"
+MODEL_SERVERS=(); MODEL_SERVER_COUNT=3
+prompt_model_servers > "$_pms_out" 2>&1 <<< $'3\n10.0.0.1\n10.0.0.1\n10.0.0.3\n\n\n\n\n\n\n\n' || true
+out="$(cat "$_pms_out")"; rm -f "$_pms_out"
+assert_contains "warns about duplicate addresses" "same address" "$out"
+
+# ── python provisioning ───────────────────────────────────────────────────────
+describe ensure_openwebui_python
+OPENWEBUI_PY_VERSION=3.12; OPENWEBUI_PY_DIR=/opt/python
+mock_script pct <<'EOF'
+shift 2   # drop "exec <id>"
+[ "$1" = "--" ] && shift
+case "$1" in
+  bash) case "$*" in
+          *"command -v python3.12"*) echo "/usr/bin/python3.12"; exit 0;;
+          *) exit 0;;
+        esac;;
+  runuser) exit 0;;   # service user can execute it
+  *) exit 0;;
+esac
+EOF
+assert_eq "uses an existing usable interpreter" "/usr/bin/python3.12" "$(ensure_openwebui_python 2>/dev/null)"
+mock_script pct <<'EOF'
+shift 2; [ "$1" = "--" ] && shift
+case "$1" in
+  bash) case "$*" in
+          *"command -v python3.12"*) echo "/root/.local/bin/python3.12"; exit 0;;
+          *uv*) exit 0;;
+          *) exit 0;;
+        esac;;
+  runuser) exit 1;;   # service user CANNOT execute the /root one
+  *) exit 0;;
+esac
+EOF
+out="$(ensure_openwebui_python 2>&1 >/dev/null)"
+assert_contains "rejects an interpreter the service user cannot run" "not executable by the service user" "$out"
+
+# ── privilege / fatal helpers ─────────────────────────────────────────────────
+describe require_root
+# `id` is stubbed rather than the test being run as a different user.
+mock_command id 0 "0"
+assert_ok "root passes" bash -c "source '$FUNCS'; require_root"
+mock_command id 0 "1000"
+assert_fail "non-root is rejected" bash -c "source '$FUNCS'; require_root"
+out="$(bash -c "source '$FUNCS'; require_root" 2>&1)"
+assert_contains "explains it needs the Proxmox host" "Proxmox host" "$out"
+mock_command id 0 "0"
+
+describe die_storage
+assert_status "exits 1" 1 bash -c "source '$FUNCS'; die_storage"
+assert_contains "names the reason" "storage that fits" \
+  "$(bash -c "source '$FUNCS'; die_storage" 2>&1)"
+
+# ── storage prompt ────────────────────────────────────────────────────────────
+describe prompt_storage_config
+mock_command pvesm 0 "$PVESM_REAL_OUTPUT"
+ROOTFS_GB=32; STORAGE="local"
+_ps_out="$(mktemp)"
+prompt_storage_config > "$_ps_out" 2>&1 <<< $'\n' || true
+assert_eq   "keeps the default size on empty input" "32" "$ROOTFS_GB"
+assert_ne   "picks a storage with room"             ""   "$STORAGE"
+ROOTFS_GB=32; STORAGE="local"
+prompt_storage_config > "$_ps_out" 2>&1 <<< $'64\n' || true
+assert_eq   "takes the typed size" "64" "$ROOTFS_GB"
+# 64 GiB does not fit in `local` (8.3 GiB free) — it must move elsewhere.
+assert_ne   "will not choose a storage that is too small" "local" "$STORAGE"
+# Nothing has room at all -> die_storage must fire rather than continue.
+mock_command pvesm 0 'Name   Type   Status   Total (KiB)   Used (KiB)   Available (KiB)   %
+tiny    dir   active       1048576       524288            524288  50.00%'
+ROOTFS_GB=64
+assert_fail "aborts when nothing fits" \
+  bash -c "source '$FUNCS'; NONINTERACTIVE=true; ROOTFS_GB=64; STORAGE=''; STORAGE_CFG=''; prompt_storage_config"
+rm -f "$_ps_out"
+mock_command pvesm 0 "$PVESM_REAL_OUTPUT"
+ROOTFS_GB=32; STORAGE="local"
+
+# ── gitea credential prompt ───────────────────────────────────────────────────
+describe prompt_gitea_credentials
+_pg_out="$(mktemp)"
+GITEA_SERVER_URL="https://git.example.net"; GITEA_ADMIN_USER="tester"
+GITEA_REPO_NAME="ollama-smart-router"; GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
+mock_command curl 0 '{"login":"tester"}'
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
+assert_eq "accepts a verified token"  "TOKEN123" "$GITEA_DEPLOY_TOKEN"
+assert_eq "owner comes from the token" "tester"  "$GITEA_OWNER"
+assert_eq "config stays version controlled" "gitea" "$CONFIG_SOURCE"
+# TLS verification is forced off for the TurnKey appliance's self-signed cert.
+assert_eq "forces GITEA_VERIFY_TLS=false" "false" "$GITEA_VERIFY_TLS"
+
+# A token owned by a different account: the real login wins as repo owner.
+GITEA_DEPLOY_TOKEN=""; GITEA_ADMIN_USER="tester"
+mock_command curl 0 '{"login":"someone-else"}'
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
+assert_eq "owner follows the token, not the typed username" "someone-else" "$GITEA_OWNER"
+assert_contains "says whose token it is" "someone-else" "$(cat "$_pg_out")"
+
+# No token at all -> fall back to a local, non-version-controlled config.
+GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\n\n' || true
+assert_eq "no token falls back to local" "local" "$CONFIG_SOURCE"
+
+# Token rejected three times -> give up, but do not abort the install.
+GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
+mock_command curl 22
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nbad1\nbad2\nbad3\n' || true
+assert_eq "gives up after 3 attempts" "local" "$CONFIG_SOURCE"
+assert_contains "reports the attempt count" "3" "$(cat "$_pg_out")"
+assert_ok "returns 0 so provisioning continues" \
+  bash -c "source '$FUNCS'; NONINTERACTIVE=true; GITEA_DEPLOY_TOKEN=''; GITEA_SERVER_URL=https://g.example; \
+           GITEA_ADMIN_USER=t; GITEA_REPO_NAME=r; GITEA_VERIFY_TLS=false; GITEA_CURL_OPTS=(); \
+           prompt_gitea_credentials"
+rm -f "$_pg_out"
+GITEA_ADMIN_USER="tester"; GITEA_OWNER="tester"; GITEA_DEPLOY_TOKEN=""
+
+# ── gitea access test ─────────────────────────────────────────────────────────
+describe test_gitea_access
+GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
+GITEA_REPO_NAME="ollama-smart-router"; GITEA_REPO_OWNER=""; GITEA_REPO_PRIVATE=true
+assert_ok "no token is a skip, not a failure" test_gitea_access ""
+
+# NOTE on these curl stubs: gitea_probe_user calls curl WITHOUT -X and parses
+# bare JSON, while gitea_api calls it WITH -X and appends a `\n<status>` line.
+# A stub that answers both the same way makes the probe fail on the trailing
+# status digits, so every case below branches on -X first.
+
+# Happy path: auth ok, repo exists, commit created.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;      # probe
+esac
+case "$*" in
+  *contents*) echo '{"commit":{"html_url":"https://git.example.net/c/1"}}'; echo 201; exit 0;;
+  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
+esac
+EOF
+out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
+assert_eq       "succeeds end to end"        "0" "$rc"
+assert_contains "reports the authenticated user" "tester" "$out"
+assert_contains "reports the test commit"        "test commit succeeded" "$out"
+
+# http:// remote: warn about the redirect that drops the Authorization header.
+GITEA_SERVER_URL="http://git.example.net"
+out="$(test_gitea_access TOKEN 2>&1)"
+assert_contains "warns about http:// losing the token" "drops the auth token" "$out"
+GITEA_SERVER_URL="https://git.example.net"
+
+# Repo missing everywhere (404 + empty search) -> created under the token owner.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;
+esac
+case "$*" in
+  *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
+  *search*)       echo '{"data":[]}'; echo 200; exit 0;;
+  *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
+  *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
+esac
+EOF
+out="$(test_gitea_access TOKEN 2>&1)" || true
+assert_contains "creates the repo when it is missing" "Creating repository" "$out"
+assert_contains "and still commits into it"           "test commit succeeded" "$out"
+
+# Commit rejected -> non-zero and the HTTP code surfaced.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;
+esac
+case "$*" in
+  *contents*) echo '{"message":"forbidden"}'; echo 403; exit 0;;
+  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
+esac
+EOF
+assert_fail "a rejected commit fails the test" test_gitea_access TOKEN
+assert_contains "surfaces the HTTP status" "403" "$(test_gitea_access TOKEN 2>&1)"
+
+# Auth itself fails -> stop before touching the repository at all.
+mock_command curl 22
+mock_reset_log
+assert_fail "an unusable token fails fast" test_gitea_access TOKEN
+assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count 'contents')"
+
+# ── repo seeding ──────────────────────────────────────────────────────────────
+describe seed_gitea_repo
+seedtree="$(mktemp -d)"
+mkdir -p "${seedtree}/env" "${seedtree}/services/ollama-router"
+echo "A=1" > "${seedtree}/env/router.env"
+echo "[tiers]" > "${seedtree}/services/ollama-router/router.ini"
+CONFIG_SEED_IF_MISSING=true
+assert_fail "no token means no seeding" seed_gitea_repo "$seedtree" ""
+CONFIG_SEED_IF_MISSING=false
+assert_ok   "seeding disabled is a clean no-op" seed_gitea_repo "$seedtree" TOKEN
+assert_contains "and says so" "not writing" "$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+CONFIG_SEED_IF_MISSING=true
+
+# Everything absent -> every file is created.
+mock_script curl <<'EOF'
+case "$*" in
+  *"-X POST"*) echo '{}'; echo 201; exit 0;;
+  *)           echo '{"message":"Not Found"}'; echo 404; exit 0;;
+esac
+EOF
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "creates both files"    "2 created" "$out"
+assert_contains "counts nothing skipped" "0 already present" "$out"
+
+# Everything already present -> nothing is overwritten.
+mock_script curl <<'EOF'
+echo '{"path":"x"}'; echo 200; exit 0
+EOF
+mock_reset_log
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "existing files are left alone" "2 already present" "$out"
+assert_eq       "no POST is issued"             "0" "$(mock_call_count '-X POST')"
+
+# A single failure is reported without aborting the rest of the walk.
+mock_script curl <<'EOF'
+case "$*" in
+  *"-X POST"*router.ini*) echo '{"message":"nope"}'; echo 422; exit 0;;
+  *"-X POST"*)            echo '{}'; echo 201; exit 0;;
+  *)                      echo '{}'; echo 404; exit 0;;
+esac
+EOF
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "reports the failed file" "failed to seed" "$out"
+assert_contains "still seeds the others"  "1 created"      "$out"
+rm -rf "$seedtree"
+
+# ── container clone ───────────────────────────────────────────────────────────
+describe clone_config_repo
+CT_ID=910; CONFIG_REPO_DIR="/app/config-repo"
+GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
+GITEA_REPO_NAME="ollama-smart-router"; GITEA_VERIFY_TLS=false
+mock_reset_log; mock_command pct 0
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+calls="$(mock_calls)"
+assert_contains "pushes a credential file into the container" "push 910" "$calls"
+assert_contains "with 0600 permissions"                       "--perms 0600" "$calls"
+assert_contains "clones the configured repo"  "ollama-smart-router.git" "$calls"
+assert_contains "honours GITEA_VERIFY_TLS"    "http.sslVerify=false"    "$calls"
+assert_contains "removes the credential file afterwards" "rm -f /root/.git-credentials" "$calls"
+assert_contains "tightens permissions on the clone" "chmod -R go-rwx" "$calls"
+assert_not_contains "never puts the token on a command line" "SECRETTOKEN" "$calls"
+
+# The credential entry must carry the remote's scheme; git will not match an
+# https:// credential against an http:// request.
+_cred_seen="$(mktemp)"
+mock_script pct <<EOF
+if [ "\$1" = "push" ]; then cp "\$3" "${_cred_seen}"; fi
+exit 0
+EOF
+GITEA_SERVER_URL="http://git.example.net"
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+assert_file_contains "credential scheme follows the remote" \
+  "http://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
+GITEA_SERVER_URL="https://git.example.net"
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+assert_file_contains "https remote gets an https credential" \
+  "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
+rm -f "$_cred_seen"
+
+# ── summary ───────────────────────────────────────────────────────────────────
+rm -rf "$cfgdir"
+summary
