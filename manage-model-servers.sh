@@ -149,6 +149,9 @@ env_set() {
   rm -f "$tmp"
 }
 
+# NOTE for callers: this dies on an unknown tier, but a `die` inside $(...)
+# only kills the subshell. Assignment sites must therefore append `|| exit 1`,
+# or an invalid tier silently yields an empty key and corrupts router.env.
 tier_env_key() {
   case "$1" in
     fast)   echo "BACKEND_QWEN_FAST" ;;
@@ -173,7 +176,15 @@ csv_to_lines() { printf '%s\n' "$1" | tr ',' '\n' | sed '/^[[:space:]]*$/d'; }
 lines_to_csv() { paste -sd, - ; }
 
 get_servers()  { csv_to_lines "$(env_get MODEL_SERVERS)"; }
-get_tier()     { csv_to_lines "$(env_get "$(tier_env_key "$1")")"; }
+# Returns 1 rather than dying on an unknown tier: this runs inside command
+# substitutions, where `exit` would kill only the subshell and the caller would
+# see an empty (successful-looking) list. Callers that must abort validate the
+# tier separately with `tier_env_key "$tier" >/dev/null`.
+get_tier() {
+  local __k
+  __k="$(tier_env_key "$1")" || return 1
+  csv_to_lines "$(env_get "$__k")"
+}
 
 contains_line() {  # $1 = needle, stdin = haystack
   local needle="$1" line
@@ -470,7 +481,7 @@ cmd_add() {
   if [[ -n "${TIER_ARG:-}" ]]; then
     for tier in $(csv_to_lines "$TIER_ARG"); do
       local key existing
-      key="$(tier_env_key "$tier")"
+      key="$(tier_env_key "$tier")" || exit 1
       existing="$(get_tier "$tier" | lines_to_csv)"
       for url in "${to_add[@]}"; do
         existing="${existing}${existing:+,}${url}"
@@ -523,7 +534,7 @@ cmd_remove() {
   env_set MODEL_SERVERS "$remaining"
 
   for tier in fast medium heavy; do
-    key="$(tier_env_key "$tier")"
+    key="$(tier_env_key "$tier")" || exit 1
     kept="$(get_tier "$tier" | grep -vxF -f <(printf '%s\n' "${to_remove[@]}") | lines_to_csv || true)"
     if [[ "$kept" != "$(get_tier "$tier" | lines_to_csv)" ]]; then
       env_set "$key" "$kept"
@@ -538,7 +549,7 @@ cmd_set_tier() {
   local -a wanted=("$@")
   local addr url key list
   [[ -n "$tier" ]] || die "set-tier: no tier given"
-  key="$(tier_env_key "$tier")"
+  key="$(tier_env_key "$tier")" || exit 1
   (( ${#wanted[@]} > 0 )) || die "set-tier: no servers given"
 
   list=""
@@ -951,10 +962,11 @@ cmd_apply() {
 # for a username/password, which then fails against Gitea.
 git_push_authenticated() {
   local remote branch token user host cred sslverify out rc=0 hostpart scheme
-  remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || {
+  remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || remote=""
+  if [[ -z "$remote" ]]; then
     note "  No 'origin' remote is configured; the commit stays local."
     return 1
-  }
+  fi
   branch="$(git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo main)"
 
   # A non-HTTP remote (ssh) carries its own auth; just let git do its thing.
