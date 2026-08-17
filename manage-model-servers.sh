@@ -52,7 +52,7 @@ Commands:
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
-  set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|heavy)
+  set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
   set-server-model <tier> <server> <model>
                              Set the model for ONE server within a tier
@@ -79,13 +79,13 @@ Options:
   -h, --help                 This help
 
 Examples:
-  manage-model-servers.sh add 10.0.0.55 --tier heavy --apply
+  manage-model-servers.sh add 10.0.0.55 --tier large --apply
   manage-model-servers.sh add ollama7.lan:11434 --tier fast,medium --apply --commit
   manage-model-servers.sh remove 10.0.0.52 --apply
-  manage-model-servers.sh set-tier heavy 10.0.0.54 10.0.0.55 --apply
+  manage-model-servers.sh set-tier large 10.0.0.54 10.0.0.55 --apply
   manage-model-servers.sh models
-  manage-model-servers.sh set-model heavy qwen3:32b --apply --commit
-  manage-model-servers.sh set-server-model heavy 10.0.0.54 llama3.3:70b --apply
+  manage-model-servers.sh set-model large qwen3:32b --apply --commit
+  manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
   manage-model-servers.sh set-keepalive 2h --apply
   manage-model-servers.sh set-webui-version latest --apply
 USAGE
@@ -154,11 +154,186 @@ env_set() {
 # or an invalid tier silently yields an empty key and corrupts router.env.
 tier_env_key() {
   case "$1" in
-    fast)   echo "BACKEND_QWEN_FAST" ;;
-    medium) echo "BACKEND_QWEN_MEDIUM" ;;
-    heavy)  echo "BACKEND_QWEN_HEAVY" ;;
-    *) die "unknown tier '$1' (expected fast, medium or heavy)" ;;
+    fast)   echo "BACKEND_FAST" ;;
+    medium) echo "BACKEND_MEDIUM" ;;
+    large)  echo "BACKEND_LARGE" ;;
+    xlarge) echo "BACKEND_XLARGE" ;;
+    *) die "unknown tier '$1' (expected fast, medium, large or xlarge)" ;;
   esac
+}
+
+# Tier names have been renamed twice, so a config can be one or two generations
+# behind:
+#
+#   BACKEND_QWEN_HEAVY  ->  BACKEND_HEAVY  ->  BACKEND_LARGE
+#   model_name qwen-heavy  ->  heavy  ->  large
+#
+# (the QWEN_ infix went when the router stopped being Qwen-specific; "heavy"
+# became "large" when the xlarge tier was added). This brings either generation
+# forward: env keys are renamed in place so router.env keeps its key order,
+# aliases in litellm_config.yaml and router.ini are rewritten, the stale
+# large_params ceiling is corrected, and the new xlarge entries are added empty
+# so the tier is visible but inactive until servers are assigned to it.
+# Runs once at startup and is a no-op on an already-current config.
+
+# current-key|legacy-name[,older-name...] — one per line, newest legacy first.
+# A function rather than a top-level array so the migration is self-contained:
+# a global here would be invisible to anything that sources only the functions.
+legacy_env_key_map() {
+  cat <<'MAPEOF'
+BACKEND_FAST|BACKEND_QWEN_FAST
+BACKEND_MEDIUM|BACKEND_QWEN_MEDIUM
+BACKEND_LARGE|BACKEND_HEAVY,BACKEND_QWEN_HEAVY
+MODEL_LARGE|MODEL_HEAVY
+TIER_LARGE_SERVERS|TIER_HEAVY_SERVERS
+MAPEOF
+}
+
+# NOTE: every check below is an explicit `if`. Under `set -e` a bare
+# `grep -q ... && return 0` statement exits the script when the grep does not
+# match, because the whole AND-list inherits the failing status.
+config_has_legacy_names() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  local pair legacies legacy
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] || continue
+    legacies="${pair#*|}"
+    for legacy in ${legacies//,/ }; do
+      if grep -q "^${legacy}=" "$ENV_FILE"; then return 0; fi
+    done
+  done < <(legacy_env_key_map)
+  if [[ -f "$LITELLM_YAML" ]]; then
+    if grep -qE '\b(qwen-(fast|medium|heavy)|heavy)\b' "$LITELLM_YAML"; then return 0; fi
+  fi
+  if [[ -f "$ROUTER_INI" ]]; then
+    if grep -qE '^(heavy|heavy_params|prefer_larger_heavy|prefer_smaller_fast) *=' "$ROUTER_INI"; then return 0; fi
+  fi
+  return 1
+}
+
+# Rename a single key in place, preserving its position in the file.
+env_rename_key() {
+  local legacy="$1" key="$2" tmp
+  grep -q "^${legacy}=" "$ENV_FILE" || return 1
+  tmp="$(mktemp)"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    # Both present (a hand-edited file): the modern key wins. Drop the stale
+    # one so it cannot come back to life on a later edit.
+    grep -v "^${legacy}=" "$ENV_FILE" > "$tmp"
+  else
+    awk -v old="$legacy" -v newk="$key" -F= \
+      '{ if ($1==old) { sub(/^[^=]*=/,""); print newk "=" $0 } else print }' \
+      "$ENV_FILE" > "$tmp"
+  fi
+  cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
+  return 0
+}
+
+migrate_legacy_names() {
+  local pair key legacies legacy changed=false tmp f
+  [[ -f "$ENV_FILE" ]] || return 0
+  config_has_legacy_names || return 0
+
+  if $DRY_RUN; then
+    note "  [dry-run] would migrate legacy tier names (heavy -> large, drop QWEN_)"
+    return 0
+  fi
+
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] || continue
+    key="${pair%%|*}"; legacies="${pair#*|}"
+    for legacy in ${legacies//,/ }; do
+      if env_rename_key "$legacy" "$key"; then changed=true; fi
+    done
+  done < <(legacy_env_key_map)
+
+  # Aliases in the generated LiteLLM config and the router's tier map.
+  for f in "$LITELLM_YAML" "$ROUTER_INI"; do
+    [[ -f "$f" ]] || continue
+    grep -qE '\b(qwen-(fast|medium|heavy)|heavy)\b' "$f" || continue
+    tmp="$(mktemp)"
+    # qwen-heavy collapses straight to large; order matters so the generic
+    # heavy->large rule does not fire first and leave "qwen-large" behind.
+    sed -E 's/\bqwen-heavy\b/large/g; s/\bqwen-(fast|medium)\b/\1/g; s/\bheavy\b/large/g' \
+      "$f" > "$tmp"
+    cat "$tmp" > "$f"; rm -f "$tmp"
+    changed=true
+  done
+
+  # regenerate_litellm preserves router_settings verbatim from the existing
+  # file, so without this the migrated config would keep a three-tier fallback
+  # map and xlarge would never gain one.
+  if [[ -f "$LITELLM_YAML" ]] && grep -q '^  fallbacks:' "$LITELLM_YAML" \
+     && ! grep -q '^    - xlarge:' "$LITELLM_YAML"; then
+    tmp="$(mktemp)"
+    sed '/^  fallbacks:/a\    - xlarge: ["large", "medium", "fast"]' "$LITELLM_YAML" > "$tmp"
+    cat "$tmp" > "$LITELLM_YAML"; rm -f "$tmp"
+    changed=true
+  fi
+
+  # router.ini: rename the renamed tunables, correct the large band ceiling and
+  # add the xlarge entries. Section-aware, so this is python rather than sed.
+  if [[ -f "$ROUTER_INI" ]]; then
+    if python3 - "$ROUTER_INI" <<'INIMIG'
+import io, sys, configparser
+path = sys.argv[1]
+cp = configparser.ConfigParser()
+cp.read(path)
+touched = False
+
+def rename(section, old, new):
+    global touched
+    if cp.has_section(section) and cp.has_option(section, old) and not cp.has_option(section, new):
+        cp.set(section, new, cp.get(section, old))
+        cp.remove_option(section, old)
+        touched = True
+
+def add(section, option, value):
+    global touched
+    if not cp.has_section(section):
+        cp.add_section(section); touched = True
+    if not cp.has_option(section, option):
+        cp.set(section, option, value); touched = True
+
+rename("discovery", "heavy_params", "large_params")
+rename("weights", "prefer_larger_heavy", "prefer_larger")
+rename("weights", "prefer_smaller_fast", "prefer_smaller")
+
+# The old large/heavy band ran to the top. Split it only if it is still the
+# untouched default -- a hand-tuned ceiling is the operator's decision.
+if cp.has_option("discovery", "large_params") and \
+   cp.get("discovery", "large_params").strip() in ("20:999", "20:1000"):
+    cp.set("discovery", "large_params", "20:70")
+    touched = True
+
+add("thresholds", "xlarge", "2000")
+add("keywords", "xlarge",
+    '["prove", "derive", "rigorous", "comprehensive", "exhaustive", '
+    '"step by step proof", "entire codebase", "whole repository", '
+    '"research report", "literature review"]')
+add("tiers", "xlarge", "xlarge")
+add("discovery", "xlarge_params", "70:999")
+
+if touched:
+    with open(path, "w", encoding="utf-8") as fh:
+        cp.write(fh)
+sys.exit(0 if touched else 1)
+INIMIG
+    then changed=true; fi
+  fi
+
+  # Make the new tier visible in router.env, but empty: migration must not
+  # invent a server assignment the operator did not ask for.
+  grep -q '^BACKEND_XLARGE=' "$ENV_FILE" || { env_set BACKEND_XLARGE "" >/dev/null; changed=true; }
+  grep -q '^MODEL_XLARGE='   "$ENV_FILE" || { env_set MODEL_XLARGE   "" >/dev/null; changed=true; }
+
+  if $changed; then
+    note "Migrated legacy tier names in the configuration:"
+    note "  the 'heavy' tier is now 'large', and any BACKEND_QWEN_* keys were renamed."
+    note "  A new 'xlarge' tier was added with no servers — assign some with:"
+    note "    $0 set-tier xlarge <addr...>  &&  $0 set-model xlarge <tag>"
+    note "  Run '$0 apply' to push this to the running services."
+  fi
 }
 
 # Tier model_name comes from router.ini so custom names are honoured.
@@ -167,7 +342,7 @@ tier_model_name() {
   if [[ -f "$ROUTER_INI" ]]; then
     val="$(awk -v k="$key" '/^\[tiers\]/{f=1;next} /^\[/{f=0} f && $1==k {print $3; exit}' "$ROUTER_INI")"
   fi
-  printf '%s' "${val:-qwen-${key}}"
+  printf '%s' "${val:-${key}}"
 }
 
 # NOTE the trailing newline: without it the final element has no line
@@ -269,7 +444,7 @@ current_tier_tag() {
 # --- rendering ----------------------------------------------------------------
 tiers_of() {  # which tiers reference this URL
   local url="$1" tier out=""
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     if get_tier "$tier" | contains_line "$url"; then
       out="${out}${out:+,}${tier}"
     fi
@@ -305,7 +480,7 @@ cmd_list() {
   echo "Tier assignments (one row per server):"
   printf '  %-7s %-14s %-34s %s\n' "TIER" "ALIAS" "SERVER" "MODEL"
   local tier alias tag url any
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     alias="$(tier_model_name "$tier")"
     any=false
     while IFS= read -r url || [[ -n "$url" ]]; do
@@ -380,7 +555,7 @@ regenerate_litellm() {
   tmp="$(mktemp)"
   {
     echo "model_list:"
-    for tier in fast medium heavy; do
+    for tier in fast medium large xlarge; do
       name="$(tier_model_name "$tier")"
       tier_tag="${TIER_MODEL_OVERRIDE[$tier]:-}"
       [[ -n "$tier_tag" ]] || tier_tag="$(current_tier_tag "$name")"
@@ -416,9 +591,9 @@ regenerate_litellm() {
 router_settings:
   routing_strategy: latency-based-routing
   fallbacks:
-    - qwen-heavy: ["qwen-medium", "qwen-fast"]
-    - qwen-medium: ["qwen-heavy", "qwen-fast"]
-    - qwen-fast: ["qwen-medium", "qwen-heavy"]
+    - large: ["medium", "fast"]
+    - medium: ["large", "fast"]
+    - fast: ["medium", "large"]
 YAMLEOF
     fi
   } > "$tmp"
@@ -533,7 +708,7 @@ cmd_remove() {
   remaining="$(get_servers | grep -vxF -f <(printf '%s\n' "${to_remove[@]}") | lines_to_csv)"
   env_set MODEL_SERVERS "$remaining"
 
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     key="$(tier_env_key "$tier")" || exit 1
     kept="$(get_tier "$tier" | grep -vxF -f <(printf '%s\n' "${to_remove[@]}") | lines_to_csv || true)"
     if [[ "$kept" != "$(get_tier "$tier" | lines_to_csv)" ]]; then
@@ -812,7 +987,7 @@ cmd_models() {
     END { if (prev != "") printf "  %-30s %s\n", prev, hosts }'
   rm -f "$tmp"
   echo
-  echo "Set one for a tier with:  $0 set-model <fast|medium|heavy> <model>"
+  echo "Set one for a tier with:  $0 set-model <fast|medium|large|xlarge> <model>"
 }
 
 cmd_set_model() {
@@ -1228,6 +1403,7 @@ done
 
 ensure_config_or_forward
 $DRY_RUN && note "(dry run — no files will be written)"
+migrate_legacy_names
 
 case "$COMMAND" in
   list)     cmd_list false ;;

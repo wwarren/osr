@@ -162,7 +162,8 @@ Internally it has three collaborating parts:
   `/api/tags` on `refresh_seconds`. Writes a new inventory dict wholesale, so a
   reader never observes a half-built structure.
 * **Classifier** — turns a conversation into requirements: size class
-  (fast/medium/heavy), whether it looks like code, whether it carries an image.
+  (fast/medium/large/xlarge), whether it looks like code, whether it carries an
+  image.
 * **Selector + dispatcher** — scores every `(host, model)` pair, ranks them, and
   dispatches to the best, failing forward on error.
 
@@ -233,10 +234,10 @@ Each `(host, model)` pair is scored; highest wins.
 
 | Signal | Effect |
 |---|---|
-| **Size-band fit** | Request class maps to a parameter band (`0:9`, `9:20`, `20:999` billions). In-band scores 1.0; outside decays linearly by `band_falloff` rather than disqualifying |
+| **Size-band fit** | Request class maps to a parameter band (`0:9`, `9:20`, `20:70`, `70:999` billions). Ceilings are **exclusive**, so the bands are disjoint. In-band scores 1.0; outside decays linearly by `band_falloff` rather than disqualifying |
 | **Code specialisation** | `+code_match` when a code request meets a code model; `−code_match × offtask_penalty` when a code model takes prose |
 | **Vision** | `+vision_match` when an image request meets a vision model; `−vision_match` when it doesn't; small off-task penalty for a vision model on plain text |
-| **Extremes within class** | Heavy requests bias larger, fast requests bias smaller |
+| **Extremes within class** | Large requests bias larger, fast requests bias smaller |
 | **Unknown size** | Scores `unknown_params` (0.3) — usable but never preferred |
 | **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt |
 | **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load across hosts serving the same model |
@@ -308,7 +309,7 @@ edits and a `git pull` updates the command.
 
 ```
 manage-model-servers list | status | discover | models
-manage-model-servers add <addr> [--tier fast,heavy] [--apply] [--commit]
+manage-model-servers add <addr> [--tier fast,large] [--apply] [--commit]
 manage-model-servers remove <addr|#> [--apply]
 manage-model-servers set-tier  <tier> <addr...>  [--apply]
 manage-model-servers set-model <tier> <model>    [--apply]
@@ -335,6 +336,20 @@ then optionally applies and restarts. Design points:
 * Both verify the tag is **actually present** on the affected server(s) before
   writing it (`models` lists what is available; `--no-probe` overrides for a
   not-yet-pulled model).
+* **Legacy names are migrated on startup.** The tiers have been renamed twice
+  — `BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
+  `model_name: qwen-heavy` → `heavy` → `large` — so a deployed config may be
+  one or two generations behind. Either is brought forward in one pass: env
+  keys are renamed in place so they keep their position in `router.env` and
+  diffs stay readable; aliases in `litellm_config.yaml` and `router.ini` are
+  rewritten; the renamed tunables (`heavy_params`, `prefer_larger_heavy`) move
+  with them; the old `large_params = 20:999` ceiling is split into `20:70` plus
+  a new `70:999` xlarge band, but only if it is still the untouched default;
+  and the `xlarge` tier is added **empty**, since migration must not invent a
+  server assignment. Model *tags* are untouched — `ollama/qwen3:32b` is a
+  model, not a routing name. The Python services independently fall back
+  through the same name chain, closing the window where a service restarts
+  before the migration has run.
 * `commit` authenticates with the deploy token from `router.env`. Gitea rejects
   account passwords for git-over-HTTP, and the stored git credentials are
   deleted after provisioning, so the token is written to a temporary 0600

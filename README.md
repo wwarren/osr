@@ -4,8 +4,6 @@ A Proxmox LXC that fronts a small Ollama cluster with complexity-based model
 routing, load balancing, a chat UI, and health alerting. Provisioned by
 `ollama-smart-router-install.sh` (run as root on the Proxmox host).
 
-## ALL comments, .md's, and unit tests written with Qwen3.8:27B
-
 ## What gets deployed
 
 An unprivileged Debian 13 container running four systemd services, all as the
@@ -32,10 +30,15 @@ A background task polls every Ollama target's `/api/tags` on an interval
 *actually* serving — model name, parameter count, quantisation and family. Each
 request is then scored against that live inventory rather than a static map:
 
-- **Size fit** — the request is classified `fast` / `medium` / `heavy` (prompt
-  length + keywords), and each model is scored on how well its parameter count
-  fits that class's band (`0:9`, `9:20`, `20:999` billions by default), decaying
-  outside the band rather than being disqualified.
+- **Size fit** — the request is classified `fast` / `medium` / `large` /
+  `xlarge` (prompt length + keywords), and each model is scored on how well its
+  parameter count fits that class's band (`0:9`, `9:20`, `20:70`, `70:999`
+  billions by default), decaying outside the band rather than being
+  disqualified. Band ceilings are **exclusive**, so the bands are disjoint and a
+  70B model belongs to `xlarge` alone — otherwise `large`, which prefers the
+  biggest model in its band, would take the very model that defines `xlarge`.
+  The size preference is a position *within* the band, so an out-of-band giant
+  never outscores a perfect in-band fit.
 - **Specialisation** — a code request prefers a code model (`coder`, `starcoder`,
   `deepseek-coder`…); a request containing an image prefers a vision model
   (`llava`, `-vl`, `minicpm-v`…). A specialist serving an off-task request takes
@@ -54,7 +57,7 @@ Parameter counts come from `details.parameter_size`, falling back to the tag
 
 Discovery polls **every** configured host — it reads the full `MODEL_SERVERS`
 list, not just the per-tier `BACKEND_*` vars, so a host you left out of all
-three tiers is still discovered and can still be selected on merit.
+tier is still discovered and can still be selected on merit.
 
 Requests are dispatched straight to the chosen host's OpenAI-compatible
 endpoint. The decision is reported in response headers: `X-Router-Model`,
@@ -62,7 +65,7 @@ endpoint. The decision is reported in response headers: `X-Router-Model`,
 
 An explicitly requested model that exists in the inventory is honoured and sent
 to a host that has it — so the Open WebUI picker becomes meaningful. The tier
-aliases (`qwen-fast`/`qwen-medium`/`qwen-heavy`) and `auto` mean "decide for me",
+aliases (`fast`/`medium`/`large`/`xlarge`) and `auto` mean "decide for me",
 with a tier alias pinning the size class.
 
 Endpoints for inspection:
@@ -85,7 +88,7 @@ complexity analysis picks a tier name and forwards to LiteLLM, which keeps its
 own latency routing and cross-tier fallbacks. Responses carry
 `X-Router-Mode: litellm`.
 
-LiteLLM (`/app/router/litellm_config.yaml`) maps the three tiers to backends
+LiteLLM (`/app/router/litellm_config.yaml`) maps the four tiers to backends
 with `latency-based-routing` and cross-tier fallbacks:
 
 Tiers, their servers and their model tags are all chosen at install time; the
@@ -100,10 +103,10 @@ The installer is driven by environment variables (all have defaults). Key ones:
   — `STORAGE` and `ROOTFS_GB` are confirmed against live free space at install time
 - `OPENWEBUI_VERSION` (0.11.0), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true)
 - `MODEL_SERVER_COUNT` (1–20), `MODEL_SERVER_1`…`MODEL_SERVER_<n>`, `OLLAMA_PORT`, `MODEL_SERVER_MIN`/`MODEL_SERVER_MAX`
-- `TIER_FAST_SERVERS` / `TIER_MEDIUM_SERVERS` / `TIER_HEAVY_SERVERS` (e.g. `1,3`)
-- `MODEL_FAST` / `MODEL_MEDIUM` / `MODEL_HEAVY` — model tag per tier
+- `TIER_FAST_SERVERS` / `TIER_MEDIUM_SERVERS` / `TIER_LARGE_SERVERS` / `TIER_XLARGE_SERVERS` (e.g. `1,3`)
+- `MODEL_FAST` / `MODEL_MEDIUM` / `MODEL_LARGE` / `MODEL_XLARGE` — model tag per tier
 - `NONINTERACTIVE` (false) — take every default and skip all prompts
-- `GITEA_SERVER_URL` (`https://git.url.txt`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
+- `GITEA_SERVER_URL` (`https://git.bancs.net`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
 - `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`)
 - `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
 - `OPENWEBUI_PORT` (8080)
@@ -142,6 +145,44 @@ defaults, so the whole thing can run unattended from environment variables.
 
 ### Model servers and tiers
 
+The four tiers are named `fast`, `medium`, `large` and `xlarge`. Those names are the
+LiteLLM `model_name` aliases you call over the API, the keys in `router.ini`,
+and the `BACKEND_FAST` / `BACKEND_MEDIUM` / `BACKEND_LARGE` / `BACKEND_XLARGE` entries in
+`router.env` that list which servers back each tier. Nothing about them is
+model-specific — a tier is a size class, and you point it at whatever model you
+like with `set-model` or `set-server-model`.
+
+> **Upgrading an existing install.** The tiers have been renamed twice, so a
+> deployed config may be one or two generations behind:
+>
+> ```
+> BACKEND_QWEN_HEAVY  ->  BACKEND_HEAVY  ->  BACKEND_LARGE
+> model_name qwen-heavy  ->  heavy  ->  large
+> ```
+>
+> (the `QWEN_` infix went when the router stopped being Qwen-specific; `heavy`
+> became `large` when `xlarge` was added). `manage-model-servers.sh` brings
+> either generation forward automatically on its next run: it renames the env
+> keys in place, rewrites the aliases in `litellm_config.yaml` and `router.ini`,
+> renames the `heavy_params` / `prefer_larger_heavy` tunables, splits the old
+> `large_params = 20:999` ceiling into `20:70` + `70:999`, adds the `xlarge`
+> entries, and tells you to run `apply`. It then prints nothing on later runs.
+>
+> The new `xlarge` tier is added **with no servers** — migration will not invent
+> an assignment. Populate it when you're ready:
+>
+> ```bash
+> manage-model-servers set-tier  xlarge 10.0.0.54
+> manage-model-servers set-model xlarge llama3.3:70b --apply --commit
+> ```
+>
+> Real model *tags* like `qwen3:32b` are left alone; only routing names change.
+> A hand-tuned `large_params` is left alone too. The services independently read
+> the old key names as a fallback, so a router that restarts before the
+> migration runs still resolves its backends. **If you call the API with
+> `qwen-heavy` or `heavy`, change it to `large`** — the old aliases stop
+> resolving once the config is regenerated.
+
 Only `MODEL_SERVER_1`–`MODEL_SERVER_3` carry built-in defaults; higher indices
 have none and must be typed (or preset via `MODEL_SERVER_<n>`).
 
@@ -155,20 +196,22 @@ them with its latency routing. The same server may also back several tiers —
 necessary when you only have two. Defaults scale with the count so nothing sits
 idle:
 
-Servers are split into three contiguous groups, with the remainder going to the
-heavy tier (which gains most from extra parallel capacity). Counts below 3
-can't give every tier its own host, so they share:
+Servers are split into four contiguous groups, with the remainder going to the
+xlarge tier (which gains most from extra parallel capacity). Counts below 4
+can't give every tier its own host, so the upper tiers share the last one — an
+xlarge model is the least likely to fit on an early, smaller host:
 
-| Servers | fast | medium | heavy |
-|---|---|---|---|
-| 1 | 1 | 1 | 1 |
-| 2 | 1 | 2 | 2 |
-| 3 | 1 | 2 | 3 |
-| 5 | 1 | 2 | 3,4,5 |
-| 6 | 1,2 | 3,4 | 5,6 |
-| 20 | 1–6 | 7–12 | 13–20 |
+| Servers | fast | medium | large | xlarge |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 1 | 1 |
+| 2 | 1 | 2 | 2 | 2 |
+| 3 | 1 | 2 | 3 | 3 |
+| 4 | 1 | 2 | 3 | 4 |
+| 5 | 1 | 2 | 3 | 4,5 |
+| 8 | 1,2 | 3,4 | 5,6 | 7,8 |
+| 20 | 1–5 | 6–10 | 11–15 | 16–20 |
 
-From 3 servers up, every host lands in exactly one tier — no gaps, no overlap.
+From 4 servers up, every host lands in exactly one tier — no gaps, no overlap.
 
 The installer prints the resulting routing plan, warns about servers assigned to
 no tier, and warns if the same address was entered twice (it would be weighted
@@ -259,7 +302,7 @@ while — it is a large dependency tree.
   Gitea runs as a **TurnKey Gitea 18.0-1 appliance**, which serves through
   nginx on **80/443** — Gitea's own port 3000 is bound to localhost *inside*
   that container and is not reachable from outside, so the URL is
-  `https://git.url.txt` with no port.
+  `https://git.bancs.net` with no port.
 
   TurnKey ships a **self-signed certificate**, so `prompt_gitea_credentials`
   sets `GITEA_VERIFY_TLS=false` unconditionally — certificate verification is
@@ -376,12 +419,12 @@ manage-model-servers set-keepalive 2h --apply
 ```
 manage-model-servers list                                  # servers + tier map
 manage-model-servers status                                # + live reachability
-manage-model-servers add 10.0.0.55 --tier heavy --apply
+manage-model-servers add 10.0.0.55 --tier large --apply
 manage-model-servers remove 3 --apply
-manage-model-servers set-tier heavy 10.0.0.54 10.0.0.55 --apply
+manage-model-servers set-tier large 10.0.0.54 10.0.0.55 --apply
 manage-model-servers models                                # what's available where
-manage-model-servers set-model heavy qwen3:32b --apply      # every server in the tier
-manage-model-servers set-server-model heavy 10.0.0.54 llama3.3:70b   # just one server
+manage-model-servers set-model large qwen3:32b --apply      # every server in the tier
+manage-model-servers set-server-model large 10.0.0.54 llama3.3:70b   # just one server
 manage-model-servers set-keepalive 2h --apply                # keep models resident
 manage-model-servers set-webui-version                       # pinned / installed / latest
 manage-model-servers set-webui-version latest --apply        # upgrade Open WebUI

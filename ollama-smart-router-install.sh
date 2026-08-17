@@ -99,24 +99,27 @@ KEEP_ALIVE_REFRESH_SECONDS="${KEEP_ALIVE_REFRESH_SECONDS:-240}"
 # it to whatever you actually `ollama pull`ed (e.g. qwen3:32b).
 MODEL_FAST="${MODEL_FAST:-qwen2.5-coder}"
 MODEL_MEDIUM="${MODEL_MEDIUM:-qwen3:14b}"
-MODEL_HEAVY="${MODEL_HEAVY:-qwen3.8:27b}"
+MODEL_LARGE="${MODEL_LARGE:-qwen3.8:27b}"
+MODEL_XLARGE="${MODEL_XLARGE:-llama3.3:70b}"
 # Tier -> server assignment, as 1-based server numbers. Empty means "derive a
 # sensible default from the server count". A tier may list several servers;
 # LiteLLM load-balances across them with the configured latency routing.
 TIER_FAST_SERVERS="${TIER_FAST_SERVERS:-}"
 TIER_MEDIUM_SERVERS="${TIER_MEDIUM_SERVERS:-}"
-TIER_HEAVY_SERVERS="${TIER_HEAVY_SERVERS:-}"
+TIER_LARGE_SERVERS="${TIER_LARGE_SERVERS:-}"
+TIER_XLARGE_SERVERS="${TIER_XLARGE_SERVERS:-}"
 # Skip every prompt and use the values above / from the environment.
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
 # Populated by the prompts: normalised base URLs, and 0-based index lists.
 MODEL_SERVERS=()
 TIER_FAST_IDX=""
 TIER_MEDIUM_IDX=""
-TIER_HEAVY_IDX=""
+TIER_LARGE_IDX=""
+TIER_XLARGE_IDX=""
 # Gitea runs as a TurnKey appliance behind nginx on 443/80 — Gitea's own port
 # 3000 is bound to localhost inside that container and is NOT reachable from
 # outside, so the URL is the plain hostname with no port.
-GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.url.txt}"
+GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.bancs.net}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
 GITEA_REPO_NAME="${GITEA_REPO_NAME:-ollama-smart-router}"
@@ -707,31 +710,42 @@ prompt_mattermost_config() {
 }
 
 # Default tier->server assignment for any server count from 1 upwards. Servers
-# are split into three contiguous groups; the remainder goes to the heavy tier,
-# which benefits most from extra parallel capacity. Counts below 3 can't give
-# every tier its own host, so they share.
+# are split into four contiguous groups; the remainder goes to the xlarge tier,
+# which benefits most from extra parallel capacity. Counts below 4 can't give
+# every tier its own host, so the upper tiers share the last one — an xlarge
+# model is the least likely to fit on an early, smaller host.
 default_tier_selection() {
   local tier="$1" n="$MODEL_SERVER_COUNT" base
-  local fast_start fast_end medium_start medium_end heavy_start heavy_end
+  local fast_start fast_end medium_start medium_end
+  local large_start large_end xlarge_start xlarge_end
   if (( n <= 1 )); then
     echo "1"; return 0
   fi
   if (( n == 2 )); then
     case "$tier" in
       fast)   echo "1" ;;
-      medium) echo "2" ;;
-      heavy)  echo "2" ;;
+      *)      echo "2" ;;      # medium, large and xlarge share the second host
     esac
     return 0
   fi
-  base=$(( n / 3 ))
-  fast_start=1;                 fast_end=$(( base ))
-  medium_start=$(( base + 1 )); medium_end=$(( base * 2 ))
-  heavy_start=$(( base * 2 + 1 )); heavy_end=$n           # absorbs the remainder
+  if (( n == 3 )); then
+    case "$tier" in
+      fast)   echo "1" ;;
+      medium) echo "2" ;;
+      *)      echo "3" ;;      # large and xlarge share the third host
+    esac
+    return 0
+  fi
+  base=$(( n / 4 ))
+  fast_start=1;                    fast_end=$(( base ))
+  medium_start=$(( base + 1 ));    medium_end=$(( base * 2 ))
+  large_start=$(( base * 2 + 1 )); large_end=$(( base * 3 ))
+  xlarge_start=$(( base * 3 + 1 )); xlarge_end=$n         # absorbs the remainder
   case "$tier" in
     fast)   seq_csv "$fast_start" "$fast_end" ;;
     medium) seq_csv "$medium_start" "$medium_end" ;;
-    heavy)  seq_csv "$heavy_start" "$heavy_end" ;;
+    large)  seq_csv "$large_start" "$large_end" ;;
+    xlarge) seq_csv "$xlarge_start" "$xlarge_end" ;;
   esac
 }
 
@@ -845,15 +859,20 @@ prompt_model_servers() {
     "${TIER_MEDIUM_SERVERS:-$(default_tier_selection medium)}" valid_tier_selection
   TIER_MEDIUM_IDX="$(tier_selection_to_indices "$tier_sel")"
 
-  prompt_until_valid "    heavy tier  (long / analytical)" tier_sel \
-    "${TIER_HEAVY_SERVERS:-$(default_tier_selection heavy)}" valid_tier_selection
-  TIER_HEAVY_IDX="$(tier_selection_to_indices "$tier_sel")"
+  prompt_until_valid "    large tier  (long / analytical)" tier_sel \
+    "${TIER_LARGE_SERVERS:-$(default_tier_selection large)}" valid_tier_selection
+  TIER_LARGE_IDX="$(tier_selection_to_indices "$tier_sel")"
+
+  prompt_until_valid "    xlarge tier (deepest / 70B+)" tier_sel \
+    "${TIER_XLARGE_SERVERS:-$(default_tier_selection xlarge)}" valid_tier_selection
+  TIER_XLARGE_IDX="$(tier_selection_to_indices "$tier_sel")"
 
   echo
   echo "  Model tag served by each tier (must already be pulled on those hosts)."
   prompt_until_valid "    fast   model" MODEL_FAST   "$MODEL_FAST"   valid_nonempty
   prompt_until_valid "    medium model" MODEL_MEDIUM "$MODEL_MEDIUM" valid_nonempty
-  prompt_until_valid "    heavy  model" MODEL_HEAVY  "$MODEL_HEAVY"  valid_nonempty
+  prompt_until_valid "    large  model" MODEL_LARGE  "$MODEL_LARGE"  valid_nonempty
+  prompt_until_valid "    xlarge model" MODEL_XLARGE "$MODEL_XLARGE" valid_nonempty
 
   echo
   echo "  Ollama unloads an idle model after 5 minutes by default. Set a"
@@ -863,14 +882,15 @@ prompt_model_servers() {
 
   echo
   echo "  Routing plan:"
-  printf '    qwen-fast   -> %s (%s)\n' "$(indices_to_urls "$TIER_FAST_IDX")"   "$MODEL_FAST"
-  printf '    qwen-medium -> %s (%s)\n' "$(indices_to_urls "$TIER_MEDIUM_IDX")" "$MODEL_MEDIUM"
-  printf '    qwen-heavy  -> %s (%s)\n' "$(indices_to_urls "$TIER_HEAVY_IDX")"  "$MODEL_HEAVY"
+  printf '    fast   -> %s (%s)\n' "$(indices_to_urls "$TIER_FAST_IDX")"   "$MODEL_FAST"
+  printf '    medium -> %s (%s)\n' "$(indices_to_urls "$TIER_MEDIUM_IDX")" "$MODEL_MEDIUM"
+  printf '    large  -> %s (%s)\n' "$(indices_to_urls "$TIER_LARGE_IDX")"  "$MODEL_LARGE"
+  printf '    xlarge -> %s (%s)\n' "$(indices_to_urls "$TIER_XLARGE_IDX")" "$MODEL_XLARGE"
 
   # Servers that ended up in no tier would sit idle — worth saying out loud.
   local unused="" idx
   for (( idx = 0; idx < MODEL_SERVER_COUNT; idx++ )); do
-    case " ${TIER_FAST_IDX} ${TIER_MEDIUM_IDX} ${TIER_HEAVY_IDX} " in
+    case " ${TIER_FAST_IDX} ${TIER_MEDIUM_IDX} ${TIER_LARGE_IDX} ${TIER_XLARGE_IDX} " in
       *" $idx "*) ;;
       *) unused="${unused}${unused:+, }$(( idx + 1 ))" ;;
     esac
@@ -1517,14 +1537,16 @@ MATTERMOST_VERIFY_TLS=true
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
 LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
-BACKEND_QWEN_FAST=$(indices_to_urls "$TIER_FAST_IDX")
-BACKEND_QWEN_MEDIUM=$(indices_to_urls "$TIER_MEDIUM_IDX")
-BACKEND_QWEN_HEAVY=$(indices_to_urls "$TIER_HEAVY_IDX")
+BACKEND_FAST=$(indices_to_urls "$TIER_FAST_IDX")
+BACKEND_MEDIUM=$(indices_to_urls "$TIER_MEDIUM_IDX")
+BACKEND_LARGE=$(indices_to_urls "$TIER_LARGE_IDX")
+BACKEND_XLARGE=$(indices_to_urls "$TIER_XLARGE_IDX")
 MODEL_SERVER_COUNT=${MODEL_SERVER_COUNT}
 MODEL_SERVERS=$(IFS=,; printf '%s' "${MODEL_SERVERS[*]}")
 MODEL_FAST=${MODEL_FAST}
 MODEL_MEDIUM=${MODEL_MEDIUM}
-MODEL_HEAVY=${MODEL_HEAVY}
+MODEL_LARGE=${MODEL_LARGE}
+MODEL_XLARGE=${MODEL_XLARGE}
 OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
 KEEP_ALIVE_REFRESH_SECONDS=${KEEP_ALIVE_REFRESH_SECONDS}
 TORCH_CPU_ONLY=${TORCH_CPU_ONLY}
@@ -1561,16 +1583,21 @@ LITELLM_URL = os.getenv("LITELLM_URL", f"{LITELLM_BASE}/v1/chat/completions")
 # keyword lists and discovery heuristics can change without editing this file.
 # Built-in defaults keep the service working if the ini is missing or partial.
 _DEFAULTS = {
-    "thresholds": {"heavy": "800", "medium": "250"},
+    "thresholds": {"xlarge": "2000", "large": "800", "medium": "250"},
     "keywords": {
         "code_first": "true",
         "code": json.dumps(["def ", "fn ", "function", "class ", "import ",
                             "sql", "script", "code", "bug", "error", "compile"]),
-        "heavy": json.dumps(["analyze", "evaluate", "optimise", "optimize",
+        "large": json.dumps(["analyze", "evaluate", "optimise", "optimize",
                              "architecture", "mathematics", "calculate",
                              "summarise this article"]),
+        "xlarge": json.dumps(["prove", "derive", "rigorous", "comprehensive",
+                              "exhaustive", "step by step proof",
+                              "entire codebase", "whole repository",
+                              "research report", "literature review"]),
     },
-    "tiers": {"fast": "qwen-fast", "medium": "qwen-medium", "heavy": "qwen-heavy"},
+    "tiers": {"fast": "fast", "medium": "medium", "large": "large",
+              "xlarge": "xlarge"},
     "discovery": {
         "enabled": "true",
         "refresh_seconds": "60",
@@ -1580,7 +1607,8 @@ _DEFAULTS = {
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
-        "heavy_params": "20:999",
+        "large_params": "20:70",
+        "xlarge_params": "70:999",
         # How quickly score decays per billion parameters outside the band.
         "band_falloff": "12",
         # Substrings marking a model as code-specialised / vision / embedding.
@@ -1597,8 +1625,8 @@ _DEFAULTS = {
         "band_fit": "1.0",
         "code_match": "0.6",
         "vision_match": "1.5",
-        "prefer_larger_heavy": "0.15",
-        "prefer_smaller_fast": "0.15",
+        "prefer_larger": "0.15",
+        "prefer_smaller": "0.15",
         "unknown_params": "0.3",
         # Fraction of the specialist weight applied as a penalty when a
         # specialised model (code/vision) is used for an off-task request.
@@ -1641,15 +1669,19 @@ def _band(cp: configparser.ConfigParser, option: str) -> tuple:
 
 
 _cfg = _load_config(ROUTER_INI)
-TOKEN_THRESHOLD_HEAVY = _cfg.getint("thresholds", "heavy")
+TOKEN_THRESHOLD_XLARGE = _cfg.getint("thresholds", "xlarge")
+TOKEN_THRESHOLD_LARGE = _cfg.getint("thresholds", "large")
 TOKEN_THRESHOLD_MEDIUM = _cfg.getint("thresholds", "medium")
 CODE_FIRST = _cfg.getboolean("keywords", "code_first")
 CODE_KEYWORDS = _json_list(_cfg, "keywords", "code")
-HEAVY_KEYWORDS = _json_list(_cfg, "keywords", "heavy")
+LARGE_KEYWORDS = _json_list(_cfg, "keywords", "large")
+XLARGE_KEYWORDS = _json_list(_cfg, "keywords", "xlarge")
 TIER_FAST = _cfg.get("tiers", "fast")
 TIER_MEDIUM = _cfg.get("tiers", "medium")
-TIER_HEAVY = _cfg.get("tiers", "heavy")
-TIER_NAMES = {TIER_FAST: "fast", TIER_MEDIUM: "medium", TIER_HEAVY: "heavy"}
+TIER_LARGE = _cfg.get("tiers", "large")
+TIER_XLARGE = _cfg.get("tiers", "xlarge")
+TIER_NAMES = {TIER_FAST: "fast", TIER_MEDIUM: "medium", TIER_LARGE: "large",
+              TIER_XLARGE: "xlarge"}
 
 DISCOVERY_ENABLED = _cfg.getboolean("discovery", "enabled")
 DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
@@ -1657,8 +1689,12 @@ DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
 BANDS = {
     "fast": _band(_cfg, "fast_params"),
     "medium": _band(_cfg, "medium_params"),
-    "heavy": _band(_cfg, "heavy_params"),
+    "large": _band(_cfg, "large_params"),
+    "xlarge": _band(_cfg, "xlarge_params"),
 }
+# Highest ceiling across all bands — the one band whose upper bound stays
+# inclusive, so a model above every other band still scores a perfect fit.
+TOP_BAND_HIGH = max(high for _, high in BANDS.values())
 BAND_FALLOFF = _cfg.getfloat("discovery", "band_falloff")
 CODE_MODELS = _json_list(_cfg, "discovery", "code_models")
 VISION_MODELS = _json_list(_cfg, "discovery", "vision_models")
@@ -1669,14 +1705,36 @@ EMBEDDING_FAMILIES = _json_list(_cfg, "discovery", "embedding_families")
 W_BAND = _cfg.getfloat("weights", "band_fit")
 W_CODE = _cfg.getfloat("weights", "code_match")
 W_VISION = _cfg.getfloat("weights", "vision_match")
-W_LARGER = _cfg.getfloat("weights", "prefer_larger_heavy")
-W_SMALLER = _cfg.getfloat("weights", "prefer_smaller_fast")
+W_LARGER = _cfg.getfloat("weights", "prefer_larger")
+W_SMALLER = _cfg.getfloat("weights", "prefer_smaller")
 W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
 W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
               "transfer-encoding", "upgrade"}
+
+
+# Historical names for each tier's backend env key, newest first. The keys
+# dropped their QWEN_ infix when the router stopped being Qwen-specific, and
+# "heavy" was then renamed "large" when the xlarge tier was added. A service
+# can start against a router.env that manage-model-servers.sh has not migrated
+# yet -- without these fallbacks such a start looks healthy while resolving no
+# backends at all.
+_TIER_ENV_ALIASES = {
+    "fast": ("BACKEND_FAST", "BACKEND_QWEN_FAST"),
+    "medium": ("BACKEND_MEDIUM", "BACKEND_QWEN_MEDIUM"),
+    "large": ("BACKEND_LARGE", "BACKEND_HEAVY", "BACKEND_QWEN_HEAVY"),
+    "xlarge": ("BACKEND_XLARGE",),
+}
+
+
+def _tier_env(tier: str) -> str:
+    for name in _TIER_ENV_ALIASES.get(tier, ("BACKEND_%s" % tier.upper(),)):
+        value = os.getenv(name)
+        if value:
+            return value
+    return ""
 
 
 def _discovery_servers() -> list:
@@ -1701,9 +1759,8 @@ def _discovery_servers() -> list:
     every_host = _split(os.getenv("MODEL_SERVERS", ""))
     if every_host:
         return every_host
-    return _split(",".join(os.getenv(env, "") or "" for env in
-                           ("BACKEND_QWEN_FAST", "BACKEND_QWEN_MEDIUM",
-                            "BACKEND_QWEN_HEAVY")))
+    return _split(",".join(
+        _tier_env(t) for t in ("fast", "medium", "large", "xlarge")))
 
 
 SERVERS = _discovery_servers()
@@ -1831,8 +1888,10 @@ def analyze_complexity(prompt: str) -> str:
     approx_tokens = len(text_lower.split()) * 1.3
     if CODE_FIRST and any(kw in text_lower for kw in CODE_KEYWORDS):
         return TIER_FAST
-    if approx_tokens > TOKEN_THRESHOLD_HEAVY or any(kw in text_lower for kw in HEAVY_KEYWORDS):
-        return TIER_HEAVY
+    if approx_tokens > TOKEN_THRESHOLD_XLARGE or any(kw in text_lower for kw in XLARGE_KEYWORDS):
+        return TIER_XLARGE
+    if approx_tokens > TOKEN_THRESHOLD_LARGE or any(kw in text_lower for kw in LARGE_KEYWORDS):
+        return TIER_LARGE
     if approx_tokens > TOKEN_THRESHOLD_MEDIUM:
         return TIER_MEDIUM
     if not CODE_FIRST and any(kw in text_lower for kw in CODE_KEYWORDS):
@@ -1864,8 +1923,10 @@ def classify_request(messages: list) -> dict:
     is_code = any(kw in lowered for kw in CODE_KEYWORDS)
     if CODE_FIRST and is_code:
         request_class = "fast"
-    elif approx_tokens > TOKEN_THRESHOLD_HEAVY or any(kw in lowered for kw in HEAVY_KEYWORDS):
-        request_class = "heavy"
+    elif approx_tokens > TOKEN_THRESHOLD_XLARGE or any(kw in lowered for kw in XLARGE_KEYWORDS):
+        request_class = "xlarge"
+    elif approx_tokens > TOKEN_THRESHOLD_LARGE or any(kw in lowered for kw in LARGE_KEYWORDS):
+        request_class = "large"
     elif approx_tokens > TOKEN_THRESHOLD_MEDIUM:
         request_class = "medium"
     else:
@@ -1878,9 +1939,15 @@ def score_entry(entry: dict, need: dict) -> float:
     """Heuristic fit of one discovered (server, model) pair to one request."""
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
+    # Upper bound is EXCLUSIVE so adjacent bands are disjoint. With the defaults
+    # (large 20:70, xlarge 70:999) an inclusive bound would place a 70B model in
+    # both, and the size bias below would then let large take the very model
+    # that defines xlarge. The topmost band keeps an inclusive ceiling so the
+    # biggest model in the pool still lands somewhere.
+    in_band = low <= params < high or params == high == TOP_BAND_HIGH
     if params <= 0:
         fit = W_UNKNOWN
-    elif low <= params <= high:
+    elif in_band:
         fit = 1.0
     else:
         distance = (low - params) if params < low else (params - high)
@@ -1900,12 +1967,21 @@ def score_entry(entry: dict, need: dict) -> float:
         # and is usually the wrong pick when an equal-sized text model exists.
         score -= W_VISION * W_OFFTASK
 
-    # Within a band, bias toward the extreme the class actually wants.
-    if params > 0:
-        if need["class"] == "heavy":
-            score += W_LARGER * min(params / 100.0, 1.0)
+    # Within a band, bias toward the extreme the class actually wants. The bias
+    # is a position WITHIN the band (0 at the floor, 1 at the ceiling) and is
+    # applied only to in-band models. Rewarding absolute size instead would let
+    # an out-of-band giant outscore a perfect in-band fit: a 70B model sits at
+    # large's exclusive ceiling, so the gentle falloff still scores it ~1.0, and
+    # an unbounded size bonus would push it past the 32B that actually belongs
+    # to the tier.
+    if params > 0 and in_band:
+        span = high - low
+        position = (params - low) / span if span > 0 else 1.0
+        position = max(0.0, min(position, 1.0))
+        if need["class"] in ("large", "xlarge"):
+            score += W_LARGER * position
         elif need["class"] == "fast":
-            score += W_SMALLER * (1.0 - min(params / 100.0, 1.0))
+            score += W_SMALLER * (1.0 - position)
     return score
 
 
@@ -2131,7 +2207,7 @@ async def list_models(request: Request):
     Open WebUI's picker is meaningful. Falls back to LiteLLM's list."""
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         seen, data = set(), []
-        for alias in ("auto", TIER_FAST, TIER_MEDIUM, TIER_HEAVY):
+        for alias in ("auto", TIER_FAST, TIER_MEDIUM, TIER_LARGE, TIER_XLARGE):
             if alias not in seen:
                 seen.add(alias)
                 data.append({"id": alias, "object": "model", "owned_by": "router"})
@@ -2217,9 +2293,10 @@ else:
 # tier -> model tag, so we pin only the models this system actually fronts
 # rather than everything a host happens to have pulled (which would thrash VRAM).
 TIER_MODELS = {
-    "qwen-fast": (os.getenv("MODEL_FAST", "") or "").strip(),
-    "qwen-medium": (os.getenv("MODEL_MEDIUM", "") or "").strip(),
-    "qwen-heavy": (os.getenv("MODEL_HEAVY", "") or "").strip(),
+    "fast": (os.getenv("MODEL_FAST", "") or "").strip(),
+    "medium": (os.getenv("MODEL_MEDIUM", "") or "").strip(),
+    "large": (os.getenv("MODEL_LARGE") or os.getenv("MODEL_HEAVY", "") or "").strip(),
+    "xlarge": (os.getenv("MODEL_XLARGE", "") or "").strip(),
 }
 
 
@@ -2268,10 +2345,33 @@ def _url_list(value: str) -> list:
     return [u.strip().rstrip("/") for u in (value or "").split(",") if u.strip()]
 
 
+# Historical names for each tier's backend env key, newest first. The keys
+# dropped their QWEN_ infix when the router stopped being Qwen-specific, and
+# "heavy" was then renamed "large" when the xlarge tier was added.
+# manage-model-servers.sh rewrites router.env on its next write, but a service
+# can start against a file that has not been migrated yet -- without these
+# fallbacks such a start looks healthy while routing to nothing at all.
+_TIER_ENV_ALIASES = {
+    "fast": ("BACKEND_FAST", "BACKEND_QWEN_FAST"),
+    "medium": ("BACKEND_MEDIUM", "BACKEND_QWEN_MEDIUM"),
+    "large": ("BACKEND_LARGE", "BACKEND_HEAVY", "BACKEND_QWEN_HEAVY"),
+    "xlarge": ("BACKEND_XLARGE",),
+}
+
+
+def _tier_env(tier: str) -> str:
+    for name in _TIER_ENV_ALIASES.get(tier, ("BACKEND_%s" % tier.upper(),)):
+        value = os.getenv(name)
+        if value:
+            return value
+    return ""
+
+
 BACKENDS = {
-    "qwen-fast": _url_list(os.getenv("BACKEND_QWEN_FAST", "")),
-    "qwen-medium": _url_list(os.getenv("BACKEND_QWEN_MEDIUM", "")),
-    "qwen-heavy": _url_list(os.getenv("BACKEND_QWEN_HEAVY", "")),
+    "fast": _url_list(_tier_env("fast")),
+    "medium": _url_list(_tier_env("medium")),
+    "large": _url_list(_tier_env("large")),
+    "xlarge": _url_list(_tier_env("xlarge")),
 }
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 # One state per (tier, url) pair: the same host can back more than one tier.
@@ -2408,16 +2508,18 @@ PYEOF
       [[ -n "$OLLAMA_KEEP_ALIVE" ]] && printf '      keep_alive: %s\n' "$OLLAMA_KEEP_ALIVE"
     done
   }
-  emit_tier_deployments qwen-fast   "$MODEL_FAST"   "$TIER_FAST_IDX"
-  emit_tier_deployments qwen-medium "$MODEL_MEDIUM" "$TIER_MEDIUM_IDX"
-  emit_tier_deployments qwen-heavy  "$MODEL_HEAVY"  "$TIER_HEAVY_IDX"
+  emit_tier_deployments fast   "$MODEL_FAST"   "$TIER_FAST_IDX"
+  emit_tier_deployments medium "$MODEL_MEDIUM" "$TIER_MEDIUM_IDX"
+  emit_tier_deployments large  "$MODEL_LARGE"  "$TIER_LARGE_IDX"
+  emit_tier_deployments xlarge "$MODEL_XLARGE" "$TIER_XLARGE_IDX"
   cat <<'YAMLEOF'
 router_settings:
   routing_strategy: latency-based-routing
   fallbacks:
-    - qwen-heavy: ["qwen-medium", "qwen-fast"]
-    - qwen-medium: ["qwen-heavy", "qwen-fast"]
-    - qwen-fast: ["qwen-medium", "qwen-heavy"]
+    - xlarge: ["large", "medium", "fast"]
+    - large: ["xlarge", "medium", "fast"]
+    - medium: ["large", "fast"]
+    - fast: ["medium", "large"]
 YAMLEOF
 } > "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 
@@ -2474,7 +2576,9 @@ cat > "${REPO_DIR}/services/ollama-router/router.ini" <<'INIEOF'
 # without touching router.py. Applied at provisioning time.
 [thresholds]
 # Approximate token counts (words * 1.3) above which a tier is chosen.
-heavy = 800
+# Evaluated highest-first: xlarge, then large, then medium.
+xlarge = 2000
+large = 800
 medium = 250
 
 [keywords]
@@ -2483,12 +2587,15 @@ medium = 250
 # code_first=true means a code match wins regardless of prompt length.
 code_first = true
 code = ["def ", "fn ", "function", "class ", "import ", "sql", "script", "code", "bug", "error", "compile"]
-heavy = ["analyze", "evaluate", "optimise", "optimize", "architecture", "mathematics", "calculate", "summarise this article"]
+large = ["analyze", "evaluate", "optimise", "optimize", "architecture", "mathematics", "calculate", "summarise this article"]
+# Checked before the large list: work that wants the deepest model available.
+xlarge = ["prove", "derive", "rigorous", "comprehensive", "exhaustive", "step by step proof", "entire codebase", "whole repository", "research report", "literature review"]
 
 [tiers]
-fast = qwen-fast
-medium = qwen-medium
-heavy = qwen-heavy
+fast = fast
+medium = medium
+large = large
+xlarge = xlarge
 
 [discovery]
 # Poll each Ollama target's /api/tags for the models it is actually serving,
@@ -2503,7 +2610,8 @@ servers =
 # Parameter-count bands (billions) each request class prefers: low:high
 fast_params = 0:9
 medium_params = 9:20
-heavy_params = 20:999
+large_params = 20:70
+xlarge_params = 70:999
 # Score decay per billion parameters outside the preferred band.
 band_falloff = 12
 # Name substrings / model families used to classify what a model is for.
@@ -2518,8 +2626,8 @@ embedding_families = ["bert", "nomic-bert"]
 band_fit = 1.0
 code_match = 0.6
 vision_match = 1.5
-prefer_larger_heavy = 0.15
-prefer_smaller_fast = 0.15
+prefer_larger = 0.15
+prefer_smaller = 0.15
 unknown_params = 0.3
 # Penalty fraction when a specialised model serves an off-task request
 # (a vision model answering plain text, a code model answering prose).
@@ -2661,7 +2769,7 @@ Commands:
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
-  set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|heavy)
+  set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
   set-server-model <tier> <server> <model>
                              Set the model for ONE server within a tier
@@ -2688,13 +2796,13 @@ Options:
   -h, --help                 This help
 
 Examples:
-  manage-model-servers.sh add 10.0.0.55 --tier heavy --apply
+  manage-model-servers.sh add 10.0.0.55 --tier large --apply
   manage-model-servers.sh add ollama7.lan:11434 --tier fast,medium --apply --commit
   manage-model-servers.sh remove 10.0.0.52 --apply
-  manage-model-servers.sh set-tier heavy 10.0.0.54 10.0.0.55 --apply
+  manage-model-servers.sh set-tier large 10.0.0.54 10.0.0.55 --apply
   manage-model-servers.sh models
-  manage-model-servers.sh set-model heavy qwen3:32b --apply --commit
-  manage-model-servers.sh set-server-model heavy 10.0.0.54 llama3.3:70b --apply
+  manage-model-servers.sh set-model large qwen3:32b --apply --commit
+  manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
   manage-model-servers.sh set-keepalive 2h --apply
   manage-model-servers.sh set-webui-version latest --apply
 USAGE
@@ -2763,11 +2871,186 @@ env_set() {
 # or an invalid tier silently yields an empty key and corrupts router.env.
 tier_env_key() {
   case "$1" in
-    fast)   echo "BACKEND_QWEN_FAST" ;;
-    medium) echo "BACKEND_QWEN_MEDIUM" ;;
-    heavy)  echo "BACKEND_QWEN_HEAVY" ;;
-    *) die "unknown tier '$1' (expected fast, medium or heavy)" ;;
+    fast)   echo "BACKEND_FAST" ;;
+    medium) echo "BACKEND_MEDIUM" ;;
+    large)  echo "BACKEND_LARGE" ;;
+    xlarge) echo "BACKEND_XLARGE" ;;
+    *) die "unknown tier '$1' (expected fast, medium, large or xlarge)" ;;
   esac
+}
+
+# Tier names have been renamed twice, so a config can be one or two generations
+# behind:
+#
+#   BACKEND_QWEN_HEAVY  ->  BACKEND_HEAVY  ->  BACKEND_LARGE
+#   model_name qwen-heavy  ->  heavy  ->  large
+#
+# (the QWEN_ infix went when the router stopped being Qwen-specific; "heavy"
+# became "large" when the xlarge tier was added). This brings either generation
+# forward: env keys are renamed in place so router.env keeps its key order,
+# aliases in litellm_config.yaml and router.ini are rewritten, the stale
+# large_params ceiling is corrected, and the new xlarge entries are added empty
+# so the tier is visible but inactive until servers are assigned to it.
+# Runs once at startup and is a no-op on an already-current config.
+
+# current-key|legacy-name[,older-name...] — one per line, newest legacy first.
+# A function rather than a top-level array so the migration is self-contained:
+# a global here would be invisible to anything that sources only the functions.
+legacy_env_key_map() {
+  cat <<'MAPEOF'
+BACKEND_FAST|BACKEND_QWEN_FAST
+BACKEND_MEDIUM|BACKEND_QWEN_MEDIUM
+BACKEND_LARGE|BACKEND_HEAVY,BACKEND_QWEN_HEAVY
+MODEL_LARGE|MODEL_HEAVY
+TIER_LARGE_SERVERS|TIER_HEAVY_SERVERS
+MAPEOF
+}
+
+# NOTE: every check below is an explicit `if`. Under `set -e` a bare
+# `grep -q ... && return 0` statement exits the script when the grep does not
+# match, because the whole AND-list inherits the failing status.
+config_has_legacy_names() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  local pair legacies legacy
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] || continue
+    legacies="${pair#*|}"
+    for legacy in ${legacies//,/ }; do
+      if grep -q "^${legacy}=" "$ENV_FILE"; then return 0; fi
+    done
+  done < <(legacy_env_key_map)
+  if [[ -f "$LITELLM_YAML" ]]; then
+    if grep -qE '\b(qwen-(fast|medium|heavy)|heavy)\b' "$LITELLM_YAML"; then return 0; fi
+  fi
+  if [[ -f "$ROUTER_INI" ]]; then
+    if grep -qE '^(heavy|heavy_params|prefer_larger_heavy|prefer_smaller_fast) *=' "$ROUTER_INI"; then return 0; fi
+  fi
+  return 1
+}
+
+# Rename a single key in place, preserving its position in the file.
+env_rename_key() {
+  local legacy="$1" key="$2" tmp
+  grep -q "^${legacy}=" "$ENV_FILE" || return 1
+  tmp="$(mktemp)"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    # Both present (a hand-edited file): the modern key wins. Drop the stale
+    # one so it cannot come back to life on a later edit.
+    grep -v "^${legacy}=" "$ENV_FILE" > "$tmp"
+  else
+    awk -v old="$legacy" -v newk="$key" -F= \
+      '{ if ($1==old) { sub(/^[^=]*=/,""); print newk "=" $0 } else print }' \
+      "$ENV_FILE" > "$tmp"
+  fi
+  cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
+  return 0
+}
+
+migrate_legacy_names() {
+  local pair key legacies legacy changed=false tmp f
+  [[ -f "$ENV_FILE" ]] || return 0
+  config_has_legacy_names || return 0
+
+  if $DRY_RUN; then
+    note "  [dry-run] would migrate legacy tier names (heavy -> large, drop QWEN_)"
+    return 0
+  fi
+
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] || continue
+    key="${pair%%|*}"; legacies="${pair#*|}"
+    for legacy in ${legacies//,/ }; do
+      if env_rename_key "$legacy" "$key"; then changed=true; fi
+    done
+  done < <(legacy_env_key_map)
+
+  # Aliases in the generated LiteLLM config and the router's tier map.
+  for f in "$LITELLM_YAML" "$ROUTER_INI"; do
+    [[ -f "$f" ]] || continue
+    grep -qE '\b(qwen-(fast|medium|heavy)|heavy)\b' "$f" || continue
+    tmp="$(mktemp)"
+    # qwen-heavy collapses straight to large; order matters so the generic
+    # heavy->large rule does not fire first and leave "qwen-large" behind.
+    sed -E 's/\bqwen-heavy\b/large/g; s/\bqwen-(fast|medium)\b/\1/g; s/\bheavy\b/large/g' \
+      "$f" > "$tmp"
+    cat "$tmp" > "$f"; rm -f "$tmp"
+    changed=true
+  done
+
+  # regenerate_litellm preserves router_settings verbatim from the existing
+  # file, so without this the migrated config would keep a three-tier fallback
+  # map and xlarge would never gain one.
+  if [[ -f "$LITELLM_YAML" ]] && grep -q '^  fallbacks:' "$LITELLM_YAML" \
+     && ! grep -q '^    - xlarge:' "$LITELLM_YAML"; then
+    tmp="$(mktemp)"
+    sed '/^  fallbacks:/a\    - xlarge: ["large", "medium", "fast"]' "$LITELLM_YAML" > "$tmp"
+    cat "$tmp" > "$LITELLM_YAML"; rm -f "$tmp"
+    changed=true
+  fi
+
+  # router.ini: rename the renamed tunables, correct the large band ceiling and
+  # add the xlarge entries. Section-aware, so this is python rather than sed.
+  if [[ -f "$ROUTER_INI" ]]; then
+    if python3 - "$ROUTER_INI" <<'INIMIG'
+import io, sys, configparser
+path = sys.argv[1]
+cp = configparser.ConfigParser()
+cp.read(path)
+touched = False
+
+def rename(section, old, new):
+    global touched
+    if cp.has_section(section) and cp.has_option(section, old) and not cp.has_option(section, new):
+        cp.set(section, new, cp.get(section, old))
+        cp.remove_option(section, old)
+        touched = True
+
+def add(section, option, value):
+    global touched
+    if not cp.has_section(section):
+        cp.add_section(section); touched = True
+    if not cp.has_option(section, option):
+        cp.set(section, option, value); touched = True
+
+rename("discovery", "heavy_params", "large_params")
+rename("weights", "prefer_larger_heavy", "prefer_larger")
+rename("weights", "prefer_smaller_fast", "prefer_smaller")
+
+# The old large/heavy band ran to the top. Split it only if it is still the
+# untouched default -- a hand-tuned ceiling is the operator's decision.
+if cp.has_option("discovery", "large_params") and \
+   cp.get("discovery", "large_params").strip() in ("20:999", "20:1000"):
+    cp.set("discovery", "large_params", "20:70")
+    touched = True
+
+add("thresholds", "xlarge", "2000")
+add("keywords", "xlarge",
+    '["prove", "derive", "rigorous", "comprehensive", "exhaustive", '
+    '"step by step proof", "entire codebase", "whole repository", '
+    '"research report", "literature review"]')
+add("tiers", "xlarge", "xlarge")
+add("discovery", "xlarge_params", "70:999")
+
+if touched:
+    with open(path, "w", encoding="utf-8") as fh:
+        cp.write(fh)
+sys.exit(0 if touched else 1)
+INIMIG
+    then changed=true; fi
+  fi
+
+  # Make the new tier visible in router.env, but empty: migration must not
+  # invent a server assignment the operator did not ask for.
+  grep -q '^BACKEND_XLARGE=' "$ENV_FILE" || { env_set BACKEND_XLARGE "" >/dev/null; changed=true; }
+  grep -q '^MODEL_XLARGE='   "$ENV_FILE" || { env_set MODEL_XLARGE   "" >/dev/null; changed=true; }
+
+  if $changed; then
+    note "Migrated legacy tier names in the configuration:"
+    note "  the 'heavy' tier is now 'large', and any BACKEND_QWEN_* keys were renamed."
+    note "  A new 'xlarge' tier was added with no servers — assign some with:"
+    note "    $0 set-tier xlarge <addr...>  &&  $0 set-model xlarge <tag>"
+    note "  Run '$0 apply' to push this to the running services."
+  fi
 }
 
 # Tier model_name comes from router.ini so custom names are honoured.
@@ -2776,7 +3059,7 @@ tier_model_name() {
   if [[ -f "$ROUTER_INI" ]]; then
     val="$(awk -v k="$key" '/^\[tiers\]/{f=1;next} /^\[/{f=0} f && $1==k {print $3; exit}' "$ROUTER_INI")"
   fi
-  printf '%s' "${val:-qwen-${key}}"
+  printf '%s' "${val:-${key}}"
 }
 
 # NOTE the trailing newline: without it the final element has no line
@@ -2878,7 +3161,7 @@ current_tier_tag() {
 # --- rendering ----------------------------------------------------------------
 tiers_of() {  # which tiers reference this URL
   local url="$1" tier out=""
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     if get_tier "$tier" | contains_line "$url"; then
       out="${out}${out:+,}${tier}"
     fi
@@ -2914,7 +3197,7 @@ cmd_list() {
   echo "Tier assignments (one row per server):"
   printf '  %-7s %-14s %-34s %s\n' "TIER" "ALIAS" "SERVER" "MODEL"
   local tier alias tag url any
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     alias="$(tier_model_name "$tier")"
     any=false
     while IFS= read -r url || [[ -n "$url" ]]; do
@@ -2989,7 +3272,7 @@ regenerate_litellm() {
   tmp="$(mktemp)"
   {
     echo "model_list:"
-    for tier in fast medium heavy; do
+    for tier in fast medium large xlarge; do
       name="$(tier_model_name "$tier")"
       tier_tag="${TIER_MODEL_OVERRIDE[$tier]:-}"
       [[ -n "$tier_tag" ]] || tier_tag="$(current_tier_tag "$name")"
@@ -3025,9 +3308,9 @@ regenerate_litellm() {
 router_settings:
   routing_strategy: latency-based-routing
   fallbacks:
-    - qwen-heavy: ["qwen-medium", "qwen-fast"]
-    - qwen-medium: ["qwen-heavy", "qwen-fast"]
-    - qwen-fast: ["qwen-medium", "qwen-heavy"]
+    - large: ["medium", "fast"]
+    - medium: ["large", "fast"]
+    - fast: ["medium", "large"]
 YAMLEOF
     fi
   } > "$tmp"
@@ -3142,7 +3425,7 @@ cmd_remove() {
   remaining="$(get_servers | grep -vxF -f <(printf '%s\n' "${to_remove[@]}") | lines_to_csv)"
   env_set MODEL_SERVERS "$remaining"
 
-  for tier in fast medium heavy; do
+  for tier in fast medium large xlarge; do
     key="$(tier_env_key "$tier")" || exit 1
     kept="$(get_tier "$tier" | grep -vxF -f <(printf '%s\n' "${to_remove[@]}") | lines_to_csv || true)"
     if [[ "$kept" != "$(get_tier "$tier" | lines_to_csv)" ]]; then
@@ -3421,7 +3704,7 @@ cmd_models() {
     END { if (prev != "") printf "  %-30s %s\n", prev, hosts }'
   rm -f "$tmp"
   echo
-  echo "Set one for a tier with:  $0 set-model <fast|medium|heavy> <model>"
+  echo "Set one for a tier with:  $0 set-model <fast|medium|large|xlarge> <model>"
 }
 
 cmd_set_model() {
@@ -3837,6 +4120,7 @@ done
 
 ensure_config_or_forward
 $DRY_RUN && note "(dry run — no files will be written)"
+migrate_legacy_names
 
 case "$COMMAND" in
   list)     cmd_list false ;;
@@ -4113,9 +4397,10 @@ cat > "$motd_tmp" <<EOF
 
   MODEL TIERS  ->  OLLAMA BACKEND(S)
   ---------------------------------------------------------------------------
-   qwen-fast     ->  $(indices_to_urls "$TIER_FAST_IDX")   (ollama/${MODEL_FAST})
-   qwen-medium   ->  $(indices_to_urls "$TIER_MEDIUM_IDX")   (ollama/${MODEL_MEDIUM})
-   qwen-heavy    ->  $(indices_to_urls "$TIER_HEAVY_IDX")   (ollama/${MODEL_HEAVY})
+   fast     ->  $(indices_to_urls "$TIER_FAST_IDX")   (ollama/${MODEL_FAST})
+   medium   ->  $(indices_to_urls "$TIER_MEDIUM_IDX")   (ollama/${MODEL_MEDIUM})
+   large    ->  $(indices_to_urls "$TIER_LARGE_IDX")   (ollama/${MODEL_LARGE})
+   xlarge   ->  $(indices_to_urls "$TIER_XLARGE_IDX")   (ollama/${MODEL_XLARGE})
    ${MODEL_SERVER_COUNT} server(s) total
 
   PATHS & COMMANDS
@@ -4125,8 +4410,8 @@ cat > "$motd_tmp" <<EOF
    WebUI config  : /app/openwebui/.env
    Config repo   : ${CONFIG_REPO_DIR}  (git pull && ./install/apply-config.sh)
    Model servers : manage-model-servers list | status | models
-                   manage-model-servers add <ip> --tier heavy --apply
-                   manage-model-servers set-model heavy <tag> --apply
+                   manage-model-servers add <ip> --tier large --apply
+                   manage-model-servers set-model large <tag> --apply
                    manage-model-servers set-server-model <tier> <ip> <tag>
                    manage-model-servers set-webui-version latest --apply
                    manage-model-servers set-keepalive 2h --apply
