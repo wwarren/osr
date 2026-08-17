@@ -336,20 +336,16 @@ then optionally applies and restarts. Design points:
 * Both verify the tag is **actually present** on the affected server(s) before
   writing it (`models` lists what is available; `--no-probe` overrides for a
   not-yet-pulled model).
-* **Legacy names are migrated on startup.** The tiers have been renamed twice
-  — `BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
-  `model_name: qwen-heavy` → `heavy` → `large` — so a deployed config may be
-  one or two generations behind. Either is brought forward in one pass: env
-  keys are renamed in place so they keep their position in `router.env` and
-  diffs stay readable; aliases in `litellm_config.yaml` and `router.ini` are
-  rewritten; the renamed tunables (`heavy_params`, `prefer_larger_heavy`) move
-  with them; the old `large_params = 20:999` ceiling is split into `20:70` plus
-  a new `70:999` xlarge band, but only if it is still the untouched default;
-  and the `xlarge` tier is added **empty**, since migration must not invent a
-  server assignment. Model *tags* are untouched — `ollama/qwen3:32b` is a
-  model, not a routing name. The Python services independently fall back
-  through the same name chain, closing the window where a service restarts
-  before the migration has run.
+* **No automatic config migration.** The tiers were renamed twice
+  (`BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
+  `model_name: qwen-heavy` → `heavy` → `large`), but the management script does
+  not rewrite an older config — upgrading is reprovisioning or a hand edit, so
+  nothing mutates a deployment behind the operator's back. The Python services
+  do still resolve the old env key names through a read-only fallback chain, so
+  a service starting against an un-migrated `router.env` finds its backends
+  instead of coming up healthy with none. Anything `router.ini` omits falls back
+  to the built-in defaults in `router.py`, so a config predating the `xlarge`
+  tier still loads.
 * `commit` authenticates with the deploy token from `router.env`. Gitea rejects
   account passwords for git-over-HTTP, and the stored git credentials are
   deleted after provisioning, so the token is written to a temporary 0600

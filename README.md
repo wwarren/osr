@@ -56,7 +56,7 @@ Parameter counts come from `details.parameter_size`, falling back to the tag
 (`qwen3:14b` → 14B) when absent.
 
 Discovery polls **every** configured host — it reads the full `MODEL_SERVERS`
-list, not just the per-tier `BACKEND_*` vars, so a host you left out of all
+list, not just the per-tier `BACKEND_*` vars, so a host you left out of every
 tier is still discovered and can still be selected on merit.
 
 Requests are dispatched straight to the chosen host's OpenAI-compatible
@@ -152,8 +152,8 @@ and the `BACKEND_FAST` / `BACKEND_MEDIUM` / `BACKEND_LARGE` / `BACKEND_XLARGE` e
 model-specific — a tier is a size class, and you point it at whatever model you
 like with `set-model` or `set-server-model`.
 
-> **Upgrading an existing install.** The tiers have been renamed twice, so a
-> deployed config may be one or two generations behind:
+> **Upgrading an existing install — manual.** The tiers have been renamed twice,
+> so a config deployed before this version may be one or two generations behind:
 >
 > ```
 > BACKEND_QWEN_HEAVY  ->  BACKEND_HEAVY  ->  BACKEND_LARGE
@@ -161,26 +161,36 @@ like with `set-model` or `set-server-model`.
 > ```
 >
 > (the `QWEN_` infix went when the router stopped being Qwen-specific; `heavy`
-> became `large` when `xlarge` was added). `manage-model-servers.sh` brings
-> either generation forward automatically on its next run: it renames the env
-> keys in place, rewrites the aliases in `litellm_config.yaml` and `router.ini`,
-> renames the `heavy_params` / `prefer_larger_heavy` tunables, splits the old
-> `large_params = 20:999` ceiling into `20:70` + `70:999`, adds the `xlarge`
-> entries, and tells you to run `apply`. It then prints nothing on later runs.
+> became `large` when `xlarge` was added). **There is no automatic migration** —
+> the scripts do not rewrite an old config. Either reprovision, or edit
+> `env/router.env`, `services/litellm-proxy/litellm_config.yaml` and
+> `services/ollama-router/router.ini` by hand:
 >
-> The new `xlarge` tier is added **with no servers** — migration will not invent
-> an assignment. Populate it when you're ready:
+> | Old | New |
+> |---|---|
+> | `BACKEND_QWEN_HEAVY=` / `BACKEND_HEAVY=` | `BACKEND_LARGE=` |
+> | `BACKEND_QWEN_FAST=` / `BACKEND_QWEN_MEDIUM=` | `BACKEND_FAST=` / `BACKEND_MEDIUM=` |
+> | `MODEL_HEAVY=` | `MODEL_LARGE=` |
+> | `model_name: qwen-heavy` / `heavy` | `model_name: large` |
+> | `[thresholds] heavy =` / `[keywords] heavy =` / `[tiers] heavy =` | `large =` |
+> | `heavy_params = 20:999` | `large_params = 20:70` **plus** `xlarge_params = 70:999` |
+> | `prefer_larger_heavy` / `prefer_smaller_fast` | `prefer_larger` / `prefer_smaller` |
+>
+> Then add the new tier's keys (`BACKEND_XLARGE=`, `MODEL_XLARGE=`), an
+> `xlarge = xlarge` entry under `[tiers]`, and an `xlarge` threshold and keyword
+> list — or leave those out and the router falls back to its built-in defaults
+> for anything `router.ini` does not set. Populate the tier with:
 >
 > ```bash
 > manage-model-servers set-tier  xlarge 10.0.0.54
 > manage-model-servers set-model xlarge llama3.3:70b --apply --commit
 > ```
 >
-> Real model *tags* like `qwen3:32b` are left alone; only routing names change.
-> A hand-tuned `large_params` is left alone too. The services independently read
-> the old key names as a fallback, so a router that restarts before the
-> migration runs still resolves its backends. **If you call the API with
-> `qwen-heavy` or `heavy`, change it to `large`** — the old aliases stop
+> Model *tags* like `qwen3:32b` are unaffected — only routing names changed. The
+> running services do still read the old env key names as a fallback, so a
+> service that starts against an un-migrated `router.env` resolves its backends
+> rather than coming up healthy with nothing behind it. **If you call the API
+> with `qwen-heavy` or `heavy`, change it to `large`** — the old aliases stop
 > resolving once the config is regenerated.
 
 Only `MODEL_SERVER_1`–`MODEL_SERVER_3` carry built-in defaults; higher indices
