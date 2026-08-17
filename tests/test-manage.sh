@@ -99,7 +99,7 @@ assert_fail "junk"     valid_keep_alive abc
 describe env_get
 reset_repo
 assert_eq "reads a plain value"    "tester" "$(env_get GITEA_ADMIN_USER)"
-assert_eq "reads a comma list"     "http://10.0.0.51:11434,http://10.0.0.52:11434,http://10.0.0.53:11434" "$(env_get MODEL_SERVERS)"
+assert_eq "reads a comma list"     "http://10.0.0.51:11434,http://10.0.0.52:11434,http://10.0.0.53:11434,http://10.0.0.54:11434" "$(env_get MODEL_SERVERS)"
 assert_eq "reads an empty value"   ""       "$(env_get OLLAMA_KEEP_ALIVE)"
 assert_eq "missing key is empty"   ""       "$(env_get NO_SUCH_KEY)"
 assert_eq "value containing = is preserved" \
@@ -121,18 +121,136 @@ assert_eq "dry-run writes nothing" "3h" "$(env_get OLLAMA_KEEP_ALIVE)"
 DRY_RUN=false
 
 describe tier_env_key
-assert_eq "fast"   "BACKEND_QWEN_FAST"   "$(tier_env_key fast)"
-assert_eq "medium" "BACKEND_QWEN_MEDIUM" "$(tier_env_key medium)"
-assert_eq "heavy"  "BACKEND_QWEN_HEAVY"  "$(tier_env_key heavy)"
+assert_eq "fast"   "BACKEND_FAST"   "$(tier_env_key fast)"
+assert_eq "medium" "BACKEND_MEDIUM" "$(tier_env_key medium)"
+assert_eq "large"  "BACKEND_LARGE"  "$(tier_env_key large)"
+assert_eq "xlarge" "BACKEND_XLARGE" "$(tier_env_key xlarge)"
 assert_fail "rejects an unknown tier" bash -c "source '$FUNCS'; tier_env_key turbo"
+assert_not_contains "no longer Qwen-specific" "QWEN" "$(tier_env_key fast)"
+
+describe legacy_env_key_map
+map="$(legacy_env_key_map)"
+assert_contains "maps the fast tier key"  "BACKEND_FAST|BACKEND_QWEN_FAST"  "$map"
+assert_contains "large carries TWO older names" \
+  "BACKEND_LARGE|BACKEND_HEAVY,BACKEND_QWEN_HEAVY" "$map"
+assert_contains "the model tag key too"   "MODEL_LARGE|MODEL_HEAVY" "$map"
+assert_not_contains "xlarge has no legacy name" "XLARGE" "$map"
+assert_ok "every line is current|legacy" \
+  bash -c "! printf '%s\n' \"\$(source '$FUNCS'; legacy_env_key_map)\" | grep -qv '|'"
+
+describe config_has_legacy_names
+reset_repo
+assert_fail "a current config has nothing to migrate" config_has_legacy_names
+rm -rf "$REPO_DIR"; make_legacy_config_repo "$REPO_DIR"
+assert_ok "a legacy config is detected" config_has_legacy_names
+# Detected from any one of the three files on its own.
+reset_repo
+env_set BACKEND_HEAVY "http://10.0.0.9:11434"
+assert_ok "detects a legacy env key alone" config_has_legacy_names
+reset_repo
+printf 'model_list:\n  - model_name: heavy\n' > "$LITELLM_YAML"
+assert_ok "detects a legacy yaml alias alone" config_has_legacy_names
+reset_repo
+printf '[weights]\nprefer_larger_heavy = 0.15\n' > "$ROUTER_INI"
+assert_ok "detects a legacy ini tunable alone" config_has_legacy_names
+reset_repo
+
+describe env_rename_key
+reset_repo
+env_set OLD_KEY "value1"
+assert_ok "renames an existing key" env_rename_key OLD_KEY NEW_KEY
+assert_eq "value carried over" "value1" "$(env_get NEW_KEY)"
+assert_eq "old key gone"       ""       "$(env_get OLD_KEY)"
+assert_fail "absent legacy key is a no-op" env_rename_key NOT_THERE SOMETHING
+reset_repo
+# Both present: the modern key wins and the legacy one is dropped.
+env_set NEW_KEY "modern"; env_set OLD_KEY "stale"
+env_rename_key OLD_KEY NEW_KEY
+assert_eq "modern value preserved" "modern" "$(env_get NEW_KEY)"
+assert_eq "stale key removed"      ""       "$(env_get OLD_KEY)"
+reset_repo
+
+describe migrate_legacy_names
+# A config repo written before the de-Qwen rename must upgrade itself in place.
+rm -rf "$REPO_DIR"; make_legacy_config_repo "$REPO_DIR"
+out="$(migrate_legacy_names 2>&1)"
+assert_eq "renames the fast tier key"   "http://10.0.0.51:11434" "$(env_get BACKEND_FAST)"
+assert_eq "renames the medium tier key" "http://10.0.0.52:11434" "$(env_get BACKEND_MEDIUM)"
+assert_eq "preserves a multi-server list" \
+  "http://10.0.0.52:11434,http://10.0.0.53:11434" "$(env_get BACKEND_LARGE)"
+assert_eq "drops the legacy key"        "" "$(env_get BACKEND_QWEN_FAST)"
+assert_eq "other keys are untouched"    "tester" "$(env_get GITEA_ADMIN_USER)"
+assert_contains "says what it migrated" "'heavy' tier is now 'large'" "$out"
+assert_contains "points at the new tier" "set-tier xlarge" "$out"
+# The two-generation leg: BACKEND_QWEN_HEAVY -> BACKEND_LARGE in one pass.
+assert_eq "collapses both renames at once" \
+  "http://10.0.0.52:11434,http://10.0.0.53:11434" "$(env_get BACKEND_LARGE)"
+assert_eq "MODEL_HEAVY follows to MODEL_LARGE" "qwen3:32b" "$(env_get MODEL_LARGE)"
+# The new tier appears, but empty — migration must not invent an assignment.
+assert_eq "adds an empty xlarge backend" "" "$(env_get BACKEND_XLARGE)"
+assert_ok "xlarge key really exists" bash -c "grep -q '^BACKEND_XLARGE=' '$ENV_FILE'"
+assert_eq "xlarge has no servers" "0" "$(get_tier xlarge | grep -c . || true)"
+assert_contains "tells you to apply"    "apply" "$out"
+# Renamed in place, not deleted-and-appended, so a diff of router.env stays
+# readable: the key must still sit between the two it was written between.
+assert_eq "key order is preserved" "LITELLM_BASE_URL BACKEND_FAST BACKEND_MEDIUM" \
+  "$(grep -n '^\(LITELLM_BASE_URL\|BACKEND_FAST\|BACKEND_MEDIUM\)=' "$ENV_FILE" \
+     | sort -t: -k1,1n | cut -d= -f1 | cut -d: -f2 | paste -sd' ')"
+# The aliases move with the keys.
+assert_file_contains "yaml alias renamed"        "model_name: large" "$LITELLM_YAML"
+assert_ok "no qwen- alias survives in the yaml" \
+  bash -c "! grep -qE 'qwen-' '$LITELLM_YAML'"
+assert_ok "no heavy alias survives in the yaml" \
+  bash -c "! grep -qw heavy '$LITELLM_YAML'"
+assert_file_contains "xlarge gains a fallback entry" '- xlarge: ["large", "medium", "fast"]' "$LITELLM_YAML"
+assert_file_contains "fallbacks renamed too" '- large: ["medium", "fast"]' "$LITELLM_YAML"
+assert_file_contains "router.ini alias renamed"  "large = large"     "$ROUTER_INI"
+assert_file_contains "router.ini gains the xlarge tier"  "xlarge = xlarge"    "$ROUTER_INI"
+assert_file_contains "router.ini gains an xlarge band"   "xlarge_params = 70:999" "$ROUTER_INI"
+assert_file_contains "the stale large ceiling is split"  "large_params = 20:70"   "$ROUTER_INI"
+assert_file_contains "renamed weight key"                "prefer_larger = "       "$ROUTER_INI"
+assert_ok "no heavy tunables remain" \
+  bash -c "! grep -qE '^(heavy|heavy_params|prefer_larger_heavy|prefer_smaller_fast) *=' '$ROUTER_INI'"
+# Model TAGS are not aliases — a real qwen3:32b must survive untouched.
+assert_file_contains "real model tags are left alone" "ollama/qwen3:32b" "$LITELLM_YAML"
+
+# Idempotent: a second pass changes nothing and stays quiet.
+out="$(migrate_legacy_names 2>&1)"
+assert_eq "second run is silent" "" "$out"
+assert_eq "values still correct" "http://10.0.0.51:11434" "$(env_get BACKEND_FAST)"
+
+# Already-modern config: nothing to do.
+reset_repo
+out="$(migrate_legacy_names 2>&1)"
+assert_eq "modern config is a no-op" "" "$out"
+
+# Both keys present (a hand-edited file): the modern one wins, legacy is dropped.
+rm -rf "$REPO_DIR"; make_legacy_config_repo "$REPO_DIR"
+printf 'BACKEND_FAST=http://10.9.9.9:11434\n' >> "$ENV_FILE"
+migrate_legacy_names >/dev/null 2>&1
+assert_eq "modern key wins over legacy" "http://10.9.9.9:11434" "$(env_get BACKEND_FAST)"
+assert_eq "legacy key is removed"       "" "$(env_get BACKEND_QWEN_FAST)"
+assert_eq "only one BACKEND_FAST remains" "1" "$(grep -c '^BACKEND_FAST=' "$ENV_FILE")"
+
+# Dry run must not write.
+rm -rf "$REPO_DIR"; make_legacy_config_repo "$REPO_DIR"
+DRY_RUN=true
+out="$(migrate_legacy_names 2>&1)"
+DRY_RUN=false
+assert_contains "dry-run announces the migration" "[dry-run]" "$out"
+assert_eq "dry-run leaves the legacy key in place" \
+  "http://10.0.0.51:11434" "$(env_get BACKEND_QWEN_FAST)"
+assert_eq "dry-run adds no xlarge key" "" "$(env_get BACKEND_XLARGE)"
+assert_eq "dry-run writes no modern key" "" "$(env_get BACKEND_FAST)"
+reset_repo
 
 describe tier_model_name
 reset_repo
-assert_eq "reads from router.ini" "qwen-fast" "$(tier_model_name fast)"
+assert_eq "reads from router.ini" "fast" "$(tier_model_name fast)"
 printf '[tiers]\nfast = custom-fast\n' > "$ROUTER_INI"
 assert_eq "honours a custom alias" "custom-fast" "$(tier_model_name fast)"
 rm -f "$ROUTER_INI"
-assert_eq "falls back when ini is missing" "qwen-heavy" "$(tier_model_name heavy)"
+assert_eq "falls back when ini is missing" "large" "$(tier_model_name large)"
 reset_repo
 
 # ── list helpers ──────────────────────────────────────────────────────────────
@@ -148,14 +266,14 @@ assert_eq "single line"       "a"     "$(printf 'a\n' | lines_to_csv)"
 
 describe get_servers
 reset_repo
-assert_eq "all servers"      "3" "$(get_servers | grep -c .)"
+assert_eq "all servers"      "4" "$(get_servers | grep -c .)"
 env_set MODEL_SERVERS ""
 assert_eq "no servers configured yields nothing" "0" "$(get_servers | grep -c . || true)"
 reset_repo
 
 describe get_tier
 assert_eq "fast tier"        "1" "$(get_tier fast | grep -c .)"
-assert_eq "heavy tier (two)" "2" "$(get_tier heavy | grep -c .)"
+assert_eq "large tier (two)" "2" "$(get_tier large | grep -c .)"
 assert_fail "an unknown tier is rejected" get_tier turbo
 
 describe contains_line
@@ -167,21 +285,21 @@ assert_ok   "matches a final line without newline" \
 describe tiers_of
 reset_repo
 assert_eq "server in one tier"   "fast"        "$(tiers_of http://10.0.0.51:11434)"
-assert_eq "server in two tiers"  "medium,heavy" "$(tiers_of http://10.0.0.52:11434)"
+assert_eq "server in two tiers"  "medium,large" "$(tiers_of http://10.0.0.52:11434)"
 assert_eq "unassigned server"    "—"           "$(tiers_of http://10.0.0.99:11434)"
 
 # ── yaml reading ──────────────────────────────────────────────────────────────
 describe current_pair_tag
 reset_repo
 assert_eq "reads the tag for a specific host" \
-  "qwen3:32b" "$(current_pair_tag qwen-heavy http://10.0.0.52:11434)"
+  "qwen3:32b" "$(current_pair_tag large http://10.0.0.52:11434)"
 assert_eq "a different host in the same tier has its own tag" \
-  "mixtral:8x7b" "$(current_pair_tag qwen-heavy http://10.0.0.53:11434)"
-assert_eq "unknown pair is empty" "" "$(current_pair_tag qwen-heavy http://10.0.0.99:11434)"
+  "mixtral:8x7b" "$(current_pair_tag large http://10.0.0.53:11434)"
+assert_eq "unknown pair is empty" "" "$(current_pair_tag large http://10.0.0.99:11434)"
 
 describe current_tier_tag
-assert_eq "first tag for the tier" "qwen3:32b" "$(current_tier_tag qwen-heavy)"
-assert_eq "fast tier"              "qwen2.5-coder:7b" "$(current_tier_tag qwen-fast)"
+assert_eq "first tag for the tier" "qwen3:32b" "$(current_tier_tag large)"
+assert_eq "fast tier"              "qwen2.5-coder:7b" "$(current_tier_tag fast)"
 assert_eq "unknown alias is empty" ""          "$(current_tier_tag nope)"
 
 # ── reachability ──────────────────────────────────────────────────────────────
@@ -215,20 +333,20 @@ assert_file_contains "keeps per-host model A" "ollama/qwen3:32b"   "$LITELLM_YAM
 assert_file_contains "keeps per-host model B" "ollama/mixtral:8x7b" "$LITELLM_YAML"
 assert_file_contains "preserves router_settings" "latency-based-routing" "$LITELLM_YAML"
 assert_file_contains "preserves fallbacks"       "fallbacks"             "$LITELLM_YAML"
-assert_eq "one deployment per (tier,server) pair" "4" "$(grep -c 'model_name:' "$LITELLM_YAML")"
-TIER_MODEL_OVERRIDE[heavy]="new:1b"
+assert_eq "one deployment per (tier,server) pair" "5" "$(grep -c 'model_name:' "$LITELLM_YAML")"
+TIER_MODEL_OVERRIDE[large]="new:1b"
 regenerate_litellm >/dev/null 2>&1
 assert_eq "tier override applies to every host in the tier" \
   "2" "$(grep -c 'ollama/new:1b' "$LITELLM_YAML")"
 reset_repo
-PAIR_MODEL_OVERRIDE["heavy|http://10.0.0.53:11434"]="solo:7b"
+PAIR_MODEL_OVERRIDE["large|http://10.0.0.53:11434"]="solo:7b"
 regenerate_litellm >/dev/null 2>&1
 assert_file_contains "per-pair override applied"      "ollama/solo:7b"     "$LITELLM_YAML"
 assert_file_contains "the other host is untouched"    "ollama/qwen3:32b"   "$LITELLM_YAML"
 reset_repo
 env_set OLLAMA_KEEP_ALIVE "2h"
 regenerate_litellm >/dev/null 2>&1
-assert_eq "keep_alive emitted per deployment" "4" "$(grep -c 'keep_alive: 2h' "$LITELLM_YAML")"
+assert_eq "keep_alive emitted per deployment" "5" "$(grep -c 'keep_alive: 2h' "$LITELLM_YAML")"
 env_set OLLAMA_KEEP_ALIVE ""
 regenerate_litellm >/dev/null 2>&1
 assert_eq "blank keep_alive emits nothing" "0" "$(grep -c 'keep_alive' "$LITELLM_YAML" || true)"
@@ -248,14 +366,14 @@ ASSUME_YES=true
 describe cmd_add
 reset_repo; NO_PROBE=true
 cmd_add 10.0.0.60 >/dev/null 2>&1
-assert_eq "server appended"     "4" "$(get_servers | grep -c .)"
+assert_eq "server appended"     "5" "$(get_servers | grep -c .)"
 assert_eq "not tiered by default" "—" "$(tiers_of http://10.0.0.60:11434)"
 reset_repo
-TIER_ARG="heavy"; cmd_add 10.0.0.60 >/dev/null 2>&1; TIER_ARG=""
-assert_eq "--tier assigns it"   "heavy" "$(tiers_of http://10.0.0.60:11434)"
+TIER_ARG="large"; cmd_add 10.0.0.60 >/dev/null 2>&1; TIER_ARG=""
+assert_eq "--tier assigns it"   "large" "$(tiers_of http://10.0.0.60:11434)"
 reset_repo
 cmd_add 10.0.0.51 >/dev/null 2>&1
-assert_eq "duplicate is skipped" "3" "$(get_servers | grep -c .)"
+assert_eq "duplicate is skipped" "4" "$(get_servers | grep -c .)"
 assert_fail "rejects an invalid address" bash -c "source '$FUNCS'; REPO_DIR='$REPO_DIR'; ENV_FILE='$ENV_FILE'; NO_PROBE=true; ASSUME_YES=true; cmd_add 'not valid'"
 MODEL_SERVER_MAX=3
 assert_fail "refuses to exceed the maximum" cmd_add 10.0.0.70
@@ -264,13 +382,13 @@ MODEL_SERVER_MAX=20
 describe cmd_remove
 reset_repo
 cmd_remove http://10.0.0.53:11434 >/dev/null 2>&1
-assert_eq "server removed"        "2" "$(get_servers | grep -c .)"
-assert_eq "tier membership cleaned" "1" "$(get_tier heavy | grep -c .)"
+assert_eq "server removed"        "3" "$(get_servers | grep -c .)"
+assert_eq "tier membership cleaned" "1" "$(get_tier large | grep -c .)"
 reset_repo
 cmd_remove 1 >/dev/null 2>&1
-assert_eq "removal by list number" "2" "$(get_servers | grep -c .)"
+assert_eq "removal by list number" "3" "$(get_servers | grep -c .)"
 reset_repo
-MODEL_SERVER_MIN=3
+MODEL_SERVER_MIN=4
 assert_fail "refuses to drop below the minimum" cmd_remove 1
 MODEL_SERVER_MIN=1
 reset_repo
@@ -287,20 +405,20 @@ reset_repo
 
 describe cmd_set_model
 reset_repo
-cmd_set_model heavy newmodel:1b >/dev/null 2>&1
+cmd_set_model large newmodel:1b >/dev/null 2>&1
 assert_eq "applies to every host in the tier" "2" "$(grep -c 'ollama/newmodel:1b' "$LITELLM_YAML")"
-assert_fail "rejects an ollama/ prefix" cmd_set_model heavy ollama/x
+assert_fail "rejects an ollama/ prefix" cmd_set_model large ollama/x
 assert_fail "rejects an unknown tier"   cmd_set_model turbo x
 reset_repo
 
 describe cmd_set_server_model
 reset_repo; NO_PROBE=true
-cmd_set_server_model heavy http://10.0.0.53:11434 solo:7b >/dev/null 2>&1
+cmd_set_server_model large http://10.0.0.53:11434 solo:7b >/dev/null 2>&1
 assert_file_contains "sets the chosen host"       "ollama/solo:7b"   "$LITELLM_YAML"
 assert_file_contains "leaves the other host alone" "ollama/qwen3:32b" "$LITELLM_YAML"
 assert_fail "rejects a host outside the tier" cmd_set_server_model fast http://10.0.0.53:11434 x:1b
-assert_fail "rejects an unconfigured host"    cmd_set_server_model heavy 10.9.9.9 x:1b
-assert_fail "rejects an ollama/ prefix"       cmd_set_server_model heavy http://10.0.0.53:11434 ollama/x
+assert_fail "rejects an unconfigured host"    cmd_set_server_model large 10.9.9.9 x:1b
+assert_fail "rejects an ollama/ prefix"       cmd_set_server_model large http://10.0.0.53:11434 ollama/x
 reset_repo
 
 describe resolve_server_arg
@@ -334,7 +452,7 @@ reset_repo
 out="$(cmd_list false 2>&1)"
 assert_contains "shows servers"         "10.0.0.51" "$out"
 assert_contains "shows the keep-alive"  "Keep-alive" "$out"
-assert_contains "one row per deployment" "qwen-heavy" "$out"
+assert_contains "one row per deployment" "large" "$out"
 assert_contains "shows per-host models" "mixtral:8x7b" "$out"
 
 describe cmd_discover

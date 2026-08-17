@@ -160,24 +160,49 @@ assert_eq "single"        "3"       "$(seq_csv 3 3)"
 assert_eq "empty range"   ""        "$(seq_csv 3 2)"
 
 describe default_tier_selection
-for n in 1 2 3 4 5 6 9 12 20; do
+# Four tiers now. Every server must be used exactly once when there are enough
+# of them, and every tier must still get *a* server when there are not.
+for n in 1 2 3 4 5 6 8 9 12 20; do
   MODEL_SERVER_COUNT=$n
-  f="$(default_tier_selection fast)"; m="$(default_tier_selection medium)"; h="$(default_tier_selection heavy)"
-  if (( n >= 3 )); then
-    all="$(printf '%s,%s,%s' "$f" "$m" "$h" | tr ',' '\n' | grep -c .)"
-    uniq="$(printf '%s,%s,%s' "$f" "$m" "$h" | tr ',' '\n' | sort -n | uniq | grep -c .)"
+  f="$(default_tier_selection fast)";  m="$(default_tier_selection medium)"
+  l="$(default_tier_selection large)"; x="$(default_tier_selection xlarge)"
+  if (( n >= 4 )); then
+    all="$(printf '%s,%s,%s,%s' "$f" "$m" "$l" "$x" | tr ',' '\n' | grep -c .)"
+    uniq="$(printf '%s,%s,%s,%s' "$f" "$m" "$l" "$x" | tr ',' '\n' | sort -n | uniq | grep -c .)"
     if [[ "$all" == "$n" && "$uniq" == "$n" ]]; then
-      _pass "N=${n} covers every server exactly once (${f} / ${m} / ${h})"
+      _pass "N=${n} covers every server exactly once (${f} / ${m} / ${l} / ${x})"
     else
       _fail "N=${n} coverage" "${n} unique assignments" "${all} total / ${uniq} unique"
     fi
   else
-    [[ -n "$f" && -n "$m" && -n "$h" ]] \
-      && _pass "N=${n} every tier still gets a server (${f} / ${m} / ${h})" \
-      || _fail "N=${n} tiers populated" "all non-empty" "${f}/${m}/${h}"
+    if [[ -n "$f" && -n "$m" && -n "$l" && -n "$x" ]]; then
+      _pass "N=${n} every tier still gets a server (${f} / ${m} / ${l} / ${x})"
+    else
+      _fail "N=${n} tiers populated" "all non-empty" "${f}/${m}/${l}/${x}"
+    fi
   fi
 done
+# Ordering: a tier never sits on a lower-numbered server than the tier below it.
+MODEL_SERVER_COUNT=8
+first() { printf '%s' "${1%%,*}"; }
+assert_ok "tiers are assigned in ascending server order" bash -c "
+  f=\$(printf '%s' '$(default_tier_selection fast)'   | cut -d, -f1)
+  m=\$(printf '%s' '$(default_tier_selection medium)' | cut -d, -f1)
+  l=\$(printf '%s' '$(default_tier_selection large)'  | cut -d, -f1)
+  x=\$(printf '%s' '$(default_tier_selection xlarge)' | cut -d, -f1)
+  [ \$f -le \$m ] && [ \$m -le \$l ] && [ \$l -le \$x ]"
+# The remainder lands on xlarge, which gains most from parallel capacity.
+MODEL_SERVER_COUNT=6
+assert_eq "xlarge absorbs the remainder at N=6" "4,5,6" "$(default_tier_selection xlarge)"
+MODEL_SERVER_COUNT=1
+assert_eq "a single server backs every tier" "1" "$(default_tier_selection xlarge)"
+MODEL_SERVER_COUNT=2
+assert_eq "at N=2 the upper tiers share server 2" "2" "$(default_tier_selection large)"
+assert_eq "and xlarge shares it too"              "2" "$(default_tier_selection xlarge)"
 MODEL_SERVER_COUNT=3
+assert_eq "at N=3 large and xlarge share server 3" "3" "$(default_tier_selection large)"
+assert_eq "xlarge on server 3 as well"             "3" "$(default_tier_selection xlarge)"
+MODEL_SERVER_COUNT=4
 
 describe indices_to_urls
 MODEL_SERVERS=(http://a:1 http://b:2 http://c:3)
@@ -542,9 +567,9 @@ describe prompt_model_servers
 MODEL_SERVER_COUNT=3; MODEL_SERVER_MIN=1; MODEL_SERVER_MAX=20
 MODEL_SERVER_1=10.0.0.51; MODEL_SERVER_2=10.0.0.52; MODEL_SERVER_3=10.0.0.53
 MODEL_SERVER_4=""; MODEL_SERVER_5=""
-TIER_FAST_SERVERS=""; TIER_MEDIUM_SERVERS=""; TIER_HEAVY_SERVERS=""
-MODEL_FAST=a; MODEL_MEDIUM=b; MODEL_HEAVY=c; OLLAMA_KEEP_ALIVE=""
-MODEL_SERVERS=(); TIER_FAST_IDX=""; TIER_MEDIUM_IDX=""; TIER_HEAVY_IDX=""
+TIER_FAST_SERVERS=""; TIER_MEDIUM_SERVERS=""; TIER_LARGE_SERVERS=""; TIER_XLARGE_SERVERS=""
+MODEL_FAST=a; MODEL_MEDIUM=b; MODEL_LARGE=c; MODEL_XLARGE=d; OLLAMA_KEEP_ALIVE=""
+MODEL_SERVERS=(); TIER_FAST_IDX=""; TIER_MEDIUM_IDX=""; TIER_LARGE_IDX=""; TIER_XLARGE_IDX=""
 # Redirect to a file rather than $(...): command substitution runs the function
 # in a subshell, where its assignments to MODEL_SERVERS et al. are discarded.
 _pms_out="$(mktemp)"

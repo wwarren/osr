@@ -20,12 +20,12 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **405 assertions, 104/104 functions covered.**
+Current state: **467 assertions, 108/108 functions covered.**
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 55 | 237 |
-| `manage` | `manage-model-servers.sh` | 49 | 168 |
+| `installer` | `ollama-smart-router-install.sh` | 55 | 245 |
+| `manage` | `manage-model-servers.sh` | 53 | 222 |
 
 ## Layout
 
@@ -86,7 +86,9 @@ mock_call_count X # occurrences of a substring
 ```
 
 Fixtures: `make_config_repo <dir>` builds a config repo laid out exactly as
-`apply-config.sh` expects. `PVESM_REAL_OUTPUT` is the user's actual
+`apply-config.sh` expects. `make_legacy_config_repo <dir>` builds the same repo
+two generations back (`BACKEND_QWEN_HEAVY`, `model_name: qwen-heavy`, no xlarge
+tier), which is what the `migrate_legacy_names` tests upgrade. `PVESM_REAL_OUTPUT` is the user's actual
 `pvesm status` output, including the `(KiB)` unit tokens and an inactive row —
 that string is what caught the storage-parsing bug.
 
@@ -147,6 +149,8 @@ bugs in this family have been found by these tests.
 | `add --tier bogus` accepted an unknown tier | same |
 | `get_tier turbo` returned success and an empty list | same, nested two deep |
 | `git_push_authenticated` continued with an empty remote | only the exit status of `git remote get-url` was checked |
+| `migrate_legacy_names` silently renamed nothing | its key map was a top-level array, invisible to anything sourcing only the functions |
+| `large` selected the 70B model that defines `xlarge` | band ceilings were inclusive, so adjacent bands overlapped, and the size bias rewarded absolute size rather than position in the band |
 
 Each fix is in place and pinned by a regression assertion.
 
