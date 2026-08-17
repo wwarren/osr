@@ -116,7 +116,7 @@ TIER_HEAVY_IDX=""
 # Gitea runs as a TurnKey appliance behind nginx on 443/80 — Gitea's own port
 # 3000 is bound to localhost inside that container and is NOT reachable from
 # outside, so the URL is the plain hostname with no port.
-GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.bancs.net}"
+GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.url.txt}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
 GITEA_REPO_NAME="${GITEA_REPO_NAME:-ollama-smart-router}"
