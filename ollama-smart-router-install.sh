@@ -1564,6 +1564,7 @@ import configparser
 import json
 import os
 import re
+import sys
 import time
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -1935,16 +1936,49 @@ def classify_request(messages: list) -> dict:
             "approx_tokens": round(approx_tokens)}
 
 
+def _in_band(params: float, low: float, high: float) -> bool:
+    """Is a parameter count inside a band?
+
+    The upper bound is EXCLUSIVE so adjacent bands are disjoint. With the
+    defaults (large 20:70, xlarge 70:999) an inclusive bound would place a 70B
+    model in both, and the size bias in score_entry would then let large take
+    the very model that defines xlarge. The topmost band keeps an inclusive
+    ceiling so the biggest model in the pool still lands somewhere.
+    """
+    return low <= params < high or params == high == TOP_BAND_HIGH
+
+
+def band_distance(entry: dict, need: dict) -> float:
+    """How far outside the requested band a model sits, in billions (0 = in).
+
+    Used to order candidates when nothing is in band at all -- see
+    rank_candidates. A model of unknown size returns 0.0 because it cannot be
+    placed on the axis, not because it fits; that matches the benefit of the
+    doubt score_entry already gives it via unknown_params.
+    """
+    low, high = BANDS.get(need["class"], (0.0, 999.0))
+    params = entry["params_b"]
+    if params <= 0 or _in_band(params, low, high):
+        return 0.0
+    return (low - params) if params < low else (params - high)
+
+
+def in_requested_band(entry: dict, need: dict) -> bool:
+    """Does this model's size genuinely fall inside the requested band?
+
+    Distinct from `band_distance(...) == 0.0`, which is also true for a model
+    of unknown size. Keeping them separate matters: one unknown-size model in
+    the pool must not switch off distance ranking for every other candidate.
+    """
+    low, high = BANDS.get(need["class"], (0.0, 999.0))
+    return entry["params_b"] > 0 and _in_band(entry["params_b"], low, high)
+
+
 def score_entry(entry: dict, need: dict) -> float:
     """Heuristic fit of one discovered (server, model) pair to one request."""
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
-    # Upper bound is EXCLUSIVE so adjacent bands are disjoint. With the defaults
-    # (large 20:70, xlarge 70:999) an inclusive bound would place a 70B model in
-    # both, and the size bias below would then let large take the very model
-    # that defines xlarge. The topmost band keeps an inclusive ceiling so the
-    # biggest model in the pool still lands somewhere.
-    in_band = low <= params < high or params == high == TOP_BAND_HIGH
+    in_band = _in_band(params, low, high)
     if params <= 0:
         fit = W_UNKNOWN
     elif in_band:
@@ -1997,15 +2031,37 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
         scored.append((score_entry(entry, need), entry))
     if not scored:
         return []
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    # Ordinarily score alone orders the list. But when NOTHING is in band it
+    # cannot: the falloff floors at zero once a model is band_falloff billions
+    # outside, so for an xlarge request (70:999) against a 14B/27B pool every
+    # candidate flattens to exactly 0.0. They then look tied, and the rotation
+    # below hands the prompt to the smallest model half the time while the
+    # largest sits idle. In that case rank by how far each model is from the
+    # band, so the closest wins, and let score break ties only among models
+    # that are equally far out.
+    use_distance = not any(in_requested_band(e, need) for _, e in scored)
+
+    def _distance(entry):
+        return band_distance(entry, need) if use_distance else 0.0
+
+    # Sorting on (distance asc, score desc) is identical to the previous
+    # score-only sort whenever use_distance is False.
+    scored.sort(key=lambda pair: (_distance(pair[1]), -pair[0]))
 
     # Rotate through candidates that score within tie_epsilon of the best, so
     # the same model on several hosts shares load instead of always hitting the
     # first one. (LiteLLM does this for the static path; direct dispatch needs
-    # its own.)
+    # its own.) Equal distance is part of "tied": without it the rotation would
+    # spread load across models of visibly different size.
     best_score = scored[0][0]
-    tied = [e for s, e in scored if best_score - s <= TIE_EPSILON]
-    rest = [e for s, e in scored if best_score - s > TIE_EPSILON]
+    best_distance = _distance(scored[0][1])
+    tied, rest = [], []
+    for s_val, e in scored:
+        if _distance(e) == best_distance and best_score - s_val <= TIE_EPSILON:
+            tied.append(e)
+        else:
+            rest.append(e)
     if len(tied) > 1:
         key = f"{need['class']}|{need['code']}|{need['vision']}"
         index = _rotation.get(key, 0) % len(tied)
@@ -2203,22 +2259,52 @@ async def route_chat_completion(request: Request):
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """Advertise the discovered models plus the virtual auto-routing entries, so
-    Open WebUI's picker is meaningful. Falls back to LiteLLM's list."""
+    """Advertise auto + the tier aliases, then whatever is actually available.
+
+    The aliases are emitted FIRST and UNCONDITIONALLY. They are resolved by the
+    router itself, so they must stay selectable in states where nothing
+    downstream knows about them:
+
+      * discovery empty -- every Ollama host down, discovery disabled, or the
+        first poll still in flight;
+      * a tier with no LiteLLM deployment -- which is exactly xlarge until
+        servers are assigned to it.
+
+    This path used to return LiteLLM's list verbatim whenever discovery was
+    empty. That made the picker mirror litellm_config.yaml, so a tier with no
+    deployment never appeared, and a stale alias still in that file was
+    advertised as though it were live.
+    """
+    seen, data = set(), []
+    for alias in ("auto", TIER_FAST, TIER_MEDIUM, TIER_LARGE, TIER_XLARGE):
+        if alias and alias not in seen:
+            seen.add(alias)
+            data.append({"id": alias, "object": "model", "owned_by": "router"})
+
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
-        seen, data = set(), []
-        for alias in ("auto", TIER_FAST, TIER_MEDIUM, TIER_LARGE, TIER_XLARGE):
-            if alias not in seen:
-                seen.add(alias)
-                data.append({"id": alias, "object": "model", "owned_by": "router"})
         for entry in INVENTORY["models"]:
             if entry["is_embedding"] or entry["name"] in seen:
                 continue
             seen.add(entry["name"])
             data.append({"id": entry["name"], "object": "model", "owned_by": "ollama"})
         return JSONResponse({"object": "list", "data": data})
-    return await _stream_upstream("GET", f"{LITELLM_BASE}/v1/models",
-                                  _forward_headers(request))
+
+    # Discovery unavailable: supplement the aliases with LiteLLM's own list so
+    # real model names are still offered. An alias already emitted is never
+    # displaced by a stale entry of the same name.
+    try:
+        async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT) as client:
+            response = await client.get(f"{LITELLM_BASE}/v1/models",
+                                        headers=_forward_headers(request))
+        for entry in (response.json().get("data") or []):
+            name = str(entry.get("id") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                data.append({"id": name, "object": "model", "owned_by": "litellm"})
+    except Exception as exc:  # noqa: BLE001 - the alias list must still be served
+        print("model list: LiteLLM unreachable (%s); serving aliases only" % exc,
+              file=sys.stderr, flush=True)
+    return JSONResponse({"object": "list", "data": data})
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

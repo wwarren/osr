@@ -38,7 +38,12 @@ request is then scored against that live inventory rather than a static map:
   70B model belongs to `xlarge` alone — otherwise `large`, which prefers the
   biggest model in its band, would take the very model that defines `xlarge`.
   The size preference is a position *within* the band, so an out-of-band giant
-  never outscores a perfect in-band fit.
+  never outscores a perfect in-band fit. If **no** model is in band — asking for
+  `xlarge` when the largest host has a 27B — candidates are ranked by distance
+  to the band rather than by score, so the closest (largest available) model
+  wins. Without that they would all flatten to the same floored score and the
+  load-spreading rotation would hand the request to the smallest one half the
+  time.
 - **Specialisation** — a code request prefers a code model (`coder`, `starcoder`,
   `deepseek-coder`…); a request containing an image prefers a vision model
   (`llava`, `-vl`, `minicpm-v`…). A specialist serving an off-task request takes

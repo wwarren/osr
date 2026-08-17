@@ -234,7 +234,7 @@ Each `(host, model)` pair is scored; highest wins.
 
 | Signal | Effect |
 |---|---|
-| **Size-band fit** | Request class maps to a parameter band (`0:9`, `9:20`, `20:70`, `70:999` billions). Ceilings are **exclusive**, so the bands are disjoint. In-band scores 1.0; outside decays linearly by `band_falloff` rather than disqualifying |
+| **Size-band fit** | Request class maps to a parameter band (`0:9`, `9:20`, `20:70`, `70:999` billions). Ceilings are **exclusive**, so the bands are disjoint. In-band scores 1.0; outside decays linearly by `band_falloff` rather than disqualifying. When *nothing* is in band, candidates are ordered by distance to the band instead of by score — the falloff floors at zero, so otherwise every candidate ties and load-rotation would pick arbitrarily |
 | **Code specialisation** | `+code_match` when a code request meets a code model; `−code_match × offtask_penalty` when a code model takes prose |
 | **Vision** | `+vision_match` when an image request meets a vision model; `−vision_match` when it doesn't; small off-task penalty for a vision model on plain text |
 | **Extremes within class** | Large requests bias larger, fast requests bias smaller |
