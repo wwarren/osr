@@ -124,49 +124,6 @@ EOF
   chmod +x "${root}/install/apply-config.sh"
 }
 
-# A config repo in the PRE-RENAME layout: Qwen-specific tier keys and LiteLLM
-# aliases. Used to prove migrate_legacy_names upgrades an existing deployment.
-make_legacy_config_repo() {
-  local root="$1"
-  make_config_repo "$root"
-  # Wind the fixture back two generations: "large" was "heavy", and the tier
-  # keys carried a QWEN_ infix. The xlarge tier did not exist at all.
-  sed -i -e '/^BACKEND_XLARGE=/d' -e '/^MODEL_XLARGE=/d' "${root}/env/router.env"
-  sed -i -e 's/^BACKEND_LARGE=/BACKEND_QWEN_HEAVY=/' \
-         -e 's/^BACKEND_FAST=/BACKEND_QWEN_FAST=/' \
-         -e 's/^BACKEND_MEDIUM=/BACKEND_QWEN_MEDIUM=/' \
-         -e 's/^MODEL_LARGE=/MODEL_HEAVY=/' "${root}/env/router.env"
-  # Drop the xlarge deployment and rename the aliases.
-  sed -i -e '/model_name: xlarge/,+3d' -e '/- xlarge:/d' \
-    "${root}/services/litellm-proxy/litellm_config.yaml"
-  sed -i -E 's/\b(fast|medium)\b/qwen-\1/g; s/\blarge\b/qwen-heavy/g' \
-    "${root}/services/litellm-proxy/litellm_config.yaml"
-  cat > "${root}/services/ollama-router/router.ini" <<'EOF'
-[thresholds]
-heavy = 800
-medium = 250
-
-[keywords]
-code_first = true
-heavy = ["analyze", "evaluate"]
-
-[tiers]
-fast = qwen-fast
-medium = qwen-medium
-heavy = qwen-heavy
-
-[discovery]
-enabled = true
-fast_params = 0:9
-medium_params = 9:20
-heavy_params = 20:999
-
-[weights]
-prefer_larger_heavy = 0.15
-prefer_smaller_fast = 0.15
-EOF
-}
-
 # `pvesm status` output in the real current format, including the "(KiB)" unit
 # tokens that shift header columns relative to data rows.
 PVESM_REAL_OUTPUT='Name                      Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %
