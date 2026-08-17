@@ -71,49 +71,100 @@ GITEA_DEPLOY_TOKEN=
 GITEA_VERIFY_TLS=false
 MATTERMOST_CHANNEL=ollama-monitor
 LITELLM_BASE_URL=http://127.0.0.1:4000
-BACKEND_QWEN_FAST=http://10.0.0.51:11434
-BACKEND_QWEN_MEDIUM=http://10.0.0.52:11434
-BACKEND_QWEN_HEAVY=http://10.0.0.52:11434,http://10.0.0.53:11434
-MODEL_SERVER_COUNT=3
-MODEL_SERVERS=http://10.0.0.51:11434,http://10.0.0.52:11434,http://10.0.0.53:11434
+BACKEND_FAST=http://10.0.0.51:11434
+BACKEND_MEDIUM=http://10.0.0.52:11434
+BACKEND_LARGE=http://10.0.0.52:11434,http://10.0.0.53:11434
+BACKEND_XLARGE=http://10.0.0.54:11434
+MODEL_SERVER_COUNT=4
+MODEL_SERVERS=http://10.0.0.51:11434,http://10.0.0.52:11434,http://10.0.0.53:11434,http://10.0.0.54:11434
 MODEL_FAST=qwen2.5-coder:7b
 MODEL_MEDIUM=qwen3:14b
-MODEL_HEAVY=qwen3:32b
+MODEL_LARGE=qwen3:32b
+MODEL_XLARGE=llama3.3:70b
 OLLAMA_KEEP_ALIVE=
 TORCH_CPU_ONLY=true
 EOF
   cat > "${root}/services/litellm-proxy/litellm_config.yaml" <<'EOF'
 model_list:
-  - model_name: qwen-fast
+  - model_name: fast
     litellm_params:
       model: ollama/qwen2.5-coder:7b
       api_base: http://10.0.0.51:11434
-  - model_name: qwen-medium
+  - model_name: medium
     litellm_params:
       model: ollama/qwen3:14b
       api_base: http://10.0.0.52:11434
-  - model_name: qwen-heavy
+  - model_name: large
     litellm_params:
       model: ollama/qwen3:32b
       api_base: http://10.0.0.52:11434
-  - model_name: qwen-heavy
+  - model_name: large
     litellm_params:
       model: ollama/mixtral:8x7b
       api_base: http://10.0.0.53:11434
+  - model_name: xlarge
+    litellm_params:
+      model: ollama/llama3.3:70b
+      api_base: http://10.0.0.54:11434
 router_settings:
   routing_strategy: latency-based-routing
   fallbacks:
-    - qwen-heavy: ["qwen-medium", "qwen-fast"]
+    - xlarge: ["large", "medium", "fast"]
+    - large: ["medium", "fast"]
 EOF
   cat > "${root}/services/ollama-router/router.ini" <<'EOF'
 [tiers]
-fast = qwen-fast
-medium = qwen-medium
-heavy = qwen-heavy
+fast = fast
+medium = medium
+large = large
+xlarge = xlarge
 EOF
   printf 'open-webui==0.6.5\n' > "${root}/services/open-webui/requirements.txt"
   printf '#!/usr/bin/env bash\necho "apply-config ran for $1"\n' > "${root}/install/apply-config.sh"
   chmod +x "${root}/install/apply-config.sh"
+}
+
+# A config repo in the PRE-RENAME layout: Qwen-specific tier keys and LiteLLM
+# aliases. Used to prove migrate_legacy_names upgrades an existing deployment.
+make_legacy_config_repo() {
+  local root="$1"
+  make_config_repo "$root"
+  # Wind the fixture back two generations: "large" was "heavy", and the tier
+  # keys carried a QWEN_ infix. The xlarge tier did not exist at all.
+  sed -i -e '/^BACKEND_XLARGE=/d' -e '/^MODEL_XLARGE=/d' "${root}/env/router.env"
+  sed -i -e 's/^BACKEND_LARGE=/BACKEND_QWEN_HEAVY=/' \
+         -e 's/^BACKEND_FAST=/BACKEND_QWEN_FAST=/' \
+         -e 's/^BACKEND_MEDIUM=/BACKEND_QWEN_MEDIUM=/' \
+         -e 's/^MODEL_LARGE=/MODEL_HEAVY=/' "${root}/env/router.env"
+  # Drop the xlarge deployment and rename the aliases.
+  sed -i -e '/model_name: xlarge/,+3d' -e '/- xlarge:/d' \
+    "${root}/services/litellm-proxy/litellm_config.yaml"
+  sed -i -E 's/\b(fast|medium)\b/qwen-\1/g; s/\blarge\b/qwen-heavy/g' \
+    "${root}/services/litellm-proxy/litellm_config.yaml"
+  cat > "${root}/services/ollama-router/router.ini" <<'EOF'
+[thresholds]
+heavy = 800
+medium = 250
+
+[keywords]
+code_first = true
+heavy = ["analyze", "evaluate"]
+
+[tiers]
+fast = qwen-fast
+medium = qwen-medium
+heavy = qwen-heavy
+
+[discovery]
+enabled = true
+fast_params = 0:9
+medium_params = 9:20
+heavy_params = 20:999
+
+[weights]
+prefer_larger_heavy = 0.15
+prefer_smaller_fast = 0.15
+EOF
 }
 
 # `pvesm status` output in the real current format, including the "(KiB)" unit
