@@ -20,12 +20,12 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **415 assertions, 104/104 functions covered.**
+Current state: **448 assertions, 107/107 functions covered.**
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 55 | 245 |
-| `manage` | `manage-model-servers.sh` | 49 | 170 |
+| `installer` | `ollama-smart-router-install.sh` | 56 | 255 |
+| `manage` | `manage-model-servers.sh` | 51 | 193 |
 
 ## Layout
 
@@ -148,6 +148,7 @@ bugs in this family have been found by these tests.
 | `get_tier turbo` returned success and an empty list | same, nested two deep |
 | `git_push_authenticated` continued with an empty remote | only the exit status of `git remote get-url` was checked |
 | `large` selected the 70B model that defines `xlarge` | band ceilings were inclusive, so adjacent bands overlapped, and the size bias rewarded absolute size rather than position in the band |
+| `prompt_until_valid` hung forever on exhausted stdin | `read` returning EOF was not distinguished from an empty answer, so an invalid default re-tested itself in an infinite loop |
 
 Each fix is in place and pinned by a regression assertion.
 

@@ -472,6 +472,79 @@ mock_command git 0
 out="$(cmd_commit "msg" 2>&1)"
 assert_contains "no-git config dir is a no-op" "not a git repository" "$out"
 
+describe cmd_set_webhook
+reset_repo
+env_set MATTERMOST_WEBHOOK_URL ""
+env_set MATTERMOST_CHANNEL "ollama-monitor"
+env_set MATTERMOST_MONITOR_USER "OllamaMonitor"
+env_set MATTERMOST_VERIFY_TLS "true"
+cmd_set_webhook "https://mm.example.net/hooks/abc" >/dev/null 2>&1
+assert_eq "stores the url" "https://mm.example.net/hooks/abc" "$(env_get MATTERMOST_WEBHOOK_URL)"
+cmd_set_webhook --verify-tls false >/dev/null 2>&1
+assert_eq "sets verify-tls"  "false" "$(env_get MATTERMOST_VERIFY_TLS)"
+cmd_set_webhook --username "Bot" >/dev/null 2>&1
+assert_eq "sets the username" "Bot" "$(env_get MATTERMOST_MONITOR_USER)"
+# An EMPTY channel is meaningful: post wherever the webhook is bound.
+cmd_set_webhook --channel "" >/dev/null 2>&1
+assert_eq "clears the channel override" "" "$(env_get MATTERMOST_CHANNEL)"
+# An empty URL is also meaningful: it disables posting.
+cmd_set_webhook "" >/dev/null 2>&1
+assert_eq "an empty url disables alerting" "" "$(env_get MATTERMOST_WEBHOOK_URL)"
+assert_fail "rejects a non-url"        cmd_set_webhook "not-a-url"
+assert_fail "rejects a bad verify-tls" cmd_set_webhook --verify-tls maybe
+assert_fail "rejects an unknown flag"  cmd_set_webhook --nope x
+out="$(cmd_set_webhook "https://mm.example.net/hooks/secret123" 2>&1)"
+assert_not_contains "never echoes the full webhook path" "secret123" "$out"
+reset_repo
+
+describe cmd_test_alert
+reset_repo
+env_set MATTERMOST_WEBHOOK_URL ""
+out="$(cmd_test_alert 2>&1)"; rc=$?
+assert_contains "explains a missing webhook" "not set" "$out"
+assert_contains "says how to set one"        "set-webhook" "$out"
+assert_ne "returns non-zero"                 "0" "$rc"
+
+env_set MATTERMOST_WEBHOOK_URL "https://mm.example.net/hooks/abc"
+env_set MATTERMOST_CHANNEL "ollama-monitor"
+env_set MATTERMOST_VERIFY_TLS "true"
+
+# Delivered.
+mock_command curl 0 "200"
+out="$(cmd_test_alert 2>&1)"
+assert_contains "reports delivery"        "Delivered" "$out"
+assert_contains "names the channel"       "#ollama-monitor" "$out"
+assert_ok "exits 0 on success" bash -c "source '$FUNCS'; ENV_FILE='$ENV_FILE'; cmd_test_alert >/dev/null 2>&1"
+
+# The payload must carry the channel override and the username.
+mock_reset_log; mock_command curl 0 "200"; cmd_test_alert >/dev/null 2>&1
+assert_contains "posts JSON"              "Content-Type: application/json" "$(mock_calls)"
+assert_contains "includes the channel"    "ollama-monitor" "$(mock_calls)"
+
+# Transport failure: curl exits non-zero and prints no HTTP code.
+mock_command curl 7 ""
+out="$(cmd_test_alert 2>&1)"
+assert_contains "reports a connection failure" "Could not reach" "$out"
+assert_contains "explains curl exit 7"         "Connection refused" "$out"
+mock_command curl 60 ""
+out="$(cmd_test_alert 2>&1)"
+assert_contains "maps a TLS failure to the fix" "verify-tls false" "$out"
+
+# 4xx WITH a channel override: retried without it, and that retry succeeds.
+mock_script curl <<'EOF'
+for a in "$@"; do case "$a" in *'"channel"'*) echo -n 403; exit 0;; esac; done
+echo -n 200
+EOF
+out="$(cmd_test_alert 2>&1)"
+assert_contains "retries without the override"  "Retrying without" "$out"
+assert_contains "identifies the override as the fault" "refusing to redirect" "$out"
+
+# 4xx both ways: the webhook itself is wrong.
+mock_command curl 0 "404"
+out="$(cmd_test_alert 2>&1)"
+assert_contains "reports a dead webhook" "wrong or has been deleted" "$out"
+reset_repo
+
 describe cmd_set_token
 reset_repo
 mock_command curl 0 '{"login":"tester"}'

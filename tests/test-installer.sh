@@ -98,6 +98,14 @@ describe valid_nonempty
 assert_ok   "accepts text"               valid_nonempty x
 assert_fail "rejects empty"              valid_nonempty ""
 
+describe valid_bool
+assert_ok   "accepts true"        valid_bool true
+assert_ok   "accepts false"       valid_bool false
+assert_fail "rejects True"        valid_bool True
+assert_fail "rejects yes"         valid_bool yes
+assert_fail "rejects 1"           valid_bool 1
+assert_fail "rejects empty"       valid_bool ""
+
 describe valid_positive_int
 assert_ok   "accepts 1"                  valid_positive_int 1
 assert_ok   "accepts 64"                 valid_positive_int 64
@@ -530,6 +538,14 @@ NONINTERACTIVE=true
 assert_fail "non-interactive rejects an invalid preset" \
   prompt_until_valid "ip" RESULT "not-an-ip" valid_ipv4
 NONINTERACTIVE=false
+# Exhausted stdin with an invalid default used to spin forever, hanging any
+# piped or partially-answered run. It must give up instead.
+assert_status "gives up when stdin runs out" 1 \
+  timeout 5 bash -c "source '$FUNCS'; NONINTERACTIVE=false; R=''; \
+                     prompt_until_valid 'ip' R 'not-an-ip' valid_ipv4 < /dev/null"
+assert_ok "still accepts a valid default at EOF" \
+  timeout 5 bash -c "source '$FUNCS'; NONINTERACTIVE=false; R=''; \
+                     prompt_until_valid 'ip' R '10.0.0.1' valid_ipv4 < /dev/null"
 
 describe prompt_secret
 SECRET=""
@@ -554,14 +570,21 @@ assert_contains "warns when the gateway is off-subnet" "outside" "$(cat "$_pn_ou
 rm -f "$_pn_out"
 
 describe prompt_mattermost_config
-MATTERMOST_WEBHOOK_URL=""; MATTERMOST_CHANNEL="ollama-monitor"; MATTERMOST_MONITOR_USER="OllamaMonitor"
+MATTERMOST_WEBHOOK_URL=""; MATTERMOST_CHANNEL="ollama-monitor"
+MATTERMOST_MONITOR_USER="OllamaMonitor"; MATTERMOST_VERIFY_TLS="true"
 _pm_out="$(mktemp)"
 prompt_mattermost_config > "$_pm_out" 2>&1 <<< $'\n' || true
 assert_contains "blank webhook disables alerting" "No webhook" "$(cat "$_pm_out")"
 rm -f "$_pm_out"
-prompt_mattermost_config <<< $'https://mm/hooks/x\nchan\nuser' >/dev/null 2>&1
+prompt_mattermost_config <<< $'https://mm/hooks/x\nchan\nuser\nfalse' >/dev/null 2>&1
 assert_eq "captures the webhook" "https://mm/hooks/x" "$MATTERMOST_WEBHOOK_URL"
 assert_eq "captures the channel"  "chan" "$MATTERMOST_CHANNEL"
+assert_eq "captures verify-tls"   "false" "$MATTERMOST_VERIFY_TLS"
+# An internal Mattermost behind a self-signed cert must be configurable here.
+MATTERMOST_VERIFY_TLS="true"
+prompt_mattermost_config <<< $'https://mm/hooks/x\n\n\n\n' >/dev/null 2>&1
+assert_eq "verify-tls defaults through" "true" "$MATTERMOST_VERIFY_TLS"
+MATTERMOST_VERIFY_TLS="true"
 
 describe prompt_model_servers
 MODEL_SERVER_COUNT=3; MODEL_SERVER_MIN=1; MODEL_SERVER_MAX=20
