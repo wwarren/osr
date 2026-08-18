@@ -198,6 +198,14 @@ loads the model and resets its unload timer without generating anything. It runs
 only when `OLLAMA_KEEP_ALIVE` is set; blank leaves each server's own setting in
 charge. Down hosts are skipped so a dead host never stalls the cycle.
 
+**Webhook delivery.** An incoming webhook is bound to one channel, and many
+Mattermost servers refuse a payload that names a different one — which surfaces
+as a 4xx that reads like a permissions failure. On any 4xx the monitor retries
+once **without** the `channel` field and logs a warning, so the alert lands in
+the webhook's own channel rather than being dropped. `MATTERMOST_VERIFY_TLS`
+covers the other common failure, an internal CA. `manage-model-servers
+test-alert` reproduces the exact payload and reports which of the two applies.
+
 ---
 
 ## 5. Request routing

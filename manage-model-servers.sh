@@ -64,6 +64,12 @@ Commands:
   commit [message]           Commit and push the config repo to Gitea
   set-token [token]          Store/replace the Gitea deploy token used for
                              pushing (prompts if not given, then verifies it)
+  test-alert [message]       Post a test message through the Mattermost webhook
+                             and report exactly why it failed if it did
+  set-webhook [url] [--channel <c>] [--username <u>] [--verify-tls true|false]
+                             Configure Mattermost alerting. An empty url
+                             disables posting; an empty --channel posts to
+                             whichever channel the webhook is bound to
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
@@ -1038,6 +1044,150 @@ git_push_authenticated() {
   return 1
 }
 
+# Post a message through the configured webhook, exactly as monitor.py does,
+# and report precisely why it failed. Without this there is no way to tell a
+# missing URL from a TLS failure from a rejected channel override -- all three
+# just look like "alerts do not arrive".
+cmd_test_alert() {
+  local message="${1:-}" url channel user verify host
+  url="$(env_get MATTERMOST_WEBHOOK_URL)"
+  channel="$(env_get MATTERMOST_CHANNEL)"
+  user="$(env_get MATTERMOST_MONITOR_USER)"; [[ -n "$user" ]] || user="OllamaMonitor"
+  verify="$(env_get MATTERMOST_VERIFY_TLS)"
+  [[ -n "$message" ]] || message="Test alert from $(hostname) via ${0##*/} — if you can read this, monitor alerting works."
+
+  if [[ -z "$url" ]]; then
+    echo "MATTERMOST_WEBHOOK_URL is not set in ${ENV_FILE}."
+    echo "The monitor logs alerts instead of posting them. Set one with:"
+    echo "  $0 set-webhook <url>"
+    return 1
+  fi
+
+  host="${url#*://}"; host="${host%%/*}"
+  echo "Webhook host : ${host}"
+  echo "Channel      : ${channel:-<webhook default>}"
+  echo "Post as      : ${user}"
+  echo "Verify TLS   : ${verify:-true}"
+  echo
+
+  local -a copts=(-sS -o /dev/null)
+  [[ "$verify" == "false" ]] && copts+=(--insecure)
+
+  _mm_post() {  # $1 = json payload -> prints "<http_code> <curl_rc>"
+    local body="$1" code rc=0
+    code="$(curl "${copts[@]}" -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' --data "$body" "$url" 2>/dev/null)" || rc=$?
+    printf '%s %s' "${code:-000}" "$rc"
+  }
+  _mm_payload() {  # $1 = include the channel override? true/false
+    python3 -c '
+import json, sys
+payload = {"username": sys.argv[1], "icon_emoji": ":white_check_mark:", "text": sys.argv[2]}
+if sys.argv[3] == "true" and sys.argv[4]:
+    payload["channel"] = sys.argv[4]
+print(json.dumps(payload))' "$user" "$message" "$1" "$channel"
+  }
+
+  local result code rc
+  result="$(_mm_post "$(_mm_payload true)")"
+  code="${result%% *}"; rc="${result##* }"
+
+  if [[ "$code" =~ ^2 ]]; then
+    # NOTE: no apostrophe inside a ${var:-default}. Bash re-parses the default,
+    # so a lone quote there opens a quote context and breaks the rest of the file.
+    local where="the channel the webhook is bound to"
+    [[ -n "$channel" ]] && where="#${channel}"
+    echo "Delivered (HTTP ${code}). Check ${where} in Mattermost."
+    return 0
+  fi
+
+  # Transport-level failure: curl never got an HTTP response.
+  if [[ "$code" == "000" ]]; then
+    echo "Could not reach the webhook (curl exit ${rc})."
+    case "$rc" in
+      6)  echo "  DNS: '${host}' does not resolve from inside this container." ;;
+      7)  echo "  Connection refused — check the host, port and any firewall." ;;
+      28) echo "  Timed out." ;;
+      35|60)
+          echo "  TLS failure. If Mattermost uses a self-signed or internal CA"
+          echo "  certificate, turn verification off:"
+          echo "    $0 set-webhook --verify-tls false" ;;
+      *)  echo "  curl exit ${rc}." ;;
+    esac
+    return 1
+  fi
+
+  echo "Mattermost rejected the message (HTTP ${code})."
+
+  # A 4xx WITH a channel override is very often the override itself: a webhook
+  # is bound to one channel and many servers refuse to redirect it. Re-test
+  # without the override so the report says which of the two is at fault.
+  if [[ -n "$channel" && "$code" =~ ^4 ]]; then
+    echo "Retrying without the channel override ..."
+    result="$(_mm_post "$(_mm_payload false)")"
+    if [[ "${result%% *}" =~ ^2 ]]; then
+      echo
+      echo "That worked. The webhook is fine; Mattermost is refusing to redirect"
+      echo "it to '${channel}'. Either clear the override:"
+      echo "    $0 set-webhook --channel ''"
+      echo "  or allow channel overrides for this webhook in the System Console"
+      echo "  (Integrations -> Incoming Webhooks), and confirm '${channel}' is the"
+      echo "  channel's URL handle rather than its display name."
+      return 1
+    fi
+    echo "  Still rejected (HTTP ${result%% *}) — the webhook URL itself is the problem."
+  fi
+
+  case "$code" in
+    400) echo "  400 usually means a malformed payload or an unknown channel." ;;
+    401|403) echo "  The webhook is not authorised to post there. Re-check it in"
+             echo "  Integrations -> Incoming Webhooks." ;;
+    404) echo "  404 means the webhook URL is wrong or has been deleted." ;;
+  esac
+  return 1
+}
+
+# Set the Mattermost webhook and its options without hand-editing router.env.
+cmd_set_webhook() {
+  local url="" set_url=false
+  while (( $# )); do
+    case "$1" in
+      --channel)    env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
+      --username)   env_set MATTERMOST_MONITOR_USER "${2:?--username needs a value}"; CHANGED=true; shift 2 ;;
+      --verify-tls)
+        [[ "${2-}" == "true" || "${2-}" == "false" ]] \
+          || die "set-webhook: --verify-tls takes 'true' or 'false'"
+        env_set MATTERMOST_VERIFY_TLS "$2"; CHANGED=true; shift 2 ;;
+      -*) die "set-webhook: unknown option '$1'" ;;
+      *)  url="$1"; set_url=true; shift ;;
+    esac
+  done
+
+  if $set_url; then
+    # An empty URL is meaningful: it disables posting and the monitor logs
+    # alerts instead, which is the documented way to turn alerting off.
+    if [[ -n "$url" ]]; then
+      [[ "$url" =~ ^https?://[^[:space:]]+$ ]] \
+        || die "set-webhook: '${url}' is not an http(s) URL"
+    fi
+    env_set MATTERMOST_WEBHOOK_URL "$url"
+    CHANGED=true
+    if [[ -n "$url" ]]; then
+      echo "Webhook stored in ${ENV_FILE}."
+    else
+      echo "Webhook cleared — the monitor will log alerts instead of posting."
+    fi
+  fi
+
+  $CHANGED || { echo "Nothing to change. See: $0 --help"; return 0; }
+  echo
+  echo "  webhook   : $(env_get MATTERMOST_WEBHOOK_URL | sed -E 's#(://[^/]+/).*#\1<redacted>#')"
+  echo "  channel   : $(env_get MATTERMOST_CHANNEL)"
+  echo "  username  : $(env_get MATTERMOST_MONITOR_USER)"
+  echo "  verify tls: $(env_get MATTERMOST_VERIFY_TLS)"
+  note "Run '$0 apply' to restart the monitor, then '$0 test-alert'."
+}
+
 cmd_set_token() {
   local token="${1:-}" confirm_token=""
   if [[ -z "$token" ]]; then
@@ -1218,6 +1368,13 @@ while (( $# > 0 )); do
     --dry-run)   DRY_RUN=true; shift ;;
     -y|--yes)    ASSUME_YES=true; shift ;;
     -h|--help)   usage; exit 0 ;;
+    # set-webhook's own flags. They are passed through rather than handled
+    # here, because they take a value that may legitimately be EMPTY
+    # (--channel '' clears the override) and only that command understands them.
+    --channel|--username|--verify-tls)
+      [[ "$COMMAND" == "set-webhook" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
     --*)         die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
@@ -1244,12 +1401,14 @@ case "$COMMAND" in
   apply)    cmd_apply ;;
   commit)   cmd_commit "${ARGS[0]:-Update model server list}" ;;
   set-token) cmd_set_token "${ARGS[0]:-}" ;;
+  test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
+  set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
   *)        die "unknown command '${COMMAND}' (try --help)" ;;
 esac
 
 case "$COMMAND" in
-  add|remove|set-tier|set-model|set-server-model|set-keepalive|set-webui-version)
+  add|remove|set-tier|set-model|set-server-model|set-keepalive|set-webui-version|set-webhook)
     if ! $CHANGED && ! $DRY_RUN; then
       exit 0        # nothing was written; no need to nag about applying
     fi

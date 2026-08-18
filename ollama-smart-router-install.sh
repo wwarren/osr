@@ -146,6 +146,9 @@ GITEA_OWNER="${GITEA_ADMIN_USER}"
 MATTERMOST_WEBHOOK_URL="${MATTERMOST_WEBHOOK_URL:-}"
 MATTERMOST_MONITOR_USER="${MATTERMOST_MONITOR_USER:-OllamaMonitor}"
 MATTERMOST_CHANNEL="${MATTERMOST_CHANNEL:-ollama-monitor}"
+# Verification is ON by default. An internal Mattermost behind a self-signed
+# certificate needs this false, or every alert fails as a transport error.
+MATTERMOST_VERIFY_TLS="${MATTERMOST_VERIFY_TLS:-true}"
 
 # --- cleanup on failure -------------------------------------------------------
 CT_CREATED=""
@@ -578,6 +581,10 @@ valid_nonempty() {
 valid_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 ))
 }
+# Only the two literals the generated env files and the Python services parse.
+valid_bool() {
+  [[ "$1" == "true" || "$1" == "false" ]]
+}
 # Blank (use the server's own setting), -1 (never unload), 0 (unload at once),
 # a bare number of seconds, or a Go duration such as 30m / 2h / 1h30m.
 valid_keep_alive() {
@@ -636,14 +643,27 @@ prompt_until_valid() {
     fi
     printf -v "$var_name" '%s' "$default"; return 0
   fi
+  local eof=false
   while true; do
-    read -r -p "$prompt [${default}]: " value
+    # `read` returns non-zero at EOF, but may still have set `value` from a
+    # final line with no trailing newline -- so record EOF and evaluate the
+    # value anyway rather than discarding it.
+    if ! read -r -p "$prompt [${default}]: " value; then
+      eof=true
+    fi
     [[ -z "$value" ]] && value="$default"
     if "$validator" "$value"; then
       printf -v "$var_name" '%s' "$value"
       return 0
     fi
     echo "  Not a valid value: '${value}' — try again." >&2
+    # Without this the loop spins forever on an exhausted stdin: there is
+    # nothing left to read, so every iteration re-tests the same bad default.
+    if $eof; then
+      echo "  No more input; giving up on ${var_name}." >&2
+      return 1
+    fi
+    value=""
   done
 }
 
@@ -702,8 +722,13 @@ prompt_mattermost_config() {
   prompt_until_valid "Incoming webhook URL (blank to disable alerts)" \
     MATTERMOST_WEBHOOK_URL "$MATTERMOST_WEBHOOK_URL" valid_optional_url
   if [[ -n "$MATTERMOST_WEBHOOK_URL" ]]; then
+    echo "  The channel name is the URL handle (ollama-monitor), not the display"
+    echo "  name. Leave it blank to post wherever the webhook itself is bound —"
+    echo "  some servers reject an explicit channel override."
     prompt_value "Channel name"    MATTERMOST_CHANNEL      "$MATTERMOST_CHANNEL"
     prompt_value "Post as username" MATTERMOST_MONITOR_USER "$MATTERMOST_MONITOR_USER"
+    prompt_until_valid "Verify the Mattermost TLS certificate (true/false)" \
+      MATTERMOST_VERIFY_TLS "$MATTERMOST_VERIFY_TLS" valid_bool
   else
     echo "  No webhook — the monitor will log alerts instead of posting them."
   fi
@@ -1533,7 +1558,7 @@ GITEA_VERIFY_TLS=${GITEA_VERIFY_TLS}
 MATTERMOST_WEBHOOK_URL=${MATTERMOST_WEBHOOK_URL}
 MATTERMOST_MONITOR_USER=${MATTERMOST_MONITOR_USER}
 MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL}
-MATTERMOST_VERIFY_TLS=true
+MATTERMOST_VERIFY_TLS=${MATTERMOST_VERIFY_TLS}
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
 LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
@@ -2464,6 +2489,17 @@ BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 server_states = {(tier, url): True for tier, urls in BACKENDS.items() for url in urls}
 
 
+def _post_once(payload: dict) -> tuple:
+    """POST one payload. Returns (ok, status, body) -- status None on transport
+    failure, with the exception text as the body."""
+    try:
+        with httpx.Client(verify=MATTERMOST_VERIFY_TLS) as client:
+            resp = client.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=5.0)
+        return (resp.status_code < 400, resp.status_code, resp.text.strip())
+    except Exception as exc:  # noqa: BLE001 - transport errors are reported, not raised
+        return (False, None, str(exc))
+
+
 def post_mattermost(message: str, emoji: str = ":warning:") -> bool:
     """Post to the configured channel. Returns True on a 2xx delivery."""
     if not MATTERMOST_WEBHOOK_URL:
@@ -2474,22 +2510,44 @@ def post_mattermost(message: str, emoji: str = ":warning:") -> bool:
         "icon_emoji": emoji,
         "text": message,
     }
-    # An incoming webhook is bound to a channel, but posting the channel handle
-    # explicitly makes the target unambiguous (and overrides the default when
-    # the webhook allows it).
+    # An incoming webhook is already bound to a channel. Naming the channel
+    # explicitly makes the target unambiguous, but Mattermost REJECTS the
+    # override unless the webhook is allowed to post elsewhere -- and a server
+    # with channel overrides disabled fails every message with a 4xx that reads
+    # like a permissions problem. So: try with the override, and on any 4xx
+    # fall back to the webhook's own default channel rather than losing the
+    # alert entirely.
     if MATTERMOST_CHANNEL:
         payload["channel"] = MATTERMOST_CHANNEL
-    try:
-        with httpx.Client(verify=MATTERMOST_VERIFY_TLS) as client:
-            resp = client.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=5.0)
-        if resp.status_code >= 400:
-            logging.error("Mattermost rejected message (HTTP %s): %s",
-                          resp.status_code, resp.text.strip())
-            return False
+
+    ok, status, body = _post_once(payload)
+    if ok:
         return True
-    except Exception as exc:
-        logging.error("Failed message delivery: %s", exc)
+
+    if status is not None and 400 <= status < 500 and "channel" in payload:
+        retry = {k: v for k, v in payload.items() if k != "channel"}
+        ok_retry, status_retry, body_retry = _post_once(retry)
+        if ok_retry:
+            logging.warning(
+                "Mattermost refused the channel override to '%s' (HTTP %s: %s); "
+                "delivered to the webhook's own default channel instead. Either "
+                "clear MATTERMOST_CHANNEL, or allow channel overrides for this "
+                "webhook in the System Console.",
+                MATTERMOST_CHANNEL, status, body)
+            return True
+        logging.error("Mattermost rejected message (HTTP %s): %s -- and again "
+                      "without the channel override (HTTP %s): %s",
+                      status, body, status_retry, body_retry)
         return False
+
+    if status is None:
+        logging.error("Failed message delivery: %s%s", body,
+                      "" if MATTERMOST_VERIFY_TLS is False
+                      else "  (if this is a certificate error, set "
+                           "MATTERMOST_VERIFY_TLS=false in router.env)")
+    else:
+        logging.error("Mattermost rejected message (HTTP %s): %s", status, body)
+    return False
 
 
 def send_startup_notice() -> None:
@@ -2867,6 +2925,12 @@ Commands:
   commit [message]           Commit and push the config repo to Gitea
   set-token [token]          Store/replace the Gitea deploy token used for
                              pushing (prompts if not given, then verifies it)
+  test-alert [message]       Post a test message through the Mattermost webhook
+                             and report exactly why it failed if it did
+  set-webhook [url] [--channel <c>] [--username <u>] [--verify-tls true|false]
+                             Configure Mattermost alerting. An empty url
+                             disables posting; an empty --channel posts to
+                             whichever channel the webhook is bound to
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
@@ -3841,6 +3905,150 @@ git_push_authenticated() {
   return 1
 }
 
+# Post a message through the configured webhook, exactly as monitor.py does,
+# and report precisely why it failed. Without this there is no way to tell a
+# missing URL from a TLS failure from a rejected channel override -- all three
+# just look like "alerts do not arrive".
+cmd_test_alert() {
+  local message="${1:-}" url channel user verify host
+  url="$(env_get MATTERMOST_WEBHOOK_URL)"
+  channel="$(env_get MATTERMOST_CHANNEL)"
+  user="$(env_get MATTERMOST_MONITOR_USER)"; [[ -n "$user" ]] || user="OllamaMonitor"
+  verify="$(env_get MATTERMOST_VERIFY_TLS)"
+  [[ -n "$message" ]] || message="Test alert from $(hostname) via ${0##*/} — if you can read this, monitor alerting works."
+
+  if [[ -z "$url" ]]; then
+    echo "MATTERMOST_WEBHOOK_URL is not set in ${ENV_FILE}."
+    echo "The monitor logs alerts instead of posting them. Set one with:"
+    echo "  $0 set-webhook <url>"
+    return 1
+  fi
+
+  host="${url#*://}"; host="${host%%/*}"
+  echo "Webhook host : ${host}"
+  echo "Channel      : ${channel:-<webhook default>}"
+  echo "Post as      : ${user}"
+  echo "Verify TLS   : ${verify:-true}"
+  echo
+
+  local -a copts=(-sS -o /dev/null)
+  [[ "$verify" == "false" ]] && copts+=(--insecure)
+
+  _mm_post() {  # $1 = json payload -> prints "<http_code> <curl_rc>"
+    local body="$1" code rc=0
+    code="$(curl "${copts[@]}" -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' --data "$body" "$url" 2>/dev/null)" || rc=$?
+    printf '%s %s' "${code:-000}" "$rc"
+  }
+  _mm_payload() {  # $1 = include the channel override? true/false
+    python3 -c '
+import json, sys
+payload = {"username": sys.argv[1], "icon_emoji": ":white_check_mark:", "text": sys.argv[2]}
+if sys.argv[3] == "true" and sys.argv[4]:
+    payload["channel"] = sys.argv[4]
+print(json.dumps(payload))' "$user" "$message" "$1" "$channel"
+  }
+
+  local result code rc
+  result="$(_mm_post "$(_mm_payload true)")"
+  code="${result%% *}"; rc="${result##* }"
+
+  if [[ "$code" =~ ^2 ]]; then
+    # NOTE: no apostrophe inside a ${var:-default}. Bash re-parses the default,
+    # so a lone quote there opens a quote context and breaks the rest of the file.
+    local where="the channel the webhook is bound to"
+    [[ -n "$channel" ]] && where="#${channel}"
+    echo "Delivered (HTTP ${code}). Check ${where} in Mattermost."
+    return 0
+  fi
+
+  # Transport-level failure: curl never got an HTTP response.
+  if [[ "$code" == "000" ]]; then
+    echo "Could not reach the webhook (curl exit ${rc})."
+    case "$rc" in
+      6)  echo "  DNS: '${host}' does not resolve from inside this container." ;;
+      7)  echo "  Connection refused — check the host, port and any firewall." ;;
+      28) echo "  Timed out." ;;
+      35|60)
+          echo "  TLS failure. If Mattermost uses a self-signed or internal CA"
+          echo "  certificate, turn verification off:"
+          echo "    $0 set-webhook --verify-tls false" ;;
+      *)  echo "  curl exit ${rc}." ;;
+    esac
+    return 1
+  fi
+
+  echo "Mattermost rejected the message (HTTP ${code})."
+
+  # A 4xx WITH a channel override is very often the override itself: a webhook
+  # is bound to one channel and many servers refuse to redirect it. Re-test
+  # without the override so the report says which of the two is at fault.
+  if [[ -n "$channel" && "$code" =~ ^4 ]]; then
+    echo "Retrying without the channel override ..."
+    result="$(_mm_post "$(_mm_payload false)")"
+    if [[ "${result%% *}" =~ ^2 ]]; then
+      echo
+      echo "That worked. The webhook is fine; Mattermost is refusing to redirect"
+      echo "it to '${channel}'. Either clear the override:"
+      echo "    $0 set-webhook --channel ''"
+      echo "  or allow channel overrides for this webhook in the System Console"
+      echo "  (Integrations -> Incoming Webhooks), and confirm '${channel}' is the"
+      echo "  channel's URL handle rather than its display name."
+      return 1
+    fi
+    echo "  Still rejected (HTTP ${result%% *}) — the webhook URL itself is the problem."
+  fi
+
+  case "$code" in
+    400) echo "  400 usually means a malformed payload or an unknown channel." ;;
+    401|403) echo "  The webhook is not authorised to post there. Re-check it in"
+             echo "  Integrations -> Incoming Webhooks." ;;
+    404) echo "  404 means the webhook URL is wrong or has been deleted." ;;
+  esac
+  return 1
+}
+
+# Set the Mattermost webhook and its options without hand-editing router.env.
+cmd_set_webhook() {
+  local url="" set_url=false
+  while (( $# )); do
+    case "$1" in
+      --channel)    env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
+      --username)   env_set MATTERMOST_MONITOR_USER "${2:?--username needs a value}"; CHANGED=true; shift 2 ;;
+      --verify-tls)
+        [[ "${2-}" == "true" || "${2-}" == "false" ]] \
+          || die "set-webhook: --verify-tls takes 'true' or 'false'"
+        env_set MATTERMOST_VERIFY_TLS "$2"; CHANGED=true; shift 2 ;;
+      -*) die "set-webhook: unknown option '$1'" ;;
+      *)  url="$1"; set_url=true; shift ;;
+    esac
+  done
+
+  if $set_url; then
+    # An empty URL is meaningful: it disables posting and the monitor logs
+    # alerts instead, which is the documented way to turn alerting off.
+    if [[ -n "$url" ]]; then
+      [[ "$url" =~ ^https?://[^[:space:]]+$ ]] \
+        || die "set-webhook: '${url}' is not an http(s) URL"
+    fi
+    env_set MATTERMOST_WEBHOOK_URL "$url"
+    CHANGED=true
+    if [[ -n "$url" ]]; then
+      echo "Webhook stored in ${ENV_FILE}."
+    else
+      echo "Webhook cleared — the monitor will log alerts instead of posting."
+    fi
+  fi
+
+  $CHANGED || { echo "Nothing to change. See: $0 --help"; return 0; }
+  echo
+  echo "  webhook   : $(env_get MATTERMOST_WEBHOOK_URL | sed -E 's#(://[^/]+/).*#\1<redacted>#')"
+  echo "  channel   : $(env_get MATTERMOST_CHANNEL)"
+  echo "  username  : $(env_get MATTERMOST_MONITOR_USER)"
+  echo "  verify tls: $(env_get MATTERMOST_VERIFY_TLS)"
+  note "Run '$0 apply' to restart the monitor, then '$0 test-alert'."
+}
+
 cmd_set_token() {
   local token="${1:-}" confirm_token=""
   if [[ -z "$token" ]]; then
@@ -4021,6 +4229,13 @@ while (( $# > 0 )); do
     --dry-run)   DRY_RUN=true; shift ;;
     -y|--yes)    ASSUME_YES=true; shift ;;
     -h|--help)   usage; exit 0 ;;
+    # set-webhook's own flags. They are passed through rather than handled
+    # here, because they take a value that may legitimately be EMPTY
+    # (--channel '' clears the override) and only that command understands them.
+    --channel|--username|--verify-tls)
+      [[ "$COMMAND" == "set-webhook" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
     --*)         die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
@@ -4047,12 +4262,14 @@ case "$COMMAND" in
   apply)    cmd_apply ;;
   commit)   cmd_commit "${ARGS[0]:-Update model server list}" ;;
   set-token) cmd_set_token "${ARGS[0]:-}" ;;
+  test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
+  set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
   *)        die "unknown command '${COMMAND}' (try --help)" ;;
 esac
 
 case "$COMMAND" in
-  add|remove|set-tier|set-model|set-server-model|set-keepalive|set-webui-version)
+  add|remove|set-tier|set-model|set-server-model|set-keepalive|set-webui-version|set-webhook)
     if ! $CHANGED && ! $DRY_RUN; then
       exit 0        # nothing was written; no need to nag about applying
     fi

@@ -112,7 +112,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `MODEL_FAST` / `MODEL_MEDIUM` / `MODEL_LARGE` / `MODEL_XLARGE` — model tag per tier
 - `NONINTERACTIVE` (false) — take every default and skip all prompts
 - `GITEA_SERVER_URL` (`https://git.bancs.net`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
-- `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`)
+- `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`), `MATTERMOST_VERIFY_TLS` (true)
 - `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
 - `OPENWEBUI_PORT` (8080)
 
@@ -137,8 +137,11 @@ The installer prompts for:
    failing partway through `pct create`.
 4. **Gitea** — server URL, username, repository name, and auth token (hidden).
    Preset `GITEA_DEPLOY_TOKEN` to skip the token prompt on unattended runs.
-5. **Mattermost** — incoming webhook URL (blank disables alerting), plus channel
-   and posting username when a webhook is given.
+5. **Mattermost** — incoming webhook URL (blank disables alerting), plus
+   channel, posting username, and whether to verify the server's TLS
+   certificate. The channel is the **URL handle** (`ollama-monitor`), not the
+   display name; leaving it blank posts wherever the webhook is already bound,
+   which avoids the channel-override rejection described below.
 6. **Model servers** — how many (**1–20**), each address, the tier assignment,
    and the model tag per tier. A count outside the range is rejected with a
    specific error (too few / too many / not a number) and re-prompted.
@@ -334,6 +337,46 @@ while — it is a large dependency tree.
   (visible in `journalctl -u ollama-monitor`) if the webhook is rejected.
 - **Container:** readiness is polled (systemd + DNS) before apt runs, apt is
   retried, and an `ERR` trap destroys a half-provisioned container on failure.
+
+## Mattermost alerting
+
+The monitor posts **state transitions only** — a backend going down, and its
+recovery — plus one startup notice each time the service restarts. A healthy,
+unchanged cluster is silent by design, so "no messages" is the normal state
+and not on its own evidence of a problem.
+
+Check and change it without hand-editing `router.env`:
+
+```bash
+manage-model-servers test-alert                 # post a test message, diagnose failures
+manage-model-servers set-webhook <url>          # set (empty url disables alerting)
+manage-model-servers set-webhook --channel ''   # post wherever the webhook is bound
+manage-model-servers set-webhook --verify-tls false   # self-signed Mattermost
+manage-model-servers apply                      # restart the monitor to pick it up
+```
+
+`test-alert` uses the identical payload and TLS setting as the monitor, and
+separates the three failures that otherwise look the same:
+
+| Symptom | Cause |
+|---|---|
+| `MATTERMOST_WEBHOOK_URL is not set` | never configured — the monitor logs alerts instead of posting |
+| `curl exit 60` / TLS failure | self-signed or internal CA → `set-webhook --verify-tls false` |
+| 4xx that succeeds on retry without the channel | Mattermost refuses the **channel override** |
+| 404 both ways | the webhook URL is wrong or deleted |
+
+That third row is the common one. An incoming webhook is bound to a channel,
+and many servers refuse to let a payload redirect it elsewhere — so naming the
+channel explicitly fails with what reads like a permissions error. The monitor
+handles this itself: on any 4xx it retries once **without** the channel field
+and logs a warning, so the alert reaches the webhook's own channel rather than
+being lost. Clearing `--channel ''` removes the warning.
+
+The service log is the other source of truth:
+
+```bash
+journalctl -u ollama-monitor -n 50 --no-pager | grep -i mattermost
+```
 
 ## Operating
 
