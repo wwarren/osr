@@ -111,17 +111,25 @@ flowchart TB
         end
     end
 
-    A -->|Requires| B
-    B -->|Requires| C
-    D -->|Requires| C
+    A -->|"After + Wants"| B
+    B -->|"After + Wants"| C
+    D -->|"After + Wants"| C
 ```
 
 ### Unit dependency rationale
 
-* `open-webui` **Requires** `ollama-router` — the UI's only backend is the router.
-* `ollama-router` and `ollama-monitor` **Require** `litellm-proxy` — the router
-  needs it for the fallback path, and the ordering guarantees it is present
-  before traffic arrives.
+* Every cross-service dependency is `After=` + `Wants=`, never `Requires=`.
+  Ordering is real — the UI should come up behind the router, the router behind
+  LiteLLM — but no service needs its upstream *present* in order to start. The
+  router serves from its own discovery inventory; the monitor probes the Ollama
+  hosts directly; the UI needs the router only when a request arrives.
+* This is not a style preference. `Requires=` propagates stop and restart, so a
+  crash-looping `litellm-proxy` stopped `ollama-router`, which stopped
+  `open-webui`. That is fatal on a first install: Open WebUI runs its alembic
+  migrations on first start, and being killed part way through leaves
+  `data/webui.db` with a column added but the revision unstamped. Every later
+  start then dies on `duplicate column name: info_json` and the UI never
+  returns — with a clean journal on the unit that actually failed.
 * All units are `Restart=always`. `open-webui` carries `TimeoutStartSec=600`
   because its first start downloads a local embedding model.
 
@@ -166,6 +174,45 @@ Internally it has three collaborating parts:
   image.
 * **Selector + dispatcher** — scores every `(host, model)` pair, ranks them, and
   dispatches to the best, failing forward on error.
+* **Decision recorder** — writes one JSON object per request to
+  `/var/log/ollama-router/decisions.jsonl`.
+
+#### Why the decision log exists
+
+A routing decision is only evaluable against the decisions it *rejected*. The
+model that answered tells you nothing about whether it should have; the
+alternatives and their scores do. So the record keeps the whole comparison:
+
+```
+request    class, why that class, which keywords matched, length, prompt preview
+ranking    candidate count, tie-group size, whether distance ranking was used
+candidates every scored (host, model) pair: score, in_band, band_distance, and
+           the score split into its band / code / vision / size terms
+chosen     model, host, rank, score
+attempts   each fall-forward hop with its outcome and latency
+outcome    status, ttfb_ms, total_ms
+```
+
+`score_entry()` is a one-line wrapper around `score_breakdown()` so there is a
+single implementation of the arithmetic and the logged terms can never drift
+from the score that actually decided the routing. The terms are unrounded
+inside the breakdown — `sum(terms) == score` exactly — and rounded once, at the
+point the record is built.
+
+The record is written from the response's `BackgroundTask`, after the last byte
+has streamed, because that is the only point at which `total_ms` is knowable.
+The one-line journal summary is emitted at dispatch instead, so `journalctl -f`
+shows decisions live.
+
+`POST /routing/explain` returns the identical shape without executing the
+request, so a hypothesis formed from the log can be tested against a prompt
+directly.
+
+Cost is bounded by construction: `log_candidates` caps how many candidates are
+stored, `prompt_chars` caps the text, and a `RotatingFileHandler` caps the file.
+A log that cannot be opened disables itself with a warning — a router that
+refuses to route because it cannot write a log would be a worse failure than
+routing blind.
 
 ### 4.2 LiteLLM proxy (`litellm-proxy.service`)
 
@@ -184,10 +231,45 @@ installer provisions a dedicated interpreter for it (see §7.3).
 
 ### 4.4 Health monitor (`ollama-monitor.service`)
 
-No listener. Polls each distinct host once per cycle and maps the result onto
-every `(tier, host)` pair that uses it, so a host shared by two tiers is probed
-once but alerted per tier. Posts state *transitions* only — down and recovery —
-plus a startup notice that doubles as a webhook permission check.
+No listener. Polls each distinct host once per cycle and posts state
+*transitions* only — down and recovery. A healthy, unchanged cluster is silent.
+
+**Health is a property of the host, not of the tier.** State is keyed by URL and
+the message names every tier the host serves. Keying it per `(tier, host)` meant
+one unreachable box produced one alert per tier it backed — and since a
+single-server deployment points all four tiers at the same URL, one outage
+posted four identical messages and four more on recovery.
+
+Three mechanisms keep the channel quiet, all configurable under `[alerting]` in
+`monitor.ini`:
+
+| Mechanism | Default | Problem it solves |
+|---|---|---|
+| `failure_threshold` / `recovery_threshold` | 3 / 2 consecutive probes | A backend answering slowly — one probe timing out, the next succeeding — otherwise alternates down/up **every cycle, forever**. Thresholds of 1 reproduce that flood. |
+| `state_file` (systemd `StateDirectory=`) | `/var/lib/ollama-monitor/state.json` | Held only in memory, health defaulted to "everything is up", so each restart rediscovered an ongoing outage and re-announced it. With `Restart=always` that is one message per `RestartSec` for the length of the outage. |
+| `startup_notice` | `auto` | The webhook self-test is useful on a first start and after a reconfiguration, and pure noise on the 400th restart. `auto` posts only when there is no prior state or the watched set changed. |
+
+On top of those, the send path itself is guarded. The state file carries
+`last_check` (the raw probe result for the most recent cycle), `last_check_at`,
+and `last_posted_digest` — a fingerprint of the believed health of every watched
+host at the moment of the last message. `announce()` recomputes that fingerprint
+and **drops the message if it is unchanged**, so an unchanged cluster cannot
+produce a post even if the debouncing above were bypassed entirely. The
+fingerprint is written back after a successful post, which is why the loop saves
+state twice on a transition cycle and not at all in steady state.
+
+`repeat_seconds` (default `0`, off) is the single deliberate exception: it
+re-reports an outage that is still ongoing, and is excluded from the digest
+guard by design. Transitions occurring in the same cycle are batched into one
+message.
+
+State is written **before** the message is posted: if the post hangs and the
+unit is killed, a lost alert beats a duplicated one. An unwritable or corrupt
+state file degrades to memory-only with a warning rather than failing the
+daemon, and settings are read through a section-safe accessor — `ConfigParser`'s
+`fallback=` covers a missing *option* but still raises `NoSectionError` for a
+missing *section*, which would otherwise crash-loop the daemon against a
+hand-trimmed `monitor.ini`.
 
 It also runs the **keep-alive maintainer**. Ollama's OpenAI-compatible endpoint
 does not accept a `keep_alive` field, so a model driven through the router would
@@ -344,6 +426,16 @@ then optionally applies and restarts. Design points:
 * Both verify the tag is **actually present** on the affected server(s) before
   writing it (`models` lists what is available; `--no-probe` overrides for a
   not-yet-pulled model).
+* **The repo is on PATH inside the container.** `apply-config.sh` makes every
+  `*.sh` in the repo executable (skipping `.git/`) and writes a `profile.d`
+  snippet appending the repo root and `install/` to `PATH`. Appended rather
+  than prepended, so a committed file cannot shadow a system binary. Because
+  `profile.d` is read only by login shells, the `/usr/local/bin` symlink is
+  kept for `pct exec` — and it is created as the script's *first* action, so a
+  failure further down cannot leave a half-applied system without its
+  management command. The repo stays `0700 root:root` throughout: `router.env`
+  holds live secrets, so this is operator convenience, not a grant to the
+  service account.
 * **No automatic config migration.** The tiers were renamed twice
   (`BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
   `model_name: qwen-heavy` → `heavy` → `large`), but the management script does
@@ -528,8 +620,11 @@ permissive than the 0640 runtime copy it feeds.
 
 | Failure | Detection | System behaviour | Operator signal |
 |---|---|---|---|
-| One Ollama host down | Connect error mid-request; next poll | Fail-forward to next candidate; dropped from inventory | Mattermost alert; `/routing/inventory` |
-| All Ollama hosts down | Empty inventory | Falls back to LiteLLM path, which also fails → 502 | Alerts per host |
+| One Ollama host down | Connect error mid-request; `failure_threshold` consecutive failed probes | Fail-forward to next candidate; dropped from inventory | One Mattermost alert naming every tier it served; `/routing/inventory` |
+| All Ollama hosts down | Empty inventory | Falls back to LiteLLM path, which also fails → 502 | One batched alert listing every host |
+| A host flapping (intermittent timeouts) | Streak counters never reach a threshold | Treated as up; no churn | Nothing posted — check `/routing/inventory` and the probe latency |
+| Monitor restarted during an outage | Health reloaded from `state_file` | Outage is remembered, not re-announced | `Resuming with N backend(s) already known down` in the journal |
+| Monitor `state_file` unwritable | Write failure | Degrades to memory-only; alerting still works | One warning; restarts will re-announce |
 | A model removed from a host | Next discovery poll | Stops being a candidate within `refresh_seconds` | Inventory diff |
 | Gitea unreachable at install | Auth probe | Local config mode; provisioning completes | Explicit console warning |
 | Gitea unreachable at runtime | — | **No effect** — nothing reads it | — |
@@ -569,7 +664,11 @@ permissive than the 0640 runtime copy it feeds.
 | `GET /routing/inventory` | What does each host currently serve; who is down and why |
 | `POST /routing/explain` | What *would* happen to this prompt, with scores |
 | `journalctl -u <unit>` | Service logs; monitor logs suppressed alerts too |
-| Mattermost `#ollama-monitor` | Host up/down transitions and startup confirmation |
+| `/var/log/ollama-router/decisions.jsonl` | Every routing decision with all candidate scores |
+| `manage-model-servers routing-stats` | Whether the scoring is discriminating, and where it drifted |
+| `X-Router-Request-Id` | Ties a response back to its record in the decision log |
+| Mattermost `#ollama-monitor` | Host up/down transitions, and a startup confirmation on first start or reconfiguration |
+| `/var/lib/ollama-monitor/state.json` | What the monitor believes about each host, and when it last said so |
 | `/etc/motd` | Ports, tier map, config paths at login |
 
 ---

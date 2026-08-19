@@ -64,6 +64,11 @@ OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 # Change it later on a running container with:
 #   manage-model-servers set-webui-version <version|latest> --apply
 OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.11.0}"
+# Log levels for the two services that do their own logging. The router and the
+# monitor read theirs from their .ini files instead, so they can be changed by
+# commit rather than by editing the environment.
+LITELLM_LOG="${LITELLM_LOG:-ERROR}"
+OPENWEBUI_LOG_LEVEL="${OPENWEBUI_LOG_LEVEL:-INFO}"
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-ant-hp-nfs-backups}"
@@ -1516,7 +1521,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -1562,6 +1567,9 @@ MATTERMOST_VERIFY_TLS=${MATTERMOST_VERIFY_TLS}
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
 LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
+# LiteLLM reads this itself: ERROR / WARNING / INFO / DEBUG. DEBUG prints the
+# full request and response for every call, so keep it off unless diagnosing.
+LITELLM_LOG=${LITELLM_LOG}
 BACKEND_FAST=$(indices_to_urls "$TIER_FAST_IDX")
 BACKEND_MEDIUM=$(indices_to_urls "$TIER_MEDIUM_IDX")
 BACKEND_LARGE=$(indices_to_urls "$TIER_LARGE_IDX")
@@ -1587,10 +1595,13 @@ cat > "${REPO_DIR}/services/ollama-router/router.py" <<'PYEOF'
 import asyncio
 import configparser
 import json
+import logging
+import logging.handlers
 import os
 import re
 import sys
 import time
+import uuid
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
@@ -1661,6 +1672,19 @@ _DEFAULTS = {
         # rotated through, so identical models on several hosts share load.
         "tie_epsilon": "0.05",
     },
+    "logging": {
+        "level": "INFO",
+        "decisions": "true",
+        # systemd's LogsDirectory= creates and owns this; the literal path is
+        # only reached when router.py is run by hand.
+        "decision_file": "",
+        "max_bytes": "20000000",
+        "backup_count": "5",
+        # Characters of prompt text kept in each record. 0 logs no text at all,
+        # only the derived features.
+        "prompt_chars": "200",
+        "log_candidates": "10",
+    },
 }
 ROUTER_INI = os.getenv(
     "ROUTER_INI",
@@ -1669,10 +1693,24 @@ ROUTER_INI = os.getenv(
 
 
 def _load_config(path: str) -> configparser.ConfigParser:
+    """Built-in defaults, overlaid with router.ini if it parses.
+
+    A malformed ini -- a duplicated section header is the easy one to write by
+    hand -- must not stop the router. Falling back to the defaults and saying
+    so loudly beats a service that crash-loops on a config typo, which is a
+    much harder failure to read from the outside.
+    """
     cp = configparser.ConfigParser()
     cp.read_dict(_DEFAULTS)
     if os.path.exists(path):
-        cp.read(path)
+        try:
+            cp.read(path)
+        except configparser.Error as exc:
+            sys.stderr.write(
+                "WARNING: %s is malformed (%s); using built-in defaults for "
+                "everything it would have set.\n" % (path, exc))
+            cp = configparser.ConfigParser()
+            cp.read_dict(_DEFAULTS)
     return cp
 
 
@@ -1736,6 +1774,85 @@ W_SMALLER = _cfg.getfloat("weights", "prefer_smaller")
 W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
 W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
+
+# --- logging ------------------------------------------------------------------
+# Two sinks with different jobs:
+#
+#   the journal    one human-readable line per request, for watching live
+#   decisions.jsonl  one machine-readable object per request, for answering
+#                    "is the scoring any good?" after the fact
+#
+# The JSONL file is the reason this exists. Judging routing quality means
+# comparing what was asked for against what every candidate scored, across
+# hundreds of requests -- that is a query, not something you read in a terminal.
+LOG_LEVEL = _cfg.get("logging", "level", fallback="INFO").strip().upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("router")
+
+LOG_DECISIONS = _cfg.getboolean("logging", "decisions", fallback=True)
+PROMPT_CHARS = _cfg.getint("logging", "prompt_chars", fallback=200)
+LOG_CANDIDATES = _cfg.getint("logging", "log_candidates", fallback=10)
+_LOG_DIR = os.getenv("LOGS_DIRECTORY", "/var/log/ollama-router")
+DECISION_FILE = (os.getenv("ROUTER_DECISION_FILE")
+                 or _cfg.get("logging", "decision_file", fallback="").strip()
+                 or os.path.join(_LOG_DIR, "decisions.jsonl"))
+
+_decision_log = None
+
+
+def _init_decision_log():
+    """A rotating JSONL sink, or None if it cannot be opened.
+
+    Never fatal: a router that refuses to start because it cannot write a log
+    is worse than one that routes without one. The failure is reported once.
+    """
+    global _decision_log, LOG_DECISIONS
+    if not LOG_DECISIONS:
+        return None
+    try:
+        os.makedirs(os.path.dirname(DECISION_FILE) or ".", exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            DECISION_FILE,
+            maxBytes=_cfg.getint("logging", "max_bytes", fallback=20_000_000),
+            backupCount=_cfg.getint("logging", "backup_count", fallback=5),
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))  # the record IS the line
+        logger = logging.getLogger("router.decisions")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False          # never duplicate JSON into the journal
+        logger.handlers = [handler]
+        _decision_log = logger
+        log.info("Decision log: %s", DECISION_FILE)
+    except Exception as exc:  # noqa: BLE001
+        LOG_DECISIONS = False
+        log.warning("Cannot open the decision log at %s (%s). Routing continues; "
+                    "set logging.decision_file in router.ini to a writable path.",
+                    DECISION_FILE, exc)
+    return _decision_log
+
+
+def record_decision(payload: dict) -> None:
+    """Append one decision record. Silently no-ops when logging is off."""
+    if not LOG_DECISIONS or _decision_log is None:
+        return
+    try:
+        _decision_log.info(json.dumps(payload, separators=(",", ":"), default=str))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Could not write a decision record: %s", exc)
+
+
+def redact_prompt(text: str) -> str:
+    """Prompt text for the log, truncated to prompt_chars (0 = keep none)."""
+    if PROMPT_CHARS <= 0 or not text:
+        return ""
+    text = " ".join(text.split())            # collapse newlines: one JSON line
+    if len(text) <= PROMPT_CHARS:
+        return text
+    return text[:PROMPT_CHARS] + "..."
 
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
               "transfer-encoding", "upgrade"}
@@ -1886,8 +2003,31 @@ async def refresh_inventory() -> dict:
             continue
         servers[server] = {"up": True, "model_count": len(entries)}
         models.extend(entries)
+    previous = INVENTORY
     INVENTORY = {"models": models, "servers": servers,
                  "updated_at": time.time(), "errors": errors}
+    # Log the DIFF, not the poll. A line every refresh_seconds would bury the
+    # one thing worth seeing: the inventory changing under a running router,
+    # which is the usual explanation for "it routed differently this time".
+    was = {(e["server"], e["name"]) for e in previous.get("models", [])}
+    now = {(e["server"], e["name"]) for e in models}
+    if was != now:
+        added = sorted(f"{m}@{sv}" for sv, m in now - was)
+        gone = sorted(f"{m}@{sv}" for sv, m in was - now)
+        log.info("inventory changed: %d model(s) on %d/%d host(s)%s%s",
+                 len(models), sum(1 for v in servers.values() if v["up"]),
+                 len(servers),
+                 f"; added {', '.join(added)}" if added else "",
+                 f"; gone {', '.join(gone)}" if gone else "")
+    for server, message in errors.items():
+        if previous.get("errors", {}).get(server) != message:
+            log.warning("discovery: %s is not answering: %s", server, message)
+    for server, status in servers.items():
+        if status["up"] and previous.get("errors", {}).get(server):
+            log.info("discovery: %s is answering again (%d models)",
+                     server, status["model_count"])
+    log.debug("inventory refreshed: %d models, %d servers, %d error(s)",
+              len(models), len(servers), len(errors))
     return INVENTORY
 
 
@@ -1895,13 +2035,25 @@ async def _discovery_loop() -> None:
     while True:
         try:
             await refresh_inventory()
-        except Exception:  # noqa: BLE001 - never let the loop die
-            pass
+        except Exception as exc:  # noqa: BLE001 - never let the loop die
+            log.warning("discovery refresh failed: %s", exc)
         await asyncio.sleep(max(5, DISCOVERY_REFRESH))
 
 
 @app.on_event("startup")
 async def _startup() -> None:
+    _init_decision_log()
+    log.info("Router starting: discovery=%s, %d configured server(s), "
+             "log level %s", DISCOVERY_ENABLED, len(SERVERS), LOG_LEVEL)
+    log.info("Bands: %s", ", ".join(
+        f"{name} {low:g}-{high:g}B" for name, (low, high) in sorted(BANDS.items())))
+    log.info("Weights: band=%.2f code=%.2f vision=%.2f larger=%.2f smaller=%.2f "
+             "unknown=%.2f offtask=%.2f tie=%.3f",
+             W_BAND, W_CODE, W_VISION, W_LARGER, W_SMALLER, W_UNKNOWN,
+             W_OFFTASK, TIE_EPSILON)
+    if not SERVERS:
+        log.warning("No discovery targets. Every request will take the LiteLLM "
+                    "fallback path — check BACKEND_* in router.env.")
     if DISCOVERY_ENABLED and SERVERS:
         await refresh_inventory()
         asyncio.create_task(_discovery_loop())
@@ -1946,19 +2098,38 @@ def classify_request(messages: list) -> dict:
     text = " ".join(text_parts)
     lowered = text.lower()
     approx_tokens = len(lowered.split()) * 1.3
-    is_code = any(kw in lowered for kw in CODE_KEYWORDS)
+    # Keep the keywords that actually fired, not just the boolean. When a short
+    # prompt lands in xlarge, "which word did that?" is the whole question, and
+    # a bare True/False cannot answer it.
+    hit_code = [kw for kw in CODE_KEYWORDS if kw in lowered]
+    hit_large = [kw for kw in LARGE_KEYWORDS if kw in lowered]
+    hit_xlarge = [kw for kw in XLARGE_KEYWORDS if kw in lowered]
+    is_code = bool(hit_code)
     if CODE_FIRST and is_code:
-        request_class = "fast"
-    elif approx_tokens > TOKEN_THRESHOLD_XLARGE or any(kw in lowered for kw in XLARGE_KEYWORDS):
-        request_class = "xlarge"
-    elif approx_tokens > TOKEN_THRESHOLD_LARGE or any(kw in lowered for kw in LARGE_KEYWORDS):
-        request_class = "large"
+        request_class, reason = "fast", "code keyword (code_first)"
+    elif approx_tokens > TOKEN_THRESHOLD_XLARGE:
+        request_class, reason = "xlarge", f"length > {TOKEN_THRESHOLD_XLARGE}"
+    elif hit_xlarge:
+        request_class, reason = "xlarge", "xlarge keyword"
+    elif approx_tokens > TOKEN_THRESHOLD_LARGE:
+        request_class, reason = "large", f"length > {TOKEN_THRESHOLD_LARGE}"
+    elif hit_large:
+        request_class, reason = "large", "large keyword"
     elif approx_tokens > TOKEN_THRESHOLD_MEDIUM:
-        request_class = "medium"
+        request_class, reason = "medium", f"length > {TOKEN_THRESHOLD_MEDIUM}"
+    elif is_code:
+        request_class, reason = "fast", "code keyword"
     else:
-        request_class = "fast"
+        request_class, reason = "fast", "default"
     return {"class": request_class, "code": is_code, "vision": has_image,
-            "approx_tokens": round(approx_tokens)}
+            "approx_tokens": round(approx_tokens),
+            # Everything below is for the log and /routing/explain. Nothing in
+            # the routing path reads it.
+            "reason": reason,
+            "chars": len(text),
+            "messages": len(messages or []),
+            "matched": {"code": hit_code, "large": hit_large, "xlarge": hit_xlarge},
+            "prompt": redact_prompt(text)}
 
 
 def _in_band(params: float, low: float, high: float) -> bool:
@@ -2001,6 +2172,18 @@ def in_requested_band(entry: dict, need: dict) -> bool:
 
 def score_entry(entry: dict, need: dict) -> float:
     """Heuristic fit of one discovered (server, model) pair to one request."""
+    return score_breakdown(entry, need)["score"]
+
+
+def score_breakdown(entry: dict, need: dict) -> dict:
+    """score_entry, with every term kept separately.
+
+    The total is the only thing routing uses; the terms are what make the log
+    worth having. "qwen3:14b beat qwen3:32b" is not actionable -- "it beat it
+    by 0.6 because the request matched a code keyword and 14b is the coder"
+    is. score_entry() is a thin wrapper so there is exactly one implementation
+    of the arithmetic and the two can never disagree.
+    """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
     in_band = _in_band(params, low, high)
@@ -2011,20 +2194,23 @@ def score_entry(entry: dict, need: dict) -> float:
     else:
         distance = (low - params) if params < low else (params - high)
         fit = max(0.0, 1.0 - (distance / BAND_FALLOFF))
-    score = W_BAND * fit
+    band_term = W_BAND * fit
+    code_term = 0.0
+    vision_term = 0.0
+    size_term = 0.0
 
     if need["code"]:
-        score += W_CODE if entry["is_code"] else 0.0
+        code_term = W_CODE if entry["is_code"] else 0.0
     elif entry["is_code"]:
         # A code model on a general request is usable but not preferred.
-        score -= W_CODE * W_OFFTASK
+        code_term = -W_CODE * W_OFFTASK
 
     if need["vision"]:
-        score += W_VISION if entry["is_vision"] else -W_VISION
+        vision_term = W_VISION if entry["is_vision"] else -W_VISION
     elif entry["is_vision"]:
         # A vision model answers text fine, but it is tuned for something else
         # and is usually the wrong pick when an equal-sized text model exists.
-        score -= W_VISION * W_OFFTASK
+        vision_term = -W_VISION * W_OFFTASK
 
     # Within a band, bias toward the extreme the class actually wants. The bias
     # is a position WITHIN the band (0 at the floor, 1 at the ceiling) and is
@@ -2033,15 +2219,32 @@ def score_entry(entry: dict, need: dict) -> float:
     # large's exclusive ceiling, so the gentle falloff still scores it ~1.0, and
     # an unbounded size bonus would push it past the 32B that actually belongs
     # to the tier.
+    position = None
     if params > 0 and in_band:
         span = high - low
         position = (params - low) / span if span > 0 else 1.0
         position = max(0.0, min(position, 1.0))
         if need["class"] in ("large", "xlarge"):
-            score += W_LARGER * position
+            size_term = W_LARGER * position
         elif need["class"] == "fast":
-            score += W_SMALLER * (1.0 - position)
-    return score
+            size_term = W_SMALLER * (1.0 - position)
+
+    # Unrounded on purpose: sum(terms) == score has to hold exactly, or the
+    # breakdown is not a breakdown. Rounding for display happens in
+    # explain_candidates, once, at the point the record is built.
+    return {
+        "score": band_term + code_term + vision_term + size_term,
+        "band_fit": fit,
+        "in_band": bool(params > 0 and in_band),
+        "band_distance": band_distance(entry, need),
+        "band_position": position,
+        "terms": {
+            "band": band_term,
+            "code": code_term,
+            "vision": vision_term,
+            "size": size_term,
+        },
+    }
 
 
 def rank_candidates(need: dict, inventory: dict = None) -> list:
@@ -2095,6 +2298,64 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
     return tied + rest
 
 
+def explain_candidates(need: dict, candidates: list, limit: int = None) -> list:
+    """Per-candidate score breakdowns, in the order they were ranked.
+
+    Recomputed rather than threaded out of rank_candidates: scoring is pure and
+    cheap, and keeping rank_candidates' signature unchanged means the routing
+    path and its tests are untouched by logging.
+    """
+    limit = LOG_CANDIDATES if limit is None else limit
+    out = []
+    for rank, entry in enumerate(candidates[:limit] if limit > 0 else candidates):
+        detail = score_breakdown(entry, need)
+        out.append({
+            "rank": rank,
+            "model": entry["name"],
+            "server": entry["server"],
+            "params_b": entry["params_b"],
+            "is_code": entry["is_code"],
+            "is_vision": entry["is_vision"],
+            "score": round(detail["score"], 4),
+            "in_band": detail["in_band"],
+            "band_fit": round(detail["band_fit"], 4),
+            "band_distance": round(detail["band_distance"], 3),
+            "band_position": (None if detail["band_position"] is None
+                              else round(detail["band_position"], 4)),
+            "terms": {k: round(v, 4) for k, v in detail["terms"].items()},
+        })
+    return out
+
+
+def rank_meta(need: dict, candidates: list) -> dict:
+    """Facts about the ranking itself, not about any one candidate.
+
+    `tied` is the size of the group the rotation shuffles: a persistently large
+    tie group means tie_epsilon is too wide and load is being spread across
+    models that are not really equivalent. `distance_ranked` true means nothing
+    in the pool was in band -- the clearest signal that the bands and the
+    models actually installed have drifted apart.
+    """
+    if not candidates:
+        return {"candidates": 0, "tied": 0, "distance_ranked": False}
+    distance_ranked = not any(in_requested_band(e, need) for e in candidates)
+    scores = [score_entry(e, need) for e in candidates]
+    best = scores[0]
+    if distance_ranked:
+        best_distance = band_distance(candidates[0], need)
+        tied = sum(
+            1 for sc, entry in zip(scores, candidates)
+            if band_distance(entry, need) == best_distance and best - sc <= TIE_EPSILON
+        )
+    else:
+        tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
+    return {
+        "candidates": len(candidates),
+        "tied": tied,
+        "distance_ranked": distance_ranked,
+    }
+
+
 def find_named_model(model_name: str) -> list:
     """Servers hosting an explicitly requested model, best first."""
     wanted = (model_name or "").strip().lower()
@@ -2125,6 +2386,21 @@ async def close_upstream(response: httpx.Response, client: httpx.AsyncClient) ->
     await client.aclose()
 
 
+async def finish_and_record(response: httpx.Response, client: httpx.AsyncClient,
+                            record: dict, started: float) -> None:
+    """Close the upstream, then write the decision record.
+
+    Runs as the response's BackgroundTask, i.e. after the last byte has been
+    streamed -- which is the only point at which total_ms is knowable. The
+    record is written here rather than at dispatch so it carries the full
+    latency; the one-line journal summary is emitted at dispatch so live
+    tailing still shows the decision immediately.
+    """
+    await close_upstream(response, client)
+    record["total_ms"] = round((time.monotonic() - started) * 1000, 1)
+    record_decision(record)
+
+
 async def _stream_upstream(method: str, url: str, headers: dict,
                            json_body=None, content=None,
                            extra_headers: dict = None) -> StreamingResponse:
@@ -2149,16 +2425,20 @@ async def _stream_upstream(method: str, url: str, headers: dict,
 
 
 async def _dispatch_direct(candidates: list, body: dict, headers: dict,
-                           need: dict) -> StreamingResponse:
+                           need: dict, record: dict = None) -> StreamingResponse:
     """Send to the best candidate, falling forward through the ranked list on
     connection errors or upstream 5xx. Retrying is only safe before any body has
     been streamed, which is why the status is checked before returning."""
+    record = record if record is not None else {}
+    attempts = record.setdefault("attempts", [])
+    started = time.monotonic()
     last_error = None
     for position, entry in enumerate(candidates):
         attempt_body = dict(body)
         attempt_body["model"] = entry["name"]
         client = httpx.AsyncClient(timeout=300.0)
         url = f"{entry['server']}/v1/chat/completions"
+        attempt_started = time.monotonic()
         try:
             upstream_request = client.build_request(
                 "POST", url, headers=headers, json=attempt_body
@@ -2167,12 +2447,47 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
         except httpx.RequestError as exc:
             await client.aclose()
             last_error = f"{entry['server']}: {exc}"
+            attempts.append({"rank": position, "server": entry["server"],
+                             "model": entry["name"], "outcome": "connect_error",
+                             "error": str(exc),
+                             "ms": round((time.monotonic() - attempt_started) * 1000, 1)})
+            log.warning("fall-forward: %s (%s) unreachable: %s",
+                        entry["server"], entry["name"], exc)
             continue
         if upstream_response.status_code >= 500 and position < len(candidates) - 1:
             await upstream_response.aclose()
             await client.aclose()
             last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+            attempts.append({"rank": position, "server": entry["server"],
+                             "model": entry["name"], "outcome": "http_5xx",
+                             "status": upstream_response.status_code,
+                             "ms": round((time.monotonic() - attempt_started) * 1000, 1)})
+            log.warning("fall-forward: %s (%s) returned HTTP %s",
+                        entry["server"], entry["name"], upstream_response.status_code)
             continue
+        ttfb = round((time.monotonic() - attempt_started) * 1000, 1)
+        attempts.append({"rank": position, "server": entry["server"],
+                         "model": entry["name"], "outcome": "served",
+                         "status": upstream_response.status_code, "ms": ttfb})
+        record.update({
+            "mode": "discovery",
+            "chosen": {"model": entry["name"], "server": entry["server"],
+                       "params_b": entry["params_b"], "rank": position,
+                       "score": round(score_entry(entry, need), 4)},
+            "status": upstream_response.status_code,
+            "ttfb_ms": ttfb,
+            "fell_forward": position,
+        })
+        # The live view. One line, everything needed to see whether the pick
+        # was sane, without opening the JSONL.
+        log.info("route %s class=%s%s%s -> %s @ %s (score %.3f, rank %d/%d, "
+                 "%s, %.0fms, status %s)",
+                 record.get("id", "-"), need["class"],
+                 " code" if need["code"] else "", " vision" if need["vision"] else "",
+                 entry["name"], entry["server"],
+                 record["chosen"]["score"], position + 1, len(candidates),
+                 "in band" if in_requested_band(entry, need) else "OUT OF BAND",
+                 ttfb, upstream_response.status_code)
         response_headers = dict(upstream_response.headers)
         response_headers.update({
             "X-Router-Model": entry["name"],
@@ -2180,13 +2495,21 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             "X-Router-Class": need["class"],
             "X-Router-Mode": "discovery",
             "X-Router-Candidates": str(len(candidates)),
+            "X-Router-Request-Id": str(record.get("id", "")),
         })
         return StreamingResponse(
             upstream_response.aiter_raw(),
             status_code=upstream_response.status_code,
             headers=response_headers,
-            background=BackgroundTask(close_upstream, upstream_response, client),
+            background=BackgroundTask(finish_and_record, upstream_response,
+                                      client, record, started),
         )
+    record.update({"mode": "discovery", "outcome": "no_usable_target",
+                   "status": 502, "error": last_error,
+                   "total_ms": round((time.monotonic() - started) * 1000, 1)})
+    record_decision(record)
+    log.error("no usable Ollama target for class=%s after %d candidate(s): %s",
+              need["class"], len(candidates), last_error)
     raise HTTPException(status_code=502,
                         detail=f"No usable Ollama target. Last error: {last_error}")
 
@@ -2228,19 +2551,20 @@ async def routing_explain(request: Request):
         messages = [{"role": "user", "content": body["prompt"]}]
     need = classify_request(messages or [])
     candidates = rank_candidates(need)
+    # Deliberately the SAME shape the decision log records, so a hypothesis
+    # formed here can be checked against real traffic without translating
+    # between two formats.
+    limit = int(body.get("limit") or 10)
     return JSONResponse({
         "request": need,
         "legacy_tier": analyze_complexity(
             " ".join(m.get("content", "") for m in (messages or [])
                      if isinstance(m, dict) and isinstance(m.get("content"), str))
         ),
+        "ranking": rank_meta(need, candidates),
         "chosen": ({"model": candidates[0]["name"], "server": candidates[0]["server"]}
                    if candidates else None),
-        "candidates": [
-            {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
-             "score": round(score_entry(e, need), 4)}
-            for e in candidates[:10]
-        ],
+        "candidates": explain_candidates(need, candidates, limit),
     })
 
 
@@ -2253,21 +2577,47 @@ async def route_chat_completion(request: Request):
     messages = body.get("messages", [])
     headers = _forward_headers(request)
     requested = str(body.get("model") or "").strip()
+    # A short id ties the journal line, the response header and the JSONL
+    # record together, so a user report ("this answer was terrible") can be
+    # traced to the exact decision that produced it.
+    request_id = uuid.uuid4().hex[:12]
+    record = {
+        "id": request_id,
+        "ts": time.time(),
+        "requested_model": requested or None,
+        "stream": bool(body.get("stream")),
+    }
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         need = classify_request(messages)
         # An explicitly requested real model is honoured; tier aliases and
         # "auto" mean "decide for me".
         candidates = []
+        selection = "auto"
         if requested and requested.lower() not in ("auto", "") \
                 and requested not in TIER_NAMES:
             candidates = find_named_model(requested)
+            if candidates:
+                selection = "explicit_model"
+            else:
+                log.info("requested model %r is not in the inventory; routing on "
+                         "merit instead", requested)
         if not candidates:
             if requested in TIER_NAMES:
                 need = dict(need, **{"class": TIER_NAMES[requested]})
+                selection = "tier_alias"
             candidates = rank_candidates(need)
+        record.update({
+            "selection": selection,
+            "request": need,
+            "ranking": rank_meta(need, candidates),
+            "candidates": explain_candidates(need, candidates),
+            "inventory_age_s": round(time.time() - (INVENTORY.get("updated_at") or 0), 1),
+        })
         if candidates:
-            return await _dispatch_direct(candidates, body, headers, need)
+            return await _dispatch_direct(candidates, body, headers, need, record)
+        log.warning("discovery is on but no candidate survived filtering "
+                    "(class=%s); falling back to LiteLLM", need["class"])
 
     # Fallback: the original static path through LiteLLM, which keeps its own
     # latency routing and cross-tier fallbacks.
@@ -2276,10 +2626,26 @@ async def route_chat_completion(request: Request):
         if isinstance(msg, dict) and isinstance(msg.get("content"), str)
     )
     body["model"] = analyze_complexity(full_prompt_context)
-    return await _stream_upstream(
+    started = time.monotonic()
+    record.update({
+        "mode": "litellm",
+        "reason": ("discovery disabled" if not DISCOVERY_ENABLED
+                   else "empty inventory" if not INVENTORY.get("models")
+                   else "no candidate"),
+        "chosen": {"model": body["model"], "server": LITELLM_BASE},
+        "request": record.get("request") or classify_request(messages),
+    })
+    log.info("route %s -> LiteLLM tier %s (%s)",
+             request_id, body["model"], record["reason"])
+    response = await _stream_upstream(
         "POST", LITELLM_URL, headers, json_body=body,
-        extra_headers={"X-Router-Mode": "litellm", "X-Router-Model": body["model"]},
+        extra_headers={"X-Router-Mode": "litellm", "X-Router-Model": body["model"],
+                       "X-Router-Request-Id": request_id},
     )
+    record["ttfb_ms"] = round((time.monotonic() - started) * 1000, 1)
+    record["status"] = response.status_code
+    record_decision(record)
+    return response
 
 
 @app.get("/v1/models")
@@ -2352,13 +2718,18 @@ PYEOF
 # --- monitor.py (probes each Ollama backend directly) ---
 cat > "${REPO_DIR}/services/ollama-monitor/monitor.py" <<'PYEOF'
 import configparser
+import json
 import logging
 import os
 import socket
+import tempfile
 import time
 import httpx
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Configured properly further down, once monitor.ini has been read; this call
+# only guarantees that anything logged during config parsing is not lost.
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
+                    level=logging.INFO)
 
 MATTERMOST_WEBHOOK_URL = os.getenv("MATTERMOST_WEBHOOK_URL")
 MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OllamaMonitor")
@@ -2368,7 +2739,8 @@ MATTERMOST_VERIFY_TLS = os.getenv("MATTERMOST_VERIFY_TLS", "true").lower() == "t
 # Polling behaviour comes from monitor.ini (version controlled); environment
 # variables still win, so an operator can override without a commit.
 _DEFAULTS = {"polling": {"interval_seconds": "15", "timeout_seconds": "5",
-                         "health_path": "/api/tags"}}
+                         "health_path": "/api/tags"},
+             "logging": {"level": "INFO"}}
 MONITOR_INI = os.getenv(
     "MONITOR_INI",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.ini"),
@@ -2378,11 +2750,70 @@ _cfg.read_dict(_DEFAULTS)
 if os.path.exists(MONITOR_INI):
     _cfg.read(MONITOR_INI)
 
+
+def _ini(section: str, option: str, default: str) -> str:
+    """Read one setting, tolerating a missing SECTION.
+
+    ConfigParser.get()'s `fallback` only covers a missing *option* -- a missing
+    section still raises NoSectionError. Reading a hand-trimmed monitor.ini
+    that has no [keep_alive] or [alerting] would therefore kill the daemon at
+    import time, and systemd would restart it into the same crash forever.
+    """
+    try:
+        return _cfg.get(section, option, fallback=default)
+    except configparser.NoSectionError:
+        return default
+
+
 CHECK_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",
-                               _cfg.get("polling", "interval_seconds")))
+                               _ini("polling", "interval_seconds", "15")))
 CHECK_TIMEOUT = float(os.getenv("MONITOR_TIMEOUT_SECONDS",
-                                _cfg.get("polling", "timeout_seconds")))
-HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH", _cfg.get("polling", "health_path"))
+                                _ini("polling", "timeout_seconds", "5")))
+HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH",
+                        _ini("polling", "health_path", "/api/tags"))
+
+LOG_LEVEL = (os.getenv("MONITOR_LOG_LEVEL")
+             or _ini("logging", "level", "INFO")).strip().upper()
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# --- alerting behaviour -------------------------------------------------------
+# Everything here exists to make the channel quiet when nothing has changed.
+# The daemon is EDGE-triggered: it posts on a transition, never on a state.
+#
+#   failure_threshold / recovery_threshold
+#       consecutive probes required before a transition is believed. Without
+#       these a backend that answers slowly -- one probe timing out, the next
+#       succeeding -- alternates down/up every cycle and posts forever.
+#   repeat_seconds
+#       0 (default) means a host that stays down is reported exactly once. Set
+#       it to re-post a reminder while an outage continues.
+#   startup_notice
+#       auto  -> only on the first ever start, or when the watched set changes
+#       always/never -> as they say
+def _int_ini(section, option, default, env=None):
+    raw = (os.getenv(env) if env else None) or _ini(section, option, default)
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.warning("%s.%s=%r is not an integer; using %s",
+                        section, option, raw, default)
+        return int(default)
+
+
+ALERT_FAILURES = max(1, _int_ini("alerting", "failure_threshold", "3",
+                                 "MONITOR_FAILURE_THRESHOLD"))
+ALERT_RECOVERIES = max(1, _int_ini("alerting", "recovery_threshold", "2",
+                                   "MONITOR_RECOVERY_THRESHOLD"))
+REPEAT_SECONDS = max(0, _int_ini("alerting", "repeat_seconds", "0",
+                                 "MONITOR_REPEAT_SECONDS"))
+STARTUP_NOTICE = (os.getenv("MONITOR_STARTUP_NOTICE")
+                  or _ini("alerting", "startup_notice", "auto")).strip().lower()
+# systemd's StateDirectory= creates and chowns this for us and exports the path;
+# the literal is only reached when the daemon is run by hand.
+_STATE_DIR = os.getenv("STATE_DIRECTORY", "/var/lib/ollama-monitor")
+STATE_FILE = os.getenv("MONITOR_STATE_FILE",
+                       _ini("alerting", "state_file",
+                            os.path.join(_STATE_DIR, "state.json")))
 
 # --- keep-alive maintenance ---------------------------------------------------
 # Ollama's OpenAI-compatible endpoint does not support a keep_alive field, so a
@@ -2391,11 +2822,10 @@ HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH", _cfg.get("polling", "health_path"
 # does honour keep_alive: an empty-message request loads the model and (re)sets
 # its unload timer without generating anything.
 KEEP_ALIVE = (os.getenv("OLLAMA_KEEP_ALIVE", "") or "").strip()
-KEEP_ALIVE_MODE = _cfg.get("keep_alive", "enabled", fallback="auto").strip().lower()
+KEEP_ALIVE_MODE = _ini("keep_alive", "enabled", "auto").strip().lower()
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_REFRESH_SECONDS",
-                                    _cfg.get("keep_alive", "refresh_seconds",
-                                             fallback="240")))
-KEEP_ALIVE_TIMEOUT = float(_cfg.get("keep_alive", "timeout_seconds", fallback="120"))
+                                    _ini("keep_alive", "refresh_seconds", "240")))
+KEEP_ALIVE_TIMEOUT = float(_ini("keep_alive", "timeout_seconds", "120"))
 if KEEP_ALIVE_MODE == "auto":
     KEEP_ALIVE_ENABLED = bool(KEEP_ALIVE)
 else:
@@ -2485,8 +2915,76 @@ BACKENDS = {
     "xlarge": _url_list(_tier_env("xlarge")),
 }
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
-# One state per (tier, url) pair: the same host can back more than one tier.
-server_states = {(tier, url): True for tier, urls in BACKENDS.items() for url in urls}
+
+# url -> [tiers it backs]. Health is a property of the HOST, not of the tier, so
+# state is keyed by URL. Keying it by (tier, url) meant one unreachable box
+# produced one alert per tier it served -- and with a single-server deployment
+# every tier points at the same URL, so a single outage posted four identical
+# messages, then four more on recovery.
+SERVER_TIERS = {}
+for _tier, _urls in BACKENDS.items():
+    for _url in _urls:
+        SERVER_TIERS.setdefault(_url, []).append(_tier)
+
+# Consecutive-probe counters. Deliberately NOT persisted: they are evidence
+# about the current process's observations, and a restart should re-observe.
+fail_streak = {url: 0 for url in SERVER_TIERS}
+ok_streak = {url: 0 for url in SERVER_TIERS}
+
+
+def _tier_label(url: str) -> str:
+    tiers = SERVER_TIERS.get(url, [])
+    return "%s `%s`" % ("tiers" if len(tiers) > 1 else "tier",
+                        "`, `".join(tiers)) if tiers else "no tier"
+
+
+# --- persistent state ---------------------------------------------------------
+# Health has to survive a restart. Held only in memory it defaulted to "everything
+# is up", so each restart re-discovered the same outage and re-announced it --
+# which, with Restart=always, turns one down backend into a message every
+# RestartSec for as long as the outage lasts.
+_state_writable = True
+
+
+def load_state() -> dict:
+    """{"servers": {url: {"healthy": bool, "since": ts, "last_alert": ts}},
+        "watched": [url, ...]}  -- empty dict when there is no usable file."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("servers"), dict):
+            return data
+        logging.warning("Ignoring malformed state file %s.", STATE_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - a bad state file must not be fatal
+        logging.warning("Could not read state file %s: %s", STATE_FILE, exc)
+    return {}
+
+
+def save_state(state: dict) -> None:
+    """Write atomically, and degrade to memory-only rather than dying."""
+    global _state_writable
+    if not _state_writable:
+        return
+    try:
+        directory = os.path.dirname(STATE_FILE) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".state-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2, sort_keys=True)
+            os.replace(tmp, STATE_FILE)      # atomic: never a half-written file
+        except Exception:
+            os.unlink(tmp)
+            raise
+    except Exception as exc:  # noqa: BLE001
+        _state_writable = False
+        logging.warning(
+            "Cannot persist state to %s (%s). Alerting still works, but a "
+            "restart during an outage will re-announce it. Set state_file in "
+            "monitor.ini to a writable path, or add StateDirectory= to the "
+            "unit.", STATE_FILE, exc)
 
 
 def _post_once(payload: dict) -> tuple:
@@ -2550,14 +3048,31 @@ def post_mattermost(message: str, emoji: str = ":warning:") -> bool:
     return False
 
 
-def send_startup_notice() -> None:
+def send_startup_notice(state: dict) -> None:
+    """Announce a start -- but only when the start is news.
+
+    This message is a webhook self-test, so it is genuinely useful the first
+    time and after a reconfiguration. Posting it on EVERY start is what turns a
+    restart loop into a channel flood, so under the default `auto` it fires
+    only when there is no prior state or the watched set has changed.
+    """
+    watched = sorted(SERVER_TIERS)
+    if STARTUP_NOTICE == "never":
+        return
+    if STARTUP_NOTICE != "always":
+        if state.get("servers") and state.get("watched") == watched:
+            logging.info("Restart with an unchanged configuration; startup "
+                         "notice suppressed (startup_notice=auto).")
+            return
     host = socket.gethostname()
     tiers = ", ".join(
         f"{tier} -> {', '.join(urls)}" for tier, urls in BACKENDS.items()
     ) or "none configured"
+    reason = ("configuration changed" if state.get("servers")
+              else "first start on this host")
     message = (
-        f"Ollama monitor online on `{host}` — health alerting is active. "
-        f"Watching tiers: {tiers}. "
+        f"Ollama monitor online on `{host}` — health alerting is active "
+        f"({reason}). Watching tiers: {tiers}. "
         f"(This is a startup test message confirming webhook access to "
         f"#{MATTERMOST_CHANNEL}.)"
     )
@@ -2575,14 +3090,158 @@ def send_startup_notice() -> None:
 
 
 def backend_healthy(url: str) -> bool:
+    """One probe. Timed, because a host that answers slowly is the thing that
+    used to produce alert/recovery churn, and the latency is the evidence."""
+    started = time.monotonic()
     try:
         with httpx.Client() as client:
             resp = client.get(f"{url.rstrip('/')}{HEALTH_PATH}", timeout=CHECK_TIMEOUT)
             resp.raise_for_status()
+        elapsed = (time.monotonic() - started) * 1000
+        logging.debug("probe %s -> HTTP %s in %.0fms", url, resp.status_code, elapsed)
+        # A probe close to the timeout is a future false alarm. Say so now,
+        # while it is still only slow.
+        if elapsed > CHECK_TIMEOUT * 1000 * 0.6:
+            logging.warning("probe %s took %.0fms (timeout is %.0fms) — close to "
+                            "being counted as a failure", url, elapsed,
+                            CHECK_TIMEOUT * 1000)
         return True
     except Exception as exc:
-        logging.debug("Backend %s unhealthy: %s", url, exc)
+        logging.info("probe %s failed after %.0fms: %s", url,
+                     (time.monotonic() - started) * 1000, exc)
         return False
+
+
+def evaluate_cycle(health: dict, state: dict, now: float) -> tuple:
+    """Fold one round of probe results into `state`.
+
+    Returns (went_down, came_up, still_down, changed) where the first three are
+    lists of URLs to announce and `changed` says whether `state` needs writing.
+    Pure apart from the streak counters, so the alerting rules can be exercised
+    without a network, a clock, or a webhook.
+    """
+    servers = state.setdefault("servers", {})
+    went_down, came_up, still_down = [], [], []
+    changed = False
+
+    for url in sorted(SERVER_TIERS):
+        if url not in health:
+            continue
+        entry = servers.get(url)
+        if entry is None:
+            # A URL we have never seen starts optimistic, so adding a server
+            # does not immediately announce it as down.
+            entry = {"healthy": True, "since": now, "last_alert": 0.0}
+            servers[url] = entry
+            changed = True
+        if health[url]:
+            ok_streak[url] = ok_streak.get(url, 0) + 1
+            fail_streak[url] = 0
+        else:
+            fail_streak[url] = fail_streak.get(url, 0) + 1
+            ok_streak[url] = 0
+
+        if entry.get("healthy", True):
+            # Require several consecutive failures. One slow probe is not an
+            # outage, and treating it as one produces a down/up pair per cycle.
+            if fail_streak[url] >= ALERT_FAILURES:
+                entry.update(healthy=False, since=now, last_alert=now)
+                went_down.append(url)
+                changed = True
+        else:
+            if ok_streak[url] >= ALERT_RECOVERIES:
+                entry.update(healthy=True, since=now, last_alert=now)
+                came_up.append(url)
+                changed = True
+            elif REPEAT_SECONDS and now - entry.get("last_alert", 0.0) >= REPEAT_SECONDS:
+                entry["last_alert"] = now
+                still_down.append(url)
+                changed = True
+
+    # Drop servers that are no longer configured, so the file does not grow
+    # forever and a removed-then-readded host starts clean.
+    for url in [u for u in servers if u not in SERVER_TIERS]:
+        del servers[url]
+        changed = True
+
+    watched = sorted(SERVER_TIERS)
+    if state.get("watched") != watched:
+        state["watched"] = watched
+        changed = True
+
+    # Record what this check actually saw, separately from what we believe.
+    # `servers` is the DEBOUNCED view (post-threshold); this is the raw probe
+    # result, which is what an operator wants when asking "what did it see just
+    # now?" It rides along with whatever write the loop was already going to do
+    # rather than forcing one per cycle -- a flapping host would otherwise
+    # rewrite the file every interval to record a bounce we deliberately ignore.
+    state["last_check"] = {url: bool(up) for url, up in sorted(health.items())}
+    state["last_check_at"] = now
+    return went_down, came_up, still_down, changed
+
+
+def _outage_line(url: str, entry: dict, now: float) -> str:
+    since = entry.get("since", now)
+    minutes = max(0, int((now - since) // 60))
+    return f"`{url}` ({_tier_label(url)}), down {minutes}m"
+
+
+def cluster_digest(state: dict) -> str:
+    """A one-line fingerprint of what we currently believe about every host."""
+    servers = state.get("servers", {})
+    return "|".join(
+        "%s=%s" % (url, "up" if servers.get(url, {}).get("healthy", True) else "down")
+        for url in sorted(SERVER_TIERS)
+    )
+
+
+def announce(went_down: list, came_up: list, still_down: list,
+             state: dict, now: float) -> bool:
+    """Post the transitions for this cycle. Returns True if anything was sent.
+
+    At most one message per transition kind, so a rack losing power is one
+    line-item list rather than one message per affected host.
+
+    The last announced fingerprint is stored in the state file and re-checked
+    here, so an unchanged cluster CANNOT produce a post -- whatever happens
+    upstream. The threshold and restart logic should already make that
+    impossible; this is the backstop that makes it true by construction, and it
+    is the one rule that survives a bug anywhere else in this file.
+    """
+    servers = state.get("servers", {})
+    digest = cluster_digest(state)
+    if digest == state.get("last_posted_digest") and (went_down or came_up):
+        # Nothing about the cluster differs from the last thing we said about
+        # it. Whatever produced these lists, saying it again would be noise.
+        logging.debug("Suppressed a message: cluster unchanged since the last "
+                      "post (%s).", digest)
+        went_down, came_up = [], []
+    if not (went_down or came_up or still_down):
+        return False
+
+    if went_down:
+        body = "\n".join(f"- `{u}` serving {_tier_label(u)}" for u in went_down)
+        post_mattermost(
+            f"**Infrastructure Alert** — {len(went_down)} backend(s) "
+            f"unavailable after {ALERT_FAILURES} consecutive failed probes:\n{body}"
+        )
+    if came_up:
+        body = "\n".join(f"- `{u}` serving {_tier_label(u)}" for u in came_up)
+        post_mattermost(
+            f"**Recovery Notice** — {len(came_up)} backend(s) operational "
+            f"again:\n{body}",
+            emoji=":white_check_mark:",
+        )
+    if still_down:
+        # The single deliberate exception to the rule above: repeat_seconds is
+        # an explicit opt-in to re-stating an UNCHANGED state, and it is off by
+        # default precisely because it breaks that guarantee.
+        body = "\n".join(_outage_line(u, servers.get(u, {}), now) for u in still_down)
+        post_mattermost(f"**Still down** — outage continues:\n{body}")
+
+    state["last_posted_digest"] = digest
+    state["last_posted_at"] = now
+    return True
 
 
 def run_health_checks() -> None:
@@ -2591,6 +3250,11 @@ def run_health_checks() -> None:
         return
     summary = ", ".join(f"{t}({len(u)})" for t, u in BACKENDS.items())
     logging.info("Monitoring daemon initialized for tiers: %s", summary)
+    logging.info("Alerting: %d consecutive failure(s) to open, %d to close, "
+                 "reminders %s, state in %s",
+                 ALERT_FAILURES, ALERT_RECOVERIES,
+                 f"every {REPEAT_SECONDS}s" if REPEAT_SECONDS else "off",
+                 STATE_FILE)
     if KEEP_ALIVE_ENABLED:
         logging.info("keep-alive maintainer active: keep_alive=%s every %ds",
                      KEEP_ALIVE, KEEP_ALIVE_INTERVAL)
@@ -2599,31 +3263,37 @@ def run_health_checks() -> None:
                      KEEP_ALIVE)
     else:
         logging.info("No OLLAMA_KEEP_ALIVE set; each server's own setting applies.")
-    # Confirm on startup that the webhook works and has channel permission.
-    send_startup_notice()
+    state = load_state()
+    # Confirm on startup that the webhook works and has channel permission --
+    # but only when this start is not just a restart of the same thing.
+    send_startup_notice(state)
+    down_at_start = [u for u, e in state.get("servers", {}).items()
+                     if not e.get("healthy", True) and u in SERVER_TIERS]
+    if down_at_start:
+        logging.info("Resuming with %d backend(s) already known down: %s",
+                     len(down_at_start), ", ".join(sorted(down_at_start)))
+
     last_pin = 0.0
     while True:
         # Probe each distinct host once per cycle, even when several tiers
         # share it, then apply the result to every tier that uses it.
-        health = {}
-        for url in {u for urls in BACKENDS.values() for u in urls}:
-            health[url] = backend_healthy(url)
-        for tier, urls in BACKENDS.items():
-            for url in urls:
-                key = (tier, url)
-                was_healthy = server_states[key]
-                now_healthy = health[url]
-                if was_healthy and not now_healthy:
-                    post_mattermost(
-                        f"Infrastructure Alert: `{url}` serving tier `{tier}` is unavailable."
-                    )
-                    server_states[key] = False
-                elif not was_healthy and now_healthy:
-                    post_mattermost(
-                        f"Recovery Notice: `{url}` serving tier `{tier}` is operational again.",
-                        emoji=":white_check_mark:",
-                    )
-                    server_states[key] = True
+        health = {url: backend_healthy(url) for url in SERVER_TIERS}
+        now = time.time()
+        went_down, came_up, still_down, changed = evaluate_cycle(health, state, now)
+        logging.debug("cycle: %s", ", ".join(
+            "%s=%s(f%d/o%d)" % (u, "up" if health[u] else "DOWN",
+                                fail_streak.get(u, 0), ok_streak.get(u, 0))
+            for u in sorted(health)))
+        # Persist BEFORE announcing: if the post hangs and the unit is killed,
+        # a duplicate alert on restart is worse than a missing one.
+        if changed:
+            save_state(state)
+        # Then again after, so the "what did we last say" fingerprint is on disk
+        # too. Both writes only happen on a cycle that changed something, which
+        # in steady state is never.
+        if announce(went_down, came_up, still_down, state, now):
+            save_state(state)
+
         if KEEP_ALIVE_ENABLED and (time.monotonic() - last_pin) >= KEEP_ALIVE_INTERVAL:
             refresh_keep_alive(health)
             last_pin = time.monotonic()
@@ -2690,6 +3360,9 @@ DO_NOT_TRACK=true
 SCARF_NO_ANALYTICS=true
 HF_HOME=/app/openwebui/cache
 SENTENCE_TRANSFORMERS_HOME=/app/openwebui/cache
+# Open WebUI's own logging. GLOBAL_LOG_LEVEL sets the floor; the per-area
+# variables are the ones worth raising when a specific part misbehaves.
+GLOBAL_LOG_LEVEL=${OPENWEBUI_LOG_LEVEL}
 EOF
 
 
@@ -2779,6 +3452,35 @@ offtask_penalty = 0.25
 # Candidates within this score of the best are rotated through, so the same
 # model on several hosts shares load.
 tie_epsilon = 0.05
+
+[logging]
+# Level for the service log (journalctl -u ollama-router). DEBUG adds a line
+# per discovery poll; INFO logs one line per routed request plus inventory
+# changes.
+level = INFO
+
+# Per-request decision records, one JSON object per line. This is what makes
+# routing quality measurable: every candidate's score and its component terms
+# are kept, so you can ask "what else was available and why did it lose?"
+# rather than guessing from the model that answered.
+#   manage-model-servers routing-stats        <- summary
+#   jq 'select(.request.class=="xlarge")' ... <- anything else
+decisions = true
+# Blank uses $LOGS_DIRECTORY (systemd LogsDirectory=), i.e.
+# /var/log/ollama-router/decisions.jsonl.
+decision_file =
+# Rotation: 20 MB per file, five old files kept.
+max_bytes = 20000000
+backup_count = 5
+
+# Characters of prompt text stored in each record. The prompt is the thing you
+# are judging the routing against, so some of it has to be kept -- but the
+# whole conversation does not. 0 stores no text at all, only the derived
+# features (length, token estimate, matched keywords, code/vision flags).
+# NOTE: whatever is kept here has the same sensitivity as the chat itself.
+prompt_chars = 200
+# How many ranked candidates to record per request. 0 = all of them.
+log_candidates = 10
 INIEOF
 
 cat > "${REPO_DIR}/services/ollama-monitor/monitor.ini" <<'INIEOF'
@@ -2806,6 +3508,41 @@ enabled = auto
 refresh_seconds = 240
 # Seconds to wait for the load call (a cold model can take a while).
 timeout_seconds = 120
+
+[logging]
+# DEBUG logs every probe with its latency and the current failure/success
+# streaks — which is how you see a host flapping BEFORE it crosses a threshold.
+# INFO logs failed probes, transitions and slow-probe warnings only.
+level = INFO
+
+[alerting]
+# The monitor is EDGE-triggered: it posts when a backend CHANGES state, never
+# once per poll. Each cycle's raw result is recorded in the state file, along
+# with a fingerprint of the last thing that was actually posted; if the cluster
+# looks the same as the last announcement, nothing is sent. These settings
+# decide when a change is believed in the first place.
+#
+# Consecutive failed probes before a backend is declared down. A single slow
+# answer is not an outage — with a threshold of 1, a backend that times out on
+# alternate cycles posts a down/up pair every interval, forever.
+failure_threshold = 3
+# Consecutive successful probes before it is declared recovered.
+recovery_threshold = 2
+# Seconds between "still down" reminders while an outage continues.
+# 0 = report an outage exactly once, which is the quiet default. This is the
+# ONLY setting that can make the monitor re-state something it has already
+# said; leaving it at 0 means an unchanged cluster is guaranteed silent.
+repeat_seconds = 0
+# auto   -> post the "monitor online" webhook self-test only on the first start
+#           or after the watched backend set changes
+# always -> post on every start (noisy if the unit is restarting)
+# never  -> never post it
+startup_notice = auto
+# Where health is remembered across restarts, together with the last raw check
+# result and the fingerprint of the last message posted. Without this the daemon
+# would start believing everything is up and re-announce an ongoing outage on
+# every restart. systemd's StateDirectory= creates and owns the directory.
+state_file = /var/lib/ollama-monitor/state.json
 INIEOF
 
 # --- install/apply-config.sh: runs INSIDE the container, copies the cloned
@@ -2821,36 +3558,113 @@ REPO_DIR="${1:-/app/config-repo}"
 ROUTER_DIR="${2:-/app/router}"
 OPENWEBUI_DIR="${3:-/app/openwebui}"
 UNIT_DIR="${4:-/etc/systemd/system}"
+# Overridable so this script can be exercised without writing to system paths.
+BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+PROFILE_DIR="${PROFILE_DIR:-/etc/profile.d}"
+LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
 
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
+# Expose the server-management tool on PATH FIRST. A symlink (not a copy) means
+# a `git pull` in the repo updates the command too. This is deliberately the
+# first step: under `set -e` any failure below would otherwise leave a
+# half-applied system with no management command to diagnose it with, which is
+# precisely when the command is most needed.
+if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
+  chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh" 2>/dev/null || true
+  install -d -m 0755 "$BIN_DIR"
+  ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" "${BIN_DIR}/manage-model-servers"
+fi
+
+# Seeding through the Gitea contents API does not preserve the executable bit,
+# and neither does `git clone` for a file committed without it -- so restore it
+# on every shell script in the repo, not just the ones under install/.
+find "${REPO_DIR}" -type f -name '*.sh' -not -path "${REPO_DIR}/.git/*" \
+  -exec chmod 0755 {} + 2>/dev/null || true
+
+# Put the repo on PATH for login shells, so the scripts are runnable by name
+# from anywhere in the container. Appended, never prepended: a file committed
+# to the repo must not be able to shadow a system command.
+#
+# The repo is 0700 root:root because env/router.env holds real secrets, so in
+# practice only root can traverse it -- this is an operator convenience, not a
+# way to expose the tools to the service account. Note also that profile.d is
+# only read by LOGIN shells (`pct enter`), which is why the /usr/local/bin
+# symlink above still exists: that is what makes `pct exec <id> -- manage-...`
+# work from the Proxmox host.
+install -d -m 0755 "$PROFILE_DIR"
+cat > "${PROFILE_DIR}/ollama-router-path.sh" <<PROFILEEOF
+# Added by ollama-smart-router apply-config.sh. Sourced by /bin/sh: keep POSIX.
+for _osr_dir in "${REPO_DIR}" "${REPO_DIR}/install"; do
+    case ":\${PATH}:" in
+        *":\${_osr_dir}:"*) ;;
+        *) [ -d "\${_osr_dir}" ] && PATH="\${PATH}:\${_osr_dir}" ;;
+    esac
+done
+unset _osr_dir
+export PATH
+PROFILEEOF
+chmod 0644 "${PROFILE_DIR}/ollama-router-path.sh"
+
+# The router's decision log already uses Python's RotatingFileHandler, but keep
+# an OS-level policy too so an operator override under /var/log/ollama-router
+# cannot grow forever. copytruncate keeps the running process on the same inode.
+install -d -m 0755 "$LOGROTATE_DIR"
+cat > "${LOGROTATE_DIR}/ollama-smart-router" <<'LOGROTATEEOF'
+/var/log/ollama-router/*.jsonl {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 ollama-router ollama-router
+}
+LOGROTATEEOF
+chmod 0644 "${LOGROTATE_DIR}/ollama-smart-router"
+
+missing=""
+# copy_required <src> <dest> [install-args...] -- absence is fatal.
+copy_required() {
+  local src="$1" dest="$2"; shift 2
+  [ -f "$src" ] || { echo "FATAL: required file missing: $src" >&2; exit 1; }
+  install "$@" "$src" "$dest"
+}
+# copy_optional <src> <dest> [install-args...] -- absence is reported, not fatal.
+# The .ini files carry built-in defaults inside router.py / monitor.py, so a
+# missing one degrades to those defaults instead of aborting the whole apply.
+copy_optional() {
+  local src="$1" dest="$2"; shift 2
+  if [ -f "$src" ]; then
+    install "$@" "$src" "$dest"
+  else
+    missing="${missing}${missing:+, }$(basename "$src")"
+  fi
+}
+
 # Application code + per-service config
-install -m 0644 "${REPO_DIR}/services/ollama-router/router.py"   "${ROUTER_DIR}/router.py"
-install -m 0644 "${REPO_DIR}/services/ollama-router/router.ini"  "${ROUTER_DIR}/router.ini"
-install -m 0644 "${REPO_DIR}/services/ollama-monitor/monitor.py"  "${ROUTER_DIR}/monitor.py"
-install -m 0644 "${REPO_DIR}/services/ollama-monitor/monitor.ini" "${ROUTER_DIR}/monitor.ini"
-install -m 0644 "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml" \
-                "${ROUTER_DIR}/litellm_config.yaml"
+copy_required "${REPO_DIR}/services/ollama-router/router.py"   "${ROUTER_DIR}/router.py"   -m 0644
+copy_required "${REPO_DIR}/services/ollama-monitor/monitor.py" "${ROUTER_DIR}/monitor.py"  -m 0644
+copy_optional "${REPO_DIR}/services/ollama-router/router.ini"  "${ROUTER_DIR}/router.ini"  -m 0644
+copy_optional "${REPO_DIR}/services/ollama-monitor/monitor.ini" "${ROUTER_DIR}/monitor.ini" -m 0644
+copy_optional "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml" \
+              "${ROUTER_DIR}/litellm_config.yaml" -m 0644
 
 # Environment files (contain secrets -> root:ollama-router 0640)
-install -m 0640 -o root -g ollama-router "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"
-install -m 0640 -o root -g ollama-router "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env"
+copy_required "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"     -m 0640 -o root -g ollama-router
+copy_optional "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env"  -m 0640 -o root -g ollama-router
 
 # systemd units
 for unit in "${REPO_DIR}"/services/*/*.service; do
+  [ -f "$unit" ] || continue
   install -m 0644 "$unit" "${UNIT_DIR}/$(basename "$unit")"
 done
 
-# Seeding through the Gitea contents API does not preserve the executable bit,
-# so restore it on the repo's own scripts.
-chmod 0755 "${REPO_DIR}"/install/*.sh 2>/dev/null || true
-
-# Expose the server-management tool on PATH. A symlink (not a copy) means a
-# `git pull` in the repo updates the command too.
-if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
-  ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" /usr/local/bin/manage-model-servers
+if [ -n "$missing" ]; then
+  echo "WARNING: not in the repo, left at previous/default values: ${missing}" >&2
 fi
-
 echo "Configuration applied from ${REPO_DIR}."
 APPLYEOF
 chmod 0755 "${REPO_DIR}/install/apply-config.sh"
@@ -2911,6 +3725,10 @@ Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
+  routing-stats [--last n] [--class c] [--file f] [--json]
+                             Summarise the router's decision log: what each
+                             request was classified as, which model answered,
+                             and whether the scoring actually discriminated
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
@@ -3304,6 +4122,166 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
+cmd_routing_stats() {
+  local file="${ROUTER_DECISION_LOG:-/var/log/ollama-router/decisions.jsonl}"
+  local limit="" want_class="" as_json=false
+  while (( $# )); do
+    case "${1-}" in
+      --file)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
+        file="$2"; shift 2 ;;
+      --last)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
+        limit="$2"; shift 2 ;;
+      --class)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
+        want_class="$2"; shift 2 ;;
+      --json)  as_json=true; shift ;;
+      "")      shift ;;
+      *)       die "routing-stats: unknown argument '$1'" ;;
+    esac
+  done
+  [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || die "routing-stats: --last takes a number"
+  if [[ ! -r "$file" ]]; then
+    note "No decision log at ${file}."
+    note "  It is written by the router, so check:"
+    note "    systemctl status ollama-router"
+    note "    grep -A3 '\[logging\]' /app/router/router.ini    # decisions = true?"
+    note "  Or point at another copy:  $0 routing-stats --file <path>"
+    return 1
+  fi
+  # NOTE: %-formatting, not f-strings -- this is embedded in a shell-quoted
+  # string and a quote inside an f-string expression cannot be escaped.
+  python3 -c '
+import json, sys, collections
+
+path, limit, want_class, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+rows, bad = [], 0
+with open(path, encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            bad += 1          # a torn last line during rotation is normal
+if want_class:
+    rows = [r for r in rows if (r.get("request") or {}).get("class") == want_class]
+if limit:
+    rows = rows[-int(limit):]
+if not rows:
+    print("  no records matched")
+    raise SystemExit(0)
+
+def pct(numerator, denominator):
+    return 100.0 * numerator / denominator if denominator else 0.0
+
+def percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[idx]
+
+total = len(rows)
+classes = collections.Counter((r.get("request") or {}).get("class", "?") for r in rows)
+reasons = collections.Counter((r.get("request") or {}).get("reason", "?") for r in rows)
+modes = collections.Counter(r.get("mode", "?") for r in rows)
+models = collections.Counter()
+servers = collections.Counter()
+in_band = out_band = 0
+distance_ranked = 0
+tie_sizes = []
+fellforward = 0
+errors = 0
+ttfb, totals = [], []
+margins = []
+
+for r in rows:
+    chosen = r.get("chosen") or {}
+    if chosen.get("model"):
+        models[chosen["model"]] += 1
+        servers[chosen.get("server", "?")] += 1
+    ranking = r.get("ranking") or {}
+    if ranking.get("distance_ranked"):
+        distance_ranked += 1
+    if ranking.get("tied"):
+        tie_sizes.append(ranking["tied"])
+    cands = r.get("candidates") or []
+    if cands:
+        top = cands[0]
+        if top.get("in_band"):
+            in_band += 1
+        else:
+            out_band += 1
+        if len(cands) > 1:
+            margins.append(round(top.get("score", 0) - cands[1].get("score", 0), 4))
+    if r.get("fell_forward"):
+        fellforward += 1
+    if r.get("outcome") == "no_usable_target" or (r.get("status") or 200) >= 500:
+        errors += 1
+    if isinstance(r.get("ttfb_ms"), (int, float)):
+        ttfb.append(r["ttfb_ms"])
+    if isinstance(r.get("total_ms"), (int, float)):
+        totals.append(r["total_ms"])
+
+if as_json:
+    print(json.dumps({
+        "records": total, "unparsable": bad,
+        "classes": dict(classes), "reasons": dict(reasons), "modes": dict(modes),
+        "models": dict(models), "servers": dict(servers),
+        "top_in_band_pct": round(pct(in_band, in_band + out_band), 1),
+        "distance_ranked_pct": round(pct(distance_ranked, total), 1),
+        "mean_tie_group": round(sum(tie_sizes) / len(tie_sizes), 2) if tie_sizes else 0,
+        "fell_forward_pct": round(pct(fellforward, total), 1),
+        "error_pct": round(pct(errors, total), 1),
+        "ttfb_ms": {"p50": percentile(ttfb, 0.5), "p95": percentile(ttfb, 0.95)},
+        "total_ms": {"p50": percentile(totals, 0.5), "p95": percentile(totals, 0.95)},
+        "median_margin": percentile(margins, 0.5),
+    }, indent=2))
+    raise SystemExit(0)
+
+print("Routing decisions: %d record(s)%s" % (total, " (%d unparsable)" % bad if bad else ""))
+print()
+print("  Request class          (what the classifier decided)")
+for name, count in classes.most_common():
+    print("    %-12s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print("  Why")
+for name, count in reasons.most_common(6):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print()
+print("  Model chosen           (what actually answered)")
+for name, count in models.most_common(10):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print("  Host chosen")
+for name, count in servers.most_common(10):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print()
+mean_tie = (sum(tie_sizes) / len(tie_sizes)) if tie_sizes else 0.0
+print("  Scoring quality")
+print("    top candidate in band     %6.1f%%   low = the bands and the models" %
+      pct(in_band, in_band + out_band))
+print("                                        installed have drifted apart")
+print("    distance-ranked requests  %6.1f%%   nothing was in band at all" %
+      pct(distance_ranked, total))
+print("    mean tie-group size       %6.2f    >2 consistently means" % mean_tie)
+print("                                        tie_epsilon is too wide")
+print("    median winning margin     %6.3f    ~0 means the score is not" %
+      percentile(margins, 0.5))
+print("                                        discriminating between models")
+print()
+print("  Delivery")
+print("    fell forward               %5.1f%%   (first choice refused the request)" % pct(fellforward, total))
+print("    errors / 5xx               %5.1f%%" % pct(errors, total))
+print("    time to first byte  p50 %8.0fms   p95 %8.0fms" % (percentile(ttfb, 0.5), percentile(ttfb, 0.95)))
+print("    total request time  p50 %8.0fms   p95 %8.0fms" % (percentile(totals, 0.5), percentile(totals, 0.95)))
+if modes.get("litellm"):
+    print()
+    print("    %d request(s) took the LiteLLM fallback path" % modes["litellm"])
+' "$file" "${limit:-0}" "$want_class" "$as_json"
+}
+
 cmd_add() {
   local -a wanted=("$@")
   local addr url current count tier
@@ -3381,6 +4359,10 @@ cmd_remove() {
     fi
     if ! get_servers | contains_line "$target"; then
       note "  not configured, skipping: ${target}"
+      continue
+    fi
+    if printf '%s\n' "${to_remove[@]:-}" | contains_line "$target"; then
+      note "  duplicate in arguments, skipping: ${target}"
       continue
     fi
     to_remove+=("$target")
@@ -3586,8 +4568,11 @@ cmd_set_webui_version() {
 
   info="$(pypi_openwebui_info "$want")" || {
     note "Could not reach PyPI to check versions."
-    [[ -n "$want" ]] || return 1
-    info=$'\t'"${want}"$'\t'
+    if [[ -n "$want" ]]; then
+      note "  Version changes are not written unless the release can be verified."
+      return 1
+    fi
+    info=$'\t\t'
   }
   latest="$(printf '%s' "$info" | cut -f1)"
   target="$(printf '%s' "$info" | cut -f2)"
@@ -4013,9 +4998,19 @@ cmd_set_webhook() {
   local url="" set_url=false
   while (( $# )); do
     case "$1" in
-      --channel)    env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
-      --username)   env_set MATTERMOST_MONITOR_USER "${2:?--username needs a value}"; CHANGED=true; shift 2 ;;
+      --channel)
+        (( $# >= 2 )) || die "set-webhook: --channel needs a value"
+        env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
+      --username)
+        # Two separate tests, deliberately. `(( $# >= 2 && -n "${2-}" ))` is not
+        # valid arithmetic: inside (( )) `-n` is minus-the-variable-n, and the
+        # string that follows is a syntax error -- so the guard failed for EVERY
+        # --username, valid value or not, and the flag could never be used.
+        (( $# >= 2 )) || die "set-webhook: --username needs a value"
+        [[ -n "${2}" ]] || die "set-webhook: --username needs a value"
+        env_set MATTERMOST_MONITOR_USER "$2"; CHANGED=true; shift 2 ;;
       --verify-tls)
+        (( $# >= 2 )) || die "set-webhook: --verify-tls needs a value"
         [[ "${2-}" == "true" || "${2-}" == "false" ]] \
           || die "set-webhook: --verify-tls takes 'true' or 'false'"
         env_set MATTERMOST_VERIFY_TLS "$2"; CHANGED=true; shift 2 ;;
@@ -4236,6 +5231,14 @@ while (( $# > 0 )); do
       [[ "$COMMAND" == "set-webhook" ]] || die "unknown option: $1"
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
+    # routing-stats' own flags, passed through for the same reason.
+    --last|--class|--file)
+      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
+    --json)
+      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
+      ARGS+=("$1"); shift ;;
     --*)         die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
@@ -4252,6 +5255,7 @@ case "$COMMAND" in
   list)     cmd_list false ;;
   status)   cmd_list true ;;
   discover) cmd_discover ;;
+  routing-stats) cmd_routing_stats ${ARGS[@]+"${ARGS[@]}"} ;;
   add)      cmd_add "${ARGS[@]:-}" ;;
   remove)   cmd_remove "${ARGS[@]:-}" ;;
   set-tier) cmd_set_tier "${ARGS[@]:-}" ;;
@@ -4323,8 +5327,12 @@ cat > "${REPO_DIR}/services/ollama-router/ollama-router.service" <<'UNITEOF'
 [Unit]
 Description=Intelligent Ollama Prompt Complexity Router Middleware
 After=network-online.target litellm-proxy.service
-Wants=network-online.target
-Requires=litellm-proxy.service
+# Wants=, deliberately NOT Requires=. LiteLLM is only the FALLBACK dispatch
+# path -- the router serves every request from its own discovery inventory and
+# does not need it to start. Requires= additionally propagates stop/restart:
+# each litellm crash-restart cycle would tear this unit down too, and through
+# open-webui's own dependency, the UI with it. See the comment on open-webui.
+Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
 User=ollama-router
@@ -4334,6 +5342,10 @@ EnvironmentFile=/app/router/.env
 ExecStart=/app/router/venv/bin/python router.py
 Restart=always
 RestartSec=3
+# Creates /var/log/ollama-router owned by this service and exports
+# $LOGS_DIRECTORY. The per-request decision records live there.
+LogsDirectory=ollama-router
+LogsDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -4368,8 +5380,10 @@ cat > "${REPO_DIR}/services/ollama-monitor/ollama-monitor.service" <<'UNITEOF'
 [Unit]
 Description=Ollama Cluster Resilience Health Monitor
 After=network-online.target litellm-proxy.service
-Wants=network-online.target
-Requires=litellm-proxy.service
+# Wants=, not Requires=: the monitor probes the Ollama hosts directly and only
+# reads LiteLLM's health endpoint. A flapping litellm must not restart the
+# monitor -- a restart re-reads state and re-arms alerting for no reason.
+Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
 User=ollama-router
@@ -4379,6 +5393,11 @@ EnvironmentFile=/app/router/.env
 ExecStart=/app/router/venv/bin/python monitor.py
 Restart=always
 RestartSec=10
+# Creates /var/lib/ollama-monitor owned by this service and exports
+# $STATE_DIRECTORY. Health state lives there so a restart during an outage does
+# not re-announce it.
+StateDirectory=ollama-monitor
+StateDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -4391,8 +5410,16 @@ cat > "${REPO_DIR}/services/open-webui/open-webui.service" <<'UNITEOF'
 [Unit]
 Description=Open WebUI (chat frontend for the smart router)
 After=network-online.target ollama-router.service
-Wants=network-online.target
-Requires=ollama-router.service
+# Wants=, not Requires=. This one matters more than the others: Open WebUI runs
+# alembic migrations against data/webui.db on its FIRST start, and that start
+# takes minutes. Requires= propagates a stop, so a crash-looping litellm-proxy
+# would stop ollama-router, which would stop THIS unit mid-migration. The
+# schema is then left with the new column applied but the alembic revision not
+# stamped, and every later start dies with
+#   sqlite3.OperationalError: duplicate column name: info_json
+# from which it never recovers. The UI needs the router only when a request
+# arrives, never to boot, so an ordering-only dependency is the correct one.
+Wants=network-online.target ollama-router.service
 [Service]
 Type=simple
 User=ollama-router
@@ -4536,13 +5563,17 @@ cat > "$motd_tmp" <<EOF
    Router config : /app/router/.env  /app/router/litellm_config.yaml
    Tunables      : /app/router/router.ini  /app/router/monitor.ini
    WebUI config  : /app/openwebui/.env
-   Config repo   : ${CONFIG_REPO_DIR}  (git pull && ./install/apply-config.sh)
+   Config repo   : ${CONFIG_REPO_DIR}  (git pull && apply-config.sh)
+                   on PATH for login shells — every *.sh in the repo is
+                   executable and runnable by name
    Model servers : manage-model-servers list | status | models
                    manage-model-servers add <ip> --tier large --apply
                    manage-model-servers set-model large <tag> --apply
                    manage-model-servers set-server-model <tier> <ip> <tag>
                    manage-model-servers set-webui-version latest --apply
                    manage-model-servers set-keepalive 2h --apply
+   Alerting      : manage-model-servers test-alert
+                   manage-model-servers set-webhook <url> [--channel <c>]
    Status        : systemctl status open-webui ollama-router litellm-proxy ollama-monitor
    Logs          : journalctl -u ollama-router -f
 ==============================================================================

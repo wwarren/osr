@@ -50,6 +50,10 @@ Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
+  routing-stats [--last n] [--class c] [--file f] [--json]
+                             Summarise the router's decision log: what each
+                             request was classified as, which model answered,
+                             and whether the scoring actually discriminated
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
@@ -443,6 +447,166 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
+cmd_routing_stats() {
+  local file="${ROUTER_DECISION_LOG:-/var/log/ollama-router/decisions.jsonl}"
+  local limit="" want_class="" as_json=false
+  while (( $# )); do
+    case "${1-}" in
+      --file)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
+        file="$2"; shift 2 ;;
+      --last)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
+        limit="$2"; shift 2 ;;
+      --class)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
+        want_class="$2"; shift 2 ;;
+      --json)  as_json=true; shift ;;
+      "")      shift ;;
+      *)       die "routing-stats: unknown argument '$1'" ;;
+    esac
+  done
+  [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || die "routing-stats: --last takes a number"
+  if [[ ! -r "$file" ]]; then
+    note "No decision log at ${file}."
+    note "  It is written by the router, so check:"
+    note "    systemctl status ollama-router"
+    note "    grep -A3 '\[logging\]' /app/router/router.ini    # decisions = true?"
+    note "  Or point at another copy:  $0 routing-stats --file <path>"
+    return 1
+  fi
+  # NOTE: %-formatting, not f-strings -- this is embedded in a shell-quoted
+  # string and a quote inside an f-string expression cannot be escaped.
+  python3 -c '
+import json, sys, collections
+
+path, limit, want_class, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+rows, bad = [], 0
+with open(path, encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            bad += 1          # a torn last line during rotation is normal
+if want_class:
+    rows = [r for r in rows if (r.get("request") or {}).get("class") == want_class]
+if limit:
+    rows = rows[-int(limit):]
+if not rows:
+    print("  no records matched")
+    raise SystemExit(0)
+
+def pct(numerator, denominator):
+    return 100.0 * numerator / denominator if denominator else 0.0
+
+def percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[idx]
+
+total = len(rows)
+classes = collections.Counter((r.get("request") or {}).get("class", "?") for r in rows)
+reasons = collections.Counter((r.get("request") or {}).get("reason", "?") for r in rows)
+modes = collections.Counter(r.get("mode", "?") for r in rows)
+models = collections.Counter()
+servers = collections.Counter()
+in_band = out_band = 0
+distance_ranked = 0
+tie_sizes = []
+fellforward = 0
+errors = 0
+ttfb, totals = [], []
+margins = []
+
+for r in rows:
+    chosen = r.get("chosen") or {}
+    if chosen.get("model"):
+        models[chosen["model"]] += 1
+        servers[chosen.get("server", "?")] += 1
+    ranking = r.get("ranking") or {}
+    if ranking.get("distance_ranked"):
+        distance_ranked += 1
+    if ranking.get("tied"):
+        tie_sizes.append(ranking["tied"])
+    cands = r.get("candidates") or []
+    if cands:
+        top = cands[0]
+        if top.get("in_band"):
+            in_band += 1
+        else:
+            out_band += 1
+        if len(cands) > 1:
+            margins.append(round(top.get("score", 0) - cands[1].get("score", 0), 4))
+    if r.get("fell_forward"):
+        fellforward += 1
+    if r.get("outcome") == "no_usable_target" or (r.get("status") or 200) >= 500:
+        errors += 1
+    if isinstance(r.get("ttfb_ms"), (int, float)):
+        ttfb.append(r["ttfb_ms"])
+    if isinstance(r.get("total_ms"), (int, float)):
+        totals.append(r["total_ms"])
+
+if as_json:
+    print(json.dumps({
+        "records": total, "unparsable": bad,
+        "classes": dict(classes), "reasons": dict(reasons), "modes": dict(modes),
+        "models": dict(models), "servers": dict(servers),
+        "top_in_band_pct": round(pct(in_band, in_band + out_band), 1),
+        "distance_ranked_pct": round(pct(distance_ranked, total), 1),
+        "mean_tie_group": round(sum(tie_sizes) / len(tie_sizes), 2) if tie_sizes else 0,
+        "fell_forward_pct": round(pct(fellforward, total), 1),
+        "error_pct": round(pct(errors, total), 1),
+        "ttfb_ms": {"p50": percentile(ttfb, 0.5), "p95": percentile(ttfb, 0.95)},
+        "total_ms": {"p50": percentile(totals, 0.5), "p95": percentile(totals, 0.95)},
+        "median_margin": percentile(margins, 0.5),
+    }, indent=2))
+    raise SystemExit(0)
+
+print("Routing decisions: %d record(s)%s" % (total, " (%d unparsable)" % bad if bad else ""))
+print()
+print("  Request class          (what the classifier decided)")
+for name, count in classes.most_common():
+    print("    %-12s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print("  Why")
+for name, count in reasons.most_common(6):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print()
+print("  Model chosen           (what actually answered)")
+for name, count in models.most_common(10):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print("  Host chosen")
+for name, count in servers.most_common(10):
+    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
+print()
+mean_tie = (sum(tie_sizes) / len(tie_sizes)) if tie_sizes else 0.0
+print("  Scoring quality")
+print("    top candidate in band     %6.1f%%   low = the bands and the models" %
+      pct(in_band, in_band + out_band))
+print("                                        installed have drifted apart")
+print("    distance-ranked requests  %6.1f%%   nothing was in band at all" %
+      pct(distance_ranked, total))
+print("    mean tie-group size       %6.2f    >2 consistently means" % mean_tie)
+print("                                        tie_epsilon is too wide")
+print("    median winning margin     %6.3f    ~0 means the score is not" %
+      percentile(margins, 0.5))
+print("                                        discriminating between models")
+print()
+print("  Delivery")
+print("    fell forward               %5.1f%%   (first choice refused the request)" % pct(fellforward, total))
+print("    errors / 5xx               %5.1f%%" % pct(errors, total))
+print("    time to first byte  p50 %8.0fms   p95 %8.0fms" % (percentile(ttfb, 0.5), percentile(ttfb, 0.95)))
+print("    total request time  p50 %8.0fms   p95 %8.0fms" % (percentile(totals, 0.5), percentile(totals, 0.95)))
+if modes.get("litellm"):
+    print()
+    print("    %d request(s) took the LiteLLM fallback path" % modes["litellm"])
+' "$file" "${limit:-0}" "$want_class" "$as_json"
+}
+
 cmd_add() {
   local -a wanted=("$@")
   local addr url current count tier
@@ -520,6 +684,10 @@ cmd_remove() {
     fi
     if ! get_servers | contains_line "$target"; then
       note "  not configured, skipping: ${target}"
+      continue
+    fi
+    if printf '%s\n' "${to_remove[@]:-}" | contains_line "$target"; then
+      note "  duplicate in arguments, skipping: ${target}"
       continue
     fi
     to_remove+=("$target")
@@ -725,8 +893,11 @@ cmd_set_webui_version() {
 
   info="$(pypi_openwebui_info "$want")" || {
     note "Could not reach PyPI to check versions."
-    [[ -n "$want" ]] || return 1
-    info=$'\t'"${want}"$'\t'
+    if [[ -n "$want" ]]; then
+      note "  Version changes are not written unless the release can be verified."
+      return 1
+    fi
+    info=$'\t\t'
   }
   latest="$(printf '%s' "$info" | cut -f1)"
   target="$(printf '%s' "$info" | cut -f2)"
@@ -1152,9 +1323,19 @@ cmd_set_webhook() {
   local url="" set_url=false
   while (( $# )); do
     case "$1" in
-      --channel)    env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
-      --username)   env_set MATTERMOST_MONITOR_USER "${2:?--username needs a value}"; CHANGED=true; shift 2 ;;
+      --channel)
+        (( $# >= 2 )) || die "set-webhook: --channel needs a value"
+        env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
+      --username)
+        # Two separate tests, deliberately. `(( $# >= 2 && -n "${2-}" ))` is not
+        # valid arithmetic: inside (( )) `-n` is minus-the-variable-n, and the
+        # string that follows is a syntax error -- so the guard failed for EVERY
+        # --username, valid value or not, and the flag could never be used.
+        (( $# >= 2 )) || die "set-webhook: --username needs a value"
+        [[ -n "${2}" ]] || die "set-webhook: --username needs a value"
+        env_set MATTERMOST_MONITOR_USER "$2"; CHANGED=true; shift 2 ;;
       --verify-tls)
+        (( $# >= 2 )) || die "set-webhook: --verify-tls needs a value"
         [[ "${2-}" == "true" || "${2-}" == "false" ]] \
           || die "set-webhook: --verify-tls takes 'true' or 'false'"
         env_set MATTERMOST_VERIFY_TLS "$2"; CHANGED=true; shift 2 ;;
@@ -1375,6 +1556,14 @@ while (( $# > 0 )); do
       [[ "$COMMAND" == "set-webhook" ]] || die "unknown option: $1"
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
+    # routing-stats' own flags, passed through for the same reason.
+    --last|--class|--file)
+      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
+    --json)
+      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
+      ARGS+=("$1"); shift ;;
     --*)         die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
@@ -1391,6 +1580,7 @@ case "$COMMAND" in
   list)     cmd_list false ;;
   status)   cmd_list true ;;
   discover) cmd_discover ;;
+  routing-stats) cmd_routing_stats ${ARGS[@]+"${ARGS[@]}"} ;;
   add)      cmd_add "${ARGS[@]:-}" ;;
   remove)   cmd_remove "${ARGS[@]:-}" ;;
   set-tier) cmd_set_tier "${ARGS[@]:-}" ;;
