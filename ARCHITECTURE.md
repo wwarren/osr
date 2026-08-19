@@ -264,8 +264,15 @@ has no IPv6 nginx fails with *Address family not supported* and refuses to
 start at all; no UI is a worse outcome than no IPv6, and the installer only
 ever configures an IPv4 address.
 
+Ordering matters during provisioning: the certificate is generated **before**
+`apply-config.sh` installs the site that names it. The other way round,
+`nginx -t` cannot load a file that does not exist yet, so every fresh install
+printed a rejection warning and then worked on the retry — which is how an
+operator learns to ignore the one warning that matters.
+
 `apply-config.sh` installs the site from the config repo and reloads nginx, but
-only after `nginx -t` passes, and never fatally — a broken proxy config must
+only after checking the certificate exists and `nginx -t` passes, and never
+fatally — a broken proxy config must
 not abort an apply that has already put the application config in place, and it
 must not take down the running front end, which is the only way in to the UI.
 
@@ -290,8 +297,12 @@ than asking.
 generates into a temporary pair and swaps only on success, so a failed renewal
 cannot leave nginx holding a key that no longer matches its certificate.
 
-`TLS_ENABLED=false` reverts the whole arrangement: no nginx, applications bound
-to `0.0.0.0` on the public ports, plain HTTP.
+`TLS_ENABLED=false` reverts the whole arrangement: no nginx or openssl package,
+no site generated, applications bound to `0.0.0.0` on the public ports, plain
+HTTP. Because the config repo is the source of truth, `apply-config.sh` also
+*removes* an installed site that is no longer in the repo — otherwise nginx
+would keep holding 8080 and 8000, which are the very ports the applications
+bind directly in that mode.
 
 ### 4.3 Open WebUI (`open-webui.service`)
 

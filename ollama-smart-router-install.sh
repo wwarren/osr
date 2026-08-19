@@ -1752,7 +1752,11 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate iproute2 openssl nginx
+base_packages=(python3 python3-pip python3-venv curl ca-certificates logrotate iproute2)
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  base_packages+=(openssl nginx)
+fi
+apt_get install -y "${base_packages[@]}"
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -3627,8 +3631,9 @@ EOF
 # Everything here is in the config repo, so the TLS front end changes by commit
 # like the rest of the system. The certificate itself is NOT: a private key does
 # not belong in git, so it lives only in ${TLS_DIR} inside the container.
-mkdir -p "${REPO_DIR}/services/nginx-tls"
-cat > "${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf" <<NGINXEOF
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  mkdir -p "${REPO_DIR}/services/nginx-tls"
+  cat > "${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf" <<NGINXEOF
 # Managed by ollama-smart-router. Installed to /etc/nginx/conf.d/ by
 # install/apply-config.sh; edit it in the repo, not in place.
 
@@ -3713,6 +3718,7 @@ server {
     }
 }
 NGINXEOF
+fi
 
 # --- per-service requirements (each venv is built from these, so dependency
 #     pins are version controlled per service) ---
@@ -3992,6 +3998,37 @@ copy_optional() {
     missing="${missing}${missing:+, }$(basename "$src")"
   fi
 }
+# copy_secret_env <src> <dest> <required|optional>
+#
+# In the provisioned container these files must be root:ollama-router 0640 so
+# services can read them without making secrets world-readable. Tests and
+# staging runs may execute this script before that account exists, though; that
+# should not abort the whole apply before systemd/nginx config is installed.
+copy_secret_env() {
+  local src="$1" dest="$2" kind="$3"
+  if [ ! -f "$src" ]; then
+    if [ "$kind" = "required" ]; then
+      echo "FATAL: required file missing: $src" >&2
+      exit 1
+    fi
+    missing="${missing}${missing:+, }$(basename "$src")"
+    return 0
+  fi
+
+  if [ "$(id -u)" = "0" ] && getent group ollama-router >/dev/null 2>&1; then
+    install -m 0640 -o root -g ollama-router "$src" "$dest"
+  else
+    install -m 0600 "$src" "$dest"
+    # Running as root means this is a real container, not a validation run --
+    # so a missing group is a genuine problem: the services run as
+    # ollama-router and will not be able to read this file. Silence here would
+    # surface later as an unexplained permission error at service start.
+    if [ "$(id -u)" = "0" ]; then
+      echo "WARNING: no ollama-router group; $(basename "$dest") is root-only and" >&2
+      echo "         the services will not be able to read it." >&2
+    fi
+  fi
+}
 
 # Application code + per-service config
 copy_required "${REPO_DIR}/services/ollama-router/router.py"   "${ROUTER_DIR}/router.py"   -m 0644
@@ -4001,9 +4038,11 @@ copy_optional "${REPO_DIR}/services/ollama-monitor/monitor.ini" "${ROUTER_DIR}/m
 copy_optional "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml" \
               "${ROUTER_DIR}/litellm_config.yaml" -m 0644
 
-# Environment files (contain secrets -> root:ollama-router 0640)
-copy_required "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"     -m 0640 -o root -g ollama-router
-copy_optional "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env"  -m 0640 -o root -g ollama-router
+# Environment files contain secrets. In the real container copy_secret_env uses
+# root:ollama-router 0640; in tests/staging without that group it degrades to an
+# owner-only copy so the rest of the apply can still be validated.
+copy_secret_env "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"    required
+copy_secret_env "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env" optional
 
 # systemd units
 for unit in "${REPO_DIR}"/services/*/*.service; do
@@ -4015,14 +4054,37 @@ done
 # passes `nginx -t` is a bug, but one that fails it must not take the running
 # front end down with it, because that is the only way in to the UI.
 nginx_site="${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf"
+installed_site="${NGINX_CONF_DIR}/ollama-smart-router.conf"
+if [ ! -f "$nginx_site" ] && [ -f "$installed_site" ]; then
+  # TLS was turned off (or the site was deleted from the repo) but nginx is
+  # still holding 8080 and 8000. Leaving it there means the applications, which
+  # bind those ports directly with TLS off, cannot start at all.
+  echo "Removing the nginx TLS site: it is no longer in the config repo."
+  rm -f "$installed_site"
+  if [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] && command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+fi
 if [ -f "$nginx_site" ]; then
   install -d -m 0755 "$NGINX_CONF_DIR"
   install -m 0644 "$nginx_site" "${NGINX_CONF_DIR}/ollama-smart-router.conf"
+  # The site names a certificate, and `nginx -t` fails outright if that file is
+  # absent. Say so plainly instead of dumping an nginx emerg trace that reads
+  # like the proxy config is broken when it is only waiting for a certificate.
+  nginx_cert="$(sed -n 's/^[[:space:]]*ssl_certificate[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
+                 "$nginx_site" | head -1)"
+  reload_nginx=yes
+  if [ -n "$nginx_cert" ] && [ ! -f "$nginx_cert" ]; then
+    echo "NOTE: ${nginx_cert} does not exist yet, so nginx was not reloaded." >&2
+    echo "      Generate it with:  manage-model-servers cert renew" >&2
+    reload_nginx=no
+  fi
   # Only talk to nginx when the file actually landed where nginx reads from.
   # `nginx -t` validates the WHOLE system configuration, so with NGINX_CONF_DIR
   # pointed elsewhere (a test, a staging copy) it would be reporting on a file
   # this script did not write -- and failing the apply over it.
-  if [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] && command -v nginx >/dev/null 2>&1; then
+  if [ "$reload_nginx" = "yes" ] && [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] \
+     && command -v nginx >/dev/null 2>&1; then
     if nginx -t >/dev/null 2>&1; then
       systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
     else
@@ -4668,6 +4730,11 @@ cmd_cert() {
   [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || die "cert: --days takes a number"
 
   local crt="${TLS_DIR}/server.crt" key="${TLS_DIR}/server.key"
+  # openssl is only installed when TLS is enabled, so on a plain-HTTP container
+  # this command has nothing to work with. Say that, rather than letting the
+  # shell report "openssl: command not found" from three frames down.
+  command -v openssl >/dev/null 2>&1 \
+    || die "openssl is not installed; this container was provisioned with TLS_ENABLED=false"
   case "$action" in
     show)
       if [[ ! -r "$crt" ]]; then
@@ -5939,6 +6006,17 @@ else
   push_local_config_tree "$REPO_DIR"
 fi
 
+# The certificate has to exist BEFORE apply-config installs the nginx site,
+# because that site names it and `nginx -t` refuses to load a file that is not
+# there. Doing this the other way round made every fresh install print
+# "nginx rejected the configuration ... cannot load certificate" and then work
+# anyway on the retry -- which is exactly how an operator learns to ignore that
+# warning.
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  echo "Configuring TLS."
+  generate_tls_cert "$ROUTER_IP" "$CT_NAME" || TLS_OK=false
+fi
+
 echo "Applying configuration."
 run_ct bash "${CONFIG_REPO_DIR}/install/apply-config.sh" "$CONFIG_REPO_DIR"
 
@@ -6066,22 +6144,17 @@ EOF
 pct push "$CT_ID" "$motd_tmp" /etc/motd --perms 0644
 rm -f "$motd_tmp"
 
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  echo "Configuring TLS."
-  if generate_tls_cert "$ROUTER_IP" "$CT_NAME"; then
-    # Debian's stock site listens on :80 and would answer for anything the
-    # config repo does not claim. Nothing here serves plain HTTP, so remove it.
-    run_ct rm -f /etc/nginx/sites-enabled/default
-    if run_ct nginx -t >/dev/null 2>&1; then
-      run_ct systemctl enable --now nginx >/dev/null 2>&1 || true
-      run_ct systemctl reload nginx >/dev/null 2>&1 || run_ct systemctl restart nginx >/dev/null 2>&1 || true
-      echo "  nginx is terminating TLS on ${OPENWEBUI_PORT} (UI) and 8000 (API)."
-    else
-      echo "WARNING: nginx rejected the generated configuration:" >&2
-      run_ct nginx -t 2>&1 | sed 's/^/         /' >&2
-      TLS_OK=false
-    fi
+if [[ "$TLS_ENABLED" == "true" ]] && $TLS_OK; then
+  # Debian's stock site listens on :80 and would answer for anything the config
+  # repo does not claim. Nothing here serves plain HTTP, so remove it.
+  run_ct rm -f /etc/nginx/sites-enabled/default
+  if run_ct nginx -t >/dev/null 2>&1; then
+    run_ct systemctl enable --now nginx >/dev/null 2>&1 || true
+    run_ct systemctl reload nginx >/dev/null 2>&1 || run_ct systemctl restart nginx >/dev/null 2>&1 || true
+    echo "nginx is terminating TLS on ${OPENWEBUI_PORT} (UI) and 8000 (API)."
   else
+    echo "WARNING: nginx rejected the generated configuration:" >&2
+    run_ct nginx -t 2>&1 | sed 's/^/         /' >&2
     TLS_OK=false
   fi
 fi

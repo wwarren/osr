@@ -620,6 +620,11 @@ cmd_cert() {
   [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || die "cert: --days takes a number"
 
   local crt="${TLS_DIR}/server.crt" key="${TLS_DIR}/server.key"
+  # openssl is only installed when TLS is enabled, so on a plain-HTTP container
+  # this command has nothing to work with. Say that, rather than letting the
+  # shell report "openssl: command not found" from three frames down.
+  command -v openssl >/dev/null 2>&1 \
+    || die "openssl is not installed; this container was provisioned with TLS_ENABLED=false"
   case "$action" in
     show)
       if [[ ! -r "$crt" ]]; then
