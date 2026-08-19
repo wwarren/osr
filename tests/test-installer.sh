@@ -935,6 +935,78 @@ assert_ok "nginx site installed" bash -c "[[ -f '${_acroot}/nginx.d/ollama-smart
 assert_file_contains "with the repo's content" "listen 8080 ssl" \
   "${_acroot}/nginx.d/ollama-smart-router.conf"
 
+# copy_secret_env: the env files hold secrets, so in the container they are
+# root:ollama-router 0640. Assert the mode rather than trusting the call site.
+_env_mode="$(stat -c '%a' "${_acroot}/router/.env")"
+assert_ok "the env file is not world-readable" \
+  bash -c "[[ '${_env_mode}' == '640' || '${_env_mode}' == '600' ]]"
+
+# Without the service account — a validation run — it must degrade to an
+# owner-only copy rather than aborting before the units and nginx site are
+# installed. Simulated by making getent report the group as absent.
+_acroot2="$(mktemp -d)"
+cp -r "${_acrepo}" "${_acroot2}/repo" 2>/dev/null || true
+mkdir -p "${_acroot2}/repo/services/ollama-router"
+echo "x = 1" > "${_acroot2}/repo/services/ollama-router/router.py"
+mock_script getent <<'EOF'
+exit 2                      # no such group
+EOF
+BIN_DIR="${_acroot2}/bin" PROFILE_DIR="${_acroot2}/profile.d" \
+  LOGROTATE_DIR="${_acroot2}/logrotate.d" NGINX_CONF_DIR="${_acroot2}/nginx.d" \
+  bash "$_ac" "${_acroot2}/repo" "${_acroot2}/router" "${_acroot2}/webui" "${_acroot2}/units" \
+  > "${_acroot2}/out" 2>&1
+assert_eq "still succeeds without the ollama-router group" "0" "$?"
+assert_file_mode "and falls back to an owner-only copy" "600" "${_acroot2}/router/.env"
+assert_ok "the units were still installed" \
+  bash -c "[[ -f '${_acroot2}/nginx.d/ollama-smart-router.conf' ]]"
+# Drop the getent stub again: it is a system lookup other tests rely on.
+rm -f "${MOCK_BIN}/getent"
+rm -rf "$_acroot2"
+
+# A site naming a certificate that does not exist yet must not be reported as a
+# broken proxy config — that is what a fresh install looks like before the cert
+# is generated, and an nginx emerg trace there teaches you to ignore the one
+# warning that matters.
+_acroot3="$(mktemp -d)"; mkdir -p "${_acroot3}/repo/services/nginx-tls" \
+  "${_acroot3}/repo/env" "${_acroot3}/repo/services/ollama-router" \
+  "${_acroot3}/repo/services/ollama-monitor" "${_acroot3}/repo/install"
+echo "x = 1" > "${_acroot3}/repo/services/ollama-router/router.py"
+echo "x = 1" > "${_acroot3}/repo/services/ollama-monitor/monitor.py"
+printf 'A=1\n' > "${_acroot3}/repo/env/router.env"
+printf 'server {\n    ssl_certificate     /nonexistent/server.crt;\n}\n' \
+  > "${_acroot3}/repo/services/nginx-tls/ollama-smart-router.conf"
+BIN_DIR="${_acroot3}/bin" PROFILE_DIR="${_acroot3}/profile.d" \
+  LOGROTATE_DIR="${_acroot3}/logrotate.d" NGINX_CONF_DIR="${_acroot3}/nginx.d" \
+  bash "$_ac" "${_acroot3}/repo" "${_acroot3}/router" "${_acroot3}/webui" "${_acroot3}/units" \
+  > "${_acroot3}/out" 2>&1
+assert_eq "a missing certificate is not fatal" "0" "$?"
+assert_contains "and is explained, not dumped as an nginx trace" \
+  "does not exist yet" "$(cat "${_acroot3}/out")"
+assert_contains "with the fix"  "cert renew" "$(cat "${_acroot3}/out")"
+assert_not_contains "no scary rejection message" "rejected the configuration" \
+  "$(cat "${_acroot3}/out")"
+rm -rf "$_acroot3"
+
+# Turning TLS off leaves the repo with no nginx site, but nginx would still be
+# holding 8080 and 8000 — the very ports the applications bind directly in that
+# mode. The repo is the source of truth, so the installed site has to go.
+_acroot4="$(mktemp -d)"; mkdir -p "${_acroot4}/repo/env" "${_acroot4}/nginx.d" \
+  "${_acroot4}/repo/services/ollama-router" "${_acroot4}/repo/services/ollama-monitor" \
+  "${_acroot4}/repo/install"
+echo "x = 1" > "${_acroot4}/repo/services/ollama-router/router.py"
+echo "x = 1" > "${_acroot4}/repo/services/ollama-monitor/monitor.py"
+printf 'A=1\n' > "${_acroot4}/repo/env/router.env"
+printf 'server { listen 8080 ssl; }\n' > "${_acroot4}/nginx.d/ollama-smart-router.conf"
+BIN_DIR="${_acroot4}/bin" PROFILE_DIR="${_acroot4}/profile.d" \
+  LOGROTATE_DIR="${_acroot4}/logrotate.d" NGINX_CONF_DIR="${_acroot4}/nginx.d" \
+  bash "$_ac" "${_acroot4}/repo" "${_acroot4}/router" "${_acroot4}/webui" "${_acroot4}/units" \
+  > "${_acroot4}/out" 2>&1
+assert_eq "apply still succeeds" "0" "$?"
+assert_ok "the stale site is removed" \
+  bash -c "[[ ! -f '${_acroot4}/nginx.d/ollama-smart-router.conf' ]]"
+assert_contains "and says why" "no longer in the config repo" "$(cat "${_acroot4}/out")"
+rm -rf "$_acroot4"
+
 # A genuinely required file missing must still be fatal.
 rm -f "${_acrepo}/services/ollama-router/router.py"
 assert_status "a missing required file aborts" 1 \

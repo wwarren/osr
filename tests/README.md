@@ -23,14 +23,14 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **710 assertions, 107/107 functions covered** (plus an integration
+Current state: **722 assertions, 107/107 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 65 | 354 |
-| `manage` | `manage-model-servers.sh` | 53 | 238 |
+| `installer` | `ollama-smart-router-install.sh` | 65 | 365 |
+| `manage` | `manage-model-servers.sh` | 53 | 239 |
 | `monitor` | generated `monitor.py` | — | 51 |
 | `router` | generated `router.py` | — | 67 |
 
@@ -166,6 +166,7 @@ bugs in this family have been found by these tests.
 | A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
 | An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
 | Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | Open WebUI's own first-run migration, upstream. The installer now starts it alone, waits for the port, and resets the empty database once — `Requires=` was a real but *separate* bug, and blaming it first cost a whole diagnosis cycle |
+| Every fresh install printed "nginx rejected the configuration" and then worked | the certificate was generated *after* `apply-config.sh` installed the site that names it, so `nginx -t` could not load it — a spurious warning that teaches you to ignore the real one |
 | `TLS_EXTRA_SAN` with a single name did nothing at all | the split loop used a bare `read`, and `tr` leaves no newline after the last field — so the last name was always dropped, and a one-entry list is entirely last |
 | `rank_meta` reported every candidate as "tied" whenever nothing was in band | it compared scores only, but `rank_candidates` groups ties by *distance first, then score* — and in the distance-ranked case every score floors to 0.0, so the tie-group metric was wrong precisely when it mattered |
 | Provisioning reported success over a dead UI | `systemctl enable --now` on a `Type=simple` unit returns as soon as the process is forked; nothing checked that the port ever opened |

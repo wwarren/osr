@@ -302,6 +302,15 @@ assert_eq "dry-run writes nothing" "$_before" \
   "$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -fingerprint)"
 DRY_RUN=false
 
+# TLS_ENABLED=false containers have no openssl, and the failure should name
+# that rather than surfacing "command not found" from inside the function.
+mock_script command <<'EOF'
+exit 1
+EOF
+out="$(PATH="/nonexistent" cmd_cert show 2>&1)"; rc=$?
+assert_eq "fails when openssl is absent" "1" "$rc"
+rm -f "${MOCK_BIN}/command"
+
 assert_fail "rejects a non-numeric --days" cmd_cert renew --days soon
 assert_fail "rejects an unknown action"    cmd_cert bogus
 assert_fail "rejects an unknown flag"      cmd_cert show --nope
