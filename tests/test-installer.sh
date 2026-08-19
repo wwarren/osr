@@ -1262,6 +1262,27 @@ assert_contains "and confirms the retry" "after the retry" "$out"
 assert_eq       "records that it reset" "true" "$OPENWEBUI_RESET"
 rm -f "$_flag"
 
+# A port clash must NOT be treated as a migration failure: resetting the
+# database would destroy data to fix something entirely unrelated.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
+EOF
+mock_script journalctl <<'EOF'
+echo "ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): address already in use"
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+OPENWEBUI_RESET=false
+start_openwebui_verified > "$_owout" 2>&1; rc=$?
+out="$(cat "$_owout")"
+assert_eq       "reports failure"                 "1" "$rc"
+assert_contains "names the real cause"            "already in use" "$out"
+assert_contains "and how to find the holder"      "ss -lntp"       "$out"
+assert_eq       "did NOT reset the database"      "false" "$OPENWEBUI_RESET"
+assert_not_contains "and did not blame migrations" "Discarding the empty database" "$out"
+
 # Something else entirely: no reset, and a warning rather than a silent success.
 mock_script ss <<'EOF'
 echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
@@ -1338,6 +1359,16 @@ assert_file_contains "open-webui wants the router" \
   "Wants=network-online.target ollama-router.service" "${_units}/open-webui.service"
 assert_file_contains "the router orders after litellm" \
   "After=network-online.target litellm-proxy.service" "${_units}/ollama-router.service"
+
+# open-webui's serve() has LITERAL defaults (host="0.0.0.0", port=8080) and
+# never reads HOST/PORT from the environment. Relying on the env file alone
+# left it binding the port nginx owns, so it died with "address already in use"
+# and the proxy answered 502 for a port nothing was listening on. The flags are
+# the fix, and this assertion is what stops them being "tidied away" later.
+assert_file_contains "open-webui is told where to bind on the command line" \
+  "serve --host \${HOST} --port \${PORT}" "${_units}/open-webui.service"
+assert_file_contains "and the values come from the env file" \
+  "EnvironmentFile=/app/openwebui/.env" "${_units}/open-webui.service"
 
 # The long first start must survive: migrations plus an embedding-model download.
 assert_file_contains "open-webui keeps a long start timeout" \
