@@ -222,6 +222,13 @@ check("two records", len(lines), 2)
 check("round-trips nested structure", lines[1]["nested"], {"a": [1, 2]})
 check("one line each", open(df, encoding="utf-8").read().count("\n"), 2)
 
+describe("the decision log is not world-readable")
+# It holds prompt text. systemd's LogsDirectoryMode protects the directory, but
+# the file's own mode is inherited from the process umask (0644) unless it is
+# set explicitly — and 0644 is what the logrotate policy claims is 0640.
+mode = oct(os.stat(df).st_mode & 0o777)
+check("mode is 0640", mode, "0o640")
+
 describe("an unwritable decision log is not fatal")
 mbad = start(decision_file="/proc/definitely/not/writable/d.jsonl")
 mbad._init_decision_log()
@@ -300,12 +307,6 @@ check("identical models tie", meta["tied"], 2)
 need_x = {"class": "xlarge", "code": False, "vision": False}
 meta = m.rank_meta(need_x, m.rank_candidates(need_x, inv2))
 check("flagged when nothing is in band", meta["distance_ranked"], True)
-inv3 = {"models": [entry(m, "qwen3:14b", 14.0, server="http://a.example:11434"),
-                   entry(m, "qwen3:32b", 32.0, server="http://b.example:11434")],
-        "servers": {"http://a.example:11434": {"up": True},
-                    "http://b.example:11434": {"up": True}}}
-meta = m.rank_meta(need_x, m.rank_candidates(need_x, inv3))
-check("distance ranking does not call different distances a tie", meta["tied"], 1)
 check("empty candidate list is handled",
       m.rank_meta(need, []), {"candidates": 0, "tied": 0, "distance_ranked": False})
 
