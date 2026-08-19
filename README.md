@@ -11,12 +11,13 @@ hardened `ollama-router` user:
 
 | Service | Unit | Port | Notes |
 |---|---|---|---|
-| Open WebUI (chat UI) | `open-webui.service` | 8080 | Points at the smart router |
-| Smart Router (OpenAI API) | `ollama-router.service` | 8000 | Complexity routing + proxy |
+| nginx (TLS front end) | `nginx.service` | 8080, 8000 | Terminates HTTPS for both public ports |
+| Open WebUI (chat UI) | `open-webui.service` | 8088 | Loopback only; reached through nginx |
+| Smart Router (OpenAI API) | `ollama-router.service` | 8010 | Loopback only; reached through nginx |
 | LiteLLM proxy | `litellm-proxy.service` | 4000 | Localhost only; load balances backends |
 | Health monitor | `ollama-monitor.service` | — | Probes backends, alerts to Mattermost |
 
-Request path: **Open WebUI → Smart Router (8000) → LiteLLM (4000) → Ollama backends (11434)**.
+Request path: **browser → nginx (TLS) → Open WebUI → nginx (TLS) → Smart Router → LiteLLM (4000) → Ollama backends (11434)**.
 
 ## How routing works
 
@@ -115,6 +116,9 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`), `MATTERMOST_VERIFY_TLS` (true)
 - `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
 - `OPENWEBUI_PORT` (8080)
+- `TLS_ENABLED` (true), `TLS_CERT_DAYS` (3650), `TLS_KEY_BITS` (4096), `TLS_DIR` (`/app/tls`)
+- `TLS_EXTRA_SAN` — extra names for the certificate, comma separated (e.g. `chat.lan,10.0.0.9`). Add the DNS name you actually browse to, or hostname verification fails
+- `OPENWEBUI_INTERNAL_PORT` (8088), `ROUTER_INTERNAL_PORT` (8010) — where the apps bind once nginx owns the public ports
 
 ### Install-time prompts
 
@@ -447,6 +451,108 @@ The service log is the other source of truth:
 ```bash
 journalctl -u ollama-monitor -n 50 --no-pager | grep -i mattermost
 ```
+
+## HTTPS
+
+Both public endpoints are served over TLS by nginx, using a self-signed
+certificate the installer generates inside the container:
+
+```
+https://<ip>:8080        Open WebUI
+https://<ip>:8000/v1     OpenAI-compatible API
+```
+
+The **ports are unchanged** — only the scheme is. Existing firewall rules and
+bookmarks keep working; add the `s`.
+
+### Why a proxy
+
+Open WebUI cannot do TLS itself. Its `serve` command passes only host and port
+to uvicorn and exposes no `--ssl-*` options, which is why its own documentation
+recommends a reverse proxy. So nginx owns 8080 and 8000, and the two
+applications move to `127.0.0.1:8088` and `127.0.0.1:8010` — loopback, so
+there is no second unencrypted listener quietly serving the same thing.
+
+The proxy config is not just `proxy_pass`. Three settings are load-bearing:
+
+| Setting | Without it |
+|---|---|
+| `Upgrade` / `Connection` headers | Open WebUI's socket.io falls back to long-polling; the UI feels broken rather than failing outright |
+| `proxy_buffering off` | nginx holds the token stream until a buffer fills, so replies arrive in bursts instead of word by word |
+| `proxy_read_timeout 1h` | a long generation is cut off mid-sentence at nginx's 60-second default |
+
+`client_max_body_size 200m` also lets Open WebUI's own limit decide what to
+reject, rather than an nginx 413.
+
+### 502 Bad Gateway
+
+nginx is working and TLS is fine — the application behind it is not listening.
+Almost always Open WebUI failing to bind:
+
+```bash
+pct exec <CTID> -- ss -lntp | grep -E '8088|8080'
+pct exec <CTID> -- journalctl -u open-webui -n 50 --no-pager
+```
+
+`address already in use` means the unit is trying the wrong port. Open WebUI's
+`serve()` is declared with **literal** defaults:
+
+```python
+def serve(host: str = "0.0.0.0", port: int = 8080):
+```
+
+It never reads `HOST` or `PORT` from the environment, so setting them in
+`.env` alone leaves it binding `0.0.0.0:8080` — the port nginx owns. The unit
+therefore passes them on the command line:
+
+```
+ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
+```
+
+systemd expands those from the `EnvironmentFile`, so the env file remains the
+single source of truth. If an older container is missing the flags, add them
+and `systemctl daemon-reload && systemctl restart open-webui`.
+
+### The certificate
+
+Self-signed, generated in the container so the private key never touches the
+Proxmox host. `subjectAltName` covers the container IP, its hostname and
+localhost — a certificate with only a CN has not been accepted as an identity
+by any current browser since Chrome 58, so the SAN list is what makes it work
+at all. Key `0600`, certificate `0644`, both under `/app/tls`.
+
+```bash
+manage-model-servers cert                      # subject, SANs, dates, fingerprint
+manage-model-servers cert renew                # keeps the existing SANs
+manage-model-servers cert renew --san chat.lan,10.0.0.9 --days 825
+```
+
+`renew` carries the existing SANs forward unless `--san` is given, so renewing
+never silently narrows the certificate and breaks a client that reaches the box
+by a name someone added months ago. It writes to a temporary pair and swaps only
+once openssl has succeeded, so a failed renewal cannot leave nginx with a key
+that no longer matches the certificate.
+
+**Browsers will warn** until the certificate is trusted. To trust it:
+
+```bash
+# Fetch a copy from the Proxmox host
+pct pull <CTID> /app/tls/server.crt ollama-router.crt
+
+# Command-line clients
+export SSL_CERT_FILE=/path/to/ollama-router.crt      # curl, requests, openai
+curl --cacert ollama-router.crt https://<ip>:8000/v1/models
+```
+
+Import it into the OS or browser trust store to stop the warning. If you reach
+the container by a DNS name, put it in the certificate first — either
+`TLS_EXTRA_SAN=chat.lan` at install time or `cert renew --san chat.lan` after —
+or hostname verification fails no matter how well trusted the certificate is.
+
+### Turning it off
+
+`TLS_ENABLED=false` at install time reverts to the previous behaviour exactly:
+no nginx, the applications bind `0.0.0.0` on 8080 and 8000, plain HTTP.
 
 ## Evaluating routing quality
 

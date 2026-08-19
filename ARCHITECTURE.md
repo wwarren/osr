@@ -45,8 +45,9 @@ flowchart LR
     end
 
     subgraph ct["ollama-smart-router LXC"]
-        router["Smart Router<br/>:8000"]
-        webui["Open WebUI<br/>:8080"]
+        nginx["nginx TLS<br/>:8080 :8000"]
+        router["Smart Router<br/>127.0.0.1:8010"]
+        webui["Open WebUI<br/>127.0.0.1:8088"]
         litellm["LiteLLM<br/>127.0.0.1:4000"]
         monitor["Health Monitor"]
     end
@@ -60,9 +61,11 @@ flowchart LR
     gitea["Gitea<br/>config repository"]
     mm["Mattermost<br/>alert channel"]
 
-    api -->|"HTTPS/HTTP<br/>OpenAI API"| router
-    browser --> webui
-    webui -->|OpenAI API| router
+    api -->|"HTTPS<br/>OpenAI API"| nginx
+    browser -->|HTTPS| nginx
+    nginx --> webui
+    nginx --> router
+    webui -->|"OpenAI API (loopback)"| router
     router -->|"direct dispatch<br/>(discovery mode)"| pool
     router -.->|"fallback"| litellm
     litellm --> pool
@@ -78,6 +81,7 @@ flowchart LR
 | Ollama hosts | HTTP `:11434` | **Critical** | Router fails forward to other hosts; total loss → 502 |
 | Gitea | HTTPS | **Provisioning only** | Install falls back to local config; running system unaffected |
 | Mattermost | HTTPS webhook | Optional | Monitor logs alerts instead of posting |
+| nginx | local | **Critical when TLS is on** | No UI and no API reachable; the applications are on loopback |
 | Proxmox host | — | Provisioning only | — |
 
 > **Key design property:** after provisioning, the only runtime dependency is
@@ -88,8 +92,9 @@ flowchart LR
 
 ## 3. Deployment view
 
-All four services run in a single unprivileged LXC container as the same
-non-login system account (`ollama-router`).
+The four application services run in a single unprivileged LXC container as the
+same non-login system account (`ollama-router`); nginx runs as the distribution
+packages it, reading the certificate as root before dropping privileges.
 
 ```mermaid
 flowchart TB
@@ -97,8 +102,9 @@ flowchart TB
         subgraph ctr["LXC (unprivileged) — 2 vCPU / 4 GB / 32 GB"]
             direction TB
             subgraph units["systemd units"]
-                A["open-webui.service<br/>0.0.0.0:8080"]
-                B["ollama-router.service<br/>0.0.0.0:8000"]
+                N["nginx.service<br/>0.0.0.0:8080 + :8000 TLS"]
+                A["open-webui.service<br/>127.0.0.1:8088"]
+                B["ollama-router.service<br/>127.0.0.1:8010"]
                 C["litellm-proxy.service<br/>127.0.0.1:4000"]
                 D["ollama-monitor.service<br/>no listener"]
             end
@@ -106,11 +112,14 @@ flowchart TB
                 E["/app/router<br/>code, .ini, .env, venv (py3.13)"]
                 F["/app/openwebui<br/>.env, venv (py3.12), data"]
                 G["/app/config-repo<br/>git clone, root-only 0700"]
+                T["/app/tls<br/>self-signed cert + key"]
                 H["/opt/python<br/>standalone CPython 3.12"]
             end
         end
     end
 
+    N -->|proxies| A
+    N -->|proxies| B
     A -->|"After + Wants"| B
     B -->|"After + Wants"| C
     D -->|"After + Wants"| C
@@ -221,6 +230,89 @@ purposes: it is the fallback dispatch path when discovery is unavailable, and it
 backs the passthrough routes for non-chat OpenAI endpoints. Its
 `litellm_config.yaml` is generated at install time with one deployment per
 `(tier, host)` pair and `latency-based-routing` plus cross-tier fallbacks.
+
+### 4.2b nginx TLS front end (`nginx.service`)
+
+Owns the two public ports (8080 for the UI, 8000 for the API) and proxies to
+`127.0.0.1:8088` and `127.0.0.1:8010`. The applications bind loopback only, so
+there is no second unencrypted listener serving the same content.
+
+**Where it binds is set on the command line, not by environment.** Open WebUI's
+`serve()` carries literal defaults — `host="0.0.0.0", port=8080` — and reads
+neither `HOST` nor `PORT` from the environment. Configuring the env file alone
+left it binding the port nginx owns, so it died with *address already in use*
+and the proxy returned **502** for a loopback port nothing was listening on.
+The unit passes `--host`/`--port` explicitly (typer exposes plain keyword
+parameters as options automatically), with systemd expanding them from the
+`EnvironmentFile` so the env file stays the single source of truth. A flag also
+cannot be silently ignored by a future release the way the variables were.
+
+**Why a proxy at all.** Open WebUI cannot terminate TLS. Its `serve` command
+passes only host and port to `uvicorn.run()` and exposes no `--ssl-*` options,
+which is why upstream's own documentation points at a reverse proxy. Patching
+the unit to call uvicorn directly would work but would bypass the CLI's own
+startup (secret-key handling, `UVICORN_WORKERS`) and need re-checking on every
+Open WebUI upgrade.
+
+**Ports deliberately unchanged.** TLS was added *on top of* 8080 and 8000
+rather than moving to 443, so existing firewall rules, bookmarks and API base
+URLs keep working — only the scheme changes.
+
+Three directives in the generated site are load-bearing rather than decorative:
+
+| Directive | What breaks without it |
+|---|---|
+| `Upgrade` / `Connection` proxy headers | Open WebUI's socket.io degrades to long-polling — the UI works but feels broken, which is harder to diagnose than an outright failure |
+| `proxy_buffering off` | nginx holds the SSE token stream until a buffer fills; replies arrive in bursts instead of streaming |
+| `proxy_read_timeout 1h` | a long generation is severed mid-sentence at nginx's 60-second default |
+
+Two things are deliberately *absent*. There is no `http2 on`, because WebSocket
+upgrade is an HTTP/1.1 mechanism and the directive only exists from nginx
+1.25.1 — on anything older the entire file is rejected and the front end never
+reloads. There are no `listen [::]` lines, because in a container whose network
+has no IPv6 nginx fails with *Address family not supported* and refuses to
+start at all; no UI is a worse outcome than no IPv6, and the installer only
+ever configures an IPv4 address.
+
+Ordering matters during provisioning: the certificate is generated **before**
+`apply-config.sh` installs the site that names it. The other way round,
+`nginx -t` cannot load a file that does not exist yet, so every fresh install
+printed a rejection warning and then worked on the retry — which is how an
+operator learns to ignore the one warning that matters.
+
+`apply-config.sh` installs the site from the config repo and reloads nginx, but
+only after checking the certificate exists and `nginx -t` passes, and never
+fatally — a broken proxy config must
+not abort an apply that has already put the application config in place, and it
+must not take down the running front end, which is the only way in to the UI.
+
+### 4.2c The certificate
+
+Self-signed, generated **inside the container** so the private key is never
+written to the Proxmox host or passed on a command line. Key `0600`,
+certificate `0644`, both under `/app/tls`. The key is not in the config repo —
+a private key does not belong in git — which is the one piece of this system's
+state that is not reproducible from the repo alone.
+
+`subjectAltName` is the part that matters: it carries the container IP as an
+`IP:` entry, the hostname and localhost as `DNS:` entries, plus anything in
+`TLS_EXTRA_SAN`. A certificate with only a CN has not been accepted as an
+identity by any current browser since Chrome 58, and an address written as
+`DNS:` instead of `IP:` fails silently until a client refuses to connect —
+which is why `tls_san_list` classifies operator-supplied names by shape rather
+than asking.
+
+`manage-model-servers cert renew` carries the existing SANs forward unless
+`--san` is given, so a renewal cannot silently narrow the certificate. It
+generates into a temporary pair and swaps only on success, so a failed renewal
+cannot leave nginx holding a key that no longer matches its certificate.
+
+`TLS_ENABLED=false` reverts the whole arrangement: no nginx or openssl package,
+no site generated, applications bound to `0.0.0.0` on the public ports, plain
+HTTP. Because the config repo is the source of truth, `apply-config.sh` also
+*removes* an installed site that is no longer in the repo — otherwise nginx
+would keep holding 8080 and 8000, which are the very ports the applications
+bind directly in that mode.
 
 ### 4.3 Open WebUI (`open-webui.service`)
 
