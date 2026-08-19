@@ -125,11 +125,11 @@ flowchart TB
   hosts directly; the UI needs the router only when a request arrives.
 * This is not a style preference. `Requires=` propagates stop and restart, so a
   crash-looping `litellm-proxy` stopped `ollama-router`, which stopped
-  `open-webui`. That is fatal on a first install: Open WebUI runs its alembic
-  migrations on first start, and being killed part way through leaves
-  `data/webui.db` with a column added but the revision unstamped. Every later
-  start then dies on `duplicate column name: info_json` and the UI never
-  returns — with a clean journal on the unit that actually failed.
+  `open-webui` — a failure whose only visible symptom was on the unit that had
+  done nothing wrong. Ordering-only dependencies remove that whole class of
+  confusion.
+* It is **not**, however, what breaks Open WebUI's first start. That has a
+  separate, upstream cause — see §4.3.
 * All units are `Restart=always`. `open-webui` carries `TimeoutStartSec=600`
   because its first start downloads a local embedding model.
 
@@ -228,6 +228,46 @@ Chat UI on `:8080`. Points at the **router**, not at LiteLLM, so UI traffic is
 smart-routed. Runs from its own virtualenv on **Python 3.12** — every
 `open-webui` release requires `>=3.11,<3.13` while Debian 13 ships 3.13, so the
 installer provisions a dedicated interpreter for it (see §7.3).
+
+#### The first-start migration, and why provisioning verifies it
+
+On a brand-new database Open WebUI creates its SQLite schema and then runs
+alembic over it. On this platform the two disagree, and the very first start
+dies:
+
+```
+sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
+    duplicate column name: info_json
+[SQL: ALTER TABLE user ADD COLUMN info_json JSON]
+```
+
+The column is present, the revision that adds it is not stamped, and every
+later start repeats the same `ALTER`. It cannot recover on its own. This is
+upstream behaviour, not a configuration error — but the database at that point
+holds no account and no data, so discarding it and starting once more produces
+a clean schema.
+
+Provisioning therefore does three things rather than one:
+
+1. **Starts Open WebUI separately, after the other three.** Its first start
+   runs migrations and downloads an embedding model on a 2-vCPU container;
+   there is nothing to gain from doing that while three other services are
+   also starting.
+2. **Waits for the port**, with `ct_wait_for_port` polling the container's own
+   `ss` and giving up early if the unit stops trying. `Type=simple` means
+   `systemctl start` returns the instant the process is forked, so "the unit
+   started" says nothing about whether the service works — which is exactly
+   how an earlier version printed *Provisioning complete* over a dead UI.
+3. **Self-heals once, and only once.** If the port never opens *and* the
+   journal carries the migration signature, `openwebui_reset_db` moves the
+   database aside — after confirming the `user` table holds zero accounts, so
+   a re-run against a live deployment can never destroy data — and the start
+   is retried. Anything else is reported with the journal excerpt and left
+   alone.
+
+The end of provisioning prints each unit's real state and whether each port
+answers. A failed Open WebUI is a warning, not a fatal error: the OpenAI API on
+`:8000` does not depend on it.
 
 ### 4.4 Health monitor (`ollama-monitor.service`)
 
