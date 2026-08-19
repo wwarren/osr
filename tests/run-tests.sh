@@ -27,6 +27,7 @@ SUITES=(
 # handed the script it should extract from.
 PY_SUITES=(
   "monitor:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-monitor.py"
+  "router:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-router.py"
 )
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'

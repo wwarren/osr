@@ -23,19 +23,20 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **542 assertions, 107/107 functions covered** (plus an integration
+Current state: **628 assertions, 107/107 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
 | `installer` | `ollama-smart-router-install.sh` | 56 | 293 |
-| `manage` | `manage-model-servers.sh` | 51 | 198 |
+| `manage` | `manage-model-servers.sh` | 52 | 218 |
 | `monitor` | generated `monitor.py` | — | 51 |
+| `router` | generated `router.py` | — | 66 |
 
 The coverage gate is a *shell* gate: it enumerates bash functions, so the Python
-suite sits outside it. `monitor` is listed in `PY_SUITES` and run after the
-others.
+suite sits outside it. `monitor` and `router` are listed in `PY_SUITES` and run
+after the others.
 
 ## Layout
 
@@ -45,6 +46,7 @@ tests/
 ├── test-installer.sh         # suite for the installer
 ├── test-manage.sh            # suite for the management script
 ├── test-monitor.py           # suite for the generated monitor.py
+├── test-router.py            # suite for the generated router.py
 └── lib/
     ├── extract-functions.py  # heredoc-aware function extractor
     ├── assert.sh             # assertions, counters, summary
@@ -182,6 +184,12 @@ Adding a function to either script without a `describe` block makes
 `./run-tests.sh` exit non-zero.
 
 ## The Python suite
+
+`test-router.py` covers the scoring and the decision log. The assertion that
+earns its keep is `sum(terms) == score`: the log is only trustworthy if the
+itemised terms reconcile exactly with the number that decided the routing, and
+an early draft rounded the terms inside `score_breakdown`, so they did not.
+Rounding now happens once, in `explain_candidates`, where the record is built.
 
 `test-monitor.py` extracts `monitor.py` and `monitor.ini` from the installer's
 heredocs into a temp dir, imports the module with `post_mattermost` replaced by
