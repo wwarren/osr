@@ -865,6 +865,119 @@ assert_file_contains "https remote gets an https credential" \
   "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 rm -f "$_cred_seen"
 
+# ── the generated apply-config.sh ─────────────────────────────────────────────
+# Not a function, so the coverage gate does not see it — but it is what runs on
+# every deploy, so it gets an integration test against a throwaway tree.
+describe apply_config_script
+_ac="$(mktemp)"
+sed -n "/^cat > \"\${REPO_DIR}\/install\/apply-config.sh\" <<'APPLYEOF'\$/,/^APPLYEOF\$/p" \
+  "$SCRIPT" | sed '1d;$d' > "$_ac"
+assert_ok "extracts from the installer" bash -c "[[ -s '$_ac' ]]"
+assert_ok "parses"                      bash -n "$_ac"
+
+_acroot="$(mktemp -d)"; _acrepo="${_acroot}/repo"
+mkdir -p "${_acrepo}"/{env,install} \
+         "${_acrepo}"/services/{ollama-router,ollama-monitor,litellm-proxy} \
+         "${_acrepo}/.git"
+echo "x = 1" > "${_acrepo}/services/ollama-router/router.py"
+echo "x = 1" > "${_acrepo}/services/ollama-monitor/monitor.py"
+printf 'BACKEND_FAST=http://h:11434\n' > "${_acrepo}/env/router.env"
+printf '#!/usr/bin/env bash\necho hi\n' > "${_acrepo}/install/manage-model-servers.sh"
+printf '#!/usr/bin/env bash\necho hi\n' > "${_acrepo}/tools-helper.sh"
+printf '#!/bin/sh\necho hook\n'         > "${_acrepo}/.git/hook.sh"
+chmod 0644 "${_acrepo}/install/manage-model-servers.sh" "${_acrepo}/tools-helper.sh" \
+           "${_acrepo}/.git/hook.sh"
+
+BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+  bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units" \
+  > "${_acroot}/out" 2>&1
+_acrc=$?
+assert_eq "runs clean with the optional files absent" "0" "$_acrc"
+assert_contains "warns about what it skipped" "router.ini" "$(cat "${_acroot}/out")"
+
+# Executable bit on every repo script, but never inside .git.
+assert_file_mode "install script made executable" "755" "${_acrepo}/install/manage-model-servers.sh"
+assert_file_mode "script outside install/ too"    "755" "${_acrepo}/tools-helper.sh"
+assert_file_mode "leaves .git alone"              "644" "${_acrepo}/.git/hook.sh"
+
+# The management command is linked FIRST, so a later failure cannot hide it.
+assert_ok "symlink created" bash -c "[[ -L '${_acroot}/bin/manage-model-servers' ]]"
+
+# PATH for login shells.
+_prof="${_acroot}/profile.d/ollama-router-path.sh"
+assert_ok "profile.d snippet written" bash -c "[[ -f '$_prof' ]]"
+assert_file_contains "adds the repo root"     "${_acrepo}" "$_prof"
+assert_file_contains "adds install/"          "${_acrepo}/install" "$_prof"
+assert_file_mode     "sourced, not executed"  "644" "$_prof"
+_newpath="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; printf '%s' \"\$PATH\"")"
+assert_contains "repo lands on PATH"    "${_acrepo}" "$_newpath"
+assert_eq "appended, never prepended — repo cannot shadow system commands" \
+  "/usr/bin:/bin" "${_newpath%%:${_acrepo}*}"
+# Sourcing repeatedly must not grow PATH without bound.
+_twice="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; . '$_prof'; . '$_prof'; printf '%s' \"\$PATH\"")"
+assert_eq "idempotent when sourced again" "$_newpath" "$_twice"
+_found="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; command -v manage-model-servers.sh")"
+assert_eq "scripts resolve by name" "${_acrepo}/install/manage-model-servers.sh" "$_found"
+
+# OS-level guardrail for file logs; the router also rotates decisions.jsonl
+# internally, but this catches operator-provided files in the same directory.
+_lr="${_acroot}/logrotate.d/ollama-smart-router"
+assert_ok "logrotate config written" bash -c "[[ -f '$_lr' ]]"
+assert_file_contains "rotates the decision logs" "/var/log/ollama-router/*.jsonl" "$_lr"
+assert_file_contains "uses copytruncate for live writers" "copytruncate" "$_lr"
+
+# A genuinely required file missing must still be fatal.
+rm -f "${_acrepo}/services/ollama-router/router.py"
+assert_status "a missing required file aborts" 1 \
+  env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+      bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
+rm -rf "$_acroot" "$_ac"
+
+# ── the generated systemd units ───────────────────────────────────────────────
+# Also not functions. These assertions exist because of a real outage: every
+# unit used Requires= on its upstream, and Requires= propagates stop/restart.
+# A crash-looping litellm-proxy therefore stopped ollama-router, which stopped
+# open-webui — nine seconds into its first-ever start, part way through the
+# alembic migration. webui.db was left with the new column added but the
+# revision unstamped, so every subsequent start failed with
+# "duplicate column name: info_json" and the UI never came back.
+describe systemd_units
+_units="$(mktemp -d)"
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  sed -n "/^cat > \"\${REPO_DIR}\/services\/[a-z-]*\/${_svc}.service\" <<'UNITEOF'\$/,/^UNITEOF\$/p" \
+    "$SCRIPT" | sed '1d;$d' > "${_units}/${_svc}.service"
+  assert_ok "extracts ${_svc}.service" bash -c "[[ -s '${_units}/${_svc}.service' ]]"
+done
+
+# The rule: ordering yes, propagation no.
+for _svc in ollama-router ollama-monitor open-webui; do
+  assert_not_contains "${_svc} does not use Requires=" \
+    "Requires=" "$(grep -v '^#' "${_units}/${_svc}.service")"
+done
+assert_file_contains "open-webui still ORDERS after the router" \
+  "After=network-online.target ollama-router.service" "${_units}/open-webui.service"
+assert_file_contains "open-webui wants the router" \
+  "Wants=network-online.target ollama-router.service" "${_units}/open-webui.service"
+assert_file_contains "the router orders after litellm" \
+  "After=network-online.target litellm-proxy.service" "${_units}/ollama-router.service"
+
+# The long first start must survive: migrations plus an embedding-model download.
+assert_file_contains "open-webui keeps a long start timeout" \
+  "TimeoutStartSec=600" "${_units}/open-webui.service"
+# Every unit runs unprivileged and comes back on its own.
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  assert_file_contains "${_svc} runs as the service account" \
+    "User=ollama-router" "${_units}/${_svc}.service"
+  assert_file_contains "${_svc} restarts" "Restart=always" "${_units}/${_svc}.service"
+done
+# The monitor's state directory is what keeps a restart from re-announcing.
+assert_file_contains "monitor gets a state directory" \
+  "StateDirectory=ollama-monitor" "${_units}/ollama-monitor.service"
+# LiteLLM must stay off the network.
+assert_file_contains "litellm binds loopback only" \
+  "--host 127.0.0.1" "${_units}/litellm-proxy.service"
+rm -rf "$_units"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"
 summary

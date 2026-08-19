@@ -21,6 +21,15 @@ SUITES=(
   "manage:${ROOT}/manage-model-servers.sh:${HERE}/test-manage.sh"
 )
 
+# Python suites. These test code the installer GENERATES rather than the
+# installer itself, so the shell coverage gate does not apply to them — there
+# are no bash functions to enumerate. Same argument convention: the suite is
+# handed the script it should extract from.
+PY_SUITES=(
+  "monitor:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-monitor.py"
+  "router:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-router.py"
+)
+
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'
 [[ -t 1 ]] || { c_red=""; c_grn=""; c_yel=""; c_bld=""; c_off=""; }
 
@@ -36,7 +45,7 @@ for arg in "$@"; do
 done
 
 if $list_only; then
-  for entry in "${SUITES[@]}"; do echo "${entry%%:*}"; done
+  for entry in "${SUITES[@]}" "${PY_SUITES[@]}"; do echo "${entry%%:*}"; done
   exit 0
 fi
 
@@ -91,6 +100,18 @@ for entry in "${SUITES[@]}"; do
   fi
   printf '\n%s══ %s ══════════════════════════════════════════%s\n' "$c_bld" "$name" "$c_off"
   bash "$test" "$script" || failed_suites+=("$name")
+done
+
+for entry in "${PY_SUITES[@]}"; do
+  IFS=: read -r name script test <<< "$entry"
+  [[ -n "$want" && "$want" != "$name" ]] && continue
+  ran_any=true
+  if [[ ! -f "$test" || ! -f "$script" ]]; then
+    printf '%sMISSING%s python suite: %s\n' "$c_red" "$c_off" "$test"
+    failed_suites+=("$name"); continue
+  fi
+  printf '\n%s══ %s ══════════════════════════════════════════%s\n' "$c_bld" "$name" "$c_off"
+  python3 "$test" "$script" || failed_suites+=("$name")
 done
 
 if ! $ran_any; then

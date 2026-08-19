@@ -247,6 +247,55 @@ assert_fail "rejects n" bash -c "source '$FUNCS'; ASSUME_YES=false; DRY_RUN=fals
 ASSUME_YES=true
 
 # ── mutating commands ─────────────────────────────────────────────────────────
+describe cmd_routing_stats
+_rs="$(mktemp -d)"
+_rslog="${_rs}/decisions.jsonl"
+# Two records: one healthy in-band pick, one that fell forward and was ranked
+# by distance because nothing was in band.
+cat > "$_rslog" <<'RSEOF'
+{"id":"a1","mode":"discovery","request":{"class":"fast","reason":"default","code":false,"vision":false},"ranking":{"candidates":2,"tied":1,"distance_ranked":false},"candidates":[{"rank":0,"model":"qwen3:8b","server":"http://a:11434","score":1.12,"in_band":true},{"rank":1,"model":"qwen3:14b","server":"http://b:11434","score":0.61,"in_band":false}],"chosen":{"model":"qwen3:8b","server":"http://a:11434"},"status":200,"ttfb_ms":120.0,"total_ms":900.0,"fell_forward":0}
+{"id":"b2","mode":"discovery","request":{"class":"xlarge","reason":"xlarge keyword","code":false,"vision":false},"ranking":{"candidates":2,"tied":2,"distance_ranked":true},"candidates":[{"rank":0,"model":"qwen3:14b","server":"http://b:11434","score":0.0,"in_band":false}],"chosen":{"model":"qwen3:14b","server":"http://b:11434"},"status":200,"ttfb_ms":300.0,"total_ms":4200.0,"fell_forward":1}
+RSEOF
+out="$(cmd_routing_stats --file "$_rslog" 2>&1)"
+assert_contains "counts the records"        "2 record(s)"   "$out"
+assert_contains "breaks down request class" "xlarge"        "$out"
+assert_contains "reports the chosen model"  "qwen3:8b"      "$out"
+assert_contains "reports the chosen host"   "http://b:11434" "$out"
+assert_contains "reports in-band rate"      "top candidate in band" "$out"
+assert_contains "reports distance ranking"  "distance-ranked requests" "$out"
+assert_contains "reports fall-forward rate" "fell forward"  "$out"
+assert_contains "reports latency"           "time to first byte" "$out"
+
+# --json is the machine-readable form; it must parse and carry the same numbers.
+out="$(cmd_routing_stats --file "$_rslog" --json 2>&1)"
+assert_ok "json parses" bash -c "printf '%s' \"\$1\" | python3 -m json.tool >/dev/null" _ "$out"
+assert_eq "half the top candidates were in band" "50.0" \
+  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["top_in_band_pct"])')"
+assert_eq "half were distance-ranked" "50.0" \
+  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["distance_ranked_pct"])')"
+assert_eq "one request fell forward" "50.0" \
+  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fell_forward_pct"])')"
+
+out="$(cmd_routing_stats --file "$_rslog" --class xlarge 2>&1)"
+assert_contains "--class filters" "1 record(s)" "$out"
+out="$(cmd_routing_stats --file "$_rslog" --last 1 2>&1)"
+assert_contains "--last keeps the newest" "1 record(s)" "$out"
+
+# A torn final line is normal during rotation and must not abort the summary.
+printf '{"id":"c3","mode":"disc' >> "$_rslog"
+out="$(cmd_routing_stats --file "$_rslog" 2>&1)"
+assert_contains "tolerates a torn line" "1 unparsable" "$out"
+
+out="$(cmd_routing_stats --file "${_rs}/missing.jsonl" 2>&1)"; rc=$?
+assert_eq "missing log is a clean failure" "1" "$rc"
+assert_contains "says where it looked"     "No decision log" "$out"
+assert_contains "and how to check the router" "systemctl status ollama-router" "$out"
+assert_fail "rejects a missing --file value"  cmd_routing_stats --file
+assert_fail "rejects a non-numeric --last" cmd_routing_stats --file "$_rslog" --last abc
+assert_fail "rejects a missing --last value"  cmd_routing_stats --file "$_rslog" --last
+assert_fail "rejects an unknown flag"      cmd_routing_stats --file "$_rslog" --nope
+rm -rf "$_rs"
+
 describe cmd_add
 reset_repo; NO_PROBE=true
 cmd_add 10.0.0.60 >/dev/null 2>&1
@@ -271,6 +320,11 @@ assert_eq "tier membership cleaned" "1" "$(get_tier large | grep -c .)"
 reset_repo
 cmd_remove 1 >/dev/null 2>&1
 assert_eq "removal by list number" "3" "$(get_servers | grep -c .)"
+reset_repo
+MODEL_SERVER_MIN=3
+cmd_remove 1 1 >/dev/null 2>&1
+assert_eq "duplicate removal counts once" "3" "$(get_servers | grep -c .)"
+MODEL_SERVER_MIN=1
 reset_repo
 MODEL_SERVER_MIN=4
 assert_fail "refuses to drop below the minimum" cmd_remove 1
@@ -493,6 +547,17 @@ assert_eq "an empty url disables alerting" "" "$(env_get MATTERMOST_WEBHOOK_URL)
 assert_fail "rejects a non-url"        cmd_set_webhook "not-a-url"
 assert_fail "rejects a bad verify-tls" cmd_set_webhook --verify-tls maybe
 assert_fail "rejects an unknown flag"  cmd_set_webhook --nope x
+# Regression: the value guards must not be written as `(( $# >= 2 && -n "$2" ))`
+# -- that is a bash ARITHMETIC context, where `-n` is minus-variable-n and the
+# string is a syntax error, so the guard rejected every value including good
+# ones. These four pin both halves: a real value is accepted, a missing or
+# empty one is not.
+env_set MATTERMOST_MONITOR_USER "OllamaMonitor"
+cmd_set_webhook --username "Bot 2" >/dev/null 2>&1
+assert_eq "a username with a space is accepted" "Bot 2" "$(env_get MATTERMOST_MONITOR_USER)"
+assert_fail "rejects an empty username"   cmd_set_webhook --username ""
+assert_fail "rejects a dangling username" cmd_set_webhook --username
+assert_fail "rejects a dangling channel"  cmd_set_webhook --channel
 out="$(cmd_set_webhook "https://mm.example.net/hooks/secret123" 2>&1)"
 assert_not_contains "never echoes the full webhook path" "secret123" "$out"
 reset_repo

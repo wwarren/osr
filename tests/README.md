@@ -1,16 +1,19 @@
-# Shell unit tests
+# Unit tests
 
 Unit tests for every function in `ollama-smart-router-install.sh` and
-`manage-model-servers.sh`. Nothing here touches a Proxmox host, a Gitea server,
-an Ollama backend or a real deployment — every external command is stubbed.
+`manage-model-servers.sh`, plus the alerting rules in the `monitor.py` the
+installer generates. Nothing here touches a Proxmox host, a Gitea server, an
+Ollama backend or a real deployment — every external command is stubbed and the
+Python suite replaces the webhook and the clock.
 
 ## Running
 
 ```bash
 cd tests
-./run-tests.sh                 # both suites + coverage report
+./run-tests.sh                 # every suite + coverage report
 ./run-tests.sh installer       # one suite
 ./run-tests.sh manage
+./run-tests.sh monitor
 ./run-tests.sh --coverage      # coverage only, no tests
 ./run-tests.sh --list          # list suite names
 ```
@@ -20,12 +23,20 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **448 assertions, 107/107 functions covered.**
+Current state: **628 assertions, 107/107 functions covered** (plus an integration
+tests for the generated `apply-config.sh` and the four systemd units, which are
+not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 56 | 255 |
-| `manage` | `manage-model-servers.sh` | 51 | 193 |
+| `installer` | `ollama-smart-router-install.sh` | 56 | 293 |
+| `manage` | `manage-model-servers.sh` | 52 | 218 |
+| `monitor` | generated `monitor.py` | — | 51 |
+| `router` | generated `router.py` | — | 66 |
+
+The coverage gate is a *shell* gate: it enumerates bash functions, so the Python
+suite sits outside it. `monitor` and `router` are listed in `PY_SUITES` and run
+after the others.
 
 ## Layout
 
@@ -34,6 +45,8 @@ tests/
 ├── run-tests.sh              # runner + coverage gate
 ├── test-installer.sh         # suite for the installer
 ├── test-manage.sh            # suite for the management script
+├── test-monitor.py           # suite for the generated monitor.py
+├── test-router.py            # suite for the generated router.py
 └── lib/
     ├── extract-functions.py  # heredoc-aware function extractor
     ├── assert.sh             # assertions, counters, summary
@@ -149,6 +162,13 @@ bugs in this family have been found by these tests.
 | `git_push_authenticated` continued with an empty remote | only the exit status of `git remote get-url` was checked |
 | `large` selected the 70B model that defines `xlarge` | band ceilings were inclusive, so adjacent bands overlapped, and the size bias rewarded absolute size rather than position in the band |
 | `prompt_until_valid` hung forever on exhausted stdin | `read` returning EOF was not distinguished from an empty answer, so an invalid default re-tested itself in an infinite loop |
+| One down host posted four identical Mattermost alerts | health was keyed by `(tier, url)`, and a single-server deployment points all four tiers at the same URL |
+| A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
+| An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
+| Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | the units used `Requires=`, which propagates a stop — a crash-looping `litellm-proxy` killed `open-webui` nine seconds into its first alembic migration, leaving the schema half-applied |
+| `set-webhook --username <name>` rejected every value, including valid ones | the guard was written `(( $# >= 2 && -n "$2" ))`; inside `(( ))` that is *minus variable n* followed by a bare string, which is an arithmetic syntax error, so the test was always false |
+| `remove 1 1` refused to run against the server minimum | the same server counted twice toward `remaining_count`, so the check saw one more removal than would actually happen |
+| A second outage after a recovery was silently swallowed | the test harness saved state before `announce()` but not after, so the recovery never cleared the last-posted fingerprint — a harness bug, but the same omission in the daemon loop would lose real alerts |
 
 Each fix is in place and pinned by a regression assertion.
 
@@ -162,3 +182,34 @@ Each fix is in place and pinned by a regression assertion.
 
 Adding a function to either script without a `describe` block makes
 `./run-tests.sh` exit non-zero.
+
+## The Python suite
+
+`test-router.py` covers the scoring and the decision log. The assertion that
+earns its keep is `sum(terms) == score`: the log is only trustworthy if the
+itemised terms reconcile exactly with the number that decided the routing, and
+an early draft rounded the terms inside `score_breakdown`, so they did not.
+Rounding now happens once, in `explain_candidates`, where the record is built.
+
+`test-monitor.py` extracts `monitor.py` and `monitor.ini` from the installer's
+heredocs into a temp dir, imports the module with `post_mattermost` replaced by
+a list-appender, and calls `evaluate_cycle` / `announce` directly with a
+scripted list of probe results and an explicit timestamp. Nothing sleeps and
+nothing resolves a hostname, so a two-hour outage runs in milliseconds.
+
+Two traps specific to it:
+
+**`os.environ` is process-global.** Each case re-imports the module to simulate
+a restart, so an override left behind by one case silently configures the next.
+`start()` clears every key in `OVERRIDES` first — an early draft "passed" a
+threshold assertion purely on a leaked `MONITOR_FAILURE_THRESHOLD=1`.
+
+**State is a file, so cases must not share one.** Every case passes its own
+`state_file`; reusing the default would let one case's remembered outage
+suppress the next case's alert.
+
+`cycles()` mirrors `run_health_checks()`'s body exactly, including the second
+`save_state()` after `announce()` — that write persists the last-posted
+fingerprint. An earlier draft omitted it and a legitimate second outage looked
+suppressed, because the recovery that should have cleared the fingerprint never
+reached disk.
