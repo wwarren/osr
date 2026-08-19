@@ -531,7 +531,10 @@ curl -s localhost:8000/routing/explain \
 | `log_candidates` | `10` | Ranked candidates recorded per request. `0` = all. |
 
 > **The prompt text in this file has the same sensitivity as the chat itself.**
-> The file is `0640` inside a `0750` directory owned by the service account. Set
+> The router chmods it to `0640` explicitly — the process umask would otherwise
+> leave it `0644` — inside a `0750` directory owned by the service account.
+> `apply-config.sh` also installs `/etc/logrotate.d/ollama-smart-router` as an
+> OS-level cap on anything else written to that directory. Set
 > `prompt_chars = 0` to keep the analysis without keeping any content.
 
 ### The other services
@@ -550,6 +553,11 @@ journalctl -u ollama-monitor -f           # probes and transitions
 
 ## When Open WebUI will not start
 
+**The installer now handles this case itself** — it starts Open WebUI on its
+own, waits for the port, and resets the database once if the first-run
+migration fails. What follows is for containers built with an older installer,
+or for a failure the installer could not resolve.
+
 The unit reports `active` but nothing listens on 8080, and the journal shows:
 
 ```
@@ -557,14 +565,11 @@ sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) duplicate column nam
 [SQL: ALTER TABLE user ADD COLUMN info_json JSON]
 ```
 
-Open WebUI was killed part way through its first-ever alembic migration. The
-column got added, the revision never got stamped, so every subsequent start
-retries the same `ALTER` and fails. It cannot recover on its own.
-
-What killed it was almost always dependency propagation: units that declare
-`Requires=` are stopped when their upstream stops, so a crash-looping
-`litellm-proxy` took down `ollama-router` and the UI with it. Current units use
-`After=` + `Wants=`, which orders startup without propagating a stop.
+Open WebUI's first start creates its schema and then runs alembic over it; on a
+brand-new database the two disagree, the column is added twice, and the process
+dies. The revision is never stamped, so every later start retries the same
+`ALTER`. It cannot recover on its own. This is upstream behaviour rather than
+anything in this configuration.
 
 On a fresh install there is nothing to preserve, so move the database aside:
 
@@ -579,14 +584,16 @@ On an install with real accounts, repair rather than replace — back up
 `webui.db`, then stamp the current revision with the alembic config inside the
 venv rather than deleting anything.
 
-Check the units are the current ones:
+Separately, check the units are the current ones:
 
 ```bash
 grep -l '^Requires=' /etc/systemd/system/{ollama-router,ollama-monitor,open-webui}.service
 ```
 
-Any output means an old unit is still installed; re-apply from the config repo
-and `systemctl daemon-reload`.
+Any output means an old unit is still installed. `Requires=` propagates a stop,
+so a crash-looping `litellm-proxy` takes the router and the UI down with it —
+a failure that shows up on the units that did nothing wrong. Re-apply from the
+config repo and `systemctl daemon-reload`.
 
 ## Operating
 

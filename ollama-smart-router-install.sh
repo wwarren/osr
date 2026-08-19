@@ -1010,6 +1010,114 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
+# --- Open WebUI first-start handling -------------------------------------------
+# Open WebUI's own first run creates its SQLite schema and then runs alembic
+# over it. On this platform that combination fails on a BRAND NEW database:
+#
+#   sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
+#       duplicate column name: info_json
+#   [SQL: ALTER TABLE user ADD COLUMN info_json JSON]
+#
+# The column is already there, the alembic revision that adds it is not
+# stamped, and the process dies. It cannot recover on its own: every later
+# start repeats the same ALTER. The database is worthless at that point --
+# there is no account in it and no data -- so the fix is to discard it and let
+# a second start build it cleanly, which works.
+#
+# This is an upstream bug, not a configuration error, so the installer treats
+# it as an expected condition rather than something the operator has to know
+# about. It is bounded: one reset, one retry, and the evidence is printed.
+OPENWEBUI_OK=true
+OPENWEBUI_RESET=false
+
+# Does anything inside the container listen on this TCP port?
+ct_port_listening() {
+  local port="$1"
+  run_ct ss -lnt 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {found=1} END {exit !found}'
+}
+
+# Wait up to $2 seconds for $1 to be listening. Returns 1 on timeout, and 2 if
+# the unit gave up first -- waiting out a ten-minute deadline on a service that
+# has already failed helps nobody.
+ct_wait_for_port() {
+  local port="$1" deadline="${2:-600}" unit="${3:-}" waited=0 state
+  while (( waited < deadline )); do
+    if ct_port_listening "$port"; then return 0; fi
+    if [[ -n "$unit" ]]; then
+      state="$(run_ct systemctl is-active "$unit" 2>/dev/null || true)"
+      case "$state" in
+        active|activating|reloading) ;;
+        *) return 2 ;;
+      esac
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+    (( waited % 60 == 0 )) && echo "  still starting (${waited}s)..."
+  done
+  return 1
+}
+
+# Is the failure the known first-run migration bug, rather than something else?
+openwebui_migration_broken() {
+  run_ct journalctl -u open-webui -n 200 --no-pager 2>/dev/null \
+    | grep -qE "duplicate column name|already exists|OperationalError"
+}
+
+# Throw away a database that has never held anything, keeping a copy.
+openwebui_reset_db() {
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  run_ct systemctl stop open-webui.service >/dev/null 2>&1 || true
+  # Belt and braces: only ever reset a database with no accounts in it. A
+  # populated one means this is not a fresh install and discarding it would
+  # destroy real data.
+  if run_ct test -f /app/openwebui/data/webui.db; then
+    local users
+    users="$(run_ct /app/openwebui/venv/bin/python -c \
+      "import sqlite3;print(sqlite3.connect('/app/openwebui/data/webui.db').execute('SELECT count(*) FROM user').fetchone()[0])" \
+      2>/dev/null | tr -d '\r')"
+    if [[ -n "$users" && "$users" != "0" ]]; then
+      echo "WARNING: ${users} account(s) in webui.db — refusing to reset it." >&2
+      return 1
+    fi
+    run_ct bash -c "for f in /app/openwebui/data/webui.db /app/openwebui/data/webui.db-wal /app/openwebui/data/webui.db-shm; do [ -e \"\$f\" ] && mv \"\$f\" \"\${f}.broken-${stamp}\"; done; true"
+    echo "  reset the half-migrated database (kept as *.broken-${stamp})"
+  fi
+  return 0
+}
+
+start_openwebui_verified() {
+  local rc
+  echo "Starting Open WebUI (first start runs migrations and downloads an"
+  echo "embedding model — this takes several minutes)."
+  run_ct systemctl start open-webui.service || true
+  ct_wait_for_port "$OPENWEBUI_PORT" 600 open-webui.service; rc=$?
+  if (( rc == 0 )); then
+    echo "  Open WebUI is listening on ${OPENWEBUI_PORT}."
+    return 0
+  fi
+
+  if openwebui_migration_broken; then
+    echo "  Open WebUI failed its first-run database migration (a known upstream"
+    echo "  bug: the schema is created, then alembic re-adds a column that is"
+    echo "  already there). Discarding the empty database and retrying once."
+    openwebui_reset_db || return 1
+    OPENWEBUI_RESET=true
+    run_ct systemctl start open-webui.service || true
+    ct_wait_for_port "$OPENWEBUI_PORT" 600 open-webui.service; rc=$?
+    if (( rc == 0 )); then
+      echo "  Open WebUI is listening on ${OPENWEBUI_PORT} after the retry."
+      return 0
+    fi
+  fi
+
+  echo "WARNING: Open WebUI did not come up on port ${OPENWEBUI_PORT}." >&2
+  echo "         The rest of the system is unaffected — the API on :8000 works" >&2
+  echo "         without it. Last 30 log lines:" >&2
+  run_ct journalctl -u open-webui -n 30 --no-pager 2>/dev/null | sed 's/^/         /' >&2
+  return 1
+}
+
 # Wait until the container's userspace is actually ready (systemd + DNS).
 wait_for_ct_ready() {
   local state
@@ -1521,7 +1629,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate iproute2
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -1821,6 +1929,16 @@ def _init_decision_log():
             encoding="utf-8",
         )
         handler.setFormatter(logging.Formatter("%(message)s"))  # the record IS the line
+        # The records carry prompt text, so tighten the mode explicitly rather
+        # than inheriting the process umask (0644 under systemd's default). The
+        # directory is already 0750 via LogsDirectoryMode, but the file's own
+        # mode is what a future bind-mount or backup job will honour -- and it
+        # is what the logrotate policy claims. Rotated backups too: the handler
+        # renames them, so each was once the live file.
+        try:
+            os.chmod(DECISION_FILE, 0o640)
+        except OSError:
+            pass
         logger = logging.getLogger("router.decisions")
         logger.setLevel(logging.INFO)
         logger.propagate = False          # never duplicate JSON into the journal
@@ -4127,15 +4245,9 @@ cmd_routing_stats() {
   local limit="" want_class="" as_json=false
   while (( $# )); do
     case "${1-}" in
-      --file)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
-        file="$2"; shift 2 ;;
-      --last)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
-        limit="$2"; shift 2 ;;
-      --class)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
-        want_class="$2"; shift 2 ;;
+      --file)  file="${2-}"; shift 2 ;;
+      --last)  limit="${2-}"; shift 2 ;;
+      --class) want_class="${2-}"; shift 2 ;;
       --json)  as_json=true; shift ;;
       "")      shift ;;
       *)       die "routing-stats: unknown argument '$1'" ;;
@@ -5583,13 +5695,47 @@ rm -f "$motd_tmp"
 
 echo "Starting services."
 run_ct systemctl daemon-reload
-run_ct systemctl enable --now \
+# Enable all four, but start Open WebUI SEPARATELY below. Its first start runs
+# database migrations and downloads an embedding model on a 2-vCPU container;
+# starting it alongside three other services makes that slow start slower and
+# gives the installer nothing to check.
+run_ct systemctl enable \
   litellm-proxy.service ollama-router.service ollama-monitor.service open-webui.service
+run_ct systemctl start \
+  litellm-proxy.service ollama-router.service ollama-monitor.service
+
+start_openwebui_verified || OPENWEBUI_OK=false
 
 # Provisioning succeeded — disarm the failure trap so we keep the container.
 CT_CREATED=""
 trap - ERR
 
+echo "=============================================================================="
+# Report what is actually running, not what was asked to run. The previous
+# version printed "Provisioning complete" over a dead UI, because
+# `systemctl enable --now` on a Type=simple unit succeeds the moment the
+# process is forked -- long before it has failed.
+report_services() {
+  local unit state ok=true
+  echo "Service status:"
+  for unit in litellm-proxy ollama-router ollama-monitor open-webui; do
+    state="$(run_ct systemctl is-active "${unit}.service" 2>/dev/null || true)"
+    printf '  %-16s %s\n' "$unit" "${state:-unknown}"
+    [[ "$state" == "active" ]] || ok=false
+  done
+  for pair in "8000:router API" "${OPENWEBUI_PORT}:Open WebUI"; do
+    if ct_port_listening "${pair%%:*}"; then
+      printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
+    else
+      printf '  %-16s NOT listening on %s\n' "${pair#*:}" "${pair%%:*}"
+      ok=false
+    fi
+  done
+  $ok
+}
+
+echo "=============================================================================="
+report_services || true
 echo "=============================================================================="
 echo "Provisioning complete."
 echo "Container ID: ${CT_ID}"
@@ -5602,5 +5748,18 @@ if [[ "$CONFIG_SOURCE" == "repo" ]]; then
   echo "Config source: git clone of ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
 else
   echo "Config source: LOCAL (not version controlled — no usable Gitea token)"
+fi
+if $OPENWEBUI_RESET; then
+  echo
+  echo "NOTE: Open WebUI's first-run migration failed and its empty database was"
+  echo "      reset once, automatically. The broken copy is kept beside it as"
+  echo "      /app/openwebui/data/webui.db.broken-<timestamp>; delete it when you"
+  echo "      are satisfied the UI works."
+fi
+if ! $OPENWEBUI_OK; then
+  echo
+  echo "WARNING: Open WebUI is NOT serving. Everything else is provisioned; the" >&2
+  echo "         OpenAI API on :8000 does not depend on it. Investigate with:" >&2
+  echo "           pct exec ${CT_ID} -- journalctl -u open-webui -n 100 --no-pager" >&2
 fi
 echo "=============================================================================="
