@@ -1521,7 +1521,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -2338,13 +2338,21 @@ def rank_meta(need: dict, candidates: list) -> dict:
     """
     if not candidates:
         return {"candidates": 0, "tied": 0, "distance_ranked": False}
+    distance_ranked = not any(in_requested_band(e, need) for e in candidates)
     scores = [score_entry(e, need) for e in candidates]
     best = scores[0]
-    tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
+    if distance_ranked:
+        best_distance = band_distance(candidates[0], need)
+        tied = sum(
+            1 for sc, entry in zip(scores, candidates)
+            if band_distance(entry, need) == best_distance and best - sc <= TIE_EPSILON
+        )
+    else:
+        tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
     return {
         "candidates": len(candidates),
         "tied": tied,
-        "distance_ranked": not any(in_requested_band(e, need) for e in candidates),
+        "distance_ranked": distance_ranked,
     }
 
 
@@ -3553,6 +3561,7 @@ UNIT_DIR="${4:-/etc/systemd/system}"
 # Overridable so this script can be exercised without writing to system paths.
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 PROFILE_DIR="${PROFILE_DIR:-/etc/profile.d}"
+LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
 
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
@@ -3596,6 +3605,25 @@ unset _osr_dir
 export PATH
 PROFILEEOF
 chmod 0644 "${PROFILE_DIR}/ollama-router-path.sh"
+
+# The router's decision log already uses Python's RotatingFileHandler, but keep
+# an OS-level policy too so an operator override under /var/log/ollama-router
+# cannot grow forever. copytruncate keeps the running process on the same inode.
+install -d -m 0755 "$LOGROTATE_DIR"
+cat > "${LOGROTATE_DIR}/ollama-smart-router" <<'LOGROTATEEOF'
+/var/log/ollama-router/*.jsonl {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 ollama-router ollama-router
+}
+LOGROTATEEOF
+chmod 0644 "${LOGROTATE_DIR}/ollama-smart-router"
 
 missing=""
 # copy_required <src> <dest> [install-args...] -- absence is fatal.
@@ -4099,9 +4127,15 @@ cmd_routing_stats() {
   local limit="" want_class="" as_json=false
   while (( $# )); do
     case "${1-}" in
-      --file)  file="${2-}"; shift 2 ;;
-      --last)  limit="${2-}"; shift 2 ;;
-      --class) want_class="${2-}"; shift 2 ;;
+      --file)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
+        file="$2"; shift 2 ;;
+      --last)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
+        limit="$2"; shift 2 ;;
+      --class)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
+        want_class="$2"; shift 2 ;;
       --json)  as_json=true; shift ;;
       "")      shift ;;
       *)       die "routing-stats: unknown argument '$1'" ;;

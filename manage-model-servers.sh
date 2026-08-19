@@ -452,9 +452,15 @@ cmd_routing_stats() {
   local limit="" want_class="" as_json=false
   while (( $# )); do
     case "${1-}" in
-      --file)  file="${2-}"; shift 2 ;;
-      --last)  limit="${2-}"; shift 2 ;;
-      --class) want_class="${2-}"; shift 2 ;;
+      --file)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
+        file="$2"; shift 2 ;;
+      --last)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
+        limit="$2"; shift 2 ;;
+      --class)
+        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
+        want_class="$2"; shift 2 ;;
       --json)  as_json=true; shift ;;
       "")      shift ;;
       *)       die "routing-stats: unknown argument '$1'" ;;
