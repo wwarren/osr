@@ -69,6 +69,41 @@ OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.11.0}"
 # commit rather than by editing the environment.
 LITELLM_LOG="${LITELLM_LOG:-ERROR}"
 OPENWEBUI_LOG_LEVEL="${OPENWEBUI_LOG_LEVEL:-INFO}"
+
+# --- TLS ----------------------------------------------------------------------
+# nginx terminates TLS on the SAME ports the services used to serve plainly
+# (8080 for the UI, 8000 for the API), and the applications move to loopback.
+# Keeping the public ports means existing bookmarks, API base URLs and firewall
+# rules keep working -- only the scheme changes.
+#
+# Open WebUI cannot do this itself: `open-webui serve` passes only host and port
+# to uvicorn and exposes no --ssl-* options, which is why its own documentation
+# recommends a reverse proxy.
+TLS_ENABLED="${TLS_ENABLED:-true}"
+TLS_DIR="${TLS_DIR:-/app/tls}"
+TLS_CERT_DAYS="${TLS_CERT_DAYS:-3650}"
+# Extra names to put in subjectAltName, comma separated. The container IP, its
+# hostname and localhost are always included. Add a DNS name here if you reach
+# the box by one -- a certificate without it will fail hostname verification
+# for every client that checks, which is most of them.
+TLS_EXTRA_SAN="${TLS_EXTRA_SAN:-}"
+TLS_KEY_BITS="${TLS_KEY_BITS:-4096}"
+# Loopback ports the applications move to once nginx owns the public ones.
+OPENWEBUI_INTERNAL_PORT="${OPENWEBUI_INTERNAL_PORT:-8088}"
+ROUTER_INTERNAL_PORT="${ROUTER_INTERNAL_PORT:-8010}"
+
+# Resolve where each application actually binds, and what a browser will see.
+# With TLS off, everything stays exactly where it was — this whole feature is
+# then a no-op, which is what makes TLS_ENABLED=false a safe escape hatch.
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  OPENWEBUI_BIND_HOST="127.0.0.1"; OPENWEBUI_BIND_PORT="$OPENWEBUI_INTERNAL_PORT"
+  ROUTER_BIND_HOST="127.0.0.1";    ROUTER_BIND_PORT="$ROUTER_INTERNAL_PORT"
+  URL_SCHEME="https"
+else
+  OPENWEBUI_BIND_HOST="0.0.0.0";   OPENWEBUI_BIND_PORT="$OPENWEBUI_PORT"
+  ROUTER_BIND_HOST="0.0.0.0";      ROUTER_BIND_PORT="8000"
+  URL_SCHEME="http"
+fi
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-ant-hp-nfs-backups}"
@@ -1010,6 +1045,81 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
+# --- TLS certificate ----------------------------------------------------------
+# Build the subjectAltName list. A self-signed certificate with no SAN is
+# rejected outright by every current browser -- CN alone has not been accepted
+# since Chrome 58 -- so this is not decoration. IP addresses have to go in as
+# IP: entries, not DNS:, or connecting by address still fails.
+tls_san_list() {
+  local ip="$1" host="$2" extra="${3:-}" entry
+  local -a names=() ips=() out=()
+
+  # NOTE: no `local IFS=,` here. An earlier version set it to split $extra and
+  # left it set, so the `${out[*]}` dedup check below joined with commas instead
+  # of spaces and every duplicate slipped through. Splitting is done with tr and
+  # a read loop instead, which cannot leak into the rest of the function.
+  [[ -n "$host" ]] && names+=("$host")
+  names+=("localhost")
+  [[ -n "$ip" ]] && ips+=("$ip")
+  ips+=("127.0.0.1")
+
+  # An operator-supplied name may be either kind; sort it by shape rather than
+  # asking, since getting this wrong stays silent until a client refuses to
+  # connect.
+  # `|| [[ -n "$entry" ]]` is load-bearing: tr leaves no newline after the last
+  # field, and a bare `read` returns non-zero on it and drops it. Without this
+  # the LAST name in TLS_EXTRA_SAN silently never reaches the certificate --
+  # and a single-entry list is entirely last, so it did nothing at all.
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+    [[ -n "$entry" ]] || continue
+    if [[ "$entry" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then ips+=("$entry")
+    else names+=("$entry"); fi
+  done < <(printf '%s' "$extra" | tr ',' '\n')
+
+  # Deduplicate, keeping order: the first DNS entry is what most tools display,
+  # and that should be the name the operator actually types.
+  local candidate seen
+  for candidate in "${names[@]/#/DNS:}" "${ips[@]/#/IP:}"; do
+    seen=false
+    for entry in ${out[@]+"${out[@]}"}; do
+      [[ "$entry" == "$candidate" ]] && { seen=true; break; }
+    done
+    $seen || out+=("$candidate")
+  done
+  (IFS=,; printf '%s' "${out[*]}")
+}
+
+# Generate the key and certificate INSIDE the container, so the private key is
+# never written to the Proxmox host's filesystem or passed on a command line.
+generate_tls_cert() {
+  local ip="$1" host="$2" san
+  san="$(tls_san_list "$ip" "$host" "$TLS_EXTRA_SAN")"
+  echo "Generating a self-signed certificate (${TLS_CERT_DAYS} days)."
+  echo "  subjectAltName: ${san}"
+  run_ct install -d -m 0750 -o root -g ollama-router "$TLS_DIR"
+  # -nodes: no passphrase, because nginx must start unattended at boot.
+  # -addext subjectAltName: one shot, no openssl.cnf to template.
+  if ! run_ct openssl req -x509 -newkey "rsa:${TLS_KEY_BITS}" -sha256 \
+        -days "$TLS_CERT_DAYS" -nodes \
+        -keyout "${TLS_DIR}/server.key" -out "${TLS_DIR}/server.crt" \
+        -subj "/CN=${host:-ollama-smart-router}/O=ollama-smart-router" \
+        -addext "subjectAltName=${san}" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+        -addext "extendedKeyUsage=serverAuth"; then
+    echo "ERROR: could not generate the TLS certificate." >&2
+    return 1
+  fi
+  # nginx reads both as root before dropping privileges, so the key never needs
+  # to be group- or world-readable.
+  run_ct chmod 0600 "${TLS_DIR}/server.key"
+  run_ct chmod 0644 "${TLS_DIR}/server.crt"
+  run_ct chown root:root "${TLS_DIR}/server.key" "${TLS_DIR}/server.crt"
+  echo "  ${TLS_DIR}/server.crt"
+  return 0
+}
+
 # --- Open WebUI first-start handling -------------------------------------------
 # Open WebUI's own first run creates its SQLite schema and then runs alembic
 # over it. On this platform that combination fails on a BRAND NEW database:
@@ -1029,6 +1139,7 @@ run_ct() { pct exec "$CT_ID" -- "$@"; }
 # about. It is bounded: one reset, one retry, and the evidence is printed.
 OPENWEBUI_OK=true
 OPENWEBUI_RESET=false
+TLS_OK=true
 
 # Does anything inside the container listen on this TCP port?
 ct_port_listening() {
@@ -1086,14 +1197,26 @@ openwebui_reset_db() {
   return 0
 }
 
+# A listening socket is not a working endpoint. `openssl s_client` completes a
+# real handshake and reports the certificate, which is the only check that
+# distinguishes "nginx is up" from "nginx is up and serving the cert we made".
+ct_tls_ok() {
+  local port="$1"
+  run_ct bash -c "printf 'HEAD / HTTP/1.0\r\n\r\n' | timeout 10 openssl s_client -quiet -verify_quiet \
+      -connect 127.0.0.1:${port} -servername localhost >/dev/null 2>&1"
+}
+
 start_openwebui_verified() {
   local rc
   echo "Starting Open WebUI (first start runs migrations and downloads an"
   echo "embedding model — this takes several minutes)."
   run_ct systemctl start open-webui.service || true
-  ct_wait_for_port "$OPENWEBUI_PORT" 600 open-webui.service; rc=$?
+  # Wait on the port Open WebUI ITSELF binds, not the public one. With TLS on,
+  # nginx is already listening on the public port, so waiting there would
+  # report success the instant provisioning started.
+  ct_wait_for_port "$OPENWEBUI_BIND_PORT" 600 open-webui.service; rc=$?
   if (( rc == 0 )); then
-    echo "  Open WebUI is listening on ${OPENWEBUI_PORT}."
+    echo "  Open WebUI is listening on ${OPENWEBUI_BIND_PORT}."
     return 0
   fi
 
@@ -1104,14 +1227,14 @@ start_openwebui_verified() {
     openwebui_reset_db || return 1
     OPENWEBUI_RESET=true
     run_ct systemctl start open-webui.service || true
-    ct_wait_for_port "$OPENWEBUI_PORT" 600 open-webui.service; rc=$?
+    ct_wait_for_port "$OPENWEBUI_BIND_PORT" 600 open-webui.service; rc=$?
     if (( rc == 0 )); then
-      echo "  Open WebUI is listening on ${OPENWEBUI_PORT} after the retry."
+      echo "  Open WebUI is listening on ${OPENWEBUI_BIND_PORT} after the retry."
       return 0
     fi
   fi
 
-  echo "WARNING: Open WebUI did not come up on port ${OPENWEBUI_PORT}." >&2
+  echo "WARNING: Open WebUI did not come up on port ${OPENWEBUI_BIND_PORT}." >&2
   echo "         The rest of the system is unaffected — the API on :8000 works" >&2
   echo "         without it. Last 30 log lines:" >&2
   run_ct journalctl -u open-webui -n 30 --no-pager 2>/dev/null | sed 's/^/         /' >&2
@@ -1629,7 +1752,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate iproute2
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate iproute2 openssl nginx
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -1672,6 +1795,8 @@ MATTERMOST_WEBHOOK_URL=${MATTERMOST_WEBHOOK_URL}
 MATTERMOST_MONITOR_USER=${MATTERMOST_MONITOR_USER}
 MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL}
 MATTERMOST_VERIFY_TLS=${MATTERMOST_VERIFY_TLS}
+ROUTER_BIND_HOST=${ROUTER_BIND_HOST}
+ROUTER_BIND_PORT=${ROUTER_BIND_PORT}
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
 LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
@@ -2830,7 +2955,12 @@ async def proxy_openai(path: str, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Loopback by default when nginx fronts us: the public port belongs to the
+    # proxy, and a second listener on 0.0.0.0 would quietly serve the same API
+    # without TLS.
+    uvicorn.run(app,
+                host=os.getenv("ROUTER_BIND_HOST", "0.0.0.0"),
+                port=int(os.getenv("ROUTER_BIND_PORT", "8000")))
 PYEOF
 
 # --- monitor.py (probes each Ollama backend directly) ---
@@ -3456,6 +3586,10 @@ YAMLEOF
 } > "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 
 # --- Open WebUI environment ---
+# Only computable here: IP_CIDR is not final until the prompts have run.
+ROUTER_IP="${IP_CIDR%/*}"
+WEBUI_PUBLIC_URL="${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
+
 # Open WebUI talks to the *complexity router* (port 8000) as an OpenAI-
 # compatible backend, so chats are smart-routed by prompt complexity. The
 # router proxies /v1/models through to LiteLLM so the model list still
@@ -3465,10 +3599,14 @@ YAMLEOF
 # instead, point OPENAI_API_BASE_URLS at http://127.0.0.1:4000/v1 (LiteLLM
 # direct). Router/LiteLLM have no master key, so the API key is a placeholder.
 cat > "${REPO_DIR}/env/openwebui.env" <<EOF
-HOST=0.0.0.0
-PORT=${OPENWEBUI_PORT}
+HOST=${OPENWEBUI_BIND_HOST}
+PORT=${OPENWEBUI_BIND_PORT}
 DATA_DIR=/app/openwebui/data
-OPENAI_API_BASE_URLS=http://127.0.0.1:8000/v1
+OPENAI_API_BASE_URLS=http://127.0.0.1:${ROUTER_BIND_PORT}/v1
+# The public origin, as a browser sees it. Open WebUI builds absolute URLs and
+# decides cookie flags from this; left unset behind a TLS proxy it emits http://
+# links and non-Secure cookies on an https:// page.
+WEBUI_URL=${WEBUI_PUBLIC_URL}
 OPENAI_API_KEYS=sk-router-local
 ENABLE_OPENAI_API=true
 ENABLE_OLLAMA_API=false
@@ -3483,6 +3621,98 @@ SENTENCE_TRANSFORMERS_HOME=/app/openwebui/cache
 GLOBAL_LOG_LEVEL=${OPENWEBUI_LOG_LEVEL}
 EOF
 
+
+# --- nginx TLS front end ---
+# nginx owns the two public ports and proxies to the loopback applications.
+# Everything here is in the config repo, so the TLS front end changes by commit
+# like the rest of the system. The certificate itself is NOT: a private key does
+# not belong in git, so it lives only in ${TLS_DIR} inside the container.
+mkdir -p "${REPO_DIR}/services/nginx-tls"
+cat > "${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf" <<NGINXEOF
+# Managed by ollama-smart-router. Installed to /etc/nginx/conf.d/ by
+# install/apply-config.sh; edit it in the repo, not in place.
+
+# Shared proxy behaviour. Two things here are not optional:
+#   - the Upgrade/Connection pair, without which Open WebUI's socket.io falls
+#     back to long-polling and chat feels broken rather than fails outright;
+#   - proxy_buffering off, without which nginx holds the SSE token stream until
+#     a buffer fills and replies arrive in bursts instead of word by word.
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    # IPv4 only, deliberately. A `listen [::]` line in a container whose
+    # network has no IPv6 makes nginx fail with "Address family not supported"
+    # and refuse to start at all -- and nginx not starting means no UI, which
+    # is a far worse outcome than no IPv6. The installer only ever configures
+    # an IPv4 address (IP_CIDR), so this matches what the container has.
+    listen ${OPENWEBUI_PORT} ssl;
+    server_name _;
+    # No HTTP/2. WebSocket upgrade is an HTTP/1.1 mechanism, which is what Open
+    # WebUI's socket.io needs, and "http2 on" only exists from nginx 1.25.1 --
+    # on anything older the whole file is rejected and the front end never
+    # reloads. Nothing here benefits enough from h2 to be worth that.
+
+    ssl_certificate     ${TLS_DIR}/server.crt;
+    ssl_certificate_key ${TLS_DIR}/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Model output is generated slowly; a default 60s read timeout cuts long
+    # answers off mid-sentence.
+    proxy_read_timeout  1h;
+    proxy_send_timeout  1h;
+    # Uploads for RAG. Open WebUI's own limit is what should reject a file,
+    # not an nginx 413.
+    client_max_body_size 200m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${OPENWEBUI_INTERNAL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Port  \$server_port;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
+
+server {
+    listen 8000 ssl;
+    server_name _;
+
+    ssl_certificate     ${TLS_DIR}/server.crt;
+    ssl_certificate_key ${TLS_DIR}/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    proxy_read_timeout  1h;
+    proxy_send_timeout  1h;
+    client_max_body_size 200m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${ROUTER_INTERNAL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        # Token streaming again: an OpenAI client reading a stream must get
+        # each chunk as it is produced.
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
+NGINXEOF
 
 # --- per-service requirements (each venv is built from these, so dependency
 #     pins are version controlled per service) ---
@@ -3680,6 +3910,7 @@ UNIT_DIR="${4:-/etc/systemd/system}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 PROFILE_DIR="${PROFILE_DIR:-/etc/profile.d}"
 LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
+NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
@@ -3780,6 +4011,30 @@ for unit in "${REPO_DIR}"/services/*/*.service; do
   install -m 0644 "$unit" "${UNIT_DIR}/$(basename "$unit")"
 done
 
+# nginx TLS front end. Validated BEFORE it is reloaded: a bad proxy config that
+# passes `nginx -t` is a bug, but one that fails it must not take the running
+# front end down with it, because that is the only way in to the UI.
+nginx_site="${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf"
+if [ -f "$nginx_site" ]; then
+  install -d -m 0755 "$NGINX_CONF_DIR"
+  install -m 0644 "$nginx_site" "${NGINX_CONF_DIR}/ollama-smart-router.conf"
+  # Only talk to nginx when the file actually landed where nginx reads from.
+  # `nginx -t` validates the WHOLE system configuration, so with NGINX_CONF_DIR
+  # pointed elsewhere (a test, a staging copy) it would be reporting on a file
+  # this script did not write -- and failing the apply over it.
+  if [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] && command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+    else
+      # Never fatal: a broken proxy config must not abort an apply that has
+      # already put the application config in place.
+      echo "WARNING: nginx rejected the configuration; leaving the running" >&2
+      echo "         front end untouched. Details:" >&2
+      nginx -t 2>&1 | sed 's/^/         /' >&2 || true
+    fi
+  fi
+fi
+
 if [ -n "$missing" ]; then
   echo "WARNING: not in the repo, left at previous/default values: ${missing}" >&2
 fi
@@ -3816,6 +4071,7 @@ ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
+TLS_DIR="${TLS_DIR:-/app/tls}"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
@@ -3843,6 +4099,10 @@ Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
+  cert [show|renew] [--days n] [--san a,b]
+                             Show, or regenerate, the self-signed TLS
+                             certificate nginx serves. 'renew' keeps the
+                             existing subjectAltName unless --san is given
   routing-stats [--last n] [--class c] [--file f] [--json]
                              Summarise the router's decision log: what each
                              request was classified as, which model answered,
@@ -4392,6 +4652,114 @@ if modes.get("litellm"):
     print()
     print("    %d request(s) took the LiteLLM fallback path" % modes["litellm"])
 ' "$file" "${limit:-0}" "$want_class" "$as_json"
+}
+
+cmd_cert() {
+  local action="${1:-show}" days="" san=""
+  shift || true
+  while (( $# )); do
+    case "${1-}" in
+      --days) days="${2-}"; shift 2 ;;
+      --san)  san="${2-}";  shift 2 ;;
+      "")     shift ;;
+      *)      die "cert: unknown argument '$1'" ;;
+    esac
+  done
+  [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || die "cert: --days takes a number"
+
+  local crt="${TLS_DIR}/server.crt" key="${TLS_DIR}/server.key"
+  case "$action" in
+    show)
+      if [[ ! -r "$crt" ]]; then
+        note "No certificate at ${crt}."
+        note "  TLS is off, or this container predates it. Generate one with:"
+        note "    $0 cert renew"
+        return 1
+      fi
+      echo "Certificate: ${crt}"
+      openssl x509 -in "$crt" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
+      echo "  subjectAltName:"
+      openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+        | grep -v 'X509v3 Subject Alternative Name' | sed 's/^ */    /'
+      echo "  fingerprint:"
+      openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^/    /'
+      # A certificate that expires next week is worth saying out loud rather
+      # than leaving in a date field to be read.
+      if openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+        if ! openssl x509 -in "$crt" -noout -checkend 2592000 >/dev/null 2>&1; then
+          note "  WARNING: expires within 30 days. Renew with:  $0 cert renew"
+        fi
+      else
+        note "  WARNING: this certificate has EXPIRED. Renew with:  $0 cert renew"
+      fi
+      [[ -r "$key" ]] || note "  WARNING: the private key ${key} is missing or unreadable."
+      ;;
+    renew)
+      local ip host names
+      ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      host="$(hostname 2>/dev/null)"
+      days="${days:-3650}"
+      # Carry the existing SANs forward unless new ones are given, so renewing
+      # never silently narrows the certificate and breaks a client that was
+      # reaching the box by a name someone added months ago.
+      if [[ -z "$san" && -r "$crt" ]]; then
+        names="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+          | grep -oE '(DNS|IP Address):[^,]+' | sed 's/IP Address:/IP:/' | paste -sd, -)"
+      fi
+      if [[ -n "$san" ]]; then
+        local part
+        names=""
+        # Same trap as tls_san_list: tr leaves the last field without a
+        # newline, and a bare read discards it. A one-name --san would
+        # otherwise be dropped entirely.
+        while IFS= read -r part || [[ -n "$part" ]]; do
+          part="$(printf '%s' "$part" | tr -d '[:space:]')"
+          [[ -n "$part" ]] || continue
+          if [[ "$part" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then part="IP:${part}"
+          else part="DNS:${part}"; fi
+          names="${names}${names:+,}${part}"
+        done < <(printf '%s' "$san" | tr ',' '\n')
+        [[ -n "$ip" ]]   && names="${names},IP:${ip}"
+        [[ -n "$host" ]] && names="DNS:${host},${names}"
+        names="${names},DNS:localhost,IP:127.0.0.1"
+      fi
+      [[ -n "$names" ]] || names="DNS:${host:-ollama-smart-router},DNS:localhost,IP:${ip:-127.0.0.1},IP:127.0.0.1"
+      echo "Renewing the self-signed certificate (${days} days)."
+      echo "  subjectAltName: ${names}"
+      $DRY_RUN && { echo "  [dry-run] nothing written"; return 0; }
+      confirm "Replace ${crt}?" || { note "Aborted."; return 1; }
+      install -d -m 0750 "$TLS_DIR"
+      # Write to a temp pair and swap only once openssl has succeeded: a failed
+      # renewal must not leave nginx with a key that no longer matches the cert.
+      local tmpk tmpc
+      tmpk="$(mktemp "${TLS_DIR}/.key.XXXXXX")"; tmpc="$(mktemp "${TLS_DIR}/.crt.XXXXXX")"
+      if ! openssl req -x509 -newkey rsa:4096 -sha256 -days "$days" -nodes \
+            -keyout "$tmpk" -out "$tmpc" \
+            -subj "/CN=${host:-ollama-smart-router}/O=ollama-smart-router" \
+            -addext "subjectAltName=${names}" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
+        rm -f "$tmpk" "$tmpc"
+        die "openssl could not generate the certificate"
+      fi
+      mv "$tmpk" "$key"; mv "$tmpc" "$crt"
+      chmod 0600 "$key"; chmod 0644 "$crt"
+      echo "  wrote ${crt}"
+      if command -v nginx >/dev/null 2>&1; then
+        if nginx -t >/dev/null 2>&1; then
+          systemctl reload nginx >/dev/null 2>&1 && echo "  nginx reloaded"
+        else
+          note "  nginx rejected its configuration; not reloading:"
+          nginx -t 2>&1 | sed 's/^/    /' >&2
+        fi
+      fi
+      note "  Clients that trusted the old certificate must trust this one."
+      ;;
+    *)
+      die "cert: expected 'show' or 'renew', got '${action}'"
+      ;;
+  esac
 }
 
 cmd_add() {
@@ -5344,6 +5712,10 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
     # routing-stats' own flags, passed through for the same reason.
+    --days|--san)
+      [[ "$COMMAND" == "cert" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
     --last|--class|--file)
       [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
       (( $# >= 2 )) || die "$1 needs a value"
@@ -5367,6 +5739,7 @@ case "$COMMAND" in
   list)     cmd_list false ;;
   status)   cmd_list true ;;
   discover) cmd_discover ;;
+  cert) cmd_cert ${ARGS[@]+"${ARGS[@]}"} ;;
   routing-stats) cmd_routing_stats ${ARGS[@]+"${ARGS[@]}"} ;;
   add)      cmd_add "${ARGS[@]:-}" ;;
   remove)   cmd_remove "${ARGS[@]:-}" ;;
@@ -5657,8 +6030,8 @@ cat > "$motd_tmp" <<EOF
 
   SERVICES
   ---------------------------------------------------------------------------
-   Open WebUI (chat UI)       http://${ROUTER_IP}:${OPENWEBUI_PORT}        [open-webui.service]
-   Smart Router (OpenAI API)  http://${ROUTER_IP}:8000/v1     [ollama-router.service]
+   Open WebUI (chat UI)       ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}        [open-webui.service]
+   Smart Router (OpenAI API)  ${URL_SCHEME}://${ROUTER_IP}:8000/v1     [ollama-router.service]
    LiteLLM proxy              http://127.0.0.1:4000  (local)  [litellm-proxy.service]
    Health monitor             Mattermost alerts               [ollama-monitor.service]
 
@@ -5693,6 +6066,26 @@ EOF
 pct push "$CT_ID" "$motd_tmp" /etc/motd --perms 0644
 rm -f "$motd_tmp"
 
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  echo "Configuring TLS."
+  if generate_tls_cert "$ROUTER_IP" "$CT_NAME"; then
+    # Debian's stock site listens on :80 and would answer for anything the
+    # config repo does not claim. Nothing here serves plain HTTP, so remove it.
+    run_ct rm -f /etc/nginx/sites-enabled/default
+    if run_ct nginx -t >/dev/null 2>&1; then
+      run_ct systemctl enable --now nginx >/dev/null 2>&1 || true
+      run_ct systemctl reload nginx >/dev/null 2>&1 || run_ct systemctl restart nginx >/dev/null 2>&1 || true
+      echo "  nginx is terminating TLS on ${OPENWEBUI_PORT} (UI) and 8000 (API)."
+    else
+      echo "WARNING: nginx rejected the generated configuration:" >&2
+      run_ct nginx -t 2>&1 | sed 's/^/         /' >&2
+      TLS_OK=false
+    fi
+  else
+    TLS_OK=false
+  fi
+fi
+
 echo "Starting services."
 run_ct systemctl daemon-reload
 # Enable all four, but start Open WebUI SEPARATELY below. Its first start runs
@@ -5716,18 +6109,27 @@ echo "==========================================================================
 # `systemctl enable --now` on a Type=simple unit succeeds the moment the
 # process is forked -- long before it has failed.
 report_services() {
-  local unit state ok=true
+  local unit state ok=true units=(litellm-proxy ollama-router ollama-monitor open-webui)
+  [[ "$TLS_ENABLED" == "true" ]] && units+=(nginx)
   echo "Service status:"
-  for unit in litellm-proxy ollama-router ollama-monitor open-webui; do
+  for unit in "${units[@]}"; do
     state="$(run_ct systemctl is-active "${unit}.service" 2>/dev/null || true)"
     printf '  %-16s %s\n' "$unit" "${state:-unknown}"
     [[ "$state" == "active" ]] || ok=false
   done
   for pair in "8000:router API" "${OPENWEBUI_PORT}:Open WebUI"; do
-    if ct_port_listening "${pair%%:*}"; then
-      printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
-    else
+    if ! ct_port_listening "${pair%%:*}"; then
       printf '  %-16s NOT listening on %s\n' "${pair#*:}" "${pair%%:*}"
+      ok=false
+    elif [[ "$TLS_ENABLED" != "true" ]]; then
+      printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
+    elif ct_tls_ok "${pair%%:*}"; then
+      printf '  %-16s TLS ok on %s\n' "${pair#*:}" "${pair%%:*}"
+    else
+      # Listening but not completing a handshake is a different fault from not
+      # listening at all, and needs saying differently.
+      printf '  %-16s listening on %s but the TLS handshake FAILED\n' \
+        "${pair#*:}" "${pair%%:*}"
       ok=false
     fi
   done
@@ -5740,8 +6142,8 @@ echo "==========================================================================
 echo "Provisioning complete."
 echo "Container ID: ${CT_ID}"
 echo "Service IP: ${ROUTER_IP}"
-echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
-echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"
+echo "OpenAI-compatible API base URL: ${URL_SCHEME}://${ROUTER_IP}:8000/v1"
+echo "Open WebUI (chat UI):          ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to the router."
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
 if [[ "$CONFIG_SOURCE" == "repo" ]]; then
@@ -5755,6 +6157,18 @@ if $OPENWEBUI_RESET; then
   echo "      reset once, automatically. The broken copy is kept beside it as"
   echo "      /app/openwebui/data/webui.db.broken-<timestamp>; delete it when you"
   echo "      are satisfied the UI works."
+fi
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  echo
+  echo "TLS: self-signed certificate at ${TLS_DIR}/server.crt, valid ${TLS_CERT_DAYS} days."
+  echo "     Browsers will warn until you trust it. To fetch a copy:"
+  echo "       pct pull ${CT_ID} ${TLS_DIR}/server.crt ollama-router.crt"
+  echo "     For API clients:  export SSL_CERT_FILE=/path/to/ollama-router.crt"
+  echo "     Inspect or replace it with:  manage-model-servers cert"
+fi
+if ! $TLS_OK; then
+  echo
+  echo "WARNING: TLS setup did not complete. See the messages above." >&2
 fi
 if ! $OPENWEBUI_OK; then
   echo

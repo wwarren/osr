@@ -23,6 +23,7 @@ ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
+TLS_DIR="${TLS_DIR:-/app/tls}"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
@@ -50,6 +51,10 @@ Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
+  cert [show|renew] [--days n] [--san a,b]
+                             Show, or regenerate, the self-signed TLS
+                             certificate nginx serves. 'renew' keeps the
+                             existing subjectAltName unless --san is given
   routing-stats [--last n] [--class c] [--file f] [--json]
                              Summarise the router's decision log: what each
                              request was classified as, which model answered,
@@ -452,15 +457,9 @@ cmd_routing_stats() {
   local limit="" want_class="" as_json=false
   while (( $# )); do
     case "${1-}" in
-      --file)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --file needs a value"
-        file="$2"; shift 2 ;;
-      --last)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --last needs a value"
-        limit="$2"; shift 2 ;;
-      --class)
-        [[ $# -ge 2 && -n "${2-}" ]] || die "routing-stats: --class needs a value"
-        want_class="$2"; shift 2 ;;
+      --file)  file="${2-}"; shift 2 ;;
+      --last)  limit="${2-}"; shift 2 ;;
+      --class) want_class="${2-}"; shift 2 ;;
       --json)  as_json=true; shift ;;
       "")      shift ;;
       *)       die "routing-stats: unknown argument '$1'" ;;
@@ -605,6 +604,114 @@ if modes.get("litellm"):
     print()
     print("    %d request(s) took the LiteLLM fallback path" % modes["litellm"])
 ' "$file" "${limit:-0}" "$want_class" "$as_json"
+}
+
+cmd_cert() {
+  local action="${1:-show}" days="" san=""
+  shift || true
+  while (( $# )); do
+    case "${1-}" in
+      --days) days="${2-}"; shift 2 ;;
+      --san)  san="${2-}";  shift 2 ;;
+      "")     shift ;;
+      *)      die "cert: unknown argument '$1'" ;;
+    esac
+  done
+  [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || die "cert: --days takes a number"
+
+  local crt="${TLS_DIR}/server.crt" key="${TLS_DIR}/server.key"
+  case "$action" in
+    show)
+      if [[ ! -r "$crt" ]]; then
+        note "No certificate at ${crt}."
+        note "  TLS is off, or this container predates it. Generate one with:"
+        note "    $0 cert renew"
+        return 1
+      fi
+      echo "Certificate: ${crt}"
+      openssl x509 -in "$crt" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
+      echo "  subjectAltName:"
+      openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+        | grep -v 'X509v3 Subject Alternative Name' | sed 's/^ */    /'
+      echo "  fingerprint:"
+      openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^/    /'
+      # A certificate that expires next week is worth saying out loud rather
+      # than leaving in a date field to be read.
+      if openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+        if ! openssl x509 -in "$crt" -noout -checkend 2592000 >/dev/null 2>&1; then
+          note "  WARNING: expires within 30 days. Renew with:  $0 cert renew"
+        fi
+      else
+        note "  WARNING: this certificate has EXPIRED. Renew with:  $0 cert renew"
+      fi
+      [[ -r "$key" ]] || note "  WARNING: the private key ${key} is missing or unreadable."
+      ;;
+    renew)
+      local ip host names
+      ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      host="$(hostname 2>/dev/null)"
+      days="${days:-3650}"
+      # Carry the existing SANs forward unless new ones are given, so renewing
+      # never silently narrows the certificate and breaks a client that was
+      # reaching the box by a name someone added months ago.
+      if [[ -z "$san" && -r "$crt" ]]; then
+        names="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+          | grep -oE '(DNS|IP Address):[^,]+' | sed 's/IP Address:/IP:/' | paste -sd, -)"
+      fi
+      if [[ -n "$san" ]]; then
+        local part
+        names=""
+        # Same trap as tls_san_list: tr leaves the last field without a
+        # newline, and a bare read discards it. A one-name --san would
+        # otherwise be dropped entirely.
+        while IFS= read -r part || [[ -n "$part" ]]; do
+          part="$(printf '%s' "$part" | tr -d '[:space:]')"
+          [[ -n "$part" ]] || continue
+          if [[ "$part" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then part="IP:${part}"
+          else part="DNS:${part}"; fi
+          names="${names}${names:+,}${part}"
+        done < <(printf '%s' "$san" | tr ',' '\n')
+        [[ -n "$ip" ]]   && names="${names},IP:${ip}"
+        [[ -n "$host" ]] && names="DNS:${host},${names}"
+        names="${names},DNS:localhost,IP:127.0.0.1"
+      fi
+      [[ -n "$names" ]] || names="DNS:${host:-ollama-smart-router},DNS:localhost,IP:${ip:-127.0.0.1},IP:127.0.0.1"
+      echo "Renewing the self-signed certificate (${days} days)."
+      echo "  subjectAltName: ${names}"
+      $DRY_RUN && { echo "  [dry-run] nothing written"; return 0; }
+      confirm "Replace ${crt}?" || { note "Aborted."; return 1; }
+      install -d -m 0750 "$TLS_DIR"
+      # Write to a temp pair and swap only once openssl has succeeded: a failed
+      # renewal must not leave nginx with a key that no longer matches the cert.
+      local tmpk tmpc
+      tmpk="$(mktemp "${TLS_DIR}/.key.XXXXXX")"; tmpc="$(mktemp "${TLS_DIR}/.crt.XXXXXX")"
+      if ! openssl req -x509 -newkey rsa:4096 -sha256 -days "$days" -nodes \
+            -keyout "$tmpk" -out "$tmpc" \
+            -subj "/CN=${host:-ollama-smart-router}/O=ollama-smart-router" \
+            -addext "subjectAltName=${names}" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
+        rm -f "$tmpk" "$tmpc"
+        die "openssl could not generate the certificate"
+      fi
+      mv "$tmpk" "$key"; mv "$tmpc" "$crt"
+      chmod 0600 "$key"; chmod 0644 "$crt"
+      echo "  wrote ${crt}"
+      if command -v nginx >/dev/null 2>&1; then
+        if nginx -t >/dev/null 2>&1; then
+          systemctl reload nginx >/dev/null 2>&1 && echo "  nginx reloaded"
+        else
+          note "  nginx rejected its configuration; not reloading:"
+          nginx -t 2>&1 | sed 's/^/    /' >&2
+        fi
+      fi
+      note "  Clients that trusted the old certificate must trust this one."
+      ;;
+    *)
+      die "cert: expected 'show' or 'renew', got '${action}'"
+      ;;
+  esac
 }
 
 cmd_add() {
@@ -1557,6 +1664,10 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
     # routing-stats' own flags, passed through for the same reason.
+    --days|--san)
+      [[ "$COMMAND" == "cert" ]] || die "unknown option: $1"
+      (( $# >= 2 )) || die "$1 needs a value"
+      ARGS+=("$1" "$2"); shift 2 ;;
     --last|--class|--file)
       [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
       (( $# >= 2 )) || die "$1 needs a value"
@@ -1580,6 +1691,7 @@ case "$COMMAND" in
   list)     cmd_list false ;;
   status)   cmd_list true ;;
   discover) cmd_discover ;;
+  cert) cmd_cert ${ARGS[@]+"${ARGS[@]}"} ;;
   routing-stats) cmd_routing_stats ${ARGS[@]+"${ARGS[@]}"} ;;
   add)      cmd_add "${ARGS[@]:-}" ;;
   remove)   cmd_remove "${ARGS[@]:-}" ;;
