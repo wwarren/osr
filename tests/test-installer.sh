@@ -926,6 +926,51 @@ assert_status "a missing required file aborts" 1 \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
 
+# ── the generated systemd units ───────────────────────────────────────────────
+# Also not functions. These assertions exist because of a real outage: every
+# unit used Requires= on its upstream, and Requires= propagates stop/restart.
+# A crash-looping litellm-proxy therefore stopped ollama-router, which stopped
+# open-webui — nine seconds into its first-ever start, part way through the
+# alembic migration. webui.db was left with the new column added but the
+# revision unstamped, so every subsequent start failed with
+# "duplicate column name: info_json" and the UI never came back.
+describe systemd_units
+_units="$(mktemp -d)"
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  sed -n "/^cat > \"\${REPO_DIR}\/services\/[a-z-]*\/${_svc}.service\" <<'UNITEOF'\$/,/^UNITEOF\$/p" \
+    "$SCRIPT" | sed '1d;$d' > "${_units}/${_svc}.service"
+  assert_ok "extracts ${_svc}.service" bash -c "[[ -s '${_units}/${_svc}.service' ]]"
+done
+
+# The rule: ordering yes, propagation no.
+for _svc in ollama-router ollama-monitor open-webui; do
+  assert_not_contains "${_svc} does not use Requires=" \
+    "Requires=" "$(grep -v '^#' "${_units}/${_svc}.service")"
+done
+assert_file_contains "open-webui still ORDERS after the router" \
+  "After=network-online.target ollama-router.service" "${_units}/open-webui.service"
+assert_file_contains "open-webui wants the router" \
+  "Wants=network-online.target ollama-router.service" "${_units}/open-webui.service"
+assert_file_contains "the router orders after litellm" \
+  "After=network-online.target litellm-proxy.service" "${_units}/ollama-router.service"
+
+# The long first start must survive: migrations plus an embedding-model download.
+assert_file_contains "open-webui keeps a long start timeout" \
+  "TimeoutStartSec=600" "${_units}/open-webui.service"
+# Every unit runs unprivileged and comes back on its own.
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  assert_file_contains "${_svc} runs as the service account" \
+    "User=ollama-router" "${_units}/${_svc}.service"
+  assert_file_contains "${_svc} restarts" "Restart=always" "${_units}/${_svc}.service"
+done
+# The monitor's state directory is what keeps a restart from re-announcing.
+assert_file_contains "monitor gets a state directory" \
+  "StateDirectory=ollama-monitor" "${_units}/ollama-monitor.service"
+# LiteLLM must stay off the network.
+assert_file_contains "litellm binds loopback only" \
+  "--host 127.0.0.1" "${_units}/litellm-proxy.service"
+rm -rf "$_units"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"
 summary

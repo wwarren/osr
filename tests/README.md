@@ -23,12 +23,13 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **521 assertions, 107/107 functions covered** (plus an integration
-test for the generated `apply-config.sh`, which is not a function).
+Current state: **542 assertions, 107/107 functions covered** (plus an integration
+tests for the generated `apply-config.sh` and the four systemd units, which are
+not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 56 | 272 |
+| `installer` | `ollama-smart-router-install.sh` | 56 | 293 |
 | `manage` | `manage-model-servers.sh` | 51 | 198 |
 | `monitor` | generated `monitor.py` | — | 51 |
 
@@ -162,6 +163,7 @@ bugs in this family have been found by these tests.
 | One down host posted four identical Mattermost alerts | health was keyed by `(tier, url)`, and a single-server deployment points all four tiers at the same URL |
 | A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
 | An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
+| Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | the units used `Requires=`, which propagates a stop — a crash-looping `litellm-proxy` killed `open-webui` nine seconds into its first alembic migration, leaving the schema half-applied |
 | `set-webhook --username <name>` rejected every value, including valid ones | the guard was written `(( $# >= 2 && -n "$2" ))`; inside `(( ))` that is *minus variable n* followed by a bare string, which is an arithmetic syntax error, so the test was always false |
 | `remove 1 1` refused to run against the server minimum | the same server counted twice toward `remaining_count`, so the check saw one more removal than would actually happen |
 | A second outage after a recovery was silently swallowed | the test harness saved state before `announce()` but not after, so the recovery never cleared the last-posted fingerprint — a harness bug, but the same omission in the daemon loop would lose real alerts |
