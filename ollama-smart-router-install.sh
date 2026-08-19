@@ -4706,8 +4706,12 @@ cat > "${REPO_DIR}/services/ollama-router/ollama-router.service" <<'UNITEOF'
 [Unit]
 Description=Intelligent Ollama Prompt Complexity Router Middleware
 After=network-online.target litellm-proxy.service
-Wants=network-online.target
-Requires=litellm-proxy.service
+# Wants=, deliberately NOT Requires=. LiteLLM is only the FALLBACK dispatch
+# path -- the router serves every request from its own discovery inventory and
+# does not need it to start. Requires= additionally propagates stop/restart:
+# each litellm crash-restart cycle would tear this unit down too, and through
+# open-webui's own dependency, the UI with it. See the comment on open-webui.
+Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
 User=ollama-router
@@ -4751,8 +4755,10 @@ cat > "${REPO_DIR}/services/ollama-monitor/ollama-monitor.service" <<'UNITEOF'
 [Unit]
 Description=Ollama Cluster Resilience Health Monitor
 After=network-online.target litellm-proxy.service
-Wants=network-online.target
-Requires=litellm-proxy.service
+# Wants=, not Requires=: the monitor probes the Ollama hosts directly and only
+# reads LiteLLM's health endpoint. A flapping litellm must not restart the
+# monitor -- a restart re-reads state and re-arms alerting for no reason.
+Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
 User=ollama-router
@@ -4779,8 +4785,16 @@ cat > "${REPO_DIR}/services/open-webui/open-webui.service" <<'UNITEOF'
 [Unit]
 Description=Open WebUI (chat frontend for the smart router)
 After=network-online.target ollama-router.service
-Wants=network-online.target
-Requires=ollama-router.service
+# Wants=, not Requires=. This one matters more than the others: Open WebUI runs
+# alembic migrations against data/webui.db on its FIRST start, and that start
+# takes minutes. Requires= propagates a stop, so a crash-looping litellm-proxy
+# would stop ollama-router, which would stop THIS unit mid-migration. The
+# schema is then left with the new column applied but the alembic revision not
+# stamped, and every later start dies with
+#   sqlite3.OperationalError: duplicate column name: info_json
+# from which it never recovers. The UI needs the router only when a request
+# arrives, never to boot, so an ordering-only dependency is the correct one.
+Wants=network-online.target ollama-router.service
 [Service]
 Type=simple
 User=ollama-router

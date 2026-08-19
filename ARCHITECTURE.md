@@ -111,17 +111,25 @@ flowchart TB
         end
     end
 
-    A -->|Requires| B
-    B -->|Requires| C
-    D -->|Requires| C
+    A -->|"After + Wants"| B
+    B -->|"After + Wants"| C
+    D -->|"After + Wants"| C
 ```
 
 ### Unit dependency rationale
 
-* `open-webui` **Requires** `ollama-router` — the UI's only backend is the router.
-* `ollama-router` and `ollama-monitor` **Require** `litellm-proxy` — the router
-  needs it for the fallback path, and the ordering guarantees it is present
-  before traffic arrives.
+* Every cross-service dependency is `After=` + `Wants=`, never `Requires=`.
+  Ordering is real — the UI should come up behind the router, the router behind
+  LiteLLM — but no service needs its upstream *present* in order to start. The
+  router serves from its own discovery inventory; the monitor probes the Ollama
+  hosts directly; the UI needs the router only when a request arrives.
+* This is not a style preference. `Requires=` propagates stop and restart, so a
+  crash-looping `litellm-proxy` stopped `ollama-router`, which stopped
+  `open-webui`. That is fatal on a first install: Open WebUI runs its alembic
+  migrations on first start, and being killed part way through leaves
+  `data/webui.db` with a column added but the revision unstamped. Every later
+  start then dies on `duplicate column name: info_json` and the UI never
+  returns — with a clean journal on the unit that actually failed.
 * All units are `Restart=always`. `open-webui` carries `TimeoutStartSec=600`
   because its first start downloads a local embedding model.
 

@@ -448,6 +448,46 @@ The service log is the other source of truth:
 journalctl -u ollama-monitor -n 50 --no-pager | grep -i mattermost
 ```
 
+## When Open WebUI will not start
+
+The unit reports `active` but nothing listens on 8080, and the journal shows:
+
+```
+sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) duplicate column name: info_json
+[SQL: ALTER TABLE user ADD COLUMN info_json JSON]
+```
+
+Open WebUI was killed part way through its first-ever alembic migration. The
+column got added, the revision never got stamped, so every subsequent start
+retries the same `ALTER` and fails. It cannot recover on its own.
+
+What killed it was almost always dependency propagation: units that declare
+`Requires=` are stopped when their upstream stops, so a crash-looping
+`litellm-proxy` took down `ollama-router` and the UI with it. Current units use
+`After=` + `Wants=`, which orders startup without propagating a stop.
+
+On a fresh install there is nothing to preserve, so move the database aside:
+
+```bash
+systemctl stop open-webui
+mv /app/openwebui/data/webui.db{,.broken}
+systemctl start open-webui
+journalctl -u open-webui -f        # first start takes minutes
+```
+
+On an install with real accounts, repair rather than replace — back up
+`webui.db`, then stamp the current revision with the alembic config inside the
+venv rather than deleting anything.
+
+Check the units are the current ones:
+
+```bash
+grep -l '^Requires=' /etc/systemd/system/{ollama-router,ollama-monitor,open-webui}.service
+```
+
+Any output means an old unit is still installed; re-apply from the config repo
+and `systemctl daemon-reload`.
+
 ## Operating
 
 ```
