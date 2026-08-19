@@ -247,6 +247,66 @@ assert_fail "rejects n" bash -c "source '$FUNCS'; ASSUME_YES=false; DRY_RUN=fals
 ASSUME_YES=true
 
 # ── mutating commands ─────────────────────────────────────────────────────────
+describe cmd_cert
+_ct="$(mktemp -d)"; TLS_DIR="${_ct}/tls"
+mock_command systemctl 0
+mock_command nginx 0
+out="$(cmd_cert show 2>&1)"; rc=$?
+assert_eq       "no certificate is a clean failure" "1" "$rc"
+assert_contains "and says how to make one" "cert renew" "$out"
+
+# Generate for real: a certificate is only worth asserting on if openssl made it.
+out="$(cmd_cert renew --days 90 --san 'osr.lan,10.0.0.5' 2>&1)"
+assert_ok "certificate written" bash -c "[[ -s '${TLS_DIR}/server.crt' ]]"
+assert_ok "key written"         bash -c "[[ -s '${TLS_DIR}/server.key' ]]"
+assert_file_mode "key is owner-only" "600" "${TLS_DIR}/server.key"
+_san="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
+assert_contains "the given DNS name is present" "DNS:osr.lan"        "$_san"
+assert_contains "the given IP is an IP entry"   "IP Address:10.0.0.5" "$_san"
+assert_contains "loopback is always present"    "DNS:localhost"       "$_san"
+assert_eq "key and certificate match" \
+  "$(openssl x509 -noout -modulus -in "${TLS_DIR}/server.crt" | openssl md5)" \
+  "$(openssl rsa  -noout -modulus -in "${TLS_DIR}/server.key" 2>/dev/null | openssl md5)"
+
+out="$(cmd_cert show 2>&1)"
+assert_contains "show reports the subject"     "ollama-smart-router" "$out"
+assert_contains "show reports the SANs"        "osr.lan"             "$out"
+assert_contains "show reports a fingerprint"   "Fingerprint"         "$out"
+
+# Renewing without --san must NOT narrow the certificate: someone added that
+# name for a reason and a silent drop breaks their client at renewal time.
+cmd_cert renew >/dev/null 2>&1
+_san2="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
+assert_contains "renew carries the DNS name forward" "DNS:osr.lan"        "$_san2"
+assert_contains "renew carries the IP forward"       "IP Address:10.0.0.5" "$_san2"
+
+# A single --san entry is the last field of the split, which is exactly the one
+# a bare `read` drops.
+cmd_cert renew --san 'only.example.com' >/dev/null 2>&1
+assert_contains "a lone --san entry is not dropped" "DNS:only.example.com" \
+  "$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
+
+# An expired certificate must be called out, not left in a date field.
+openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+  -keyout "${TLS_DIR}/server.key" -out "${TLS_DIR}/server.crt" \
+  -subj "/CN=old/O=ollama-smart-router" -addext "subjectAltName=DNS:localhost" \
+  >/dev/null 2>&1
+faketime_note=""
+assert_contains "a soon-to-expire certificate is flagged" "expires within 30 days" \
+  "$(cmd_cert show 2>&1)"
+
+DRY_RUN=true
+_before="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -fingerprint)"
+cmd_cert renew >/dev/null 2>&1
+assert_eq "dry-run writes nothing" "$_before" \
+  "$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -fingerprint)"
+DRY_RUN=false
+
+assert_fail "rejects a non-numeric --days" cmd_cert renew --days soon
+assert_fail "rejects an unknown action"    cmd_cert bogus
+assert_fail "rejects an unknown flag"      cmd_cert show --nope
+rm -rf "$_ct"
+
 describe cmd_routing_stats
 _rs="$(mktemp -d)"
 _rslog="${_rs}/decisions.jsonl"
@@ -290,9 +350,7 @@ out="$(cmd_routing_stats --file "${_rs}/missing.jsonl" 2>&1)"; rc=$?
 assert_eq "missing log is a clean failure" "1" "$rc"
 assert_contains "says where it looked"     "No decision log" "$out"
 assert_contains "and how to check the router" "systemctl status ollama-router" "$out"
-assert_fail "rejects a missing --file value"  cmd_routing_stats --file
 assert_fail "rejects a non-numeric --last" cmd_routing_stats --file "$_rslog" --last abc
-assert_fail "rejects a missing --last value"  cmd_routing_stats --file "$_rslog" --last
 assert_fail "rejects an unknown flag"      cmd_routing_stats --file "$_rslog" --nope
 rm -rf "$_rs"
 

@@ -888,7 +888,11 @@ printf '#!/bin/sh\necho hook\n'         > "${_acrepo}/.git/hook.sh"
 chmod 0644 "${_acrepo}/install/manage-model-servers.sh" "${_acrepo}/tools-helper.sh" \
            "${_acrepo}/.git/hook.sh"
 
+mkdir -p "${_acrepo}/services/nginx-tls"
+printf 'server { listen 8080 ssl; }\n' > "${_acrepo}/services/nginx-tls/ollama-smart-router.conf"
+
 BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+  NGINX_CONF_DIR="${_acroot}/nginx.d" \
   bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units" \
   > "${_acroot}/out" 2>&1
 _acrc=$?
@@ -926,12 +930,110 @@ assert_ok "logrotate config written" bash -c "[[ -f '$_lr' ]]"
 assert_file_contains "rotates the decision logs" "/var/log/ollama-router/*.jsonl" "$_lr"
 assert_file_contains "uses copytruncate for live writers" "copytruncate" "$_lr"
 
+# The TLS front end is installed from the repo like everything else.
+assert_ok "nginx site installed" bash -c "[[ -f '${_acroot}/nginx.d/ollama-smart-router.conf' ]]"
+assert_file_contains "with the repo's content" "listen 8080 ssl" \
+  "${_acroot}/nginx.d/ollama-smart-router.conf"
+
 # A genuinely required file missing must still be fatal.
 rm -f "${_acrepo}/services/ollama-router/router.py"
 assert_status "a missing required file aborts" 1 \
   env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+      NGINX_CONF_DIR="${_acroot}/nginx.d" \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+# Open WebUI cannot terminate TLS itself — `open-webui serve` passes only host
+# and port to uvicorn — so nginx fronts it. What is testable here is the
+# certificate: a self-signed cert with the wrong SANs is rejected by every
+# current browser, and CN has not been accepted as an identity since Chrome 58.
+TLS_DIR=/app/tls
+TLS_CERT_DAYS=3650
+TLS_KEY_BITS=2048
+TLS_EXTRA_SAN=""
+
+describe tls_san_list
+assert_eq "ip and hostname, plus loopback" \
+  "DNS:osr,DNS:localhost,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr '')"
+# An extra name may be a DNS name or an address; it has to be sorted by shape,
+# because an IP written as DNS: silently fails to match when a client connects.
+assert_eq "extra names are classified by shape" \
+  "DNS:osr,DNS:localhost,DNS:chat.example.com,IP:192.168.11.80,IP:127.0.0.1,IP:10.0.0.5" \
+  "$(tls_san_list 192.168.11.80 osr 'chat.example.com,10.0.0.5')"
+assert_eq "whitespace around entries is ignored" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr '  a.lan , ')"
+# Regression: an earlier version set IFS=, to split the extra list and left it
+# set, so the dedup check joined with commas and every duplicate got through.
+assert_eq "duplicates are dropped" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'a.lan,a.lan')"
+# Regression: tr leaves no newline after the last field, so a bare read drops
+# it — and a single extra name IS the last field, which made TLS_EXTRA_SAN with
+# one entry a complete no-op.
+assert_eq "a single extra name is not dropped" \
+  "DNS:osr,DNS:localhost,DNS:only.example.com,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'only.example.com')"
+assert_eq "a trailing comma is harmless" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'a.lan,')"
+assert_eq "a loopback host does not duplicate itself" \
+  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list 127.0.0.1 localhost '')"
+assert_eq "no ip or host still yields a usable list" \
+  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list '' '' '')"
+assert_not_contains "never emits an empty entry" "DNS:," "$(tls_san_list '' '' ',,')"
+
+describe generate_tls_cert
+# Run openssl for real against a temp dir, so this asserts on a certificate
+# rather than on a command line.
+_tls="$(mktemp -d)"
+TLS_DIR="$_tls"
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+assert_ok "generates a certificate" generate_tls_cert 192.168.11.80 osr
+assert_ok "certificate written"  bash -c "[[ -s '${_tls}/server.crt' ]]"
+assert_ok "private key written"  bash -c "[[ -s '${_tls}/server.key' ]]"
+assert_file_mode "the key is not readable by anyone else" "600" "${_tls}/server.key"
+assert_file_mode "the certificate is world-readable"      "644" "${_tls}/server.crt"
+_san="$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName 2>/dev/null)"
+assert_contains "carries the IP as an IP entry"   "IP Address:192.168.11.80" "$_san"
+assert_contains "carries the hostname"            "DNS:osr"                  "$_san"
+assert_contains "carries localhost"               "DNS:localhost"            "$_san"
+# The key must actually match the certificate, or nginx refuses to start.
+assert_eq "key and certificate match" \
+  "$(openssl x509 -noout -modulus -in "${_tls}/server.crt" | openssl md5)" \
+  "$(openssl rsa  -noout -modulus -in "${_tls}/server.key" 2>/dev/null | openssl md5)"
+# A cert without serverAuth is refused by some clients even when trusted.
+_ext="$(openssl x509 -in "${_tls}/server.crt" -noout -text)"
+assert_contains "is an end-entity certificate" "CA:FALSE"          "$_ext"
+assert_contains "is usable as a server cert"   "TLS Web Server Authentication" "$_ext"
+assert_ok "is currently valid" openssl x509 -in "${_tls}/server.crt" -noout -checkend 0
+TLS_EXTRA_SAN="extra.example.com"
+assert_ok "regenerates with an extra name" generate_tls_cert 192.168.11.80 osr
+assert_contains "which lands in the certificate" "DNS:extra.example.com" \
+  "$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName)"
+TLS_EXTRA_SAN=""
+rm -rf "$_tls"
+TLS_DIR=/app/tls
+
+describe ct_tls_ok
+# The probe must distinguish "listening" from "completing a handshake" — the
+# whole reason it exists rather than reusing ct_port_listening.
+# Stub pct, NOT bash. ct_tls_ok is `run_ct bash -c "openssl s_client ..."`, so
+# putting a stub named `bash` on PATH would also replace the shell every later
+# assertion in this file runs its command with.
+mock_script pct <<'EOF'
+exit 0
+EOF
+assert_ok "reports a good handshake" ct_tls_ok 8080
+mock_script pct <<'EOF'
+exit 1
+EOF
+assert_fail "reports a failed handshake" ct_tls_ok 8080
 
 # ── Open WebUI first-start handling ───────────────────────────────────────────
 # These exist because a clean install came up with a dead UI twice. The unit
@@ -940,6 +1042,10 @@ rm -rf "$_acroot" "$_ac"
 # notice that, not just launch it and declare victory.
 CT_ID=100
 OPENWEBUI_PORT=8080
+# The port Open WebUI ITSELF binds. With TLS on these differ — nginx owns the
+# public one — and start_openwebui_verified must wait on this one, or it would
+# see nginx and declare success before Open WebUI had started.
+OPENWEBUI_BIND_PORT=8080
 
 describe ct_port_listening
 mock_script ss <<'EOF'
