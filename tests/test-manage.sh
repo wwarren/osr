@@ -290,7 +290,9 @@ out="$(cmd_routing_stats --file "${_rs}/missing.jsonl" 2>&1)"; rc=$?
 assert_eq "missing log is a clean failure" "1" "$rc"
 assert_contains "says where it looked"     "No decision log" "$out"
 assert_contains "and how to check the router" "systemctl status ollama-router" "$out"
+assert_fail "rejects a missing --file value"  cmd_routing_stats --file
 assert_fail "rejects a non-numeric --last" cmd_routing_stats --file "$_rslog" --last abc
+assert_fail "rejects a missing --last value"  cmd_routing_stats --file "$_rslog" --last
 assert_fail "rejects an unknown flag"      cmd_routing_stats --file "$_rslog" --nope
 rm -rf "$_rs"
 

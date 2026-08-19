@@ -888,7 +888,7 @@ printf '#!/bin/sh\necho hook\n'         > "${_acrepo}/.git/hook.sh"
 chmod 0644 "${_acrepo}/install/manage-model-servers.sh" "${_acrepo}/tools-helper.sh" \
            "${_acrepo}/.git/hook.sh"
 
-BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" \
+BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
   bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units" \
   > "${_acroot}/out" 2>&1
 _acrc=$?
@@ -919,10 +919,17 @@ assert_eq "idempotent when sourced again" "$_newpath" "$_twice"
 _found="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; command -v manage-model-servers.sh")"
 assert_eq "scripts resolve by name" "${_acrepo}/install/manage-model-servers.sh" "$_found"
 
+# OS-level guardrail for file logs; the router also rotates decisions.jsonl
+# internally, but this catches operator-provided files in the same directory.
+_lr="${_acroot}/logrotate.d/ollama-smart-router"
+assert_ok "logrotate config written" bash -c "[[ -f '$_lr' ]]"
+assert_file_contains "rotates the decision logs" "/var/log/ollama-router/*.jsonl" "$_lr"
+assert_file_contains "uses copytruncate for live writers" "copytruncate" "$_lr"
+
 # A genuinely required file missing must still be fatal.
 rm -f "${_acrepo}/services/ollama-router/router.py"
 assert_status "a missing required file aborts" 1 \
-  env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" \
+  env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
 

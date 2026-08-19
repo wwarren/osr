@@ -300,6 +300,12 @@ check("identical models tie", meta["tied"], 2)
 need_x = {"class": "xlarge", "code": False, "vision": False}
 meta = m.rank_meta(need_x, m.rank_candidates(need_x, inv2))
 check("flagged when nothing is in band", meta["distance_ranked"], True)
+inv3 = {"models": [entry(m, "qwen3:14b", 14.0, server="http://a.example:11434"),
+                   entry(m, "qwen3:32b", 32.0, server="http://b.example:11434")],
+        "servers": {"http://a.example:11434": {"up": True},
+                    "http://b.example:11434": {"up": True}}}
+meta = m.rank_meta(need_x, m.rank_candidates(need_x, inv3))
+check("distance ranking does not call different distances a tie", meta["tied"], 1)
 check("empty candidate list is handled",
       m.rank_meta(need, []), {"candidates": 0, "tied": 0, "distance_ranked": False})
 
