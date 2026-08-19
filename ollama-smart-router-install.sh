@@ -1629,7 +1629,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates logrotate iproute2
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -1929,6 +1929,16 @@ def _init_decision_log():
             encoding="utf-8",
         )
         handler.setFormatter(logging.Formatter("%(message)s"))  # the record IS the line
+        # The records carry prompt text, so tighten the mode explicitly rather
+        # than inheriting the process umask (0644 under systemd's default). The
+        # directory is already 0750 via LogsDirectoryMode, but the file's own
+        # mode is what a future bind-mount or backup job will honour -- and it
+        # is what the logrotate policy claims. Rotated backups too: the handler
+        # renames them, so each was once the live file.
+        try:
+            os.chmod(DECISION_FILE, 0o640)
+        except OSError:
+            pass
         logger = logging.getLogger("router.decisions")
         logger.setLevel(logging.INFO)
         logger.propagate = False          # never duplicate JSON into the journal
@@ -2446,13 +2456,21 @@ def rank_meta(need: dict, candidates: list) -> dict:
     """
     if not candidates:
         return {"candidates": 0, "tied": 0, "distance_ranked": False}
+    distance_ranked = not any(in_requested_band(e, need) for e in candidates)
     scores = [score_entry(e, need) for e in candidates]
     best = scores[0]
-    tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
+    if distance_ranked:
+        best_distance = band_distance(candidates[0], need)
+        tied = sum(
+            1 for sc, entry in zip(scores, candidates)
+            if band_distance(entry, need) == best_distance and best - sc <= TIE_EPSILON
+        )
+    else:
+        tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
     return {
         "candidates": len(candidates),
         "tied": tied,
-        "distance_ranked": not any(in_requested_band(e, need) for e in candidates),
+        "distance_ranked": distance_ranked,
     }
 
 
@@ -3661,6 +3679,7 @@ UNIT_DIR="${4:-/etc/systemd/system}"
 # Overridable so this script can be exercised without writing to system paths.
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 PROFILE_DIR="${PROFILE_DIR:-/etc/profile.d}"
+LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
 
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
@@ -3704,6 +3723,25 @@ unset _osr_dir
 export PATH
 PROFILEEOF
 chmod 0644 "${PROFILE_DIR}/ollama-router-path.sh"
+
+# The router's decision log already uses Python's RotatingFileHandler, but keep
+# an OS-level policy too so an operator override under /var/log/ollama-router
+# cannot grow forever. copytruncate keeps the running process on the same inode.
+install -d -m 0755 "$LOGROTATE_DIR"
+cat > "${LOGROTATE_DIR}/ollama-smart-router" <<'LOGROTATEEOF'
+/var/log/ollama-router/*.jsonl {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 ollama-router ollama-router
+}
+LOGROTATEEOF
+chmod 0644 "${LOGROTATE_DIR}/ollama-smart-router"
 
 missing=""
 # copy_required <src> <dest> [install-args...] -- absence is fatal.

@@ -531,7 +531,10 @@ curl -s localhost:8000/routing/explain \
 | `log_candidates` | `10` | Ranked candidates recorded per request. `0` = all. |
 
 > **The prompt text in this file has the same sensitivity as the chat itself.**
-> The file is `0640` inside a `0750` directory owned by the service account. Set
+> The router chmods it to `0640` explicitly — the process umask would otherwise
+> leave it `0644` — inside a `0750` directory owned by the service account.
+> `apply-config.sh` also installs `/etc/logrotate.d/ollama-smart-router` as an
+> OS-level cap on anything else written to that directory. Set
 > `prompt_chars = 0` to keep the analysis without keeping any content.
 
 ### The other services
