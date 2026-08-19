@@ -888,7 +888,11 @@ printf '#!/bin/sh\necho hook\n'         > "${_acrepo}/.git/hook.sh"
 chmod 0644 "${_acrepo}/install/manage-model-servers.sh" "${_acrepo}/tools-helper.sh" \
            "${_acrepo}/.git/hook.sh"
 
+mkdir -p "${_acrepo}/services/nginx-tls"
+printf 'server { listen 8080 ssl; }\n' > "${_acrepo}/services/nginx-tls/ollama-smart-router.conf"
+
 BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+  NGINX_CONF_DIR="${_acroot}/nginx.d" \
   bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units" \
   > "${_acroot}/out" 2>&1
 _acrc=$?
@@ -926,12 +930,182 @@ assert_ok "logrotate config written" bash -c "[[ -f '$_lr' ]]"
 assert_file_contains "rotates the decision logs" "/var/log/ollama-router/*.jsonl" "$_lr"
 assert_file_contains "uses copytruncate for live writers" "copytruncate" "$_lr"
 
+# The TLS front end is installed from the repo like everything else.
+assert_ok "nginx site installed" bash -c "[[ -f '${_acroot}/nginx.d/ollama-smart-router.conf' ]]"
+assert_file_contains "with the repo's content" "listen 8080 ssl" \
+  "${_acroot}/nginx.d/ollama-smart-router.conf"
+
+# copy_secret_env: the env files hold secrets, so in the container they are
+# root:ollama-router 0640. Assert the mode rather than trusting the call site.
+_env_mode="$(stat -c '%a' "${_acroot}/router/.env")"
+assert_ok "the env file is not world-readable" \
+  bash -c "[[ '${_env_mode}' == '640' || '${_env_mode}' == '600' ]]"
+
+# Without the service account — a validation run — it must degrade to an
+# owner-only copy rather than aborting before the units and nginx site are
+# installed. Simulated by making getent report the group as absent.
+_acroot2="$(mktemp -d)"
+cp -r "${_acrepo}" "${_acroot2}/repo" 2>/dev/null || true
+mkdir -p "${_acroot2}/repo/services/ollama-router"
+echo "x = 1" > "${_acroot2}/repo/services/ollama-router/router.py"
+mock_script getent <<'EOF'
+exit 2                      # no such group
+EOF
+BIN_DIR="${_acroot2}/bin" PROFILE_DIR="${_acroot2}/profile.d" \
+  LOGROTATE_DIR="${_acroot2}/logrotate.d" NGINX_CONF_DIR="${_acroot2}/nginx.d" \
+  bash "$_ac" "${_acroot2}/repo" "${_acroot2}/router" "${_acroot2}/webui" "${_acroot2}/units" \
+  > "${_acroot2}/out" 2>&1
+assert_eq "still succeeds without the ollama-router group" "0" "$?"
+assert_file_mode "and falls back to an owner-only copy" "600" "${_acroot2}/router/.env"
+assert_ok "the units were still installed" \
+  bash -c "[[ -f '${_acroot2}/nginx.d/ollama-smart-router.conf' ]]"
+# Drop the getent stub again: it is a system lookup other tests rely on.
+rm -f "${MOCK_BIN}/getent"
+rm -rf "$_acroot2"
+
+# A site naming a certificate that does not exist yet must not be reported as a
+# broken proxy config — that is what a fresh install looks like before the cert
+# is generated, and an nginx emerg trace there teaches you to ignore the one
+# warning that matters.
+_acroot3="$(mktemp -d)"; mkdir -p "${_acroot3}/repo/services/nginx-tls" \
+  "${_acroot3}/repo/env" "${_acroot3}/repo/services/ollama-router" \
+  "${_acroot3}/repo/services/ollama-monitor" "${_acroot3}/repo/install"
+echo "x = 1" > "${_acroot3}/repo/services/ollama-router/router.py"
+echo "x = 1" > "${_acroot3}/repo/services/ollama-monitor/monitor.py"
+printf 'A=1\n' > "${_acroot3}/repo/env/router.env"
+printf 'server {\n    ssl_certificate     /nonexistent/server.crt;\n}\n' \
+  > "${_acroot3}/repo/services/nginx-tls/ollama-smart-router.conf"
+BIN_DIR="${_acroot3}/bin" PROFILE_DIR="${_acroot3}/profile.d" \
+  LOGROTATE_DIR="${_acroot3}/logrotate.d" NGINX_CONF_DIR="${_acroot3}/nginx.d" \
+  bash "$_ac" "${_acroot3}/repo" "${_acroot3}/router" "${_acroot3}/webui" "${_acroot3}/units" \
+  > "${_acroot3}/out" 2>&1
+assert_eq "a missing certificate is not fatal" "0" "$?"
+assert_contains "and is explained, not dumped as an nginx trace" \
+  "does not exist yet" "$(cat "${_acroot3}/out")"
+assert_contains "with the fix"  "cert renew" "$(cat "${_acroot3}/out")"
+assert_not_contains "no scary rejection message" "rejected the configuration" \
+  "$(cat "${_acroot3}/out")"
+rm -rf "$_acroot3"
+
+# Turning TLS off leaves the repo with no nginx site, but nginx would still be
+# holding 8080 and 8000 — the very ports the applications bind directly in that
+# mode. The repo is the source of truth, so the installed site has to go.
+_acroot4="$(mktemp -d)"; mkdir -p "${_acroot4}/repo/env" "${_acroot4}/nginx.d" \
+  "${_acroot4}/repo/services/ollama-router" "${_acroot4}/repo/services/ollama-monitor" \
+  "${_acroot4}/repo/install"
+echo "x = 1" > "${_acroot4}/repo/services/ollama-router/router.py"
+echo "x = 1" > "${_acroot4}/repo/services/ollama-monitor/monitor.py"
+printf 'A=1\n' > "${_acroot4}/repo/env/router.env"
+printf 'server { listen 8080 ssl; }\n' > "${_acroot4}/nginx.d/ollama-smart-router.conf"
+BIN_DIR="${_acroot4}/bin" PROFILE_DIR="${_acroot4}/profile.d" \
+  LOGROTATE_DIR="${_acroot4}/logrotate.d" NGINX_CONF_DIR="${_acroot4}/nginx.d" \
+  bash "$_ac" "${_acroot4}/repo" "${_acroot4}/router" "${_acroot4}/webui" "${_acroot4}/units" \
+  > "${_acroot4}/out" 2>&1
+assert_eq "apply still succeeds" "0" "$?"
+assert_ok "the stale site is removed" \
+  bash -c "[[ ! -f '${_acroot4}/nginx.d/ollama-smart-router.conf' ]]"
+assert_contains "and says why" "no longer in the config repo" "$(cat "${_acroot4}/out")"
+rm -rf "$_acroot4"
+
 # A genuinely required file missing must still be fatal.
 rm -f "${_acrepo}/services/ollama-router/router.py"
 assert_status "a missing required file aborts" 1 \
   env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
+      NGINX_CONF_DIR="${_acroot}/nginx.d" \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+# Open WebUI cannot terminate TLS itself — `open-webui serve` passes only host
+# and port to uvicorn — so nginx fronts it. What is testable here is the
+# certificate: a self-signed cert with the wrong SANs is rejected by every
+# current browser, and CN has not been accepted as an identity since Chrome 58.
+TLS_DIR=/app/tls
+TLS_CERT_DAYS=3650
+TLS_KEY_BITS=2048
+TLS_EXTRA_SAN=""
+
+describe tls_san_list
+assert_eq "ip and hostname, plus loopback" \
+  "DNS:osr,DNS:localhost,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr '')"
+# An extra name may be a DNS name or an address; it has to be sorted by shape,
+# because an IP written as DNS: silently fails to match when a client connects.
+assert_eq "extra names are classified by shape" \
+  "DNS:osr,DNS:localhost,DNS:chat.example.com,IP:192.168.11.80,IP:127.0.0.1,IP:10.0.0.5" \
+  "$(tls_san_list 192.168.11.80 osr 'chat.example.com,10.0.0.5')"
+assert_eq "whitespace around entries is ignored" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr '  a.lan , ')"
+# Regression: an earlier version set IFS=, to split the extra list and left it
+# set, so the dedup check joined with commas and every duplicate got through.
+assert_eq "duplicates are dropped" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'a.lan,a.lan')"
+# Regression: tr leaves no newline after the last field, so a bare read drops
+# it — and a single extra name IS the last field, which made TLS_EXTRA_SAN with
+# one entry a complete no-op.
+assert_eq "a single extra name is not dropped" \
+  "DNS:osr,DNS:localhost,DNS:only.example.com,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'only.example.com')"
+assert_eq "a trailing comma is harmless" \
+  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
+  "$(tls_san_list 192.168.11.80 osr 'a.lan,')"
+assert_eq "a loopback host does not duplicate itself" \
+  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list 127.0.0.1 localhost '')"
+assert_eq "no ip or host still yields a usable list" \
+  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list '' '' '')"
+assert_not_contains "never emits an empty entry" "DNS:," "$(tls_san_list '' '' ',,')"
+
+describe generate_tls_cert
+# Run openssl for real against a temp dir, so this asserts on a certificate
+# rather than on a command line.
+_tls="$(mktemp -d)"
+TLS_DIR="$_tls"
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+assert_ok "generates a certificate" generate_tls_cert 192.168.11.80 osr
+assert_ok "certificate written"  bash -c "[[ -s '${_tls}/server.crt' ]]"
+assert_ok "private key written"  bash -c "[[ -s '${_tls}/server.key' ]]"
+assert_file_mode "the key is not readable by anyone else" "600" "${_tls}/server.key"
+assert_file_mode "the certificate is world-readable"      "644" "${_tls}/server.crt"
+_san="$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName 2>/dev/null)"
+assert_contains "carries the IP as an IP entry"   "IP Address:192.168.11.80" "$_san"
+assert_contains "carries the hostname"            "DNS:osr"                  "$_san"
+assert_contains "carries localhost"               "DNS:localhost"            "$_san"
+# The key must actually match the certificate, or nginx refuses to start.
+assert_eq "key and certificate match" \
+  "$(openssl x509 -noout -modulus -in "${_tls}/server.crt" | openssl md5)" \
+  "$(openssl rsa  -noout -modulus -in "${_tls}/server.key" 2>/dev/null | openssl md5)"
+# A cert without serverAuth is refused by some clients even when trusted.
+_ext="$(openssl x509 -in "${_tls}/server.crt" -noout -text)"
+assert_contains "is an end-entity certificate" "CA:FALSE"          "$_ext"
+assert_contains "is usable as a server cert"   "TLS Web Server Authentication" "$_ext"
+assert_ok "is currently valid" openssl x509 -in "${_tls}/server.crt" -noout -checkend 0
+TLS_EXTRA_SAN="extra.example.com"
+assert_ok "regenerates with an extra name" generate_tls_cert 192.168.11.80 osr
+assert_contains "which lands in the certificate" "DNS:extra.example.com" \
+  "$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName)"
+TLS_EXTRA_SAN=""
+rm -rf "$_tls"
+TLS_DIR=/app/tls
+
+describe ct_tls_ok
+# The probe must distinguish "listening" from "completing a handshake" — the
+# whole reason it exists rather than reusing ct_port_listening.
+# Stub pct, NOT bash. ct_tls_ok is `run_ct bash -c "openssl s_client ..."`, so
+# putting a stub named `bash` on PATH would also replace the shell every later
+# assertion in this file runs its command with.
+mock_script pct <<'EOF'
+exit 0
+EOF
+assert_ok "reports a good handshake" ct_tls_ok 8080
+mock_script pct <<'EOF'
+exit 1
+EOF
+assert_fail "reports a failed handshake" ct_tls_ok 8080
 
 # ── Open WebUI first-start handling ───────────────────────────────────────────
 # These exist because a clean install came up with a dead UI twice. The unit
@@ -940,6 +1114,10 @@ rm -rf "$_acroot" "$_ac"
 # notice that, not just launch it and declare victory.
 CT_ID=100
 OPENWEBUI_PORT=8080
+# The port Open WebUI ITSELF binds. With TLS on these differ — nginx owns the
+# public one — and start_openwebui_verified must wait on this one, or it would
+# see nginx and declare success before Open WebUI had started.
+OPENWEBUI_BIND_PORT=8080
 
 describe ct_port_listening
 mock_script ss <<'EOF'
@@ -1084,6 +1262,27 @@ assert_contains "and confirms the retry" "after the retry" "$out"
 assert_eq       "records that it reset" "true" "$OPENWEBUI_RESET"
 rm -f "$_flag"
 
+# A port clash must NOT be treated as a migration failure: resetting the
+# database would destroy data to fix something entirely unrelated.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
+EOF
+mock_script journalctl <<'EOF'
+echo "ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): address already in use"
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+OPENWEBUI_RESET=false
+start_openwebui_verified > "$_owout" 2>&1; rc=$?
+out="$(cat "$_owout")"
+assert_eq       "reports failure"                 "1" "$rc"
+assert_contains "names the real cause"            "already in use" "$out"
+assert_contains "and how to find the holder"      "ss -lntp"       "$out"
+assert_eq       "did NOT reset the database"      "false" "$OPENWEBUI_RESET"
+assert_not_contains "and did not blame migrations" "Discarding the empty database" "$out"
+
 # Something else entirely: no reset, and a warning rather than a silent success.
 mock_script ss <<'EOF'
 echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
@@ -1160,6 +1359,16 @@ assert_file_contains "open-webui wants the router" \
   "Wants=network-online.target ollama-router.service" "${_units}/open-webui.service"
 assert_file_contains "the router orders after litellm" \
   "After=network-online.target litellm-proxy.service" "${_units}/ollama-router.service"
+
+# open-webui's serve() has LITERAL defaults (host="0.0.0.0", port=8080) and
+# never reads HOST/PORT from the environment. Relying on the env file alone
+# left it binding the port nginx owns, so it died with "address already in use"
+# and the proxy answered 502 for a port nothing was listening on. The flags are
+# the fix, and this assertion is what stops them being "tidied away" later.
+assert_file_contains "open-webui is told where to bind on the command line" \
+  "serve --host \${HOST} --port \${PORT}" "${_units}/open-webui.service"
+assert_file_contains "and the values come from the env file" \
+  "EnvironmentFile=/app/openwebui/.env" "${_units}/open-webui.service"
 
 # The long first start must survive: migrations plus an embedding-model download.
 assert_file_contains "open-webui keeps a long start timeout" \
