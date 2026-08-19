@@ -448,6 +448,106 @@ The service log is the other source of truth:
 journalctl -u ollama-monitor -n 50 --no-pager | grep -i mattermost
 ```
 
+## Evaluating routing quality
+
+Every routed request writes one JSON object to
+`/var/log/ollama-router/decisions.jsonl`, carrying the classification, **every
+candidate's score with its component terms**, the winner, and what happened
+next. The point is that a routing decision can only be judged against what it
+rejected — "qwen3:14b answered" is not evaluable, but "it beat the in-band
+qwen3:8b by 0.17 because the prompt matched a code keyword" is.
+
+```bash
+manage-model-servers routing-stats                 # summary
+manage-model-servers routing-stats --class xlarge  # one class
+manage-model-servers routing-stats --last 500      # recent traffic only
+manage-model-servers routing-stats --json          # for a script
+```
+
+The summary is built around four numbers that each point at a specific
+misconfiguration:
+
+| Number | What a bad value means |
+|---|---|
+| **top candidate in band** | Low means the `*_params` bands and the models actually installed have drifted apart — either pull different models or move the bands. |
+| **distance-ranked requests** | The share where *nothing* was in band, so ranking fell back to "closest to the band". Persistently high for one class means that class has no hardware behind it. |
+| **mean tie-group size** | How many candidates the load-spreading rotation treats as equivalent. Consistently above 2 means `tie_epsilon` is wide enough to be spreading traffic across models that are not really interchangeable. |
+| **median winning margin** | The score gap between first and second place. Near zero means the scoring is not discriminating, and the choice is effectively arbitrary. |
+
+For anything the summary does not cover, query the file directly:
+
+```bash
+# Requests where an out-of-band model won, and by how much
+jq -r 'select(.candidates[0].in_band == false)
+       | [.request.class, .chosen.model, .candidates[0].band_distance] | @tsv' \
+   /var/log/ollama-router/decisions.jsonl
+
+# Which keyword is sending things to xlarge
+jq -r 'select(.request.class=="xlarge") | .request.matched.xlarge[]' \
+   /var/log/ollama-router/decisions.jsonl | sort | uniq -c | sort -rn
+
+# Slowest requests, with the model that served them
+jq -r 'select(.total_ms) | [.total_ms, .chosen.model, .request.prompt] | @tsv' \
+   /var/log/ollama-router/decisions.jsonl | sort -rn | head
+
+# Everything about one request, by the id in the X-Router-Request-Id header
+jq 'select(.id=="9f2c1a4b7e30")' /var/log/ollama-router/decisions.jsonl
+```
+
+A worked example. This record says the request was classed `fast` because it
+matched the code keyword `function`, and that the winner was **out of band**:
+
+```
+class=fast  reason="code keyword (code_first)"  matched.code=["function"]
+  rank 0  qwen2.5-coder:14b  score 1.183  in_band=false  terms{band 0.583, code 0.6}
+  rank 1  qwen3:8b           score 1.017  in_band=true   terms{band 1.0, size 0.017}
+```
+
+The 14B coder won on the `code` term despite scoring worse on band fit. Whether
+that is right is a judgement about your pool — but it is now a visible,
+quantified judgement rather than a guess, and `code_match` in `[weights]` is the
+dial that changes it.
+
+`POST /routing/explain` returns this same shape for a prompt without executing
+it, so a hypothesis formed from the log can be tested directly:
+
+```bash
+curl -s localhost:8000/routing/explain \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "prove that the algorithm terminates"}' | jq
+```
+
+### Settings
+
+`[logging]` in `router.ini`:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `level` | `INFO` | One journal line per routed request. `DEBUG` adds discovery polls. |
+| `decisions` | `true` | The JSONL records. |
+| `decision_file` | (blank) | Blank uses systemd's `LogsDirectory=`, i.e. `/var/log/ollama-router/decisions.jsonl`. |
+| `max_bytes` / `backup_count` | 20 MB / 5 | Rotation. |
+| `prompt_chars` | `200` | Prompt text kept per record. `0` stores only derived features. |
+| `log_candidates` | `10` | Ranked candidates recorded per request. `0` = all. |
+
+> **The prompt text in this file has the same sensitivity as the chat itself.**
+> The file is `0640` inside a `0750` directory owned by the service account. Set
+> `prompt_chars = 0` to keep the analysis without keeping any content.
+
+### The other services
+
+| Service | Setting | Where |
+|---|---|---|
+| Router | `[logging] level` | `router.ini` (version controlled) |
+| Monitor | `[logging] level` | `monitor.ini`. `DEBUG` logs every probe with its latency and failure/success streaks — how you catch a host flapping *before* it crosses a threshold. |
+| LiteLLM | `LITELLM_LOG` | `router.env`. `DEBUG` prints full request/response bodies. |
+| Open WebUI | `GLOBAL_LOG_LEVEL` | `openwebui.env` |
+
+```bash
+journalctl -u ollama-router -f            # live routing decisions
+journalctl -u ollama-monitor -f           # probes and transitions
+```
+
 ## When Open WebUI will not start
 
 The unit reports `active` but nothing listens on 8080, and the journal shows:

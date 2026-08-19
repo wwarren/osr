@@ -174,6 +174,45 @@ Internally it has three collaborating parts:
   image.
 * **Selector + dispatcher** — scores every `(host, model)` pair, ranks them, and
   dispatches to the best, failing forward on error.
+* **Decision recorder** — writes one JSON object per request to
+  `/var/log/ollama-router/decisions.jsonl`.
+
+#### Why the decision log exists
+
+A routing decision is only evaluable against the decisions it *rejected*. The
+model that answered tells you nothing about whether it should have; the
+alternatives and their scores do. So the record keeps the whole comparison:
+
+```
+request    class, why that class, which keywords matched, length, prompt preview
+ranking    candidate count, tie-group size, whether distance ranking was used
+candidates every scored (host, model) pair: score, in_band, band_distance, and
+           the score split into its band / code / vision / size terms
+chosen     model, host, rank, score
+attempts   each fall-forward hop with its outcome and latency
+outcome    status, ttfb_ms, total_ms
+```
+
+`score_entry()` is a one-line wrapper around `score_breakdown()` so there is a
+single implementation of the arithmetic and the logged terms can never drift
+from the score that actually decided the routing. The terms are unrounded
+inside the breakdown — `sum(terms) == score` exactly — and rounded once, at the
+point the record is built.
+
+The record is written from the response's `BackgroundTask`, after the last byte
+has streamed, because that is the only point at which `total_ms` is knowable.
+The one-line journal summary is emitted at dispatch instead, so `journalctl -f`
+shows decisions live.
+
+`POST /routing/explain` returns the identical shape without executing the
+request, so a hypothesis formed from the log can be tested against a prompt
+directly.
+
+Cost is bounded by construction: `log_candidates` caps how many candidates are
+stored, `prompt_chars` caps the text, and a `RotatingFileHandler` caps the file.
+A log that cannot be opened disables itself with a warning — a router that
+refuses to route because it cannot write a log would be a worse failure than
+routing blind.
 
 ### 4.2 LiteLLM proxy (`litellm-proxy.service`)
 
@@ -625,6 +664,9 @@ permissive than the 0640 runtime copy it feeds.
 | `GET /routing/inventory` | What does each host currently serve; who is down and why |
 | `POST /routing/explain` | What *would* happen to this prompt, with scores |
 | `journalctl -u <unit>` | Service logs; monitor logs suppressed alerts too |
+| `/var/log/ollama-router/decisions.jsonl` | Every routing decision with all candidate scores |
+| `manage-model-servers routing-stats` | Whether the scoring is discriminating, and where it drifted |
+| `X-Router-Request-Id` | Ties a response back to its record in the decision log |
 | Mattermost `#ollama-monitor` | Host up/down transitions, and a startup confirmation on first start or reconfiguration |
 | `/var/lib/ollama-monitor/state.json` | What the monitor believes about each host, and when it last said so |
 | `/etc/motd` | Ports, tier map, config paths at login |
