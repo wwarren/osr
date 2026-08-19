@@ -237,6 +237,16 @@ Owns the two public ports (8080 for the UI, 8000 for the API) and proxies to
 `127.0.0.1:8088` and `127.0.0.1:8010`. The applications bind loopback only, so
 there is no second unencrypted listener serving the same content.
 
+**Where it binds is set on the command line, not by environment.** Open WebUI's
+`serve()` carries literal defaults — `host="0.0.0.0", port=8080` — and reads
+neither `HOST` nor `PORT` from the environment. Configuring the env file alone
+left it binding the port nginx owns, so it died with *address already in use*
+and the proxy returned **502** for a loopback port nothing was listening on.
+The unit passes `--host`/`--port` explicitly (typer exposes plain keyword
+parameters as options automatically), with systemd expanding them from the
+`EnvironmentFile` so the env file stays the single source of truth. A flag also
+cannot be silently ignored by a future release the way the variables were.
+
 **Why a proxy at all.** Open WebUI cannot terminate TLS. Its `serve` command
 passes only host and port to `uvicorn.run()` and exposes no `--ssl-*` options,
 which is why upstream's own documentation points at a reverse proxy. Patching

@@ -484,6 +484,35 @@ The proxy config is not just `proxy_pass`. Three settings are load-bearing:
 `client_max_body_size 200m` also lets Open WebUI's own limit decide what to
 reject, rather than an nginx 413.
 
+### 502 Bad Gateway
+
+nginx is working and TLS is fine — the application behind it is not listening.
+Almost always Open WebUI failing to bind:
+
+```bash
+pct exec <CTID> -- ss -lntp | grep -E '8088|8080'
+pct exec <CTID> -- journalctl -u open-webui -n 50 --no-pager
+```
+
+`address already in use` means the unit is trying the wrong port. Open WebUI's
+`serve()` is declared with **literal** defaults:
+
+```python
+def serve(host: str = "0.0.0.0", port: int = 8080):
+```
+
+It never reads `HOST` or `PORT` from the environment, so setting them in
+`.env` alone leaves it binding `0.0.0.0:8080` — the port nginx owns. The unit
+therefore passes them on the command line:
+
+```
+ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
+```
+
+systemd expands those from the `EnvironmentFile`, so the env file remains the
+single source of truth. If an older container is missing the flags, add them
+and `systemctl daemon-reload && systemctl restart open-webui`.
+
 ### The certificate
 
 Self-signed, generated in the container so the private key never touches the

@@ -1220,6 +1220,16 @@ start_openwebui_verified() {
     return 0
   fi
 
+  # A port clash is not a migration failure, and resetting the database for it
+  # would destroy data to fix something unrelated. Check for it first.
+  if run_ct journalctl -u open-webui -n 200 --no-pager 2>/dev/null \
+       | grep -qiE "address already in use|error while attempting to bind"; then
+    echo "WARNING: Open WebUI could not bind ${OPENWEBUI_BIND_HOST}:${OPENWEBUI_BIND_PORT}" >&2
+    echo "         — the address is already in use. Something else holds it;" >&2
+    echo "         check with:  pct exec ${CT_ID} -- ss -lntp" >&2
+    return 1
+  fi
+
   if openwebui_migration_broken; then
     echo "  Open WebUI failed its first-run database migration (a known upstream"
     echo "  bug: the schema is created, then alembic re-adds a column that is"
@@ -5978,7 +5988,18 @@ User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/openwebui
 EnvironmentFile=/app/openwebui/.env
-ExecStart=/app/openwebui/venv/bin/open-webui serve
+# --host/--port are passed EXPLICITLY, and that is not belt and braces.
+# open-webui's serve() is declared as:
+#     def serve(host: str = "0.0.0.0", port: int = 8080):
+# with LITERAL defaults -- it never reads HOST or PORT from the environment.
+# Setting them in the env file alone left it binding 0.0.0.0:8080, the port
+# nginx already owns, so it died with "address already in use" and the proxy
+# returned 502 for a port nothing was listening on. Typer exposes plain keyword
+# parameters as CLI options automatically, so the flags below do work, and a
+# flag cannot be quietly ignored by a future release the way an env var was.
+# systemd expands ${HOST} and ${PORT} from the EnvironmentFile above, so the
+# env file stays the single source of truth for where this binds.
+ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
 Restart=always
 RestartSec=5
 # First start downloads a local embedding model; give it room before timeout.
