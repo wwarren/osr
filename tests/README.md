@@ -23,16 +23,16 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **628 assertions, 107/107 functions covered** (plus an integration
+Current state: **663 assertions, 107/107 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 56 | 293 |
+| `installer` | `ollama-smart-router-install.sh` | 62 | 327 |
 | `manage` | `manage-model-servers.sh` | 52 | 218 |
 | `monitor` | generated `monitor.py` | — | 51 |
-| `router` | generated `router.py` | — | 66 |
+| `router` | generated `router.py` | — | 67 |
 
 The coverage gate is a *shell* gate: it enumerates bash functions, so the Python
 suite sits outside it. `monitor` and `router` are listed in `PY_SUITES` and run
@@ -165,7 +165,9 @@ bugs in this family have been found by these tests.
 | One down host posted four identical Mattermost alerts | health was keyed by `(tier, url)`, and a single-server deployment points all four tiers at the same URL |
 | A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
 | An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
-| Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | the units used `Requires=`, which propagates a stop — a crash-looping `litellm-proxy` killed `open-webui` nine seconds into its first alembic migration, leaving the schema half-applied |
+| Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | Open WebUI's own first-run migration, upstream. The installer now starts it alone, waits for the port, and resets the empty database once — `Requires=` was a real but *separate* bug, and blaming it first cost a whole diagnosis cycle |
+| `rank_meta` reported every candidate as "tied" whenever nothing was in band | it compared scores only, but `rank_candidates` groups ties by *distance first, then score* — and in the distance-ranked case every score floors to 0.0, so the tie-group metric was wrong precisely when it mattered |
+| Provisioning reported success over a dead UI | `systemctl enable --now` on a `Type=simple` unit returns as soon as the process is forked; nothing checked that the port ever opened |
 | `set-webhook --username <name>` rejected every value, including valid ones | the guard was written `(( $# >= 2 && -n "$2" ))`; inside `(( ))` that is *minus variable n* followed by a bare string, which is an arithmetic syntax error, so the test was always false |
 | `remove 1 1` refused to run against the server minimum | the same server counted twice toward `remaining_count`, so the check saw one more removal than would actually happen |
 | A second outage after a recovery was silently swallowed | the test harness saved state before `announce()` but not after, so the recovery never cleared the last-posted fingerprint — a harness bug, but the same omission in the daemon loop would lose real alerts |
@@ -184,6 +186,12 @@ Adding a function to either script without a `describe` block makes
 `./run-tests.sh` exit non-zero.
 
 ## The Python suite
+
+The `start_openwebui_verified` block is worth reading as a pattern: it drives
+the whole recover-and-retry path with a `pct` stub that changes its answer once
+the `mv` has happened, so the retry is exercised rather than assumed. It also
+re-learns the subshell rule — the function sets `OPENWEBUI_RESET`, so it must
+be run with output redirected to a file, never inside `$(...)`.
 
 `test-router.py` covers the scoring and the decision log. The assertion that
 earns its keep is `sum(terms) == score`: the log is only trustworthy if the

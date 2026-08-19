@@ -933,6 +933,206 @@ assert_status "a missing required file aborts" 1 \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
 
+# ── Open WebUI first-start handling ───────────────────────────────────────────
+# These exist because a clean install came up with a dead UI twice. The unit
+# starts fine — Type=simple succeeds the instant the process forks — and then
+# Open WebUI dies inside its own first-run migration. The installer has to
+# notice that, not just launch it and declare victory.
+CT_ID=100
+OPENWEBUI_PORT=8080
+
+describe ct_port_listening
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
+EOF
+# run_ct shells out through pct; route the inner command to the stubs.
+mock_script pct <<'EOF'
+shift 3                 # drop: exec <id> --
+"$@"
+EOF
+assert_ok   "finds a listening port"        ct_port_listening 8000
+assert_fail "does not find a closed port"   ct_port_listening 8080
+# 8000 must not match 18000 or 8000x — the awk anchor is the whole point.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:18000 0.0.0.0:*'
+EOF
+assert_fail "does not match a port that merely ends the same" ct_port_listening 8000
+
+describe ct_wait_for_port
+mock_command sleep 0                      # no real waiting in a test suite
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+EOF
+assert_ok "returns as soon as the port is up" ct_wait_for_port 8080 30
+
+# Never listening, unit still trying: times out with 1.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
+EOF
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) echo activating ;; esac
+EOF
+assert_status "times out while the unit is still activating" 1 ct_wait_for_port 8080 10 open-webui.service
+
+# Unit gave up: return 2 immediately rather than waiting out the deadline.
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) echo failed ;; esac
+EOF
+assert_status "gives up when the unit does" 2 ct_wait_for_port 8080 600 open-webui.service
+assert_status "no unit named means wait the whole deadline" 1 ct_wait_for_port 8080 10
+
+describe openwebui_migration_broken
+mock_script journalctl <<'EOF'
+echo "sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) duplicate column name: info_json"
+EOF
+assert_ok "recognises the migration failure" openwebui_migration_broken
+mock_script journalctl <<'EOF'
+echo "Loading WEBUI_SECRET_KEY from /app/openwebui/.webui_secret_key"
+EOF
+assert_fail "does not fire on a healthy log" openwebui_migration_broken
+
+describe openwebui_reset_db
+_ow="$(mktemp -d)"
+mock_script systemctl <<'EOF'
+exit 0
+EOF
+# No database yet: nothing to do, and it must not fail.
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  test) exit 1 ;;                        # no webui.db
+  *)    "$@" ;;
+esac
+EOF
+assert_ok "no database is not an error" openwebui_reset_db
+
+# A database with accounts in it must be refused — this is the guard that stops
+# the installer wiping a real deployment if it is ever re-run against one.
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  test) exit 0 ;;
+  */python) echo 3 ;;                    # three accounts
+  *)       "$@" ;;
+esac
+EOF
+out="$(openwebui_reset_db 2>&1)"; rc=$?
+assert_eq       "refuses to reset a populated database" "1" "$rc"
+assert_contains "and says why"  "refusing to reset"     "$out"
+
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  test) exit 0 ;;
+  */python) echo 0 ;;                    # empty: safe to discard
+  *)       "$@" ;;
+esac
+EOF
+out="$(openwebui_reset_db 2>&1)"; rc=$?
+assert_eq       "resets an empty database"  "0" "$rc"
+assert_contains "keeps a copy"              "broken-" "$out"
+rm -rf "$_ow"
+
+describe start_openwebui_verified
+mock_command sleep 0
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) echo active ;; esac
+EOF
+# Happy path: the port comes up.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+# NOT $(...): start_openwebui_verified sets OPENWEBUI_RESET, and a command
+# substitution is a subshell, so the assignment would be discarded and the
+# assertion would always see the value it started with.
+_owout="$(mktemp)"
+OPENWEBUI_RESET=false
+start_openwebui_verified > "$_owout" 2>&1; rc=$?
+assert_eq       "succeeds when the port comes up" "0" "$rc"
+assert_contains "says so"  "listening on 8080"    "$(cat "$_owout")"
+assert_eq       "no reset was needed" "false"     "$OPENWEBUI_RESET"
+
+# The real case: first start dies in the migration, reset, second start works.
+# The ss stub answers "closed" until the reset has happened.
+_flag="$(mktemp -u)"
+mock_script ss <<EOF
+if [ -e "${_flag}" ]; then echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+else echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'; fi
+EOF
+mock_script journalctl <<'EOF'
+echo "sqlite3.OperationalError) duplicate column name: info_json"
+EOF
+mock_script pct <<EOF
+shift 3
+case "\$1" in
+  test)     exit 0 ;;
+  */python) echo 0 ;;
+  bash)     : > "${_flag}"; exit 0 ;;      # the mv happened -> port opens next
+  *)        "\$@" ;;
+esac
+EOF
+OPENWEBUI_RESET=false
+start_openwebui_verified > "$_owout" 2>&1; rc=$?
+out="$(cat "$_owout")"
+assert_eq       "recovers from the migration failure" "0" "$rc"
+assert_contains "explains what it did" "Discarding the empty database" "$out"
+assert_contains "and confirms the retry" "after the retry" "$out"
+assert_eq       "records that it reset" "true" "$OPENWEBUI_RESET"
+rm -f "$_flag"
+
+# Something else entirely: no reset, and a warning rather than a silent success.
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
+EOF
+mock_script journalctl <<'EOF'
+echo "ModuleNotFoundError: No module named 'open_webui'"
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+OPENWEBUI_RESET=false
+start_openwebui_verified > "$_owout" 2>&1; rc=$?
+out="$(cat "$_owout")"
+assert_eq       "reports failure"        "1" "$rc"
+assert_contains "warns clearly"          "did not come up" "$out"
+assert_contains "says the API still works" ":8000" "$out"
+assert_eq       "did not touch the database" "false" "$OPENWEBUI_RESET"
+rm -f "$_owout"
+
+describe report_services
+mock_script systemctl <<'EOF'
+case "$*" in
+  *is-active*open-webui*) echo failed ;;
+  *is-active*)            echo active ;;
+esac
+EOF
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+out="$(report_services 2>&1)"; rc=$?
+assert_eq       "non-zero when something is down" "1" "$rc"
+assert_contains "names every unit"        "litellm-proxy"  "$out"
+assert_contains "shows the failed one"    "failed"         "$out"
+assert_contains "reports the live port"   "listening on 8000" "$out"
+assert_contains "and the dead one"        "NOT listening on 8080" "$out"
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) echo active ;; esac
+EOF
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
+echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+EOF
+assert_ok "zero when everything is up" report_services
+
 # ── the generated systemd units ───────────────────────────────────────────────
 # Also not functions. These assertions exist because of a real outage: every
 # unit used Requires= on its upstream, and Requires= propagates stop/restart.
