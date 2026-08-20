@@ -753,10 +753,22 @@ prompt_network_config() {
                                                  NAMESERVER "$NAMESERVER" valid_optional_ipv4
   # A gateway outside the router's subnet is almost always a typo, and the
   # container would come up with no route off-link.
-  if ! ip_in_same_subnet "$IP_CIDR" "$GATEWAY"; then
-    echo "WARNING: gateway ${GATEWAY} is outside ${IP_CIDR}." >&2
-    echo "         The container will have no working default route." >&2
-  fi
+  # Three outcomes, reported as three different things. Collapsing "could not
+  # determine" into either of the others is what made this check untrustworthy:
+  # one way it stayed silent about a real typo, the other it accused a correct
+  # gateway of being wrong.
+  ip_in_same_subnet "$IP_CIDR" "$GATEWAY"
+  case $? in
+    1)
+      echo "WARNING: gateway ${GATEWAY} is outside ${IP_CIDR}." >&2
+      echo "         The container will have no working default route." >&2
+      ;;
+    2)
+      echo "NOTE: could not check whether ${GATEWAY} is inside ${IP_CIDR}" >&2
+      echo "      (python3 unavailable, or the values did not parse). Verify" >&2
+      echo "      the gateway by hand — this check was skipped, not passed." >&2
+      ;;
+  esac
 }
 
 prompt_zerotier_config() {
@@ -767,16 +779,37 @@ prompt_zerotier_config() {
 }
 
 # True when $2 (an IPv4) falls inside the network described by $1 (addr/prefix).
+# Is $2 (an IPv4) inside the network described by $1 (addr/prefix)?
+#
+# THREE outcomes, not two:
+#   0 = yes, definitely inside
+#   1 = no, definitely outside
+#   2 = could not determine
+#
+# The two-state version was fail-OPEN: `except Exception: sys.exit(0)` turned
+# every unparseable input -- and every future bug in this snippet -- into
+# "looks fine", with `2>/dev/null` guaranteeing nobody could ever see that the
+# check had stopped checking. `192.168.11.10/99` and `notanip` both returned
+# "fine" when measured.
+#
+# The opposite error was live too: with no python3 on the host the command
+# exits 127, which the caller read as "definitely outside" and reported as a
+# confident, wrong claim about the operator's gateway. A check that cannot run
+# has to say so rather than pick a side.
 ip_in_same_subnet() {
-  local cidr="$1" gw="$2"
+  local cidr="$1" gw="$2" rc
   python3 - "$cidr" "$gw" <<'PY' 2>/dev/null
 import ipaddress, sys
 try:
     net = ipaddress.ip_interface(sys.argv[1]).network
     sys.exit(0 if ipaddress.ip_address(sys.argv[2]) in net else 1)
 except Exception:
-    sys.exit(0)   # unparseable: don't second-guess, the field validators ran
+    sys.exit(2)   # undetermined -- say so, never "fine"
 PY
+  rc=$?
+  # 127 (no python3), 126, a signal: all "could not determine", not "outside".
+  (( rc == 0 || rc == 1 )) || rc=2
+  return "$rc"
 }
 
 prompt_storage_config() {
@@ -1073,15 +1106,25 @@ push_local_config_tree() {
   tar -C "$tree" -czf "$tarball" .
   pct push "$CT_ID" "$tarball" /tmp/config-tree.tar.gz --perms 0600
   rm -f "$tarball"
-  run_ct bash -c "
+  # The script body is SINGLE-quoted, so the host expands nothing into it, and
+  # the path arrives as an argument the inner shell never re-parses.
+  #
+  # It used to be interpolated as '${CONFIG_REPO_DIR}' inside a double-quoted
+  # string: single quotes written into the script TEXT, which a value containing
+  # a single quote closes -- everything after it then runs as root inside the
+  # container, two lines above `rm -rf`. This file's own header claims values
+  # are "never re-parsed by an inner shell -- no quoting escape hatch"; that was
+  # true of the secrets and untrue right here. Arguments cannot be quoted wrong.
+  run_ct bash -c '
     set -e
-    rm -rf '${CONFIG_REPO_DIR}'
-    mkdir -p '${CONFIG_REPO_DIR}'
-    tar -xzf /tmp/config-tree.tar.gz -C '${CONFIG_REPO_DIR}'
+    repo="$1"
+    rm -rf "$repo"
+    mkdir -p "$repo"
+    tar -xzf /tmp/config-tree.tar.gz -C "$repo"
     rm -f /tmp/config-tree.tar.gz
-    chown -R root:root '${CONFIG_REPO_DIR}'
-    chmod -R go-rwx '${CONFIG_REPO_DIR}'
-  "
+    chown -R root:root "$repo"
+    chmod -R go-rwx "$repo"
+  ' push_local_config_tree "$CONFIG_REPO_DIR"
 }
 
 # Run a command inside the container.
@@ -1510,8 +1553,13 @@ install_zerotier() {
   # ZeroTier Central the status is REQUESTING_CONFIGURATION or ACCESS_DENIED and
   # no traffic flows -- reporting "joined" here would be a lie the operator only
   # discovers when nothing is reachable.
-  ZEROTIER_NET_STATUS="$(ct_out bash -c "zerotier-cli listnetworks \
-    | awk -v n=${ZEROTIER_NETWORK_ID} '\$3 == n {print \$6}'" || true)"
+  # Argument, not interpolation. The id is validated as 16 hex digits so nothing
+  # can go wrong today — but the escaping in the interpolated form was already
+  # dense enough to hide a mistake, and one pattern is easier to keep right than
+  # two. Same rule as push_local_config_tree.
+  ZEROTIER_NET_STATUS="$(ct_out bash -c \
+    'zerotier-cli listnetworks | awk -v n="$1" "\$3 == n {print \$6}"' \
+    install_zerotier "$ZEROTIER_NETWORK_ID" || true)"
   case "$ZEROTIER_NET_STATUS" in
     OK) echo "  network ${ZEROTIER_NETWORK_ID}: OK" ;;
     "") echo "  join requested; status not readable yet." ;;
@@ -1646,18 +1694,22 @@ ensure_openwebui_python() {
   # cosmetic problems (e.g. it declines to overwrite an unmanaged python3.12
   # shim in ~/.local/bin) even though the interpreter installed fine. Let the
   # `uv python find` below be the arbiter instead of aborting provisioning.
-  run_ct bash -c "
+  # Arguments, not interpolation — OPENWEBUI_PY_DIR and OPENWEBUI_PY_VERSION are
+  # both operator-settable, and '${var}' inside a double-quoted body is a quoting
+  # escape hatch, not quoting. See push_local_config_tree.
+  run_ct bash -c '
     set -e
+    export UV_PYTHON_INSTALL_DIR="$1"
     python3 -m venv /opt/uv-bootstrap
     /opt/uv-bootstrap/bin/pip install --no-cache-dir --quiet --upgrade pip
     /opt/uv-bootstrap/bin/pip install --no-cache-dir --quiet uv
-    UV_PYTHON_INSTALL_DIR='${OPENWEBUI_PY_DIR}' \
-      /opt/uv-bootstrap/bin/uv python install '${want}' || true
-  " >&2
-  interp="$(run_ct bash -c "
-    UV_PYTHON_INSTALL_DIR='${OPENWEBUI_PY_DIR}' \
-      /opt/uv-bootstrap/bin/uv python find '${want}' 2>/dev/null
-  " | tr -d '\r' | awk 'NF {print; exit}')"
+    /opt/uv-bootstrap/bin/uv python install "$2" || true
+  ' ensure_openwebui_python "$OPENWEBUI_PY_DIR" "$want" >&2
+  interp="$(run_ct bash -c '
+    UV_PYTHON_INSTALL_DIR="$1" \
+      /opt/uv-bootstrap/bin/uv python find "$2" 2>/dev/null
+  ' ensure_openwebui_python "$OPENWEBUI_PY_DIR" "$want" \
+    | tr -d '\r' | awk 'NF {print; exit}')"
   if [[ -z "$interp" ]]; then
     echo "Failed to provision a Python ${want} interpreter for Open WebUI." >&2
     echo "Set OPENWEBUI_PY_VERSION, or install a 3.11/3.12 interpreter manually." >&2
@@ -1769,33 +1821,44 @@ init_config_repo_history() {
   pct push "$CT_ID" "$cred_tmp" /root/.git-credentials --perms 0600
   rm -f "$cred_tmp"
 
-  run_ct bash -c "
+  # Same rule as push_local_config_tree, and it matters more here: `remote` is
+  # built from the Gitea URL, owner and repo name -- all operator input from the
+  # prompts -- and `branch` carries the container id. Interpolating any of them
+  # into shell text puts a quoting bug one apostrophe away from arbitrary root
+  # execution inside the container. The sslVerify line was not even quoted --
+  # a bare expansion pasted straight into the remote script.
+  #
+  # Single-quoted body, values as positional arguments. $0 is a label that shows
+  # up in any error message the inner shell prints.
+  run_ct bash -c '
     set -e
-    trap 'rm -f /root/.git-credentials' EXIT
-    cd '${CONFIG_REPO_DIR}'
+    repo="$1"; branch="$2"; remote="$3"; sslverify="$4"; ctid="$5"
+    trap "rm -f /root/.git-credentials" EXIT
+    cd "$repo"
     git -c init.defaultBranch=main init -q
-    git checkout -B '${branch}' >/dev/null
+    git checkout -B "$branch" >/dev/null
     if git remote get-url origin >/dev/null 2>&1; then
-      git remote set-url origin '${remote}'
+      git remote set-url origin "$remote"
     else
-      git remote add origin '${remote}'
+      git remote add origin "$remote"
     fi
-    git config http.sslVerify ${sslverify}
-    git config user.name 'ollama-smart-router'
-    git config user.email 'router@localhost'
+    git config http.sslVerify "$sslverify"
+    git config user.name "ollama-smart-router"
+    git config user.email "router@localhost"
     git add -A
     if git diff --cached --quiet; then
-      git commit --allow-empty -q -m 'Record deployment ${CT_ID}'
+      git commit --allow-empty -q -m "Record deployment ${ctid}"
     else
-      git commit -q -m 'Record deployment ${CT_ID}'
+      git commit -q -m "Record deployment ${ctid}"
     fi
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
-      git -c credential.helper='store --file=/root/.git-credentials' \
-          -c http.sslVerify=${sslverify} \
-          push -u origin 'HEAD:${branch}'
-    chown -R root:root '${CONFIG_REPO_DIR}'
-    chmod -R go-rwx '${CONFIG_REPO_DIR}'
-  "
+      git -c credential.helper="store --file=/root/.git-credentials" \
+          -c http.sslVerify="$sslverify" \
+          push -u origin "HEAD:${branch}"
+    chown -R root:root "$repo"
+    chmod -R go-rwx "$repo"
+  ' init_config_repo_history \
+    "$CONFIG_REPO_DIR" "$branch" "$remote" "$sslverify" "$CT_ID"
   echo "Deployment history pushed to ${GITEA_OWNER}/${GITEA_REPO_NAME}:${branch}."
 }
 
