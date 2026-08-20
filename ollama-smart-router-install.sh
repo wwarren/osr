@@ -24,6 +24,8 @@ set -euo pipefail
 #   * Configuration is generated locally and applied directly. If Gitea is
 #     available, the generated tree is initialized as a git repository afterward
 #     and pushed as deployment history; Gitea is never provisioning input.
+#   * ZeroTier is installed inside the container, with optional automatic
+#     network join from ZEROTIER_NETWORK_ID.
 #   * Routing thresholds/keywords moved out of router.py into router.ini, and
 #     monitor polling into monitor.ini, so behaviour is configurable per commit.
 # ==============================================================================
@@ -110,6 +112,11 @@ TEMPLATE_NAME="${TEMPLATE_NAME:-}"
 TEMPLATE_MIN_GIB="${TEMPLATE_MIN_GIB:-2}"
 FIREWALL="${FIREWALL:-1}"
 API_ALLOW_CIDR="${API_ALLOW_CIDR:-}"  # if FIREWALL=1, allow 8000 from this CIDR
+# ZeroTier is installed near the end of provisioning. Set this to a 16-character
+# network ID to join automatically; leave blank to install ZeroTier only.
+ZEROTIER_NETWORK_ID="${ZEROTIER_NETWORK_ID:-}"
+# Proxmox LXC config directory. Exposed for tests; production uses /etc/pve/lxc.
+LXC_CONF_DIR="${LXC_CONF_DIR:-/etc/pve/lxc}"
 # --- Ollama model servers ---------------------------------------------------
 # Everything here is only a DEFAULT offered at the prompts; set any of these in
 # the environment to pre-fill (or, with NONINTERACTIVE=true, to skip) a prompt.
@@ -170,11 +177,18 @@ TIER_XLARGE_IDX=""
 CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"
 # Container features, passed to `pct create -features`.
 #
-# nesting=1 permits nested user namespaces inside the container. It is what
-# lets you run Docker/Podman in here, and it also lets systemd's per-unit
-# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) set up its mount
-# namespaces without fighting the outer container -- every unit this installer
-# writes uses those.
+# nesting=1 permits nested user namespaces inside the container and selects a
+# more permissive AppArmor profile on the host. It is what lets you run
+# Docker/Podman in here, and it is USUALLY what lets systemd's per-unit
+# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) build its mount
+# namespaces -- every unit this installer writes asks for those.
+#
+# "Usually" is doing real work in that sentence. Whether the mount namespace is
+# permitted also depends on the privilege level and the host kernel, and when it
+# is refused the units do not degrade, they fail to start at all with
+# status=226/NAMESPACE. So the installer does not take this on faith: it runs a
+# transient probe unit inside the finished container and rewrites the generated
+# units if the answer is no. See apply_sandbox_policy.
 #
 # Extend the string rather than adding another flag to create_args; it is
 # comma separated, e.g. "nesting=1,keyctl=1". Setting CT_FEATURES="" omits
@@ -633,6 +647,9 @@ valid_optional_url() {   # blank is allowed (feature simply stays off)
 valid_optional_ipv4() {
   [[ -z "$1" ]] || valid_ipv4 "$1"
 }
+valid_optional_zerotier_network_id() {
+  [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f]{16}$ ]]
+}
 valid_nonempty() {
   [[ -n "$1" ]]
 }
@@ -740,6 +757,13 @@ prompt_network_config() {
     echo "WARNING: gateway ${GATEWAY} is outside ${IP_CIDR}." >&2
     echo "         The container will have no working default route." >&2
   fi
+}
+
+prompt_zerotier_config() {
+  echo
+  echo "--- ZeroTier (optional) ---"
+  prompt_until_valid "ZeroTier network ID (blank = install only)" \
+    ZEROTIER_NETWORK_ID "$ZEROTIER_NETWORK_ID" valid_optional_zerotier_network_id
 }
 
 # True when $2 (an IPv4) falls inside the network described by $1 (addr/prefix).
@@ -1063,6 +1087,164 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
+# Expose the host's /dev/net/tun inside the container so ZeroTier can create its
+# overlay interface.
+#
+# This MUST run between `pct create` and `pct start` -- LXC reads the config once,
+# at container start, so a mount entry added to a running container does nothing
+# until it is restarted. That is why `-start 1` was removed from create_args.
+#
+# Returns non-zero if the config file could not be written. The caller must not
+# let that abort the run: see the TUN_OK call site.
+configure_lxc_tun_device() {
+  local conf="${LXC_CONF_DIR}/${CT_ID}.conf"
+  local allow_line="lxc.cgroup2.devices.allow: c 10:200 rwm"
+  local mount_line="lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file"
+
+  if [[ ! -c /dev/net/tun ]] && command -v modprobe >/dev/null 2>&1; then
+    modprobe tun >/dev/null 2>&1 || true
+  fi
+  if [[ ! -c /dev/net/tun ]]; then
+    echo "WARNING: host /dev/net/tun is not available." >&2
+    echo "         The LXC config will still be written, but ZeroTier overlay" >&2
+    echo "         traffic needs the host TUN device to exist." >&2
+  fi
+  if [[ ! -f "$conf" ]]; then
+    echo "WARNING: cannot find ${conf}; /dev/net/tun was not added." >&2
+    return 1
+  fi
+
+  grep -qxF "$allow_line" "$conf" || printf '%s\n' "$allow_line" >> "$conf"
+  grep -qxF "$mount_line" "$conf" || printf '%s\n' "$mount_line" >> "$conf"
+  echo "  /dev/net/tun will be exposed inside the container."
+}
+
+# Run a command inside the container and capture ONE line of its output, with
+# carriage returns removed.
+#
+# This is not defensive tidying. `pct exec` goes through lxc-attach, which
+# allocates a pty when the host's stdout is a terminal -- i.e. every interactive
+# run of this installer. The pty's ONLCR turns each \n into \r\n. Command
+# substitution strips the trailing newline but NOT the \r, so
+#     state="$(run_ct systemctl is-active open-webui.service)"
+# yields "active\r", which PRINTS as "active" and COMPARES equal to nothing.
+# The symptom is a script that lists a unit as active and then declares it
+# failed in the next breath, which is exactly what happened. Three call sites
+# below already stripped \r ad hoc; routing every captured value through one
+# helper is what stops the next one forgetting.
+ct_out() {
+  run_ct "$@" 2>/dev/null | tr -d '\r' | awk 'NF {print; exit}'
+}
+
+# --- systemd sandboxing: measure, do not assume ---------------------------------
+#
+# ProtectSystem=, ProtectHome= and PrivateTmp= are not flags on a process, they
+# are a private MOUNT NAMESPACE that systemd builds before exec. Whether a
+# container is allowed to build one is decided by the AppArmor profile the
+# Proxmox host applies, which depends on the container's `features` (nesting)
+# and its privilege level, and on the host kernel.
+#
+# When it is not allowed the failure is total, not graceful:
+#     open-webui.service: Failed to set up mount namespacing: Permission denied
+#     open-webui.service: Failed at step NAMESPACE spawning ...: Permission denied
+#     open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
+# systemd never runs the binary, Restart=always spins forever, nothing binds the
+# upstream port, and the only thing an operator sees is nginx returning
+# 502 Bad Gateway. An earlier revision of this file asserted in its comments that
+# nesting=1 makes the hardening "genuinely in force"; a real install disproved
+# that, so the assertion has been replaced by a measurement.
+#
+# Two probes, because "the sandbox was refused" and "the probe itself did not
+# work" call for opposite decisions:
+#   plain fails                -> we learned nothing; keep the hardening
+#   plain ok, sandboxed fails  -> namespacing is genuinely denied; strip it
+#   both ok                    -> keep the hardening, it is real
+# Prints one of: ok | denied | unknown
+SANDBOX_DEGRADED=false
+ct_namespacing_verdict() {
+  # --collect removes the transient unit afterwards even when it failed, so a
+  # rerun of the installer does not trip over a leftover name.
+  if ! run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-plain \
+       /bin/true >/dev/null 2>&1; then
+    echo "unknown"
+    return 0
+  fi
+  if run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-sandbox \
+       -p PrivateTmp=yes -p ProtectSystem=full -p ProtectHome=yes \
+       /bin/true >/dev/null 2>&1; then
+    echo "ok"
+  else
+    echo "denied"
+  fi
+}
+
+# Remove the three mount-namespace directives from one unit file, leaving a
+# comment where they were. NoNewPrivileges= deliberately stays: it is a prctl
+# flag, not a mount, and it works in every container.
+strip_unit_namespacing() {
+  local unit="$1" tmp="${1}.tmp"
+  # Nothing to remove means nothing to say: without this guard a second pass
+  # would append the explanatory comment again on every run.
+  grep -qE '^(PrivateTmp|ProtectSystem|ProtectHome)=' "$unit" || return 0
+  awk '
+    /^(PrivateTmp|ProtectSystem|ProtectHome)=/ { next }
+    /^NoNewPrivileges=/ {
+      print
+      print "# PrivateTmp=, ProtectSystem= and ProtectHome= were removed by the"
+      print "# installer: this container denies systemd the mount namespacing they"
+      print "# are built from, so a unit that asks for them does not start AT ALL"
+      print "# (status=226/NAMESPACE) -- it does not merely run unhardened."
+      print "# NoNewPrivileges= is a process flag rather than a mount, so it stays."
+      print "# To get the hardening back, give the container nesting=1 (or make it"
+      print "# unprivileged) and re-run the installer; it re-tests on every install."
+      next
+    }
+    { print }
+  ' "$unit" > "$tmp" && mv "$tmp" "$unit"
+}
+
+# Decide the sandboxing policy for the generated units and rewrite them if the
+# container cannot honour it. Must run AFTER the units are written and BEFORE
+# they are shipped into the container.
+apply_sandbox_policy() {
+  local repo="$1" verdict unit count=0
+  echo "Testing whether systemd can build mount namespaces in this container."
+  verdict="$(ct_namespacing_verdict)"
+  case "$verdict" in
+    ok)
+      echo "  it can — per-unit sandboxing (PrivateTmp/ProtectSystem/ProtectHome)"
+      echo "  stays enabled on all four services."
+      return 0
+      ;;
+    unknown)
+      echo "WARNING: could not test mount namespacing — no transient unit would" >&2
+      echo "         run at all. Leaving the sandboxing directives in place; if" >&2
+      echo "         the services then fail with status=226/NAMESPACE, run" >&2
+      echo "         fix-service-namespacing.sh against this container." >&2
+      return 0
+      ;;
+  esac
+
+  SANDBOX_DEGRADED=true
+  echo "WARNING: this container refuses systemd's mount namespacing." >&2
+  echo "         PrivateTmp=, ProtectSystem= and ProtectHome= are implemented as" >&2
+  echo "         mount namespaces, and a unit asking for one here does not start" >&2
+  echo "         at all (status=226/NAMESPACE) — it crash-loops, nothing binds" >&2
+  echo "         the upstream ports, and nginx answers 502 Bad Gateway." >&2
+  echo "         Removing those three directives from the generated units so the" >&2
+  echo "         services can run. The services keep every other restriction:" >&2
+  echo "         non-login system account, NoNewPrivileges, loopback-only binds." >&2
+  echo "         To restore them: give the container 'nesting=1' (pct set ${CT_ID}" >&2
+  echo "         -features nesting=1), reboot it, and re-run the installer." >&2
+  for unit in "$repo"/services/*/*.service; do
+    [[ -f "$unit" ]] || continue
+    strip_unit_namespacing "$unit"
+    count=$(( count + 1 ))
+  done
+  echo "         Rewrote ${count} unit file(s)." >&2
+  return 0
+}
+
 # --- TLS certificate ----------------------------------------------------------
 # Build the subjectAltName list. A self-signed certificate with no SAN is
 # rejected outright by every current browser -- CN alone has not been accepted
@@ -1158,6 +1340,10 @@ generate_tls_cert() {
 OPENWEBUI_OK=true
 OPENWEBUI_RESET=false
 TLS_OK=true
+TUN_OK=true
+ZEROTIER_OK=true
+ZEROTIER_NODE_ID=""
+ZEROTIER_NET_STATUS=""
 
 # Does anything inside the container listen on this TCP port?
 ct_port_listening() {
@@ -1173,7 +1359,7 @@ ct_wait_for_port() {
   while (( waited < deadline )); do
     if ct_port_listening "$port"; then return 0; fi
     if [[ -n "$unit" ]]; then
-      state="$(run_ct systemctl is-active "$unit" 2>/dev/null || true)"
+      state="$(ct_out systemctl is-active "$unit" || true)"
       case "$state" in
         active|activating|reloading) ;;
         *) return 2 ;;
@@ -1262,6 +1448,80 @@ verify_service_executables() {
   echo "  the service account can run both interpreters."
 }
 
+# Install ZeroTier in the container and, if a network ID was given, request a
+# join. Every step names itself before it can fail, and the function returns
+# non-zero rather than letting `set -e` abort: this runs AFTER the whole system
+# is provisioned, so an unguarded failure here would reach the ERR trap and
+# destroy a working deployment over an optional overlay network.
+install_zerotier() {
+  echo "Installing ZeroTier inside the container."
+  if ! run_ct test -c /dev/net/tun; then
+    echo "WARNING: /dev/net/tun is not visible inside the container." >&2
+    echo "         ZeroTier will install but cannot carry overlay traffic. The" >&2
+    echo "         mount entry is applied at container START, so if it was added" >&2
+    echo "         to a running container, reboot it:  pct reboot ${CT_ID}" >&2
+  fi
+
+  # -fsSL, not -s. With -s alone curl prints nothing AND exits 0 on an HTTP
+  # error, so a 404 or a captive-portal page is piped into a root shell and
+  # executed. -f makes the transfer fail on an error status, -S restores the
+  # error message, -L follows the redirect the installer URL actually issues.
+  # --proto '=https' refuses a plaintext redirect.
+  #
+  # No `sudo`: pct exec is already root inside the container, and requiring it
+  # meant installing a package purely to satisfy this one pipeline.
+  if ! run_ct bash -c 'set -euo pipefail
+    curl -fsSL --proto "=https" --tlsv1.2 https://install.zerotier.com | bash'; then
+    echo "WARNING: the ZeroTier installer did not complete." >&2
+    return 1
+  fi
+  if ! run_ct bash -c 'command -v zerotier-cli >/dev/null'; then
+    echo "WARNING: the ZeroTier installer ran but zerotier-cli is not on PATH." >&2
+    return 1
+  fi
+  # The vendor installer already enables and starts the unit; this is only a
+  # guard for the case where it did not.
+  run_ct systemctl enable --now zerotier-one.service >/dev/null 2>&1 || true
+  # The service needs a moment to generate its identity before the CLI works.
+  if ! run_ct bash -c 'for _ in $(seq 1 30); do
+         zerotier-cli info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'; then
+    echo "WARNING: zerotier-one did not become ready. Check:" >&2
+    echo "         pct exec ${CT_ID} -- journalctl -u zerotier-one -n 50" >&2
+    return 1
+  fi
+
+  # The node address is what you have to authorise in ZeroTier Central. Printing
+  # it here saves going to look for it, and proves the daemon really answered.
+  ZEROTIER_NODE_ID="$(ct_out zerotier-cli info | awk '{print $3}' || true)"
+  [[ -n "$ZEROTIER_NODE_ID" ]] && echo "  ZeroTier node address: ${ZEROTIER_NODE_ID}"
+
+  if [[ -z "$ZEROTIER_NETWORK_ID" ]]; then
+    echo "  installed; no ZEROTIER_NETWORK_ID was given. Join later with:"
+    echo "    pct exec ${CT_ID} -- zerotier-cli join <network-id>"
+    return 0
+  fi
+
+  echo "Requesting a join to ZeroTier network ${ZEROTIER_NETWORK_ID}."
+  if ! run_ct zerotier-cli join "$ZEROTIER_NETWORK_ID"; then
+    echo "WARNING: the join request was rejected." >&2
+    return 1
+  fi
+  # A join is a REQUEST, not membership. Until the member is authorised in
+  # ZeroTier Central the status is REQUESTING_CONFIGURATION or ACCESS_DENIED and
+  # no traffic flows -- reporting "joined" here would be a lie the operator only
+  # discovers when nothing is reachable.
+  ZEROTIER_NET_STATUS="$(ct_out bash -c "zerotier-cli listnetworks \
+    | awk -v n=${ZEROTIER_NETWORK_ID} '\$3 == n {print \$6}'" || true)"
+  case "$ZEROTIER_NET_STATUS" in
+    OK) echo "  network ${ZEROTIER_NETWORK_ID}: OK" ;;
+    "") echo "  join requested; status not readable yet." ;;
+    *)  echo "  network ${ZEROTIER_NETWORK_ID}: ${ZEROTIER_NET_STATUS}"
+        echo "  -> authorise node ${ZEROTIER_NODE_ID} in ZeroTier Central; until"
+        echo "     then this member carries no traffic." ;;
+  esac
+  return 0
+}
+
 start_openwebui_verified() {
   local rc
   echo "Starting Open WebUI (first start runs migrations and downloads an"
@@ -1312,7 +1572,7 @@ wait_for_ct_ready() {
   local state
   echo "Waiting for container to become ready."
   for _ in $(seq 1 60); do
-    state="$(run_ct systemctl is-system-running 2>/dev/null || true)"
+    state="$(ct_out systemctl is-system-running || true)"
     # 'running' or 'degraded' both mean userspace is up enough to proceed.
     if [[ "$state" == "running" || "$state" == "degraded" ]]; then
       # also make sure name resolution works before we hit apt mirrors
@@ -1691,6 +1951,7 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 # a typo costs a re-prompt rather than a failed provisioning run. Every prompt
 # offers a default (Enter accepts); NONINTERACTIVE=true takes all defaults.
 prompt_network_config
+prompt_zerotier_config
 prompt_storage_config
 
 # Ask for the Gitea URL, username + auth token and verify them against the
@@ -1761,13 +2022,35 @@ create_args=(
   -net0 "name=eth0,bridge=${BRIDGE},ip=${IP_CIDR},gw=${GATEWAY},firewall=${FIREWALL}"
   -unprivileged "$CT_UNPRIVILEGED"
   -onboot 1
-  -start 1
 )
 [[ -n "$CT_FEATURES" ]] && create_args+=(-features "$CT_FEATURES")
 [[ -n "$NAMESERVER" ]] && create_args+=(-nameserver "$NAMESERVER")
 pct create "${create_args[@]}"
 CT_CREATED=1
 
+# NOT a bare call. `CT_CREATED=1` is already set, so an uncaught non-zero here
+# reaches the ERR trap, which DESTROYS the container that was just created --
+# for the optional TUN device, before a single service exists. Same pattern as
+# generate_tls_cert/TLS_OK: record the failure, carry on, report it at the end.
+TUN_OK=true
+configure_lxc_tun_device || TUN_OK=false
+
+# Confirm the features actually landed rather than trusting that they did.
+# `pct create` accepts -features on a privileged container but the resulting
+# config is the only place that says whether it stuck, and nesting is what
+# selects the AppArmor profile that permits systemd's mount namespacing.
+if [[ "$CT_FEATURES" == *nesting=1* ]]; then
+  if pct config "$CT_ID" 2>/dev/null | grep -qE '^features:.*nesting=1'; then
+    echo "  nesting=1 confirmed in the container configuration."
+  else
+    echo "WARNING: nesting=1 was requested but is not present in 'pct config ${CT_ID}'." >&2
+    echo "         systemd's per-unit sandboxing may be refused; the installer" >&2
+    echo "         tests for that later and adapts the units if so." >&2
+  fi
+fi
+
+echo "Starting container ${CT_ID}."
+pct start "$CT_ID"
 wait_for_ct_ready
 
 echo "Setting container root password."
@@ -1776,7 +2059,11 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-base_packages=(python3 python3-pip python3-venv curl ca-certificates logrotate iproute2)
+# `sudo` is here for the operator, not for this script -- nothing the installer
+# runs needs it, because `pct exec` and `pct enter` are already root. It earns
+# its place by making a reflexive `sudo systemctl restart ...` typed at a
+# container shell work instead of failing with "command not found".
+base_packages=(python3 python3-pip python3-venv curl ca-certificates logrotate iproute2 sudo)
 if [[ "$TLS_ENABLED" == "true" ]]; then
   base_packages+=(openssl nginx)
 fi
@@ -6030,6 +6317,11 @@ ProtectHome=true
 WantedBy=multi-user.target
 UNITEOF
 
+# The four units above all ask for a private mount namespace. Find out whether
+# this container will actually give them one BEFORE shipping them in — a unit
+# that asks and is refused does not start at all. See apply_sandbox_policy.
+apply_sandbox_policy "$REPO_DIR"
+
 echo "Installing the generated configuration directly."
 push_local_config_tree "$REPO_DIR"
 
@@ -6123,16 +6415,32 @@ verify_service_executables
 # Optional: if the CT firewall is on, the default input policy can drop inbound
 # traffic. Allow the Router API (8000) and Open WebUI (OPENWEBUI_PORT) from the
 # trusted subnet. LiteLLM (4000) stays localhost-only and needs no rule.
-if [[ "$FIREWALL" == "1" && -n "$API_ALLOW_CIDR" ]]; then
-  echo "Adding firewall rules to allow tcp/8000 and tcp/${OPENWEBUI_PORT} from ${API_ALLOW_CIDR}."
+fw_add_rule() {
+  # Appending blindly duplicates every rule when this runs twice against a
+  # container id whose .fw file survived. Match first.
+  grep -qxF "$1" "$fw_conf" || echo "$1" >> "$fw_conf"
+}
+if [[ "$FIREWALL" == "1" ]]; then
   mkdir -p "/etc/pve/firewall"
   fw_conf="/etc/pve/firewall/${CT_ID}.fw"
   if [[ ! -f "$fw_conf" ]]; then
     printf '[OPTIONS]\nenable: 1\n\n[RULES]\n' > "$fw_conf"
   fi
-  echo "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport 8000 -log nolog" >> "$fw_conf"
-  echo "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport ${OPENWEBUI_PORT} -log nolog" >> "$fw_conf"
-elif [[ "$FIREWALL" == "1" ]]; then
+  if [[ -n "$API_ALLOW_CIDR" ]]; then
+    echo "Adding firewall rules to allow tcp/8000 and tcp/${OPENWEBUI_PORT} from ${API_ALLOW_CIDR}."
+    fw_add_rule "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport 8000 -log nolog"
+    fw_add_rule "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport ${OPENWEBUI_PORT} -log nolog"
+  fi
+  # ZeroTier's control/data port. NOT restricted by source: peers and the root
+  # servers come from arbitrary internet addresses, so a CIDR-scoped rule would
+  # silently force every session onto ZeroTier's relays -- it still "works",
+  # just slowly and via a third party, which is the worst kind of failure to
+  # diagnose. Without the rule, Proxmox's default DROP input policy blocks the
+  # direct path entirely.
+  echo "Allowing udp/9993 inbound for ZeroTier peer traffic."
+  fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
+fi
+if [[ "$FIREWALL" == "1" && -z "$API_ALLOW_CIDR" ]]; then
   echo "WARNING: FIREWALL=1 but API_ALLOW_CIDR is unset. If the datacenter" >&2
   echo "         firewall is active, inbound tcp/8000 and tcp/${OPENWEBUI_PORT}" >&2
   echo "         may be dropped. Set API_ALLOW_CIDR (e.g. 192.168.11.0/24) or" >&2
@@ -6181,6 +6489,7 @@ cat > "$motd_tmp" <<EOF
                    manage-model-servers set-keepalive 2h --apply
    Alerting      : manage-model-servers test-alert
                    manage-model-servers set-webhook <url> [--channel <c>]
+   ZeroTier      : zerotier-cli status | zerotier-cli join [network-id]
    Status        : systemctl status open-webui ollama-router litellm-proxy ollama-monitor
    Logs          : journalctl -u ollama-router -f
 ==============================================================================
@@ -6216,6 +6525,12 @@ run_ct systemctl start \
 
 start_openwebui_verified || OPENWEBUI_OK=false
 
+# Non-fatal, and that is the whole point of the guard. This runs BEFORE the
+# ERR trap is disarmed, with CT_CREATED still set, so a bare call would let a
+# transient network failure fetching the ZeroTier installer destroy a fully
+# provisioned container -- Open WebUI migrations, certificates and all.
+install_zerotier || ZEROTIER_OK=false
+
 # Provisioning succeeded — disarm the failure trap so we keep the container.
 CT_CREATED=""
 trap - ERR
@@ -6230,7 +6545,7 @@ report_services() {
   [[ "$TLS_ENABLED" == "true" ]] && units+=(nginx)
   echo "Service status:"
   for unit in "${units[@]}"; do
-    state="$(run_ct systemctl is-active "${unit}.service" 2>/dev/null || true)"
+    state="$(ct_out systemctl is-active "${unit}.service" || true)"
     printf '  %-16s %s\n' "$unit" "${state:-unknown}"
     [[ "$state" == "active" ]] || ok=false
   done
@@ -6274,6 +6589,25 @@ echo "OpenAI-compatible API base URL: ${URL_SCHEME}://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to the router."
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
+if ! $ZEROTIER_OK; then
+  echo "ZeroTier: NOT installed — see the warnings above. Nothing else is affected."
+elif [[ -z "$ZEROTIER_NETWORK_ID" ]]; then
+  echo "ZeroTier: installed, node ${ZEROTIER_NODE_ID:-unknown} (join with: pct exec ${CT_ID} -- zerotier-cli join <network-id>)"
+elif [[ "$ZEROTIER_NET_STATUS" == "OK" ]]; then
+  echo "ZeroTier: node ${ZEROTIER_NODE_ID:-unknown} on network ${ZEROTIER_NETWORK_ID} (OK)"
+else
+  # "Requested" is the honest word. The member carries no traffic until someone
+  # authorises it, and a summary that says "joined" sends the operator looking
+  # for a routing fault instead of clicking a checkbox.
+  echo "ZeroTier: join REQUESTED for ${ZEROTIER_NETWORK_ID}${ZEROTIER_NET_STATUS:+ (${ZEROTIER_NET_STATUS})}"
+  echo "  -> authorise node ${ZEROTIER_NODE_ID:-<see zerotier-cli info>} in ZeroTier Central."
+fi
+if ! $TUN_OK; then
+  echo
+  echo "WARNING: /dev/net/tun could not be added to the container config, so" >&2
+  echo "         ZeroTier has no overlay interface. Fix the LXC config and" >&2
+  echo "         reboot the container — the mount entry is read at start." >&2
+fi
 if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
   echo "Config source: LOCAL generated config; mirrored to ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
 else
@@ -6293,6 +6627,18 @@ if [[ "$TLS_ENABLED" == "true" ]]; then
   echo "       pct pull ${CT_ID} ${TLS_DIR}/server.crt ollama-router.crt"
   echo "     For API clients:  export SSL_CERT_FILE=/path/to/ollama-router.crt"
   echo "     Inspect or replace it with:  manage-model-servers cert"
+fi
+if $SANDBOX_DEGRADED; then
+  echo
+  echo "NOTE: this container refuses systemd mount namespacing, so PrivateTmp=,"
+  echo "      ProtectSystem= and ProtectHome= were removed from the four service"
+  echo "      units — with them present the services cannot start at all"
+  echo "      (status=226/NAMESPACE) and nginx answers 502. The services still"
+  echo "      run as a non-login system account with NoNewPrivileges and"
+  echo "      loopback-only internal binds."
+  echo "      To restore the full hardening:"
+  echo "        pct set ${CT_ID} -features nesting=1 && pct reboot ${CT_ID}"
+  echo "      then re-run the installer, or fix-service-namespacing.sh ${CT_ID}."
 fi
 if ! $TLS_OK; then
   echo
