@@ -307,12 +307,13 @@ while — it is a large dependency tree.
 
 ## Provisioning-time checks
 
-- **Gitea:** `test_gitea_access` authenticates with the deploy token, creates
-  the service repo if missing, and pushes a timestamped test commit under
-  `provisioning-tests/`. Non-fatal — warns and continues on failure.
+- **Gitea:** `test_gitea_access` authenticates with the deploy token and
+  creates the service repo if missing. The actual write check happens later,
+  when the generated local config tree is committed and pushed as deployment
+  history. Non-fatal — warns and continues on failure.
 
   **Which repository:** the installer always uses `GITEA_REPO_NAME`, default
-  **`ollama-smart-router`** — every API call and the clone URL are built from
+  **`ollama-smart-router`** — every API call and the push remote are built from
   that one variable. The owner is resolved in this order: an explicit
   `GITEA_REPO_OWNER`; then the token owner; then a search across every repo the
   token can see, matching the name exactly. That search matters — if the repo
@@ -330,8 +331,7 @@ while — it is a large dependency tree.
 
   TurnKey ships a **self-signed certificate**, so `prompt_gitea_credentials`
   sets `GITEA_VERIFY_TLS=false` unconditionally — certificate verification is
-  off for the credential check, repo resolution, seeding API calls and the
-  container's `git clone` alike. The trade-off is that the deploy token travels
+  off for the credential check, repo resolution and history push. The trade-off is that the deploy token travels
   over a connection whose certificate isn't authenticated; if that network path
   isn't trusted, install the appliance's CA (or a real certificate) and change
   that line in `prompt_gitea_credentials` to `true`. Use an `https://` URL:
@@ -373,8 +373,8 @@ Three things worth knowing:
   still cannot traverse it.
 
 Re-running `apply-config.sh` restores both the executable bits and the `PATH`
-snippet, so this self-heals — neither the Gitea contents API nor `git clone`
-preserves the executable bit.
+snippet, so this self-heals even if a later edit or history operation loses an
+executable bit.
 
 ## Mattermost alerting
 
@@ -738,9 +738,9 @@ A login MOTD (`/etc/motd`) summarizes all services, IPs, ports, and config paths
 
 ## Version-controlled configuration
 
-All service configuration lives in the Gitea repo and is injected during
-provisioning. Layout — one directory per service, so each is version controlled
-independently:
+All service configuration is generated locally during provisioning and copied
+into the container. If Gitea is configured, the same tree is then initialized as
+a git repository and pushed as deployment history. Layout:
 
 ```
 services/ollama-router/    router.py  router.ini  requirements.txt  *.service
@@ -752,11 +752,11 @@ env/openwebui.env          Open WebUI env
 install/apply-config.sh    copies everything into its runtime location
 ```
 
-**Flow:** the installer builds this tree, seeds it into the repo (only files the
-repo doesn't already have, so your commits always win), installs git in the
-container, clones, and runs `apply-config.sh`. The pull happens **once, at
-provisioning time** — services never contact Gitea to start, so a Gitea outage
-can't block a boot.
+**Flow:** the installer builds this tree locally, pushes it into the container,
+and runs `apply-config.sh`. If Gitea is configured, the same generated tree is
+initialized as a git repo and pushed as deployment history. Gitea is never cloned
+or pulled during provisioning, so stale remote commits cannot affect a clean
+install.
 
 ### Keeping models loaded (the 5-minute unload)
 
@@ -825,18 +825,19 @@ one), while `set-server-model` changes a single one. Both verify the tag exists
 on the affected server(s) before writing it — which is the easiest way to correct the inherited
 `qwen3.8:27b` value. `commit` pushes using the **deploy token** from `router.env` — Gitea does not
 accept an account password for git-over-HTTP, and provisioning deletes the
-stored git credentials once the clone is done. If the token is missing, wrong,
-or lacks write access, the push fails fast with the real git error (token
-redacted) instead of hanging on a password prompt. Store or replace it with
-`manage-model-servers set-token`, which verifies it against the server.
+stored git credentials. If the token is missing, wrong, or lacks write access,
+the push fails fast with the real git error (token redacted) instead of hanging
+on a password prompt. Store or replace it with `manage-model-servers set-token`,
+which verifies it against the server.
 
 **Changing config on a running container:**
 
 ```
-cd /app/config-repo && git pull
+cd /app/config-repo
 ./install/apply-config.sh
 systemctl daemon-reload
 systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
+manage-model-servers commit "Describe the change"
 ```
 
 `router.ini` holds the complexity thresholds, keyword lists and tier names, so
@@ -850,8 +851,8 @@ Both venvs are built from the repo's `requirements.txt` files (the router,
 litellm-proxy and monitor share `/app/router/venv`, built from all three).
 
 > **Secrets:** `env/*.env` contain the real Gitea token and Mattermost webhook,
-> committed by choice. The repo is created **private**, the clone in the
-> container is locked to root-only (`chmod -R go-rwx`), and the runtime copies
+> committed by choice. The repo is created **private**, the local config tree in
+> the container is locked to root-only (`chmod -R go-rwx`), and the runtime copies
 > are `0640 root:ollama-router`. Anyone who can read the repo gets those
 > credentials — rotate the deploy token if the repo is ever shared.
 
@@ -865,7 +866,7 @@ litellm-proxy and monitor share `/app/router/venv`, built from all three).
 /app/router/router.ini           # routing thresholds + keywords
 /app/router/monitor.ini          # monitor polling + alerting tunables
 /var/lib/ollama-monitor/state.json  # remembered host health (survives restarts)
-/app/config-repo/                # cloned config repo (root-only)
+/app/config-repo/                # local config tree, optional git history
 /app/router/venv/                # router + litellm deps
 /app/openwebui/.env              # Open WebUI config
 /app/openwebui/venv/             # Open WebUI deps (isolated)
