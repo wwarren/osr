@@ -219,10 +219,22 @@ assert_eq "multiple"       "http://a:1,http://c:3"  "$(indices_to_urls '0 2')"
 assert_eq "empty"          ""                       "$(indices_to_urls '')"
 
 describe ip_in_same_subnet
-assert_ok   "gateway inside /24"   ip_in_same_subnet 192.168.11.80/24 192.168.11.1
-assert_fail "gateway outside /24"  ip_in_same_subnet 192.168.11.80/24 10.99.99.1
-assert_ok   "wide prefix contains" ip_in_same_subnet 10.0.0.5/8 10.255.0.1
-assert_ok   "unparseable is lenient" ip_in_same_subnet "garbage" "also-garbage"
+# THREE outcomes: 0 inside, 1 outside, 2 could-not-determine. The two-state
+# version answered "inside" for anything it failed to parse, so the check could
+# stop checking and nothing said so — and it answered "outside" when python3 was
+# missing, accusing a correct gateway. Neither collapse is acceptable.
+assert_status "gateway inside /24" 0   ip_in_same_subnet 192.168.11.80/24 192.168.11.1
+assert_status "gateway outside /24" 1  ip_in_same_subnet 192.168.11.80/24 10.99.99.1
+assert_status "wide prefix contains" 0 ip_in_same_subnet 10.0.0.5/8 10.255.0.1
+assert_status "unparseable is UNDETERMINED, not a pass" 2 \
+  ip_in_same_subnet "garbage" "also-garbage"
+assert_status "an impossible prefix is undetermined too" 2 \
+  ip_in_same_subnet "192.168.11.10/99" "10.0.0.1"
+# 127 from a missing python3 must not read as "definitely outside".
+assert_status "no python3 is undetermined, not 'outside'" 2 \
+  bash -c "$(declare -f ip_in_same_subnet)
+           PATH=/nonexistent
+           ip_in_same_subnet 192.168.11.80/24 192.168.11.1"
 
 # ── storage discovery ─────────────────────────────────────────────────────────
 describe parse_pvesm_table
@@ -500,7 +512,52 @@ CT_ID=321
 push_local_config_tree "$tree" >/dev/null 2>&1
 assert_contains "pushes a tarball into the container" "push 321" "$(mock_calls)"
 assert_contains "extracts it under the config dir"    "tar -xzf"  "$(mock_calls)"
+
+# The remote body used to be built by interpolating '${CONFIG_REPO_DIR}' into a
+# double-quoted string -- single quotes written into the script TEXT, which a
+# value containing an apostrophe simply closes. Everything after it then ran as
+# root inside the container, two lines above `rm -rf`. Run the real body with a
+# hostile path and prove the payload is data.
+_hostile_dir="$(mktemp -d)"
+_saved_repo_dir="$CONFIG_REPO_DIR"
+CONFIG_REPO_DIR="${_hostile_dir}/x'; echo PWNED-AS-ROOT; :'"
+mock_script pct <<'EOF'
+shift 3                 # drop: exec <id> --
+"$@"
+EOF
+_inj="$(push_local_config_tree "$tree" 2>&1 || true)"
+assert_not_contains "an apostrophe in the path cannot execute" "PWNED-AS-ROOT" "$_inj"
+CONFIG_REPO_DIR="$_saved_repo_dir"
+rm -rf "$_hostile_dir"
 rm -rf "$tree"
+
+# ── values crossing into the container's shell ────────────────────────────────
+# Four call sites build a script for `bash -c` inside the container. The rule is
+# one line long: the body is SINGLE-quoted so the host expands nothing into it,
+# and every value travels as a positional argument the inner shell never
+# re-parses. `'${VAR}'` inside a double-quoted body is not quoting, it is a
+# quoting escape hatch -- and this file's own header claims the opposite.
+describe injected_shell_bodies
+_inj_src="$(cat "$SCRIPT")"
+assert_contains "the config path travels as an argument" \
+  "' push_local_config_tree \"\$CONFIG_REPO_DIR\"" "$_inj_src"
+assert_not_contains "and is not pasted into an rm -rf" \
+  "rm -rf '\${CONFIG_REPO_DIR}'" "$_inj_src"
+assert_not_contains "nor into a cd" \
+  "cd '\${CONFIG_REPO_DIR}'" "$_inj_src"
+# remote and branch are built from prompt input (Gitea URL, owner, repo name).
+assert_not_contains "the git remote is not pasted in" \
+  "git remote set-url origin '\${remote}'" "$_inj_src"
+# This one was not even single-quoted.
+assert_not_contains "sslVerify is not a bare expansion" \
+  'git config http.sslVerify ${sslverify}' "$_inj_src"
+assert_contains "it is passed as data instead" \
+  'git config http.sslVerify "$sslverify"' "$_inj_src"
+# Same pattern in the two later additions.
+assert_not_contains "the python dir is not pasted in" \
+  "UV_PYTHON_INSTALL_DIR='\${OPENWEBUI_PY_DIR}'" "$_inj_src"
+assert_not_contains "nor the ZeroTier network id" \
+  'awk -v n=${ZEROTIER_NETWORK_ID}' "$_inj_src"
 
 describe cleanup_on_error
 CT_CREATED=""; STAGE_DIR="$(mktemp -d)"
@@ -801,7 +858,11 @@ assert_contains "initializes git in place"    "init -q"                 "$calls"
 # suppress it and it reads like a warning in the install log.
 assert_contains "without git's default-branch hint" "init.defaultBranch=main" "$calls"
 assert_contains "uses a deployment branch"    "deployment-910-test"     "$calls"
-assert_contains "honours GITEA_VERIFY_TLS"    "http.sslVerify=false"    "$calls"
+# The body is single-quoted now, so the VALUE travels as a positional argument
+# (repo branch remote sslverify ctid) rather than being pasted into the script.
+assert_contains "passes sslVerify as data, not as script text" \
+  'http.sslVerify="$sslverify"' "$calls"
+assert_contains "honours GITEA_VERIFY_TLS"    ".git false 910"          "$calls"
 assert_contains "removes the credential file afterwards" "rm -f /root/.git-credentials" "$calls"
 assert_contains "tightens permissions on the generated tree" "chmod -R go-rwx" "$calls"
 assert_not_contains "does not clone from Gitea" "git clone" "$calls"
