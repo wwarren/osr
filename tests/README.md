@@ -23,13 +23,13 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **742 assertions, 107/107 functions covered** (plus an integration
+Current state: **746 assertions, 107/107 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 65 | 385 |
+| `installer` | `ollama-smart-router-install.sh` | 65 | 389 |
 | `manage` | `manage-model-servers.sh` | 53 | 239 |
 | `monitor` | generated `monitor.py` | — | 51 |
 | `router` | generated `router.py` | — | 67 |

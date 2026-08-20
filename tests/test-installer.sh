@@ -975,6 +975,22 @@ assert_status "a missing required file aborts" 1 \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
 
+# ── container creation flags ──────────────────────────────────────────────────
+# The privilege level is a security-relevant default that lives in exactly one
+# place, so pin it rather than trusting a reader to notice a flipped digit.
+describe container_create_flags
+_cargs="$(grep -A 20 '^create_args=(' "$SCRIPT" | sed -n '/^create_args=(/,/^)/p')"
+assert_contains "privilege level comes from CT_UNPRIVILEGED" \
+  '-unprivileged "$CT_UNPRIVILEGED"' "$_cargs"
+assert_contains "defaults to privileged" \
+  'CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"' "$(cat "$SCRIPT")"
+assert_not_contains "no hardcoded unprivileged flag remains" \
+  '-unprivileged 1' "$_cargs"
+# A privileged container is not a containment boundary; the installer has to
+# say so out loud rather than leaving it to the docs.
+assert_contains "the operator is told at creation time" \
+  "not a security" "$(cat "$SCRIPT")"
+
 # ── the embedded copy of manage-model-servers.sh ──────────────────────────────
 # The installer carries a COMPLETE copy of manage-model-servers.sh inside a
 # heredoc, and that copy — not the file next to it — is what apply-config.sh
