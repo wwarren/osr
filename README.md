@@ -130,7 +130,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `TLS_EXTRA_SAN` — extra names for the certificate, comma separated (e.g. `chat.lan,10.0.0.9`). Add the DNS name you actually browse to, or hostname verification fails
 - `OPENWEBUI_INTERNAL_PORT` (8088), `ROUTER_INTERNAL_PORT` (8010) — where the apps bind once nginx owns the public ports
 - `CT_UNPRIVILEGED` (0) — `0` creates a **privileged** container, `1` an unprivileged one. See the note below before changing it
-- `CT_FEATURES` (`nesting=1`) — passed to `pct create -features`. Nesting permits nested user namespaces, so Docker/Podman work inside and systemd's per-unit sandboxing sets up its mount namespaces cleanly. Comma separated; empty omits the flag
+- `CT_FEATURES` (`nesting=1`) — passed to `pct create -features`. Nesting permits nested user namespaces, so Docker/Podman work inside, and it is usually what lets systemd's per-unit sandboxing build its mount namespaces. Only *usually*: the installer verifies the feature landed and then probes namespacing for real, adapting the units if it is refused (see [502 Bad Gateway](#502-bad-gateway)). Comma separated; empty omits the flag
 
 ### Install-time prompts
 
@@ -357,6 +357,16 @@ while — it is a large dependency tree.
   restarts are silent, so a flapping unit cannot flood the channel.
 - **Container:** readiness is polled (systemd + DNS) before apt runs, apt is
   retried, and an `ERR` trap destroys a half-provisioned container on failure.
+  `nesting=1` is confirmed present in `pct config` after creation rather than
+  assumed to have been honoured.
+- **systemd mount namespacing:** before the generated units are shipped in, the
+  installer runs two transient probe units inside the container — one plain, one
+  carrying `PrivateTmp=`/`ProtectSystem=`/`ProtectHome=`. If the sandboxed probe
+  is refused while the plain one runs, those three directives are stripped from
+  all four units, because a unit that asks for a mount namespace it cannot have
+  does not start at all (`status=226/NAMESPACE`) and nginx then answers 502. If
+  the *plain* probe also fails the result is treated as inconclusive and the
+  hardening is left alone. The outcome is printed in the final summary.
 
 ## Running the repo's scripts
 
@@ -387,6 +397,15 @@ Three things worth knowing:
 Re-running `apply-config.sh` restores both the executable bits and the `PATH`
 snippet, so this self-heals even if a later edit or history operation loses an
 executable bit.
+
+One script runs on the **Proxmox host**, not in the container:
+
+```bash
+./fix-service-namespacing.sh <CTID> [-y]
+```
+
+It repairs a container whose services crash-loop with `status=226/NAMESPACE`.
+See [502 Bad Gateway](#502-bad-gateway).
 
 ## Mattermost alerting
 
@@ -524,6 +543,41 @@ ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
 systemd expands those from the `EnvironmentFile`, so the env file remains the
 single source of truth. If an older container is missing the flags, add them
 and `systemctl daemon-reload && systemctl restart open-webui`.
+
+#### `status=226/NAMESPACE` — the container refuses mount namespacing
+
+A different cause with the same 502. The journal shows a tight restart loop and
+a counter climbing into the hundreds:
+
+```
+open-webui.service: Failed to set up mount namespacing: Permission denied
+open-webui.service: Failed at step NAMESPACE spawning /app/openwebui/venv/bin/open-webui: Permission denied
+open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
+```
+
+`PrivateTmp=`, `ProtectSystem=` and `ProtectHome=` are implemented as a private
+mount namespace. Whether an LXC container may build one depends on the AppArmor
+profile the Proxmox host applies — which depends on the container's `features`
+(nesting) and privilege level. When it is refused, systemd never runs the binary
+**at all**; the unit does not merely run unhardened. Nothing binds the upstream
+port and nginx answers 502.
+
+Repair an existing container from the Proxmox host:
+
+```bash
+./fix-service-namespacing.sh <CTID>
+```
+
+It reports the container's privilege level and features, probes namespacing with
+a real transient unit, offers to enable `nesting=1` and reboot (the fix that
+*keeps* the hardening), and only if namespacing is still refused strips the three
+directives from the units — both `/etc/systemd/system` and the `/app/config-repo`
+sources, so `manage-model-servers apply` does not put them back. `-y` skips the
+prompts. `NoNewPrivileges=` is always kept: it is a `prctl` flag, not a mount.
+
+Fresh installs no longer need this. The installer runs the same probe before it
+ships the units in and adapts them automatically, reporting the result. See
+ARCHITECTURE §3.
 
 ### The certificate
 
@@ -676,7 +730,17 @@ own, waits for the port, and resets the database once if the first-run
 migration fails. What follows is for containers built with an older installer,
 or for a failure the installer could not resolve.
 
-The unit reports `active` but nothing listens on 8080, and the journal shows:
+First check which failure this is — three different ones present as "the UI is
+down", and only one of them is the migration bug:
+
+| Journal says | Cause | Fix |
+|---|---|---|
+| `duplicate column name: info_json` | first-run migration bug (below) | reset the empty database |
+| `address already in use` | binding 8080 instead of the upstream port | `--host`/`--port` on `ExecStart` — see [502 Bad Gateway](#502-bad-gateway) |
+| `status=226/NAMESPACE` | container refuses mount namespacing | `fix-service-namespacing.sh <CTID>` |
+
+The migration case: the unit reports `active` but nothing listens, and the
+journal shows:
 
 ```
 sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) duplicate column name: info_json

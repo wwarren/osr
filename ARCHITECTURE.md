@@ -155,11 +155,61 @@ ProtectSystem=full      ProtectHome=true
 services write lives under `/app`, so no `ReadWritePaths=` exemption is needed.
 Adding one would be required if logs or venvs ever move to `/var` or `/opt`.
 
-The container is created with `-features nesting=1` (`CT_FEATURES`). Those
-directives are implemented as mount namespaces, and nesting is what lets a
-container set up its own without fighting the outer one — so the hardening
-above is genuinely in force rather than silently degraded. It also permits
-Docker/Podman inside the container.
+#### The three namespace directives are conditional, and that is deliberate
+
+`PrivateTmp=`, `ProtectSystem=` and `ProtectHome=` are not flags on a process.
+systemd implements them by building a private **mount namespace** before it
+execs the binary. Whether an LXC container is allowed to build one is decided by
+the AppArmor profile the Proxmox host applies, which depends on the container's
+`features` (nesting) and its privilege level, and on the host kernel.
+
+When it is refused, the failure is total rather than graceful:
+
+```
+open-webui.service: Failed to set up mount namespacing: Permission denied
+open-webui.service: Failed at step NAMESPACE spawning ...: Permission denied
+open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
+```
+
+systemd never runs the binary at all. `Restart=always` loops forever, nothing
+binds the upstream port, and the only symptom an operator sees is **nginx
+returning 502 Bad Gateway** — a message about a proxy, describing a mount.
+
+An earlier revision of this document claimed that `-features nesting=1` made the
+hardening "genuinely in force rather than silently degraded." A real install
+disproved it. So the installer no longer asserts; it **measures**:
+
+1. After the container is created, it checks `pct config` to confirm `nesting=1`
+   actually landed rather than trusting that `pct create` honoured it.
+2. Before the generated units are shipped in, `apply_sandbox_policy` runs two
+   transient probe units inside the finished container via `systemd-run` — one
+   plain, one carrying exactly these three directives. Two probes, because "the
+   sandbox was refused" and "the probe itself would not run" call for opposite
+   decisions:
+
+   | plain | sandboxed | verdict | action |
+   |---|---|---|---|
+   | fails | — | `unknown` | keep the hardening; we learned nothing |
+   | ok | fails | `denied` | strip the three directives, say so loudly |
+   | ok | ok | `ok` | keep them; they are real |
+
+3. On `denied`, the three lines are removed from all four unit files — the
+   staged copies, so both `/etc/systemd/system` and `/app/config-repo` end up
+   consistent and `manage-model-servers apply` does not put them back — and a
+   comment is left in each unit explaining why. `NoNewPrivileges=` stays: it is
+   a `prctl` flag, not a mount, and it works in every container. The final
+   summary reports the degradation instead of hiding it.
+
+The probe re-runs on every install, so a container later given `nesting=1` gets
+its hardening back automatically.
+
+An existing container stuck in this loop is repaired by
+`fix-service-namespacing.sh <CTID>` on the Proxmox host. It runs the same probe,
+offers to enable `nesting=1` and reboot first — the fix that *keeps* the
+hardening — and only strips the directives if namespacing is still refused
+afterwards.
+
+Nesting also permits Docker/Podman inside the container.
 
 ---
 

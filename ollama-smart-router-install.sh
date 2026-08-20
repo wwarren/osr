@@ -170,11 +170,18 @@ TIER_XLARGE_IDX=""
 CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"
 # Container features, passed to `pct create -features`.
 #
-# nesting=1 permits nested user namespaces inside the container. It is what
-# lets you run Docker/Podman in here, and it also lets systemd's per-unit
-# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) set up its mount
-# namespaces without fighting the outer container -- every unit this installer
-# writes uses those.
+# nesting=1 permits nested user namespaces inside the container and selects a
+# more permissive AppArmor profile on the host. It is what lets you run
+# Docker/Podman in here, and it is USUALLY what lets systemd's per-unit
+# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) build its mount
+# namespaces -- every unit this installer writes asks for those.
+#
+# "Usually" is doing real work in that sentence. Whether the mount namespace is
+# permitted also depends on the privilege level and the host kernel, and when it
+# is refused the units do not degrade, they fail to start at all with
+# status=226/NAMESPACE. So the installer does not take this on faith: it runs a
+# transient probe unit inside the finished container and rewrites the generated
+# units if the answer is no. See apply_sandbox_policy.
 #
 # Extend the string rather than adding another flag to create_args; it is
 # comma separated, e.g. "nesting=1,keyctl=1". Setting CT_FEATURES="" omits
@@ -1063,6 +1070,115 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
+# --- systemd sandboxing: measure, do not assume ---------------------------------
+#
+# ProtectSystem=, ProtectHome= and PrivateTmp= are not flags on a process, they
+# are a private MOUNT NAMESPACE that systemd builds before exec. Whether a
+# container is allowed to build one is decided by the AppArmor profile the
+# Proxmox host applies, which depends on the container's `features` (nesting)
+# and its privilege level, and on the host kernel.
+#
+# When it is not allowed the failure is total, not graceful:
+#     open-webui.service: Failed to set up mount namespacing: Permission denied
+#     open-webui.service: Failed at step NAMESPACE spawning ...: Permission denied
+#     open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
+# systemd never runs the binary, Restart=always spins forever, nothing binds the
+# upstream port, and the only thing an operator sees is nginx returning
+# 502 Bad Gateway. An earlier revision of this file asserted in its comments that
+# nesting=1 makes the hardening "genuinely in force"; a real install disproved
+# that, so the assertion has been replaced by a measurement.
+#
+# Two probes, because "the sandbox was refused" and "the probe itself did not
+# work" call for opposite decisions:
+#   plain fails                -> we learned nothing; keep the hardening
+#   plain ok, sandboxed fails  -> namespacing is genuinely denied; strip it
+#   both ok                    -> keep the hardening, it is real
+# Prints one of: ok | denied | unknown
+SANDBOX_DEGRADED=false
+ct_namespacing_verdict() {
+  # --collect removes the transient unit afterwards even when it failed, so a
+  # rerun of the installer does not trip over a leftover name.
+  if ! run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-plain \
+       /bin/true >/dev/null 2>&1; then
+    echo "unknown"
+    return 0
+  fi
+  if run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-sandbox \
+       -p PrivateTmp=yes -p ProtectSystem=full -p ProtectHome=yes \
+       /bin/true >/dev/null 2>&1; then
+    echo "ok"
+  else
+    echo "denied"
+  fi
+}
+
+# Remove the three mount-namespace directives from one unit file, leaving a
+# comment where they were. NoNewPrivileges= deliberately stays: it is a prctl
+# flag, not a mount, and it works in every container.
+strip_unit_namespacing() {
+  local unit="$1" tmp="${1}.tmp"
+  # Nothing to remove means nothing to say: without this guard a second pass
+  # would append the explanatory comment again on every run.
+  grep -qE '^(PrivateTmp|ProtectSystem|ProtectHome)=' "$unit" || return 0
+  awk '
+    /^(PrivateTmp|ProtectSystem|ProtectHome)=/ { next }
+    /^NoNewPrivileges=/ {
+      print
+      print "# PrivateTmp=, ProtectSystem= and ProtectHome= were removed by the"
+      print "# installer: this container denies systemd the mount namespacing they"
+      print "# are built from, so a unit that asks for them does not start AT ALL"
+      print "# (status=226/NAMESPACE) -- it does not merely run unhardened."
+      print "# NoNewPrivileges= is a process flag rather than a mount, so it stays."
+      print "# To get the hardening back, give the container nesting=1 (or make it"
+      print "# unprivileged) and re-run the installer; it re-tests on every install."
+      next
+    }
+    { print }
+  ' "$unit" > "$tmp" && mv "$tmp" "$unit"
+}
+
+# Decide the sandboxing policy for the generated units and rewrite them if the
+# container cannot honour it. Must run AFTER the units are written and BEFORE
+# they are shipped into the container.
+apply_sandbox_policy() {
+  local repo="$1" verdict unit count=0
+  echo "Testing whether systemd can build mount namespaces in this container."
+  verdict="$(ct_namespacing_verdict)"
+  case "$verdict" in
+    ok)
+      echo "  it can — per-unit sandboxing (PrivateTmp/ProtectSystem/ProtectHome)"
+      echo "  stays enabled on all four services."
+      return 0
+      ;;
+    unknown)
+      echo "WARNING: could not test mount namespacing — no transient unit would" >&2
+      echo "         run at all. Leaving the sandboxing directives in place; if" >&2
+      echo "         the services then fail with status=226/NAMESPACE, run" >&2
+      echo "         fix-service-namespacing.sh against this container." >&2
+      return 0
+      ;;
+  esac
+
+  SANDBOX_DEGRADED=true
+  echo "WARNING: this container refuses systemd's mount namespacing." >&2
+  echo "         PrivateTmp=, ProtectSystem= and ProtectHome= are implemented as" >&2
+  echo "         mount namespaces, and a unit asking for one here does not start" >&2
+  echo "         at all (status=226/NAMESPACE) — it crash-loops, nothing binds" >&2
+  echo "         the upstream ports, and nginx answers 502 Bad Gateway." >&2
+  echo "         Removing those three directives from the generated units so the" >&2
+  echo "         services can run. The services keep every other restriction:" >&2
+  echo "         non-login system account, NoNewPrivileges, loopback-only binds." >&2
+  echo "         To restore them: give the container 'nesting=1' (pct set ${CT_ID}" >&2
+  echo "         -features nesting=1), reboot it, and re-run the installer." >&2
+  for unit in "$repo"/services/*/*.service; do
+    [[ -f "$unit" ]] || continue
+    strip_unit_namespacing "$unit"
+    count=$(( count + 1 ))
+  done
+  echo "         Rewrote ${count} unit file(s)." >&2
+  return 0
+}
+
 # --- TLS certificate ----------------------------------------------------------
 # Build the subjectAltName list. A self-signed certificate with no SAN is
 # rejected outright by every current browser -- CN alone has not been accepted
@@ -1767,6 +1883,20 @@ create_args=(
 [[ -n "$NAMESERVER" ]] && create_args+=(-nameserver "$NAMESERVER")
 pct create "${create_args[@]}"
 CT_CREATED=1
+
+# Confirm the features actually landed rather than trusting that they did.
+# `pct create` accepts -features on a privileged container but the resulting
+# config is the only place that says whether it stuck, and nesting is what
+# selects the AppArmor profile that permits systemd's mount namespacing.
+if [[ "$CT_FEATURES" == *nesting=1* ]]; then
+  if pct config "$CT_ID" 2>/dev/null | grep -qE '^features:.*nesting=1'; then
+    echo "  nesting=1 confirmed in the container configuration."
+  else
+    echo "WARNING: nesting=1 was requested but is not present in 'pct config ${CT_ID}'." >&2
+    echo "         systemd's per-unit sandboxing may be refused; the installer" >&2
+    echo "         tests for that later and adapts the units if so." >&2
+  fi
+fi
 
 wait_for_ct_ready
 
@@ -6030,6 +6160,11 @@ ProtectHome=true
 WantedBy=multi-user.target
 UNITEOF
 
+# The four units above all ask for a private mount namespace. Find out whether
+# this container will actually give them one BEFORE shipping them in — a unit
+# that asks and is refused does not start at all. See apply_sandbox_policy.
+apply_sandbox_policy "$REPO_DIR"
+
 echo "Installing the generated configuration directly."
 push_local_config_tree "$REPO_DIR"
 
@@ -6293,6 +6428,18 @@ if [[ "$TLS_ENABLED" == "true" ]]; then
   echo "       pct pull ${CT_ID} ${TLS_DIR}/server.crt ollama-router.crt"
   echo "     For API clients:  export SSL_CERT_FILE=/path/to/ollama-router.crt"
   echo "     Inspect or replace it with:  manage-model-servers cert"
+fi
+if $SANDBOX_DEGRADED; then
+  echo
+  echo "NOTE: this container refuses systemd mount namespacing, so PrivateTmp=,"
+  echo "      ProtectSystem= and ProtectHome= were removed from the four service"
+  echo "      units — with them present the services cannot start at all"
+  echo "      (status=226/NAMESPACE) and nginx answers 502. The services still"
+  echo "      run as a non-login system account with NoNewPrivileges and"
+  echo "      loopback-only internal binds."
+  echo "      To restore the full hardening:"
+  echo "        pct set ${CT_ID} -features nesting=1 && pct reboot ${CT_ID}"
+  echo "      then re-run the installer, or fix-service-namespacing.sh ${CT_ID}."
 fi
 if ! $TLS_OK; then
   echo
