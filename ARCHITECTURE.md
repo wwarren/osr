@@ -58,7 +58,7 @@ flowchart LR
         oN["ollama :11434"]
     end
 
-    gitea["Gitea<br/>config repository"]
+    gitea["Gitea<br/>deployment history"]
     mm["Mattermost<br/>alert channel"]
 
     api -->|"HTTPS<br/>OpenAI API"| nginx
@@ -71,7 +71,7 @@ flowchart LR
     litellm --> pool
     monitor -->|"GET /api/tags"| pool
     monitor -->|"webhook"| mm
-    gitea -.->|"clone at provisioning"| ct
+    ct -.->|"push history"| gitea
 ```
 
 ### External dependencies
@@ -111,7 +111,7 @@ flowchart TB
             subgraph fs["Filesystem"]
                 E["/app/router<br/>code, .ini, .env, venv (py3.13)"]
                 F["/app/openwebui<br/>.env, venv (py3.12), data"]
-                G["/app/config-repo<br/>git clone, root-only 0700"]
+                G["/app/config-repo<br/>local config + git history"]
                 T["/app/tls<br/>self-signed cert + key"]
                 H["/opt/python<br/>standalone CPython 3.12"]
             end
@@ -507,8 +507,9 @@ replayed against a different host.
 
 ## 6. Configuration architecture
 
-Configuration is **version controlled in Gitea and injected at provisioning
-time** — a deliberate middle ground between baked-in config and full GitOps.
+Configuration is **generated locally and injected at provisioning time**. When
+Gitea is configured, that generated tree is committed and pushed as deployment
+history, but it is never cloned or pulled to seed a deployment.
 
 ```
 services/ollama-router/     router.py  router.ini  requirements.txt  *.service
@@ -525,9 +526,9 @@ dependency pins version independently.
 
 ### 6.1 Changing the server list — `manage-model-servers`
 
-`install/manage-model-servers.sh` is seeded into the repo and symlinked to
-`/usr/local/bin/manage-model-servers`, so it versions alongside the config it
-edits and a `git pull` updates the command.
+`install/manage-model-servers.sh` is generated into the local config tree and
+symlinked to `/usr/local/bin/manage-model-servers`, so it versions alongside the
+config it edits and local edits update the command immediately.
 
 ```
 manage-model-servers list | status | discover | models
@@ -596,21 +597,22 @@ change it.
 The router picks up an added host on its next discovery poll; `--apply` mainly
 matters for LiteLLM's static path.
 
-### Why provisioning-time pull, not pull-on-start
+### Why local config, not pull-on-start
 
 A `git pull` in `ExecStartPre` would make **Gitea a boot dependency of every
 service**. A Gitea outage during a container restart would then take down
 routing entirely, and a bad commit would break startup rather than being caught
-at install. Pulling once at provisioning keeps the blast radius of the config
-system confined to install time.
+at install. Provisioning also avoids pulling from Gitea: the installer-generated
+tree is the source of truth, and Gitea receives an outbound history push only.
 
 Changing config on a running container is an explicit, reversible act:
 
 ```bash
-cd /app/config-repo && git pull
+cd /app/config-repo
 ./install/apply-config.sh
 systemctl daemon-reload
 systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
+manage-model-servers commit "Describe the change"
 ```
 
 ---
@@ -630,11 +632,11 @@ sequenceDiagram
     G-->>I: identity (token owner)
     I->>G: resolve or create config repository
     I->>I: build config tree from answers
-    I->>G: seed missing files only
     I->>CT: pct create + start
     I->>CT: wait for systemd + DNS, install base packages
     I->>CT: create service account and directories
-    CT->>G: git clone config repo
+    I->>CT: push generated config tree
+    I->>CT: initialize git history and push branch to Gitea
     I->>CT: run install/apply-config.sh
     I->>CT: build venvs from requirements.txt
     I->>CT: provision Python 3.12 for Open WebUI
@@ -674,12 +676,13 @@ perfectly healthy host. Sizes are KiB (pvesm divides bytes by 1024) and are floo
 a capacity report is never optimistic. Inactive storages are excluded. The same
 check guards the template storage against `TEMPLATE_MIN_GIB`.
 
-### 7.2 Seeding policy
+### 7.2 History policy
 
-The installer pushes only files the repository **does not already have**, so
-committed edits always win over generated defaults. If no usable token exists,
-the tree is shipped into the container directly and applied through the same
-`apply-config.sh` path — identical end state, minus version control.
+The installer always applies the freshly generated local tree. If a usable Gitea
+token exists, that local tree is initialized as a git repository and pushed as a
+deployment-history branch. Gitea is never cloned, pulled or fetched during
+provisioning, so remote state cannot override a clean install. If no usable
+token exists, the end state is identical minus the history push.
 
 ### 7.3 Dual Python runtimes
 
@@ -724,8 +727,8 @@ never leaves the loopback interface.
 
 | Secret | At rest | Notes |
 |---|---|---|
-| Gitea deploy token | `env/router.env`, `0640 root:ollama-router` | Also committed to the repo |
-| Mattermost webhook | same | Also committed |
+| Gitea deploy token | `env/router.env`, `0640 root:ollama-router` | Also committed to the history repo |
+| Mattermost webhook | same | Also committed to the history repo |
 | Container root password | `/etc/shadow` | Never written to a file by the installer |
 
 Configuration files are **built on the Proxmox host and pushed in**, never
@@ -733,9 +736,9 @@ assembled by an inner shell. This closes an injection and mangling class:
 a token containing `'`, `$` or a backtick would otherwise break quoting or be
 silently expanded.
 
-The cloned repository is `chown root:root` + `chmod -R go-rwx`, because `git
-clone` writes mode 0644 by default — without this the clone would be *more*
-permissive than the 0640 runtime copy it feeds.
+The local config tree is `chown root:root` + `chmod -R go-rwx`, because it holds
+the env files that are also copied into runtime locations as `0640
+root:ollama-router`.
 
 ### Accepted risks
 
@@ -812,10 +815,10 @@ permissive than the 0640 runtime copy it feeds.
 | Routing logic in the router, not LiteLLM | Extend LiteLLM config | LiteLLM's model map is static YAML; dynamic discovery would mean regenerating and reloading config per change |
 | Direct dispatch when discovery succeeds | Always route via LiteLLM | Router-side ranking is inventory-aware; fail-forward replaces LiteLLM's fallbacks with something better informed |
 | Keep LiteLLM as fallback | Remove it | Preserves a tested static path when discovery is unavailable, and serves non-chat OpenAI routes |
-| Pull config at provisioning | `ExecStartPre` git pull | Avoids making Gitea a boot dependency of every service |
+| Apply generated local config at provisioning | Clone/pull Gitea config | Prevents stale remote commits from changing a clean install; Gitea is history only |
 | Separate venv + Python for Open WebUI | Shared venv | Hard version constraint (`<3.13`) and conflicting pins with LiteLLM |
 | Keyword lists as JSON arrays in `.ini` | Comma-separated | Preserves exact spacing — `"def "` must not match `default` |
-| Seed only missing files | Always overwrite | Operator commits win over generated defaults |
+| Push deployment-history branch | Push to `main` during provisioning | Avoids non-fast-forward conflicts and keeps each deployment snapshot distinct |
 | Embeddings structurally excluded | Score them low | A low score is still selectable; an embedding model cannot serve chat at all |
 
 ---
@@ -860,7 +863,7 @@ permissive than the 0640 runtime copy it feeds.
 /app/openwebui/.env               Open WebUI config (0640)
 /app/openwebui/venv/              Open WebUI deps (py3.12)
 /app/openwebui/data/              Open WebUI state (DATA_DIR)
-/app/config-repo/                 cloned config repo (root-only, 0700)
+/app/config-repo/                 local config tree, optional git history
 /opt/python/                      standalone CPython 3.12 (if uv-provisioned)
 /etc/systemd/system/*.service     the four units
 /etc/motd                         login summary

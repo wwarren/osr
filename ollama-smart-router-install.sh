@@ -21,11 +21,9 @@ set -euo pipefail
 #     container ships a chat UI in addition to the OpenAI-compatible API.
 #   * A login MOTD lists every service, IP, port and config path.
 #   * Container resources bumped to accommodate Open WebUI.
-#   * Configuration is version controlled: the installer builds a per-service
-#     config tree, seeds it into the Gitea repo (missing files only, so your
-#     commits win), then the container clones it and injects the files via
-#     install/apply-config.sh. Pull happens ONCE at provisioning time, so a
-#     Gitea outage can never block a service start.
+#   * Configuration is generated locally and applied directly. If Gitea is
+#     available, the generated tree is initialized as a git repository afterward
+#     and pushed as deployment history; Gitea is never provisioning input.
 #   * Routing thresholds/keywords moved out of router.py into router.ini, and
 #     monitor polling into monitor.ini, so behaviour is configurable per commit.
 # ==============================================================================
@@ -174,13 +172,10 @@ GITEA_REPO_PRIVATE="${GITEA_REPO_PRIVATE:-true}"
 # there (not here) if you have installed the appliance's CA or a real
 # certificate and want verification enforced.
 GITEA_VERIFY_TLS="${GITEA_VERIFY_TLS:-false}"
-# Where the config repo is cloned inside the container. Config is pulled ONCE,
-# at provisioning time — services never depend on Gitea being up to start.
+# Where the local config tree lives inside the container. It may be initialized
+# as a git repository for history, but provisioning never clones or pulls from
+# Gitea.
 CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-/app/config-repo}"
-# Auto-seed policy: push generated defaults only for files the repo does not
-# already have, so committed edits always win. Set to "false" to require a
-# pre-populated repo instead.
-CONFIG_SEED_IF_MISSING="${CONFIG_SEED_IF_MISSING:-true}"
 # Repo owner: discovered from the deploy token at runtime; this is the fallback.
 GITEA_OWNER="${GITEA_ADMIN_USER}"
 MATTERMOST_WEBHOOK_URL="${MATTERMOST_WEBHOOK_URL:-}"
@@ -967,9 +962,9 @@ prompt_model_servers() {
 # Prompt for the Gitea username and auth token, validating the pair against the
 # server before provisioning starts — a bad token discovered here costs seconds,
 # whereas discovering it after the container is built costs the whole run.
-# Leaving the token blank falls back to installing the generated config locally
-# (CONFIG_SOURCE=local), which keeps provisioning working without Gitea.
-CONFIG_SOURCE="repo"
+# Leaving the token blank still installs the generated config locally, just
+# without Gitea history.
+CONFIG_SOURCE="gitea"
 prompt_gitea_credentials() {
   local attempt=0 max_attempts=3 login=""
   echo
@@ -981,8 +976,8 @@ prompt_gitea_credentials() {
 
   # The TurnKey Gitea appliance ships a self-signed certificate, so certificate
   # verification is turned off for every Gitea call. Set here — before
-  # init_gitea_curl_opts — so the credential check, the repo resolution, the
-  # seeding API calls and the container's `git clone` all use the same setting.
+  # init_gitea_curl_opts — so the credential check, repo resolution and history
+  # push all use the same setting.
   # Trade-off: the deploy token is sent over a connection whose certificate is
   # not authenticated. Install the appliance's CA (or a real certificate) and
   # change this to "true" if that path isn't a network you trust.
@@ -996,7 +991,7 @@ prompt_gitea_credentials() {
     fi
     if [[ -z "$GITEA_DEPLOY_TOKEN" ]]; then
       echo "No token supplied — configuration will be installed directly and NOT" >&2
-      echo "version controlled. Re-run with a token to use the Gitea repo." >&2
+      echo "mirrored to Gitea history. Re-run with a token to enable history." >&2
       CONFIG_SOURCE="local"
       return 0
     fi
@@ -1204,6 +1199,44 @@ ct_tls_ok() {
   local port="$1"
   run_ct bash -c "printf 'HEAD / HTTP/1.0\r\n\r\n' | timeout 10 openssl s_client -quiet -verify_quiet \
       -connect 127.0.0.1:${port} -servername localhost >/dev/null 2>&1"
+}
+
+verify_service_executables() {
+  echo "Verifying service executables."
+  # The config tree is built under umask 077 because it contains secrets. Venvs
+  # are runtime code, not secrets; make their traversable/executable bits
+  # explicit so systemd does not fail later with status=203/EXEC.
+  run_ct chmod 0755 /app /app/router /app/openwebui
+  run_ct chmod -R a+rX /app/router/venv /app/openwebui/venv
+
+  # Each check names itself BEFORE it can fail. A bare `set -e` abort here trips
+  # the ERR trap, which destroys the container -- taking with it the only
+  # evidence of which executable the service account could not run. The whole
+  # point of this function is to make that failure legible, so it must not be
+  # the thing that hides it.
+  local ok=true
+  if ! run_ct runuser -u ollama-router -- /app/router/venv/bin/python -c 'import sys' \
+       >/dev/null 2>&1; then
+    echo "FATAL: ollama-router cannot run /app/router/venv/bin/python" >&2
+    ok=false
+  fi
+  if ! run_ct runuser -u ollama-router -- /app/openwebui/venv/bin/python -c 'import sys' \
+       >/dev/null 2>&1; then
+    echo "FATAL: ollama-router cannot run /app/openwebui/venv/bin/python" >&2
+    ok=false
+  fi
+  if ! run_ct runuser -u ollama-router -- test -x /app/openwebui/venv/bin/open-webui; then
+    echo "FATAL: /app/openwebui/venv/bin/open-webui is not executable by ollama-router" >&2
+    ok=false
+  fi
+  if ! $ok; then
+    echo "       systemd reports this as status=203/EXEC, and with TLS on the" >&2
+    echo "       only visible symptom is nginx returning 502 with nothing" >&2
+    echo "       listening behind it. The usual cause is a umask that stripped" >&2
+    echo "       the executable bits while the virtualenv was being built." >&2
+    return 1
+  fi
+  echo "  the service account can run both interpreters."
 }
 
 start_openwebui_verified() {
@@ -1428,89 +1461,59 @@ gitea_api() {
   fi
 }
 
-# Push every file under $1 that the repo does not already have, via the Gitea
-# contents API. Files that already exist are left alone, so anything you commit
-# by hand wins over the installer's generated defaults. Prints the number of
-# files created. $2 is the deploy token.
-seed_gitea_repo() {
-  local tree="$1" token="$2"
-  local base api auth owner resp http rel content_b64 payload created=0 skipped=0
+# Initialize the generated local config as a git repository and push it as
+# deployment history. This deliberately does not clone, pull or fetch from Gitea:
+# the installer-generated files remain the only provisioning input.
+init_config_repo_history() {
+  local token="$1" branch="${2:-}" host cred_tmp scheme sslverify remote
   if [[ -z "$token" ]]; then
-    echo "No Gitea token; skipping repo seeding (using local config only)." >&2
+    echo "No Gitea token; skipping deployment history push." >&2
     return 1
   fi
-  if [[ "$CONFIG_SEED_IF_MISSING" != "true" ]]; then
-    echo "CONFIG_SEED_IF_MISSING=false; not writing to the repository." >&2
-    return 0
-  fi
-  base="${GITEA_SERVER_URL%/}"; api="${base}/api/v1"
-  auth="Authorization: token ${token}"
-  owner="$GITEA_OWNER"
 
-  # Walk the generated tree deterministically.
-  while IFS= read -r rel; do
-    resp="$(gitea_api GET "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}")"
-    http="${resp##*$'\n'}"
-    if [[ "$http" == "200" ]]; then
-      skipped=$((skipped + 1))
-      continue
-    fi
-    content_b64="$(base64 -w0 < "${tree}/${rel}")"
-    payload="$(python3 -c '
-import json,sys
-print(json.dumps({"message": "Seed %s from installer" % sys.argv[1],
-                  "content": sys.argv[2]}))' "$rel" "$content_b64")"
-    resp="$(gitea_api POST "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}" "$payload")"
-    http="${resp##*$'\n'}"
-    if [[ "$http" == "201" ]]; then
-      created=$((created + 1))
-      echo "  seeded: ${rel}" >&2
-    else
-      echo "  WARNING: failed to seed ${rel} (HTTP ${http})" >&2
-    fi
-  done < <(cd "$tree" && find . -type f -printf '%P\n' | sort)
-
-  echo "Repo seeding complete: ${created} created, ${skipped} already present." >&2
-  return 0
-}
-
-# Clone the config repo into the container. The token is written to a file and
-# pushed in (never placed on a command line, where it would show up in `ps` on
-# the Proxmox host), then removed once the clone finishes.
-clone_config_repo() {
-  local token="$1" host cred_tmp
+  branch="${branch:-deployment-${CT_ID}-$(date -u +%Y%m%dT%H%M%SZ)}"
+  remote="${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}.git"
   host="${GITEA_SERVER_URL%/}"
   host="${host#*://}"
+  scheme="${GITEA_SERVER_URL%%://*}"
+  sslverify="true"
+  [[ "$GITEA_VERIFY_TLS" == "true" ]] || sslverify="false"
+
   cred_tmp="$(mktemp)"
-  # git credential store format: <scheme>://user:token@host
-  # The scheme must match the remote exactly — git will not match an https://
-  # credential against an http:// request, and the clone then fails as though
-  # no credential were stored at all.
-  local scheme="${GITEA_SERVER_URL%%://*}"
+  # git credential store format: <scheme>://user:token@host. The scheme must
+  # match the remote exactly or git will ignore the credential.
   printf '%s://%s:%s@%s\n' "$scheme" "$GITEA_OWNER" "$token" "$host" > "$cred_tmp"
   pct push "$CT_ID" "$cred_tmp" /root/.git-credentials --perms 0600
   rm -f "$cred_tmp"
 
-  local sslverify="true"
-  [[ "$GITEA_VERIFY_TLS" == "true" ]] || sslverify="false"
-
   run_ct bash -c "
     set -e
-    rm -rf '${CONFIG_REPO_DIR}'
-    git -c credential.helper='store --file=/root/.git-credentials' \
-        -c http.sslVerify=${sslverify} \
-        clone '${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}.git' \
-        '${CONFIG_REPO_DIR}'
-    # Keep pulls working later without re-supplying credentials interactively,
-    # but drop the stored password file itself.
-    git -C '${CONFIG_REPO_DIR}' config http.sslVerify ${sslverify}
-    rm -f /root/.git-credentials
-    # git clone writes 0644 files. The repo contains env/router.env with real
-    # secrets, so the working tree must not be world-readable — otherwise the
-    # clone would be laxer than the 0640 runtime copy it feeds.
+    trap 'rm -f /root/.git-credentials' EXIT
+    cd '${CONFIG_REPO_DIR}'
+    git -c init.defaultBranch=main init -q
+    git checkout -B '${branch}' >/dev/null
+    if git remote get-url origin >/dev/null 2>&1; then
+      git remote set-url origin '${remote}'
+    else
+      git remote add origin '${remote}'
+    fi
+    git config http.sslVerify ${sslverify}
+    git config user.name 'ollama-smart-router'
+    git config user.email 'router@localhost'
+    git add -A
+    if git diff --cached --quiet; then
+      git commit --allow-empty -q -m 'Record deployment ${CT_ID}'
+    else
+      git commit -q -m 'Record deployment ${CT_ID}'
+    fi
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+      git -c credential.helper='store --file=/root/.git-credentials' \
+          -c http.sslVerify=${sslverify} \
+          push -u origin 'HEAD:${branch}'
     chown -R root:root '${CONFIG_REPO_DIR}'
     chmod -R go-rwx '${CONFIG_REPO_DIR}'
   "
+  echo "Deployment history pushed to ${GITEA_OWNER}/${GITEA_REPO_NAME}:${branch}."
 }
 
 # Work out which repository to use, and set GITEA_OWNER to its real owner.
@@ -1585,18 +1588,18 @@ for repo in (data.get("data") or []):
   return 2
 }
 
-# Verify Gitea access by ensuring this service's repo exists and pushing a test
-# commit through the API. Non-fatal: warns and returns non-zero on failure.
+# Verify Gitea access by authenticating and ensuring the history repository
+# exists. The actual write check is the deployment-history push after the local
+# generated config has been installed.
 test_gitea_access() {
-  local token="$1" base api auth owner resp http body branch ts filepath content_b64 payload commit_url
+  local token="$1" base api auth owner resp http body payload
   local repo_name="$GITEA_REPO_NAME"
   if [[ -z "$token" ]]; then
-    echo "No Gitea deploy token provided; skipping Gitea access/commit test." >&2
+    echo "No Gitea deploy token provided; skipping Gitea access check." >&2
     return 0
   fi
   require_command curl
   require_command python3
-  require_command base64
   base="${GITEA_SERVER_URL%/}"
   api="${base}/api/v1"
   auth="Authorization: token ${token}"
@@ -1611,7 +1614,7 @@ test_gitea_access() {
   # 1) Authenticate and discover the token owner.
   owner="$(gitea_probe_user "$token")" || return 1
   [[ -z "$owner" ]] && owner="$GITEA_ADMIN_USER"
-  GITEA_OWNER="$owner"   # used later by seeding and by the container clone
+  GITEA_OWNER="$owner"   # used later for the deployment-history remote
   echo "Authenticated to Gitea as: ${owner}"
 
   # 2) Resolve the repository (reuse it wherever it lives), else create it.
@@ -1643,27 +1646,7 @@ test_gitea_access() {
       ;;
   esac
   echo "Configuration repository: ${GITEA_OWNER}/${repo_name}"
-
-  # 3) Determine the default branch, then push a unique test commit.
-  resp="$(gitea_api GET "${api}/repos/${owner}/${repo_name}")"
-  body="${resp%$'\n'*}"
-  branch="$(printf '%s' "$body" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch") or "main")' 2>/dev/null || true)"
-  [[ -z "$branch" ]] && branch="main"
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  filepath="provisioning-tests/${ts}.md"
-  content_b64="$(printf 'Provisioning test commit\nCreated (UTC): %s\nProxmox host: %s\nService: ollama-smart-router\n' \
-    "$ts" "$(hostname)" | base64 -w0)"
-  payload="$(printf '{"message":"Provisioning test commit %s","content":"%s","branch":"%s"}' \
-    "$ts" "$content_b64" "$branch")"
-  resp="$(gitea_api POST "${api}/repos/${owner}/${repo_name}/contents/${filepath}" "$payload")"
-  http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
-  if [[ "$http" == "201" ]]; then
-    commit_url="$(printf '%s' "$body" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",{}).get("html_url",""))' 2>/dev/null || true)"
-    echo "Gitea test commit succeeded on branch '${branch}': ${commit_url:-${base}/${owner}/${repo_name}}"
-    return 0
-  fi
-  echo "WARNING: Gitea test commit returned HTTP ${http}: ${body}" >&2
-  return 1
+  return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -1695,9 +1678,9 @@ prompt_gitea_credentials
 prompt_mattermost_config
 prompt_model_servers
 
-# Ensure the config repo exists and that the token can write to it. Non-fatal:
-# on failure we fall back to installing the configuration locally.
-if [[ "$CONFIG_SOURCE" == "repo" ]]; then
+# Ensure the history repo exists. Non-fatal: on failure we still install the
+# generated configuration locally, without Gitea history.
+if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
   if ! test_gitea_access "$GITEA_DEPLOY_TOKEN"; then
     echo "Gitea repo check failed — falling back to a local configuration." >&2
     CONFIG_SOURCE="local"
@@ -1833,7 +1816,7 @@ TORCH_CPU_ONLY=${TORCH_CPU_ONLY}
 MONITOR_INTERVAL_SECONDS=15
 EOF
 # The generated env file now holds the token; keep one copy in memory for the
-# seeding + clone steps below, then clear the original.
+# optional history push below, then clear the original.
 GITEA_DEPLOY_TOKEN_KEEP="$GITEA_DEPLOY_TOKEN"
 unset GITEA_DEPLOY_TOKEN
 
@@ -3909,13 +3892,13 @@ startup_notice = auto
 state_file = /var/lib/ollama-monitor/state.json
 INIEOF
 
-# --- install/apply-config.sh: runs INSIDE the container, copies the cloned
-#     config into place. Version controlled, so the layout is auditable. ---
+# --- install/apply-config.sh: runs INSIDE the container, copies the local
+#     generated config into place. ---
 cat > "${REPO_DIR}/install/apply-config.sh" <<'APPLYEOF'
 #!/usr/bin/env bash
-# Copy configuration from the cloned repo into its runtime locations.
-# Invoked by the installer during provisioning; safe to re-run by hand after a
-# `git pull` in the repo directory, followed by: systemctl daemon-reload &&
+# Copy configuration from the local config tree into its runtime locations.
+# Invoked by the installer during provisioning; safe to re-run by hand after
+# editing the config tree, followed by: systemctl daemon-reload &&
 # systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
 set -euo pipefail
 REPO_DIR="${1:-/app/config-repo}"
@@ -3931,7 +3914,7 @@ NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
 # Expose the server-management tool on PATH FIRST. A symlink (not a copy) means
-# a `git pull` in the repo updates the command too. This is deliberately the
+# edits in the local config tree update the command too. This is deliberately the
 # first step: under `set -e` any failure below would otherwise leave a
 # half-applied system with no management command to diagnose it with, which is
 # precisely when the command is most needed.
@@ -3941,9 +3924,9 @@ if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
   ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" "${BIN_DIR}/manage-model-servers"
 fi
 
-# Seeding through the Gitea contents API does not preserve the executable bit,
-# and neither does `git clone` for a file committed without it -- so restore it
-# on every shell script in the repo, not just the ones under install/.
+# Tar/push and git history do not guarantee the executable bit for every script
+# an operator may add later, so restore it on every shell script in the repo, not
+# just the ones under install/.
 find "${REPO_DIR}" -type f -name '*.sh' -not -path "${REPO_DIR}/.git/*" \
   -exec chmod 0755 {} + 2>/dev/null || true
 
@@ -5324,8 +5307,8 @@ openwebui_install() {
 cmd_apply() {
   local svc
   if $DRY_RUN; then echo "  [dry-run] would apply config and restart services"; return 0; fi
-  # Checked with -f, not -x: seeding through the Gitea contents API does not
-  # preserve the executable bit, and we invoke it via `bash` anyway.
+  # Checked with -f, not -x: tar/push/history round trips can lose the
+  # executable bit, and we invoke it via `bash` anyway.
   [[ -f "$APPLY_SCRIPT" ]] || die "apply script not found: ${APPLY_SCRIPT}"
   echo "Applying configuration..."
   bash "$APPLY_SCRIPT" "$REPO_DIR"
@@ -5367,9 +5350,10 @@ cmd_apply() {
 # Push using the Gitea deploy token from router.env.
 #
 # Gitea does not accept an account password for git-over-HTTP (it wants a token
-# or an app password), and provisioning deliberately deletes the stored git
-# credentials once the clone is done. Without this, git falls back to prompting
-# for a username/password, which then fails against Gitea.
+# or an app password). The installer does not keep git credentials on disk after
+# pushing deployment history, so the management command writes a temporary
+# credential entry for each push. Without this, git falls back to prompting for a
+# username/password, which then fails against Gitea.
 git_push_authenticated() {
   local remote branch token user host cred sslverify out rc=0 hostpart scheme
   remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || remote=""
@@ -5856,23 +5840,26 @@ chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
 cat > "${REPO_DIR}/README.md" <<'RDEOF'
 # ollama-smart-router — service configuration
 
-Version-controlled configuration for the Ollama Smart Router LXC. The installer
-clones this repo into the container during provisioning and runs
-`install/apply-config.sh` to copy each file into place.
+Local configuration for the Ollama Smart Router LXC. The installer generates
+this tree inside the container and runs `install/apply-config.sh` to copy each
+file into place. If Gitea is configured, this tree is pushed there as deployment
+history; it is not cloned or pulled from Gitea during provisioning.
 
     services/<service>/     unit file, code, .ini tunables, requirements.txt
     env/                    environment files consumed via systemd EnvironmentFile
     install/apply-config.sh copies everything into its runtime location
 
-Config is pulled **once, at provisioning time** — services do not contact Gitea
-to start, so a Gitea outage can never block a boot.
+Config is applied from this local tree. Gitea is only an outbound history target,
+so stale remote commits cannot change a clean install and a Gitea outage can
+never block a boot.
 
 ## Changing configuration on a running container
 
-    cd /app/config-repo && git pull
+    cd /app/config-repo
     ./install/apply-config.sh
     systemctl daemon-reload
     systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
+    manage-model-servers commit "Describe the change"
 
 ## Layout notes
 
@@ -6012,19 +5999,19 @@ ProtectHome=true
 WantedBy=multi-user.target
 UNITEOF
 
-if [[ "$CONFIG_SOURCE" == "repo" ]]; then
-  echo "Seeding the Gitea config repository (missing files only)."
-  seed_gitea_repo "$REPO_DIR" "$GITEA_DEPLOY_TOKEN_KEEP" || \
-    echo "Seeding reported problems; the clone below may be incomplete." >&2
+echo "Installing the generated configuration directly."
+push_local_config_tree "$REPO_DIR"
 
+if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
   echo "Installing git in the container."
   apt_get install -y git
 
-  echo "Cloning the config repository into the container."
-  clone_config_repo "$GITEA_DEPLOY_TOKEN_KEEP"
-else
-  echo "Installing the generated configuration directly (no Gitea repo)."
-  push_local_config_tree "$REPO_DIR"
+  echo "Initializing Gitea deployment history from the generated configuration."
+  if ! init_config_repo_history "$GITEA_DEPLOY_TOKEN_KEEP"; then
+    echo "WARNING: could not push deployment history to Gitea; continuing with" >&2
+    echo "         the local generated configuration." >&2
+    CONFIG_SOURCE="local"
+  fi
 fi
 
 # The certificate has to exist BEFORE apply-config installs the nginx site,
@@ -6045,6 +6032,10 @@ rm -rf "$STAGE_DIR"; STAGE_DIR=""
 unset GITEA_DEPLOY_TOKEN_KEEP
 
 echo "Installing Python dependencies (from the repo's requirements files)."
+# The generated config tree above is built with umask 077 because it contains
+# secret-bearing env files. Runtime venvs need ordinary executable/traversable
+# bits; otherwise systemd reports status=203/EXEC and nginx can only return 502.
+umask 022
 # router, litellm-proxy and monitor share one venv; it is built from all three
 # per-service requirements files so each service's pins stay independently
 # version controlled.
@@ -6092,6 +6083,7 @@ run_ct chown root:ollama-router /app/router/.env
 run_ct chmod 0640 /app/router/.env
 run_ct chown root:ollama-router /app/openwebui/.env
 run_ct chmod 0640 /app/openwebui/.env
+verify_service_executables
 
 
 
@@ -6147,7 +6139,7 @@ cat > "$motd_tmp" <<EOF
    Router config : /app/router/.env  /app/router/litellm_config.yaml
    Tunables      : /app/router/router.ini  /app/router/monitor.ini
    WebUI config  : /app/openwebui/.env
-   Config repo   : ${CONFIG_REPO_DIR}  (git pull && apply-config.sh)
+   Config dir    : ${CONFIG_REPO_DIR}  (edit locally, apply-config.sh, then commit)
                    on PATH for login shells — every *.sh in the repo is
                    executable and runnable by name
    Model servers : manage-model-servers list | status | models
@@ -6227,6 +6219,17 @@ report_services() {
       ok=false
     fi
   done
+  if [[ "$TLS_ENABLED" == "true" ]]; then
+    for pair in "${ROUTER_BIND_PORT}:router upstream" "${OPENWEBUI_BIND_PORT}:Open WebUI upstream"; do
+      if ct_port_listening "${pair%%:*}"; then
+        printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
+      else
+        printf '  %-16s NOT listening on %s (nginx will return 502)\n' \
+          "${pair#*:}" "${pair%%:*}"
+        ok=false
+      fi
+    done
+  fi
   $ok
 }
 
@@ -6240,10 +6243,10 @@ echo "OpenAI-compatible API base URL: ${URL_SCHEME}://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to the router."
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
-if [[ "$CONFIG_SOURCE" == "repo" ]]; then
-  echo "Config source: git clone of ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
+if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
+  echo "Config source: LOCAL generated config; mirrored to ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
 else
-  echo "Config source: LOCAL (not version controlled — no usable Gitea token)"
+  echo "Config source: LOCAL generated config (not mirrored — no usable Gitea token)"
 fi
 if $OPENWEBUI_RESET; then
   echo

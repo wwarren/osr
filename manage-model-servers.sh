@@ -1204,8 +1204,8 @@ openwebui_install() {
 cmd_apply() {
   local svc
   if $DRY_RUN; then echo "  [dry-run] would apply config and restart services"; return 0; fi
-  # Checked with -f, not -x: seeding through the Gitea contents API does not
-  # preserve the executable bit, and we invoke it via `bash` anyway.
+  # Checked with -f, not -x: tar/push/history round trips can lose the
+  # executable bit, and we invoke it via `bash` anyway.
   [[ -f "$APPLY_SCRIPT" ]] || die "apply script not found: ${APPLY_SCRIPT}"
   echo "Applying configuration..."
   bash "$APPLY_SCRIPT" "$REPO_DIR"
@@ -1247,9 +1247,10 @@ cmd_apply() {
 # Push using the Gitea deploy token from router.env.
 #
 # Gitea does not accept an account password for git-over-HTTP (it wants a token
-# or an app password), and provisioning deliberately deletes the stored git
-# credentials once the clone is done. Without this, git falls back to prompting
-# for a username/password, which then fails against Gitea.
+# or an app password). The installer does not keep git credentials on disk after
+# pushing deployment history, so the management command writes a temporary
+# credential entry for each push. Without this, git falls back to prompting for a
+# username/password, which then fails against Gitea.
 git_push_authenticated() {
   local remote branch token user host cred sslverify out rc=0 hostpart scheme
   remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || remote=""
