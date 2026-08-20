@@ -991,6 +991,17 @@ assert_not_contains "no hardcoded unprivileged flag remains" \
 assert_contains "the operator is told at creation time" \
   "not a security" "$(cat "$SCRIPT")"
 
+# Nesting is what lets systemd's per-unit sandboxing build its own mount
+# namespaces inside the container, and every generated unit relies on those.
+assert_contains "features default to nesting" \
+  'CT_FEATURES="${CT_FEATURES:-nesting=1}"' "$(cat "$SCRIPT")"
+assert_contains "features reach pct create" \
+  'create_args+=(-features "$CT_FEATURES")' "$(cat "$SCRIPT")"
+# An empty CT_FEATURES must omit the flag rather than pass an empty value,
+# which pct rejects.
+assert_contains "an empty value omits the flag" \
+  '[[ -n "$CT_FEATURES" ]] && create_args+=' "$(cat "$SCRIPT")"
+
 # ── the embedded copy of manage-model-servers.sh ──────────────────────────────
 # The installer carries a COMPLETE copy of manage-model-servers.sh inside a
 # heredoc, and that copy — not the file next to it — is what apply-config.sh
