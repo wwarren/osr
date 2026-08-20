@@ -1459,7 +1459,149 @@ assert_file_contains "monitor gets a state directory" \
 # LiteLLM must stay off the network.
 assert_file_contains "litellm binds loopback only" \
   "--host 127.0.0.1" "${_units}/litellm-proxy.service"
+# The generated units ask for a private mount namespace. That is the intended
+# default; whether the container will grant it is decided at install time by
+# apply_sandbox_policy, tested below.
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  for _d in "NoNewPrivileges=true" "PrivateTmp=true" "ProtectSystem=full" "ProtectHome=true"; do
+    assert_file_contains "${_svc} asks for ${_d%%=*}" "$_d" "${_units}/${_svc}.service"
+  done
+done
 rm -rf "$_units"
+
+# ── systemd mount namespacing ─────────────────────────────────────────────────
+# ProtectSystem=/ProtectHome=/PrivateTmp= are a private MOUNT NAMESPACE, not a
+# process flag. An LXC container that is not allowed to build one does not run
+# the unit unhardened — it does not run it at all:
+#     Failed to set up mount namespacing: Permission denied
+#     Main process exited, code=exited, status=226/NAMESPACE
+# with Restart=always looping forever, nothing on the upstream port, and nginx
+# answering 502. A real install hit exactly that, which is why the installer now
+# MEASURES this rather than asserting that nesting=1 makes it safe.
+describe ct_namespacing_verdict
+mock_script pct <<'EOF'
+shift 3                 # drop: exec <id> --
+"$@"
+EOF
+# Sandboxed transient unit refused, plain one fine — the observed failure.
+mock_script systemd-run <<'EOF'
+case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
+EOF
+assert_eq "reports denied when the sandboxed probe is refused" \
+  "denied" "$(ct_namespacing_verdict)"
+mock_script systemd-run <<'EOF'
+exit 0
+EOF
+assert_eq "reports ok when both probes run" "ok" "$(ct_namespacing_verdict)"
+# If a PLAIN transient unit will not run either, the probe has told us nothing
+# about namespacing specifically — that must not be read as "denied".
+mock_script systemd-run <<'EOF'
+exit 1
+EOF
+assert_eq "reports unknown when no transient unit runs at all" \
+  "unknown" "$(ct_namespacing_verdict)"
+
+describe strip_unit_namespacing
+_nsu="$(mktemp -d)"
+cat > "${_nsu}/open-webui.service" <<'EOF'
+[Service]
+ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+[Install]
+EOF
+strip_unit_namespacing "${_nsu}/open-webui.service"
+for _d in PrivateTmp ProtectSystem ProtectHome; do
+  assert_not_contains "removes ${_d}=" \
+    "${_d}=" "$(grep -v '^#' "${_nsu}/open-webui.service")"
+done
+# NoNewPrivileges is a prctl flag, not a mount: it works in every container and
+# must survive, or stripping the namespace would quietly drop real hardening.
+assert_file_contains "keeps NoNewPrivileges" \
+  "NoNewPrivileges=true" "${_nsu}/open-webui.service"
+assert_file_contains "says why, in the unit itself" \
+  "226/NAMESPACE" "${_nsu}/open-webui.service"
+# The rewrite must not disturb the ExecStart line — ${HOST}/${PORT} are expanded
+# by systemd from the EnvironmentFile, and mangling them re-creates the earlier
+# "binds the wrong port, nginx 502s" bug.
+assert_file_contains "leaves ExecStart untouched" \
+  'serve --host ${HOST} --port ${PORT}' "${_nsu}/open-webui.service"
+# Idempotent: running it twice must not stack comment blocks or fail.
+_before="$(cat "${_nsu}/open-webui.service")"
+strip_unit_namespacing "${_nsu}/open-webui.service"
+assert_eq "is idempotent" "$_before" "$(cat "${_nsu}/open-webui.service")"
+rm -rf "$_nsu"
+
+describe apply_sandbox_policy
+_nsr="$(mktemp -d)"
+_mkrepo() {
+  local svc
+  rm -rf "${_nsr:?}/services"
+  for svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+    mkdir -p "${_nsr}/services/${svc}"
+    printf '[Service]\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nProtectHome=true\n' \
+      > "${_nsr}/services/${svc}/${svc}.service"
+  done
+}
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+
+# Permitted: nothing is rewritten and the flag stays false.
+_mkrepo
+mock_script systemd-run <<'EOF'
+exit 0
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when namespacing works" apply_sandbox_policy "$_nsr"
+assert_eq "leaves the flag false" "false" "$SANDBOX_DEGRADED"
+assert_file_contains "leaves the units hardened" \
+  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
+
+# Refused: every unit is rewritten and the flag is set so the summary can say so.
+_mkrepo
+mock_script systemd-run <<'EOF'
+case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when namespacing is refused" apply_sandbox_policy "$_nsr"
+assert_eq "records the degradation" "true" "$SANDBOX_DEGRADED"
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  assert_not_contains "rewrites ${_svc}" \
+    "PrivateTmp=" "$(grep -v '^#' "${_nsr}/services/${_svc}/${_svc}.service")"
+done
+
+# Inconclusive: leave the hardening alone rather than dropping it on a guess.
+_mkrepo
+mock_script systemd-run <<'EOF'
+exit 1
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when the probe is inconclusive" apply_sandbox_policy "$_nsr"
+assert_eq "does not record a degradation it did not observe" \
+  "false" "$SANDBOX_DEGRADED"
+assert_file_contains "keeps the hardening on an inconclusive probe" \
+  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
+rm -rf "$_nsr"
+
+# Ordering is load-bearing: the policy has to be decided while the tree is still
+# on the host, because push_local_config_tree is what ships the units in.
+describe sandbox_policy_wiring
+_wire="$(cat "$SCRIPT")"
+assert_contains "the policy runs before the tree is pushed" \
+  'apply_sandbox_policy "$REPO_DIR"' "$_wire"
+_apply_ln="$(grep -n 'apply_sandbox_policy "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+_push_ln="$(grep -n 'push_local_config_tree "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+assert_ok "and strictly before it" bash -c "(( $_apply_ln < $_push_ln ))"
+# nesting=1 is requested at create time; whether it stuck is only visible in the
+# container config, and it was silently absent once.
+assert_contains "creation verifies the feature actually landed" \
+  "grep -qE '^features:.*nesting=1'" "$_wire"
+assert_contains "the final summary reports degraded hardening" \
+  'if $SANDBOX_DEGRADED; then' "$_wire"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"
