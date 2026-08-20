@@ -1,7 +1,7 @@
 # Ollama Smart Router — Service Architecture
 
 **System:** `ollama-smart-router`
-**Platform:** Proxmox VE, unprivileged Debian 13 LXC
+**Platform:** Proxmox VE, privileged Debian 13 LXC
 **Status:** as provisioned by `ollama-smart-router-install.sh`
 
 ---
@@ -31,7 +31,7 @@ configuration lifecycle. It explicitly does **not** cover running Ollama itself
 | **Correctness of routing** | Live inventory rather than static assumptions; embedding models structurally excluded from chat |
 | **Operability** | Every routing decision is inspectable via headers and endpoints; config is version controlled |
 | **Reproducibility** | Whole system rebuilt from one script plus a git repo |
-| **Least privilege** | One unprivileged service account; localhost-bound internals; hardened units |
+| **Least privilege** | One unprivileged service account; localhost-bound internals; hardened units. Note the *container* is privileged — see §9 |
 
 ---
 
@@ -92,14 +92,15 @@ flowchart LR
 
 ## 3. Deployment view
 
-The four application services run in a single unprivileged LXC container as the
-same non-login system account (`ollama-router`); nginx runs as the distribution
-packages it, reading the certificate as root before dropping privileges.
+The four application services run in a single **privileged** LXC container as
+the same non-login system account (`ollama-router`); nginx runs as the
+distribution packages it, reading the certificate as root before dropping
+privileges. Privileged is deliberate — see §9 for what it costs and why.
 
 ```mermaid
 flowchart TB
     subgraph host["Proxmox host"]
-        subgraph ctr["LXC (unprivileged) — 2 vCPU / 4 GB / 32 GB"]
+        subgraph ctr["LXC (privileged) — 2 vCPU / 4 GB / 32 GB"]
             direction TB
             subgraph units["systemd units"]
                 N["nginx.service<br/>0.0.0.0:8080 + :8000 TLS"]
@@ -718,7 +719,23 @@ never leaves the loopback interface.
 
 ### Identity and privilege
 
-* Unprivileged LXC; services run as the non-login `ollama-router` account.
+* **Privileged LXC.** `CT_UNPRIVILEGED=0` at creation, so there is no UID shift:
+  root inside the container is UID 0 on the host. This is what makes device
+  passthrough, host bind mounts and NFS shares work without remapping, and it is
+  the reason the setting exists — but it means **the container boundary is not a
+  security boundary**. A root process inside it is materially closer to root on
+  the Proxmox host than it would be under an unprivileged container, where a
+  container escape lands on an unprivileged host UID with no capabilities over
+  anything else.
+
+  The mitigations that remain are the ones inside the container, and they are
+  unchanged: services run as the non-login `ollama-router` account, never root;
+  systemd hardening (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`,
+  `PrivateTmp`) applies to every unit; LiteLLM and both applications bind
+  loopback only. What is gone is the outer layer, so the container should be
+  treated as trusted infrastructure on a trusted network — do not run untrusted
+  code or expose it to an untrusted one. `CT_UNPRIVILEGED=1` restores the
+  unprivileged container if the passthrough needs go away.
 * systemd hardening as listed in §3.
 * The root password is set over stdin via `chpasswd`, never passed as a
   command-line argument where it would appear in the Proxmox host's process list.

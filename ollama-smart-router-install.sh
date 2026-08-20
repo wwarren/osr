@@ -157,6 +157,17 @@ TIER_XLARGE_IDX=""
 # Gitea runs as a TurnKey appliance behind nginx on 443/80 — Gitea's own port
 # 3000 is bound to localhost inside that container and is NOT reachable from
 # outside, so the URL is the plain hostname with no port.
+# Container privilege level. 0 = PRIVILEGED (container root is real host root),
+# 1 = unprivileged (root is mapped to an unused high host UID).
+#
+# Privileged is the default here because it is what device passthrough, bind
+# mounts of host paths and NFS shares need — an unprivileged container's UID
+# shift makes those awkward or impossible. The cost is real: a privileged
+# container is NOT a security boundary against a determined root process inside
+# it. Everything else in this system still applies least privilege (services run
+# as a non-login account, systemd hardening, loopback-only internals), but the
+# container itself no longer adds a layer. Set CT_UNPRIVILEGED=1 to go back.
+CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"
 GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.test.com}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
@@ -1717,7 +1728,13 @@ else
   TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${DOWNLOAD_TEMPLATE_NAME}"
 fi
 
-echo "Creating Proxmox container ${CT_ID} (${CT_NAME})."
+if [[ "$CT_UNPRIVILEGED" == "0" ]]; then
+  echo "Creating PRIVILEGED Proxmox container ${CT_ID} (${CT_NAME})."
+  echo "  Container root is real host root; the container is not a security"
+  echo "  boundary. Set CT_UNPRIVILEGED=1 for an unprivileged container."
+else
+  echo "Creating unprivileged Proxmox container ${CT_ID} (${CT_NAME})."
+fi
 # Note: password is intentionally NOT passed here (would be visible in `ps`).
 create_args=(
   "$CT_ID" "$TEMPLATE_REF"
@@ -1729,7 +1746,7 @@ create_args=(
   -storage "$STORAGE"
   -rootfs "${STORAGE}:${ROOTFS_GB}"
   -net0 "name=eth0,bridge=${BRIDGE},ip=${IP_CIDR},gw=${GATEWAY},firewall=${FIREWALL}"
-  -unprivileged 1
+  -unprivileged "$CT_UNPRIVILEGED"
   -onboot 1
   -start 1
 )

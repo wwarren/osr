@@ -6,7 +6,7 @@ routing, load balancing, a chat UI, and health alerting. Provisioned by
 
 ## What gets deployed
 
-An unprivileged Debian 13 container running four systemd services, all as the
+A **privileged** Debian 13 container running four systemd services, all as the
 hardened `ollama-router` user:
 
 | Service | Unit | Port | Notes |
@@ -18,6 +18,16 @@ hardened `ollama-router` user:
 | Health monitor | `ollama-monitor.service` | — | Probes backends, alerts to Mattermost |
 
 Request path: **browser → nginx (TLS) → Open WebUI → nginx (TLS) → Smart Router → LiteLLM (4000) → Ollama backends (11434)**.
+
+> **The container is privileged.** Container root is real host root — the UID
+> shift that makes an unprivileged container a containment boundary is not
+> there, so a root process inside it is far closer to root on the Proxmox host.
+> That is the trade for device passthrough, host bind mounts and NFS shares
+> working without UID gymnastics. Everything *inside* still applies least
+> privilege — services run as the non-login `ollama-router` account under
+> systemd hardening, and the internals bind loopback only — but treat the
+> container as trusted infrastructure rather than a sandbox. `CT_UNPRIVILEGED=1`
+> at install time reverts to an unprivileged container.
 
 ## How routing works
 
@@ -119,6 +129,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `TLS_ENABLED` (true), `TLS_CERT_DAYS` (3650), `TLS_KEY_BITS` (4096), `TLS_DIR` (`/app/tls`)
 - `TLS_EXTRA_SAN` — extra names for the certificate, comma separated (e.g. `chat.lan,10.0.0.9`). Add the DNS name you actually browse to, or hostname verification fails
 - `OPENWEBUI_INTERNAL_PORT` (8088), `ROUTER_INTERNAL_PORT` (8010) — where the apps bind once nginx owns the public ports
+- `CT_UNPRIVILEGED` (0) — `0` creates a **privileged** container, `1` an unprivileged one. See the note below before changing it
 
 ### Install-time prompts
 
