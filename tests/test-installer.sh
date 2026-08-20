@@ -1211,6 +1211,34 @@ case "$*" in *is-active*) echo failed ;; esac
 EOF
 assert_status "gives up when the unit does" 2 ct_wait_for_port 8080 600 open-webui.service
 assert_status "no unit named means wait the whole deadline" 1 ct_wait_for_port 8080 10
+# Same CRLF trap as report_services, with a worse consequence here: "activating\r"
+# matches none of the keep-waiting cases, so the wait returns 2 immediately and
+# the installer declares a service dead that is only slow.
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) printf 'activating\r\n' ;; esac
+EOF
+assert_status "keeps waiting through a pty's CRLF" 1 ct_wait_for_port 8080 10 open-webui.service
+
+describe ct_out
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+mock_script systemctl <<'EOF'
+printf 'active\r\n'
+EOF
+assert_eq "strips the carriage return a pty adds" \
+  "active" "$(ct_out systemctl is-active open-webui.service)"
+mock_script systemctl <<'EOF'
+printf '\n\nactive\r\nsomething else\r\n'
+EOF
+assert_eq "takes the first non-empty line" \
+  "active" "$(ct_out systemctl is-active open-webui.service)"
+mock_script systemctl <<'EOF'
+exit 3
+EOF
+assert_eq "an empty result is empty, not an error string" \
+  "" "$(ct_out systemctl is-active open-webui.service || true)"
 
 describe openwebui_migration_broken
 mock_script journalctl <<'EOF'
@@ -1406,6 +1434,23 @@ assert_contains "names the missing upstream" "Open WebUI upstream" "$out"
 assert_contains "explains the 502"           "nginx will return 502" "$out"
 TLS_ENABLED=false
 
+# `pct exec` allocates a pty when the host's stdout is a terminal, and ONLCR
+# then turns every \n into \r\n. `is-active` therefore yields "active\r", which
+# prints as "active" and equals nothing — so this reported all four units as
+# active and simultaneously concluded they were down. Pin the CRLF case.
+mock_script systemctl <<'EOF'
+case "$*" in *is-active*) printf 'active\r\n' ;; esac
+EOF
+mock_script ss <<'EOF'
+echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
+echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+EOF
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+assert_ok "a pty's CRLF does not turn 'active' into a failure" report_services
+
 # ── the generated systemd units ───────────────────────────────────────────────
 # Also not functions. These assertions exist because of a real outage: every
 # unit used Requires= on its upstream, and Requires= propagates stop/restart.
@@ -1459,7 +1504,306 @@ assert_file_contains "monitor gets a state directory" \
 # LiteLLM must stay off the network.
 assert_file_contains "litellm binds loopback only" \
   "--host 127.0.0.1" "${_units}/litellm-proxy.service"
+# The generated units ask for a private mount namespace. That is the intended
+# default; whether the container will grant it is decided at install time by
+# apply_sandbox_policy, tested below.
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  for _d in "NoNewPrivileges=true" "PrivateTmp=true" "ProtectSystem=full" "ProtectHome=true"; do
+    assert_file_contains "${_svc} asks for ${_d%%=*}" "$_d" "${_units}/${_svc}.service"
+  done
+done
 rm -rf "$_units"
+
+# ── systemd mount namespacing ─────────────────────────────────────────────────
+# ProtectSystem=/ProtectHome=/PrivateTmp= are a private MOUNT NAMESPACE, not a
+# process flag. An LXC container that is not allowed to build one does not run
+# the unit unhardened — it does not run it at all:
+#     Failed to set up mount namespacing: Permission denied
+#     Main process exited, code=exited, status=226/NAMESPACE
+# with Restart=always looping forever, nothing on the upstream port, and nginx
+# answering 502. A real install hit exactly that, which is why the installer now
+# MEASURES this rather than asserting that nesting=1 makes it safe.
+describe ct_namespacing_verdict
+mock_script pct <<'EOF'
+shift 3                 # drop: exec <id> --
+"$@"
+EOF
+# Sandboxed transient unit refused, plain one fine — the observed failure.
+mock_script systemd-run <<'EOF'
+case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
+EOF
+assert_eq "reports denied when the sandboxed probe is refused" \
+  "denied" "$(ct_namespacing_verdict)"
+mock_script systemd-run <<'EOF'
+exit 0
+EOF
+assert_eq "reports ok when both probes run" "ok" "$(ct_namespacing_verdict)"
+# If a PLAIN transient unit will not run either, the probe has told us nothing
+# about namespacing specifically — that must not be read as "denied".
+mock_script systemd-run <<'EOF'
+exit 1
+EOF
+assert_eq "reports unknown when no transient unit runs at all" \
+  "unknown" "$(ct_namespacing_verdict)"
+
+describe strip_unit_namespacing
+_nsu="$(mktemp -d)"
+cat > "${_nsu}/open-webui.service" <<'EOF'
+[Service]
+ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+[Install]
+EOF
+strip_unit_namespacing "${_nsu}/open-webui.service"
+for _d in PrivateTmp ProtectSystem ProtectHome; do
+  assert_not_contains "removes ${_d}=" \
+    "${_d}=" "$(grep -v '^#' "${_nsu}/open-webui.service")"
+done
+# NoNewPrivileges is a prctl flag, not a mount: it works in every container and
+# must survive, or stripping the namespace would quietly drop real hardening.
+assert_file_contains "keeps NoNewPrivileges" \
+  "NoNewPrivileges=true" "${_nsu}/open-webui.service"
+assert_file_contains "says why, in the unit itself" \
+  "226/NAMESPACE" "${_nsu}/open-webui.service"
+# The rewrite must not disturb the ExecStart line — ${HOST}/${PORT} are expanded
+# by systemd from the EnvironmentFile, and mangling them re-creates the earlier
+# "binds the wrong port, nginx 502s" bug.
+assert_file_contains "leaves ExecStart untouched" \
+  'serve --host ${HOST} --port ${PORT}' "${_nsu}/open-webui.service"
+# Idempotent: running it twice must not stack comment blocks or fail.
+_before="$(cat "${_nsu}/open-webui.service")"
+strip_unit_namespacing "${_nsu}/open-webui.service"
+assert_eq "is idempotent" "$_before" "$(cat "${_nsu}/open-webui.service")"
+rm -rf "$_nsu"
+
+describe apply_sandbox_policy
+_nsr="$(mktemp -d)"
+_mkrepo() {
+  local svc
+  rm -rf "${_nsr:?}/services"
+  for svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+    mkdir -p "${_nsr}/services/${svc}"
+    printf '[Service]\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nProtectHome=true\n' \
+      > "${_nsr}/services/${svc}/${svc}.service"
+  done
+}
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+
+# Permitted: nothing is rewritten and the flag stays false.
+_mkrepo
+mock_script systemd-run <<'EOF'
+exit 0
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when namespacing works" apply_sandbox_policy "$_nsr"
+assert_eq "leaves the flag false" "false" "$SANDBOX_DEGRADED"
+assert_file_contains "leaves the units hardened" \
+  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
+
+# Refused: every unit is rewritten and the flag is set so the summary can say so.
+_mkrepo
+mock_script systemd-run <<'EOF'
+case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when namespacing is refused" apply_sandbox_policy "$_nsr"
+assert_eq "records the degradation" "true" "$SANDBOX_DEGRADED"
+for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
+  assert_not_contains "rewrites ${_svc}" \
+    "PrivateTmp=" "$(grep -v '^#' "${_nsr}/services/${_svc}/${_svc}.service")"
+done
+
+# Inconclusive: leave the hardening alone rather than dropping it on a guess.
+_mkrepo
+mock_script systemd-run <<'EOF'
+exit 1
+EOF
+SANDBOX_DEGRADED=false
+assert_ok "succeeds when the probe is inconclusive" apply_sandbox_policy "$_nsr"
+assert_eq "does not record a degradation it did not observe" \
+  "false" "$SANDBOX_DEGRADED"
+assert_file_contains "keeps the hardening on an inconclusive probe" \
+  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
+rm -rf "$_nsr"
+
+# Ordering is load-bearing: the policy has to be decided while the tree is still
+# on the host, because push_local_config_tree is what ships the units in.
+describe sandbox_policy_wiring
+_wire="$(cat "$SCRIPT")"
+assert_contains "the policy runs before the tree is pushed" \
+  'apply_sandbox_policy "$REPO_DIR"' "$_wire"
+_apply_ln="$(grep -n 'apply_sandbox_policy "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+_push_ln="$(grep -n 'push_local_config_tree "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+assert_ok "and strictly before it" bash -c "(( $_apply_ln < $_push_ln ))"
+# nesting=1 is requested at create time; whether it stuck is only visible in the
+# container config, and it was silently absent once.
+assert_contains "creation verifies the feature actually landed" \
+  "grep -qE '^features:.*nesting=1'" "$_wire"
+assert_contains "the final summary reports degraded hardening" \
+  'if $SANDBOX_DEGRADED; then' "$_wire"
+
+# ── ZeroTier ──────────────────────────────────────────────────────────────────
+# ZeroTier is an OPTIONAL overlay bolted on at the very end of provisioning. The
+# hazard is not that it might fail — it is *where* it fails: after Open WebUI's
+# migrations, with CT_CREATED still set and the ERR trap still armed. An
+# unguarded non-zero there destroys a finished container over an add-on.
+describe valid_optional_zerotier_network_id
+assert_ok   "accepts blank (install only)"  valid_optional_zerotier_network_id ""
+assert_ok   "accepts 16 hex digits"         valid_optional_zerotier_network_id 8056c2e21c000001
+assert_ok   "accepts uppercase"             valid_optional_zerotier_network_id 8056C2E21C000001
+assert_fail "rejects 15 digits"             valid_optional_zerotier_network_id 8056c2e21c00000
+assert_fail "rejects 17 digits"             valid_optional_zerotier_network_id 8056c2e21c0000012
+# A 10-hex-digit value is a NODE address, not a network id — the two are easy to
+# confuse and joining with the wrong one fails silently in Central.
+assert_fail "rejects a node address"        valid_optional_zerotier_network_id 8056c2e21c
+assert_fail "rejects non-hex"               valid_optional_zerotier_network_id 8056c2e21c00000z
+
+describe prompt_zerotier_config
+ZEROTIER_NETWORK_ID=""
+_zt_out="$(mktemp)"
+prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'\n' || true
+assert_eq "blank stays blank" "" "$ZEROTIER_NETWORK_ID"
+prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'8056c2e21c000001\n' || true
+assert_eq "accepts a valid id" "8056c2e21c000001" "$ZEROTIER_NETWORK_ID"
+ZEROTIER_NETWORK_ID=""
+prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'nope\n8056c2e21c000001\n' || true
+assert_eq "re-prompts after a bad id" "8056c2e21c000001" "$ZEROTIER_NETWORK_ID"
+assert_contains "and says so" "Not a valid value" "$(cat "$_zt_out")"
+rm -f "$_zt_out"
+ZEROTIER_NETWORK_ID=""
+
+describe configure_lxc_tun_device
+_lxc="$(mktemp -d)"
+LXC_CONF_DIR="$_lxc"
+CT_ID=115
+printf 'arch: amd64\nhostname: t\n' > "${_lxc}/115.conf"
+assert_ok "succeeds on a real config" configure_lxc_tun_device
+assert_file_contains "adds the device cgroup allow" \
+  "lxc.cgroup2.devices.allow: c 10:200 rwm" "${_lxc}/115.conf"
+assert_file_contains "bind-mounts the host tun" \
+  "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file" "${_lxc}/115.conf"
+_lxc_before="$(cat "${_lxc}/115.conf")"
+configure_lxc_tun_device >/dev/null 2>&1
+assert_eq "is idempotent" "$_lxc_before" "$(cat "${_lxc}/115.conf")"
+# Missing config must be reported, not swallowed — but see the wiring test below
+# for why it must also not be allowed to abort the installer.
+LXC_CONF_DIR="${_lxc}/nowhere"
+assert_fail "fails when the config is missing" configure_lxc_tun_device
+rm -rf "$_lxc"
+LXC_CONF_DIR=/etc/pve/lxc
+CT_ID=100
+
+describe fw_add_rule
+fw_conf="$(mktemp)"
+printf '[OPTIONS]\nenable: 1\n\n[RULES]\n' > "$fw_conf"
+fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
+fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
+assert_eq "writes a duplicate rule only once" \
+  "1" "$(grep -c -- '-dport 9993' "$fw_conf")"
+fw_add_rule "IN ACCEPT -p tcp -dport 8000 -log nolog"
+assert_eq "still appends distinct rules" "2" "$(grep -c '^IN ACCEPT' "$fw_conf")"
+rm -f "$fw_conf"
+
+describe install_zerotier
+ZEROTIER_NETWORK_ID=8056c2e21c000001
+mock_script pct <<'EOF'
+shift 3
+"$@"
+EOF
+mock_script systemctl <<'EOF'
+exit 0
+EOF
+mock_script zerotier-cli <<'EOF'
+case "$1" in
+  info)         echo "200 info deadbeef99 1.14.0 ONLINE" ;;
+  listnetworks) echo "200 listnetworks 8056c2e21c000001 net aa:bb:cc:dd:ee:ff OK PRIVATE zt0 10.9.0.5/24" ;;
+  join)         echo "200 join OK" ;;
+esac
+EOF
+mock_script curl <<'EOF'
+echo 'true'          # a no-op "installer" for the pipe into bash
+EOF
+out="$(install_zerotier 2>&1)"; rc=$?
+assert_eq       "succeeds on the happy path" "0" "$rc"
+assert_contains "reports the node address"   "deadbeef99" "$out"
+assert_contains "reports the network as OK"  "OK" "$out"
+
+# The join is a REQUEST. Until the member is authorised the status is not OK and
+# no traffic flows; calling that "joined" sends the operator hunting a routing
+# fault instead of clicking authorise.
+mock_script zerotier-cli <<'EOF'
+case "$1" in
+  info)         echo "200 info deadbeef99 1.14.0 ONLINE" ;;
+  listnetworks) echo "200 listnetworks 8056c2e21c000001 net aa:bb:cc:dd:ee:ff ACCESS_DENIED PRIVATE zt0 -" ;;
+  join)         echo "200 join OK" ;;
+esac
+EOF
+out="$(install_zerotier 2>&1)"; rc=$?
+assert_eq       "still returns 0 when unauthorised" "0" "$rc"
+assert_contains "surfaces the real status"   "ACCESS_DENIED" "$out"
+assert_contains "says what to do about it"   "authorise" "$out"
+
+# A failed download must return non-zero — and must NOT go on to join.
+mock_script curl <<'EOF'
+exit 22
+EOF
+out="$(install_zerotier 2>&1)"; rc=$?
+assert_eq       "returns non-zero when the installer download fails" "1" "$rc"
+assert_contains "and says which step failed" "installer did not complete" "$out"
+assert_not_contains "and does not try to join" "Requesting a join" "$out"
+
+# Installed but the CLI never appears: also non-zero, distinctly reported.
+mock_script curl <<'EOF'
+echo 'true'
+EOF
+_zt_path="$(command -v zerotier-cli)"; rm -f "$_zt_path"
+out="$(install_zerotier 2>&1)"; rc=$?
+assert_eq       "returns non-zero when zerotier-cli is absent" "1" "$rc"
+assert_contains "and names that failure separately" "not on PATH" "$out"
+ZEROTIER_NETWORK_ID=""
+
+# ── how ZeroTier is wired into the run ────────────────────────────────────────
+# These are the assertions that matter most: both call sites sit inside the
+# window where the ERR trap destroys the container.
+describe zerotier_wiring
+_zt="$(cat "$SCRIPT")"
+assert_contains "the TUN config cannot abort the run" \
+  'configure_lxc_tun_device || TUN_OK=false' "$_zt"
+assert_contains "nor can the ZeroTier install" \
+  'install_zerotier || ZEROTIER_OK=false' "$_zt"
+assert_not_contains "no bare install_zerotier call remains" \
+  $'\ninstall_zerotier\n' "$_zt"
+# The mount entry is read at container START, so it has to be written between
+# create and start — which is why -start 1 was removed from create_args.
+_cargs2="$(sed -n '/^create_args=(/,/^)/p' "$SCRIPT")"
+assert_not_contains "pct create no longer auto-starts the container" \
+  "-start 1" "$_cargs2"
+_tun_ln="$(grep -n 'configure_lxc_tun_device || TUN_OK=false' "$SCRIPT" | tail -1 | cut -d: -f1)"
+_start_ln="$(grep -n '^pct start "\$CT_ID"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+assert_ok "and the TUN entry is written before the start" \
+  bash -c "(( $_tun_ln < $_start_ln ))"
+# curl piping into a root shell: -f is what stops an HTTP error page being
+# executed, and -s alone suppresses the message that would have explained it.
+assert_contains "the installer download fails closed" \
+  'curl -fsSL --proto "=https" --tlsv1.2 https://install.zerotier.com' "$_zt"
+assert_not_contains "and does not shell out through sudo" \
+  "| sudo bash" "$_zt"
+# sudo IS installed, but for the operator's muscle memory at a container shell —
+# never as a dependency of the installer, which is already root via pct exec.
+assert_contains "sudo is installed for interactive use" \
+  "iproute2 sudo" "$_zt"
+assert_not_contains "but the installer never invokes it" \
+  "run_ct sudo" "$_zt"
+# Proxmox's default input policy is DROP, so without this rule ZeroTier silently
+# degrades to relayed traffic through third-party servers.
+assert_contains "udp/9993 is allowed when the firewall is on" \
+  'fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"' "$_zt"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"

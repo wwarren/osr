@@ -23,13 +23,13 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **749 assertions, 107/107 functions covered** (plus an integration
+Current state: **835 assertions, 74/74 + 53/53 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 65 | 392 |
+| `installer` | `ollama-smart-router-install.sh` | 74 | 478 |
 | `manage` | `manage-model-servers.sh` | 53 | 239 |
 | `monitor` | generated `monitor.py` | — | 51 |
 | `router` | generated `router.py` | — | 67 |
@@ -174,6 +174,10 @@ bugs in this family have been found by these tests.
 | Provisioning reported success over a dead UI | `systemctl enable --now` on a `Type=simple` unit returns as soon as the process is forked; nothing checked that the port ever opened |
 | `set-webhook --username <name>` rejected every value, including valid ones | the guard was written `(( $# >= 2 && -n "$2" ))`; inside `(( ))` that is *minus variable n* followed by a bare string, which is an arithmetic syntax error, so the test was always false |
 | `remove 1 1` refused to run against the server minimum | the same server counted twice toward `remaining_count`, so the check saw one more removal than would actually happen |
+| Every service crash-looped with `status=226/NAMESPACE`, and the only symptom was nginx returning 502 | `PrivateTmp=`/`ProtectSystem=`/`ProtectHome=` are a private *mount namespace*, and a container that may not build one does not run the unit unhardened — it does not run it at all. The installer had *asserted* in its comments that `nesting=1` made them safe; it now probes with a real transient unit and rewrites the units when the answer is no |
+| The optional ZeroTier install could destroy a fully provisioned container | it was called bare, after Open WebUI's migrations, while `CT_CREATED` was still set and the ERR trap still armed — so a transient failure fetching `install.zerotier.com` ran `pct destroy`. Same for `configure_lxc_tun_device`, whose `return 1` fired straight into the trap. Both now use the `TLS_OK` pattern |
+| An HTTP error page could be piped into a root shell | `curl -s … \| sudo bash` — `-s` suppresses the message AND exits 0 on a 404, so the error body is what gets executed. Now `curl -fsSL --proto "=https"`, and no `sudo` in the pipeline: `pct exec` is already root. The `sudo` package stays installed, for the operator at a container shell rather than for the installer |
+| A repair run listed all four units as `active` and then announced that some were not | `pct exec` goes through `lxc-attach`, which allocates a pty whenever the host's stdout is a terminal; ONLCR then makes `is-active` return `active\r`. That PRINTS as `active` and compares equal to nothing. In `ct_wait_for_port` it was worse — `activating\r` matched no keep-waiting case, so the installer gave up on a service that was merely slow. Every captured value now goes through `ct_out` |
 | A second outage after a recovery was silently swallowed | the test harness saved state before `announce()` but not after, so the recovery never cleared the last-posted fingerprint — a harness bug, but the same omission in the daemon loop would lose real alerts |
 
 Each fix is in place and pinned by a regression assertion.
