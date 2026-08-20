@@ -130,6 +130,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `TLS_EXTRA_SAN` — extra names for the certificate, comma separated (e.g. `chat.lan,10.0.0.9`). Add the DNS name you actually browse to, or hostname verification fails
 - `OPENWEBUI_INTERNAL_PORT` (8088), `ROUTER_INTERNAL_PORT` (8010) — where the apps bind once nginx owns the public ports
 - `CT_UNPRIVILEGED` (0) — `0` creates a **privileged** container, `1` an unprivileged one. See the note below before changing it
+- `CT_FEATURES` (`nesting=1`) — passed to `pct create -features`. Nesting permits nested user namespaces, so Docker/Podman work inside and systemd's per-unit sandboxing sets up its mount namespaces cleanly. Comma separated; empty omits the flag
 
 ### Install-time prompts
 
