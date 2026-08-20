@@ -155,6 +155,12 @@ ProtectSystem=full      ProtectHome=true
 services write lives under `/app`, so no `ReadWritePaths=` exemption is needed.
 Adding one would be required if logs or venvs ever move to `/var` or `/opt`.
 
+The container is created with `-features nesting=1` (`CT_FEATURES`). Those
+directives are implemented as mount namespaces, and nesting is what lets a
+container set up its own without fighting the outer one — so the hardening
+above is genuinely in force rather than silently degraded. It also permits
+Docker/Podman inside the container.
+
 ---
 
 ## 4. Component view

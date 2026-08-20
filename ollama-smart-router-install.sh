@@ -168,6 +168,18 @@ TIER_XLARGE_IDX=""
 # as a non-login account, systemd hardening, loopback-only internals), but the
 # container itself no longer adds a layer. Set CT_UNPRIVILEGED=1 to go back.
 CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"
+# Container features, passed to `pct create -features`.
+#
+# nesting=1 permits nested user namespaces inside the container. It is what
+# lets you run Docker/Podman in here, and it also lets systemd's per-unit
+# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) set up its mount
+# namespaces without fighting the outer container -- every unit this installer
+# writes uses those.
+#
+# Extend the string rather than adding another flag to create_args; it is
+# comma separated, e.g. "nesting=1,keyctl=1". Setting CT_FEATURES="" omits
+# -features entirely.
+CT_FEATURES="${CT_FEATURES:-nesting=1}"
 GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.test.com}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
@@ -1735,6 +1747,7 @@ if [[ "$CT_UNPRIVILEGED" == "0" ]]; then
 else
   echo "Creating unprivileged Proxmox container ${CT_ID} (${CT_NAME})."
 fi
+[[ -n "$CT_FEATURES" ]] && echo "  Features: ${CT_FEATURES}"
 # Note: password is intentionally NOT passed here (would be visible in `ps`).
 create_args=(
   "$CT_ID" "$TEMPLATE_REF"
@@ -1750,6 +1763,7 @@ create_args=(
   -onboot 1
   -start 1
 )
+[[ -n "$CT_FEATURES" ]] && create_args+=(-features "$CT_FEATURES")
 [[ -n "$NAMESERVER" ]] && create_args+=(-nameserver "$NAMESERVER")
 pct create "${create_args[@]}"
 CT_CREATED=1
