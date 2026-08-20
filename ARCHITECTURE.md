@@ -871,6 +871,39 @@ assembled by an inner shell. This closes an injection and mangling class:
 a token containing `'`, `$` or a backtick would otherwise break quoting or be
 silently expanded.
 
+#### The same rule for anything the host runs *inside* the container
+
+Four places build a script for `bash -c` in the container. All four follow one
+rule: the body is **single-quoted**, so the host expands nothing into it, and
+every value travels as a **positional argument**.
+
+```bash
+run_ct bash -c '
+  set -e
+  repo="$1"
+  rm -rf "$repo"
+' push_local_config_tree "$CONFIG_REPO_DIR"
+```
+
+They previously interpolated `'${CONFIG_REPO_DIR}'` into a double-quoted body.
+That looks quoted and is not: the single quotes become part of the script *text*,
+so a value containing an apostrophe closes them and the remainder executes — as
+root, in the container, two lines above an `rm -rf`. Measured:
+
+```
+--- OLD form (interpolated into script text) ---
+  would-rm-rf /app/x
+  PWNED-AS-ROOT-IN-CONTAINER
+--- NEW form (single-quoted body, value as argv) ---
+  would-rm-rf [/app/x'; echo PWNED-AS-ROOT-IN-CONTAINER; :']
+```
+
+The git history push was the sharper case: `remote` and `branch` are built from
+prompt input (Gitea URL, owner, repo name), and the `http.sslVerify` line was a
+bare unquoted expansion. `push_local_config_tree`, `init_config_repo_history`,
+`ensure_openwebui_python` and `install_zerotier` are all argument-passing now,
+and `describe injected_shell_bodies` fails the build if one regresses.
+
 The local config tree is `chown root:root` + `chmod -R go-rwx`, because it holds
 the env files that are also copied into runtime locations as `0640
 root:ollama-router`.
