@@ -23,13 +23,13 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **729 assertions, 107/107 functions covered** (plus an integration
+Current state: **742 assertions, 107/107 functions covered** (plus an integration
 tests for the generated `apply-config.sh` and the four systemd units, which are
 not functions).
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 65 | 372 |
+| `installer` | `ollama-smart-router-install.sh` | 65 | 385 |
 | `manage` | `manage-model-servers.sh` | 53 | 239 |
 | `monitor` | generated `monitor.py` | — | 51 |
 | `router` | generated `router.py` | — | 67 |
@@ -166,6 +166,7 @@ bugs in this family have been found by these tests.
 | A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
 | An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
 | Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | Open WebUI's own first-run migration, upstream. The installer now starts it alone, waits for the port, and resets the empty database once — `Requires=` was a real but *separate* bug, and blaming it first cost a whole diagnosis cycle |
+| The installer's embedded copy of `manage-model-servers.sh` drifted from the standalone one | only the embedded copy reaches the container, so the file next to the installer can be edited and the deployment never sees it — now pinned byte-for-byte by `describe embedded_manage_script` |
 | Every request through the TLS proxy returned 502 on a clean install | `open-webui serve` has *literal* defaults `host="0.0.0.0", port=8080` and ignores `HOST`/`PORT` entirely, so it bound the port nginx owned, died with "address already in use", and nothing was listening where nginx proxied |
 | Every fresh install printed "nginx rejected the configuration" and then worked | the certificate was generated *after* `apply-config.sh` installed the site that names it, so `nginx -t` could not load it — a spurious warning that teaches you to ignore the real one |
 | `TLS_EXTRA_SAN` with a single name did nothing at all | the split loop used a bare `read`, and `tr` leaves no newline after the last field — so the last name was always dropped, and a one-entry list is entirely last |
@@ -195,6 +196,12 @@ the whole recover-and-retry path with a `pct` stub that changes its answer once
 the `mv` has happened, so the retry is exercised rather than assumed. It also
 re-learns the subshell rule — the function sets `OPENWEBUI_RESET`, so it must
 be run with output redirected to a file, never inside `$(...)`.
+
+`describe verify_service_executables` deliberately asserts on the *message*, not
+just the return code. A failure there trips the installer's `ERR` trap, which
+destroys the container — so if the diagnosis is not printed before the function
+returns, the only evidence of which executable the service account could not run
+goes with it.
 
 The TLS tests run `openssl` for real rather than asserting on a command line:
 a certificate is only worth checking if openssl made it, and the assertions

@@ -727,21 +727,20 @@ assert_ok "no token is a skip, not a failure" test_gitea_access ""
 # A stub that answers both the same way makes the probe fail on the trailing
 # status digits, so every case below branches on -X first.
 
-# Happy path: auth ok, repo exists, commit created.
+# Happy path: auth ok, repo exists.
 mock_script curl <<'EOF'
 case "$*" in
   *-X*) ;;
   *)    echo '{"login":"tester"}'; exit 0;;      # probe
 esac
 case "$*" in
-  *contents*) echo '{"commit":{"html_url":"https://git.example.net/c/1"}}'; echo 201; exit 0;;
-  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
+  *) echo '{"default_branch":"main"}'; echo 200; exit 0;;
 esac
 EOF
 out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
 assert_eq       "succeeds end to end"        "0" "$rc"
 assert_contains "reports the authenticated user" "tester" "$out"
-assert_contains "reports the test commit"        "test commit succeeded" "$out"
+assert_contains "reports the resolved repo"       "Configuration repository: tester/ollama-smart-router" "$out"
 
 # http:// remote: warn about the redirect that drops the Authorization header.
 GITEA_SERVER_URL="http://git.example.net"
@@ -758,94 +757,55 @@ esac
 case "$*" in
   *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
   *search*)       echo '{"data":[]}'; echo 200; exit 0;;
-  *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
   *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
 esac
 EOF
 out="$(test_gitea_access TOKEN 2>&1)" || true
 assert_contains "creates the repo when it is missing" "Creating repository" "$out"
-assert_contains "and still commits into it"           "test commit succeeded" "$out"
+assert_contains "and reports the created repo"        "Configuration repository: tester/ollama-smart-router" "$out"
 
-# Commit rejected -> non-zero and the HTTP code surfaced.
+# Repo creation rejected -> non-zero and the HTTP code surfaced.
 mock_script curl <<'EOF'
 case "$*" in
   *-X*) ;;
   *)    echo '{"login":"tester"}'; exit 0;;
 esac
 case "$*" in
-  *contents*) echo '{"message":"forbidden"}'; echo 403; exit 0;;
-  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
+  *"user/repos"*) echo '{"message":"forbidden"}'; echo 403; exit 0;;
+  *search*)       echo '{"data":[]}'; echo 200; exit 0;;
+  *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
 esac
 EOF
-assert_fail "a rejected commit fails the test" test_gitea_access TOKEN
+assert_fail "a rejected repo create fails the test" test_gitea_access TOKEN
 assert_contains "surfaces the HTTP status" "403" "$(test_gitea_access TOKEN 2>&1)"
 
 # Auth itself fails -> stop before touching the repository at all.
 mock_command curl 22
 mock_reset_log
 assert_fail "an unusable token fails fast" test_gitea_access TOKEN
-assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count 'contents')"
+assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count '-X')"
 
-# ── repo seeding ──────────────────────────────────────────────────────────────
-describe seed_gitea_repo
-seedtree="$(mktemp -d)"
-mkdir -p "${seedtree}/env" "${seedtree}/services/ollama-router"
-echo "A=1" > "${seedtree}/env/router.env"
-echo "[tiers]" > "${seedtree}/services/ollama-router/router.ini"
-CONFIG_SEED_IF_MISSING=true
-assert_fail "no token means no seeding" seed_gitea_repo "$seedtree" ""
-CONFIG_SEED_IF_MISSING=false
-assert_ok   "seeding disabled is a clean no-op" seed_gitea_repo "$seedtree" TOKEN
-assert_contains "and says so" "not writing" "$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
-CONFIG_SEED_IF_MISSING=true
-
-# Everything absent -> every file is created.
-mock_script curl <<'EOF'
-case "$*" in
-  *"-X POST"*) echo '{}'; echo 201; exit 0;;
-  *)           echo '{"message":"Not Found"}'; echo 404; exit 0;;
-esac
-EOF
-out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
-assert_contains "creates both files"    "2 created" "$out"
-assert_contains "counts nothing skipped" "0 already present" "$out"
-
-# Everything already present -> nothing is overwritten.
-mock_script curl <<'EOF'
-echo '{"path":"x"}'; echo 200; exit 0
-EOF
-mock_reset_log
-out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
-assert_contains "existing files are left alone" "2 already present" "$out"
-assert_eq       "no POST is issued"             "0" "$(mock_call_count '-X POST')"
-
-# A single failure is reported without aborting the rest of the walk.
-mock_script curl <<'EOF'
-case "$*" in
-  *"-X POST"*router.ini*) echo '{"message":"nope"}'; echo 422; exit 0;;
-  *"-X POST"*)            echo '{}'; echo 201; exit 0;;
-  *)                      echo '{}'; echo 404; exit 0;;
-esac
-EOF
-out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
-assert_contains "reports the failed file" "failed to seed" "$out"
-assert_contains "still seeds the others"  "1 created"      "$out"
-rm -rf "$seedtree"
-
-# ── container clone ───────────────────────────────────────────────────────────
-describe clone_config_repo
+# ── Gitea deployment history ──────────────────────────────────────────────────
+describe init_config_repo_history
 CT_ID=910; CONFIG_REPO_DIR="/app/config-repo"
 GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
 GITEA_REPO_NAME="ollama-smart-router"; GITEA_VERIFY_TLS=false
 mock_reset_log; mock_command pct 0
-clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
 calls="$(mock_calls)"
 assert_contains "pushes a credential file into the container" "push 910" "$calls"
 assert_contains "with 0600 permissions"                       "--perms 0600" "$calls"
-assert_contains "clones the configured repo"  "ollama-smart-router.git" "$calls"
+assert_contains "sets the configured remote"  "ollama-smart-router.git" "$calls"
+assert_contains "initializes git in place"    "init -q"                 "$calls"
+# git's default-branch hint goes to STDERR, so `git init >/dev/null` does not
+# suppress it and it reads like a warning in the install log.
+assert_contains "without git's default-branch hint" "init.defaultBranch=main" "$calls"
+assert_contains "uses a deployment branch"    "deployment-910-test"     "$calls"
 assert_contains "honours GITEA_VERIFY_TLS"    "http.sslVerify=false"    "$calls"
 assert_contains "removes the credential file afterwards" "rm -f /root/.git-credentials" "$calls"
-assert_contains "tightens permissions on the clone" "chmod -R go-rwx" "$calls"
+assert_contains "tightens permissions on the generated tree" "chmod -R go-rwx" "$calls"
+assert_not_contains "does not clone from Gitea" "git clone" "$calls"
+assert_not_contains "does not pull from Gitea"  "git pull"  "$calls"
 assert_not_contains "never puts the token on a command line" "SECRETTOKEN" "$calls"
 
 # The credential entry must carry the remote's scheme; git will not match an
@@ -856,11 +816,11 @@ if [ "\$1" = "push" ]; then cp "\$3" "${_cred_seen}"; fi
 exit 0
 EOF
 GITEA_SERVER_URL="http://git.example.net"
-clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
 assert_file_contains "credential scheme follows the remote" \
   "http://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 GITEA_SERVER_URL="https://git.example.net"
-clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
+init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
 assert_file_contains "https remote gets an https credential" \
   "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 rm -f "$_cred_seen"
@@ -1015,6 +975,25 @@ assert_status "a missing required file aborts" 1 \
       bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
 rm -rf "$_acroot" "$_ac"
 
+# ── the embedded copy of manage-model-servers.sh ──────────────────────────────
+# The installer carries a COMPLETE copy of manage-model-servers.sh inside a
+# heredoc, and that copy — not the file next to it — is what apply-config.sh
+# symlinks onto PATH in the container. The two have drifted before, so pin the
+# invariant rather than trusting that both get edited together.
+describe embedded_manage_script
+_emb="$(mktemp)"
+sed -n "/^cat > \"\${REPO_DIR}\/install\/manage-model-servers.sh\" <<'MANAGEEOF'\$/,/^MANAGEEOF\$/p" \
+  "$SCRIPT" | sed '1d;$d' > "$_emb"
+assert_ok "extracts from the installer" bash -c "[[ -s '$_emb' ]]"
+assert_ok "parses"                      bash -n "$_emb"
+_standalone="${HERE}/../manage-model-servers.sh"
+if [[ -f "$_standalone" ]]; then
+  assert_ok "byte-identical to the standalone script" diff -q "$_emb" "$_standalone"
+else
+  skip "byte-identical to the standalone script" "no standalone copy alongside"
+fi
+rm -f "$_emb"
+
 # ── TLS ───────────────────────────────────────────────────────────────────────
 # Open WebUI cannot terminate TLS itself — `open-webui serve` passes only host
 # and port to uvicorn — so nginx fronts it. What is testable here is the
@@ -1106,6 +1085,53 @@ mock_script pct <<'EOF'
 exit 1
 EOF
 assert_fail "reports a failed handshake" ct_tls_ok 8080
+
+describe verify_service_executables
+mock_reset_log
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  chmod|runuser) exit 0 ;;
+  *) "$@" ;;
+esac
+EOF
+assert_ok "service executables are verified as the service user" verify_service_executables
+assert_contains "router venv made traversable" \
+  "chmod -R a+rX /app/router/venv /app/openwebui/venv" "$(mock_calls)"
+assert_contains "router python executed as the service user" \
+  "runuser -u ollama-router -- /app/router/venv/bin/python" "$(mock_calls)"
+# A failure here must be legible, because the ERR trap destroys the container
+# and takes the evidence with it. Naming the executable is the whole point.
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  chmod) exit 0 ;;
+  runuser) exit 1 ;;              # the service account cannot run it
+  *) "$@" ;;
+esac
+EOF
+_vout="$(mktemp)"
+verify_service_executables > "$_vout" 2>&1; _vrc=$?
+assert_eq       "returns non-zero when the service user cannot execute" "1" "$_vrc"
+assert_contains "names the router interpreter" \
+  "cannot run /app/router/venv/bin/python" "$(cat "$_vout")"
+assert_contains "names the Open WebUI interpreter" \
+  "cannot run /app/openwebui/venv/bin/python" "$(cat "$_vout")"
+assert_contains "explains the systemd symptom" "203/EXEC" "$(cat "$_vout")"
+assert_contains "and the 502 it surfaces as"   "502"      "$(cat "$_vout")"
+assert_contains "and the likely cause"         "umask"    "$(cat "$_vout")"
+rm -f "$_vout"
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  chmod|runuser) exit 0 ;;
+  *) "$@" ;;
+esac
+EOF
+mock_reset_log
+assert_ok "passes again once they are executable" verify_service_executables
+assert_contains "open-webui script checked" \
+  "runuser -u ollama-router -- test -x /app/openwebui/venv/bin/open-webui" "$(mock_calls)"
 
 # ── Open WebUI first-start handling ───────────────────────────────────────────
 # These exist because a clean install came up with a dead UI twice. The unit
@@ -1331,6 +1357,27 @@ echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
 echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
 EOF
 assert_ok "zero when everything is up" report_services
+TLS_ENABLED=true
+ROUTER_BIND_PORT=8010
+OPENWEBUI_BIND_PORT=8088
+OPENWEBUI_PORT=8080
+mock_script pct <<'EOF'
+shift 3
+case "$1" in
+  ss)
+    echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
+    echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
+    echo 'LISTEN 0 2048 127.0.0.1:8010 0.0.0.0:*'
+    ;;
+  bash) exit 0 ;;
+  *) "$@" ;;
+esac
+EOF
+out="$(report_services 2>&1)"; rc=$?
+assert_eq       "non-zero when an nginx upstream is down" "1" "$rc"
+assert_contains "names the missing upstream" "Open WebUI upstream" "$out"
+assert_contains "explains the 502"           "nginx will return 502" "$out"
+TLS_ENABLED=false
 
 # ── the generated systemd units ───────────────────────────────────────────────
 # Also not functions. These assertions exist because of a real outage: every
