@@ -203,6 +203,25 @@ disproved it. So the installer no longer asserts; it **measures**:
 The probe re-runs on every install, so a container later given `nesting=1` gets
 its hardening back automatically.
 
+#### Reading values back out of `pct exec`
+
+Every value the host captures from inside the container goes through `ct_out`,
+which strips carriage returns and takes the first non-empty line. That is not
+tidying. `pct exec` runs `lxc-attach`, which allocates a pty whenever the host's
+stdout is a terminal — every interactive install — and the pty's ONLCR turns
+each `\n` into `\r\n`. Command substitution strips the trailing newline but not
+the `\r`, so
+
+```bash
+state="$(run_ct systemctl is-active open-webui.service)"   # "active\r"
+[[ "$state" == "active" ]]                                  # false
+```
+
+prints `active` and compares equal to nothing. The visible symptom is a script
+that lists a unit as active and declares it failed in the same breath. In
+`ct_wait_for_port` the consequence was worse: `activating\r` matched none of the
+keep-waiting cases, so the installer abandoned a service that was only slow.
+
 An existing container stuck in this loop is repaired by
 `fix-service-namespacing.sh <CTID>` on the Proxmox host. It runs the same probe,
 offers to enable `nesting=1` and reboot first — the fix that *keeps* the
@@ -708,6 +727,42 @@ storage capacity. A typo, a bad token, or a disk without room costs a re-prompt
 rather than a wasted build. An `ERR` trap destroys a half-provisioned container
 so a failed run never leaves debris.
 
+#### The corollary: what runs after `pct create` must not fail loudly
+
+That trap is armed from the moment `CT_CREATED=1` until it is disarmed at the
+very end. Every step in between is therefore either **essential** — allowed to
+abort, because a container without it is worthless — or **optional**, in which
+case it must be called as
+
+```bash
+optional_step || FEATURE_OK=false
+```
+
+and reported in the summary. `generate_tls_cert`, `configure_lxc_tun_device` and
+`install_zerotier` all take this form. The hazard is not theoretical: ZeroTier is
+installed *after* Open WebUI's multi-minute first-run migration, so a bare call
+meant a transient failure fetching `install.zerotier.com` would run
+`pct destroy` on a fully provisioned, working system.
+
+The reverse mistake matters too — a genuinely essential step that swallows its
+own failure produces a container that provisions "successfully" and does not
+work. `verify_service_executables` is the reference for that direction: it names
+each check before it can fail, precisely so the trap does not destroy the
+evidence.
+
+#### ZeroTier and the TUN device
+
+`configure_lxc_tun_device` appends `lxc.cgroup2.devices.allow: c 10:200 rwm` and
+a bind mount of `/dev/net/tun` to the container config. Both are read **once, at
+container start**, which is why `-start 1` was removed from `create_args` and
+the container is started explicitly afterwards. Written to a running container,
+they do nothing until it is rebooted.
+
+`install_zerotier` runs last. A `join` is a *request*: the member stays in
+`REQUESTING_CONFIGURATION` or `ACCESS_DENIED` until it is authorised in ZeroTier
+Central, so the installer prints the node address and the real network status
+rather than claiming a join succeeded.
+
 **Storage selection** resolves candidates in three steps, because
 `pvesm status -content <type>` returns an empty table on some setups:
 
@@ -764,10 +819,17 @@ fails at service start.
 | 8080 | Open WebUI | `0.0.0.0` | LAN — browser UI |
 | 4000 | LiteLLM | `127.0.0.1` | **Container-local only** |
 | 11434 | Ollama hosts | outbound | Router and monitor → model pool |
+| 9993/udp | ZeroTier | `0.0.0.0` | Internet — peers and root servers |
 
 When the container firewall is enabled, the installer writes explicit accept
 rules for 8000 and 8080 from a trusted CIDR. LiteLLM needs no rule because it
 never leaves the loopback interface.
+
+The ZeroTier rule is the exception to the CIDR pattern and is written whenever
+the firewall is on, **unscoped by source** — peers and root servers arrive from
+arbitrary internet addresses. Scoping it to `API_ALLOW_CIDR` would not break
+ZeroTier outright; it would silently force every session onto ZeroTier's relay
+servers, which presents as unexplained latency rather than as a firewall fault.
 
 ---
 
@@ -821,6 +883,8 @@ root:ollama-router`.
 | **`GITEA_VERIFY_TLS=false`** | TurnKey appliance ships a self-signed certificate | Install the appliance CA and flip the flag in `prompt_gitea_credentials` |
 | **No auth on the router API** | Trusted LAN deployment | Firewall CIDR; add a reverse proxy with auth if exposed |
 | **Deploy token grants access to the Gitea storing it** | Same-system credential | Scope the token to the single repository |
+| **ZeroTier bypasses the container firewall** | The Proxmox CT firewall filters the veth on `vmbr0`; overlay traffic arrives on `zt*` inside the container, so `API_ALLOW_CIDR` does not constrain it | Network membership in ZeroTier Central *is* the access control — authorise deliberately, and add auth in front of the API if that is not enough |
+| **`curl \| bash` from a third-party host** | ZeroTier's supported install path | The fetch is `curl -fsSL --proto "=https" --tlsv1.2`, so an HTTP error page or a plaintext redirect cannot reach the shell; pin a distro package instead if that trade is unacceptable |
 
 ---
 

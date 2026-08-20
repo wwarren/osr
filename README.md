@@ -124,7 +124,8 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `NONINTERACTIVE` (false) — take every default and skip all prompts
 - `GITEA_SERVER_URL` (`https://git.test.com`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
 - `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`), `MATTERMOST_VERIFY_TLS` (true)
-- `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
+- `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped. `FIREWALL=1` also opens udp/9993 for ZeroTier, unscoped by source (see [ZeroTier](#zerotier))
+- `ZEROTIER_NETWORK_ID` — 16 hex digits to join at install time; blank installs ZeroTier without joining. See [ZeroTier](#zerotier)
 - `OPENWEBUI_PORT` (8080)
 - `TLS_ENABLED` (true), `TLS_CERT_DAYS` (3650), `TLS_KEY_BITS` (4096), `TLS_DIR` (`/app/tls`)
 - `TLS_EXTRA_SAN` — extra names for the certificate, comma separated (e.g. `chat.lan,10.0.0.9`). Add the DNS name you actually browse to, or hostname verification fails
@@ -619,6 +620,64 @@ or hostname verification fails no matter how well trusted the certificate is.
 
 `TLS_ENABLED=false` at install time reverts to the previous behaviour exactly:
 no nginx, the applications bind `0.0.0.0` on 8080 and 8000, plain HTTP.
+
+## ZeroTier
+
+ZeroTier is installed inside the container at the end of provisioning so the
+router can be reached from outside the LAN without opening a port on the
+perimeter. It is entirely optional: `ZEROTIER_NETWORK_ID` blank installs the
+daemon and joins nothing.
+
+- `ZEROTIER_NETWORK_ID` — 16 hex digits. Blank installs only. Note this is the
+  **network** id (16 digits), not the **node** address (10 digits); the two look
+  alike and joining with the wrong one fails in Central rather than locally.
+- `LXC_CONF_DIR` (`/etc/pve/lxc`) — where the container config lives. Exposed
+  so the tests can point it somewhere writable.
+
+### The TUN device
+
+ZeroTier needs `/dev/net/tun`, which an LXC container does not get by default.
+The installer appends two lines to the container's config:
+
+```
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+```
+
+Both are read **once, at container start**. That is why `pct create` no longer
+carries `-start 1`: the config is written between create and start. Adding these
+lines to a container that is already running does nothing until `pct reboot`.
+
+### A join is a request, not membership
+
+`zerotier-cli join` succeeds immediately and means nothing on its own — the
+member sits in `REQUESTING_CONFIGURATION` or `ACCESS_DENIED` until someone
+authorises it in ZeroTier Central. The installer prints the node address for
+exactly that reason, and reports the real network status rather than "joined":
+
+```
+ZeroTier: join REQUESTED for 8056c2e21c000001 (ACCESS_DENIED)
+  -> authorise node deadbeef99 in ZeroTier Central.
+```
+
+Check it later with `pct exec <CTID> -- zerotier-cli listnetworks`.
+
+### Firewall
+
+With `FIREWALL=1` the installer allows **udp/9993 inbound from any source**.
+That rule is deliberately not scoped to `API_ALLOW_CIDR`: ZeroTier peers and
+root servers come from arbitrary internet addresses. Without it Proxmox's
+default DROP input policy blocks the direct path, and ZeroTier silently falls
+back to relaying through third-party servers — it still works, just slowly, and
+it looks like a latency problem rather than a firewall one.
+
+### What ZeroTier does to the security model
+
+Worth being explicit about: the Proxmox container firewall filters the veth on
+`vmbr0`. Overlay traffic arrives on the container's `zt*` interface instead, so
+**`API_ALLOW_CIDR` does not constrain it**. Anyone authorised on the ZeroTier
+network reaches the router API and Open WebUI directly, regardless of the CIDR
+allow-list. Treat network membership in Central as the access control it now is.
 
 ## Evaluating routing quality
 
