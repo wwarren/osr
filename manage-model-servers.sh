@@ -29,8 +29,11 @@ APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
-ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8000}"
+ROUTER_URL="${ROUTER_URL:-}"          # resolved from router.env; see resolve_router_url
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
+# A refresh re-polls every configured host, so it needs more headroom than a
+# single probe -- but it must still not hang forever if nothing answers.
+ROUTER_TIMEOUT="${ROUTER_TIMEOUT:-30}"
 SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
 
 declare -A TIER_MODEL_OVERRIDE=()   # tier            -> model tag
@@ -335,14 +338,78 @@ cmd_list() {
   done
 }
 
+# The router's own listener, read from router.env rather than assumed.
+#
+# With TLS_ENABLED=true the router binds ROUTER_BIND_HOST:ROUTER_BIND_PORT
+# (127.0.0.1:8010) and nginx owns the public 8000 as HTTPS. A plain-HTTP POST to
+# 8000 then gets nginx's "400 The plain HTTP request was sent to HTTPS port",
+# which `curl -f` reports as exit 22 -- previously indistinguishable here from
+# the router being down, so the tool blamed a service that was running fine.
+# With TLS off the router binds 0.0.0.0:8000 itself. router.env records which
+# arrangement this container actually has, so read it instead of guessing.
+resolve_router_url() {
+  local host port
+  if [[ -n "$ROUTER_URL" ]]; then printf '%s\n' "$ROUTER_URL"; return 0; fi
+  host="$(env_get ROUTER_BIND_HOST)"
+  port="$(env_get ROUTER_BIND_PORT)"
+  # A config predating the TLS front end has neither key; 8000 is what it used.
+  [[ -n "$port" ]] || port="8000"
+  # A bind address is not a destination: 0.0.0.0 means "every interface", and
+  # connecting to it only incidentally reaches loopback.
+  [[ -z "$host" || "$host" == "0.0.0.0" || "$host" == "::" ]] && host="127.0.0.1"
+  printf 'http://%s:%s\n' "$host" "$port"
+}
+
+# Say why the router did not answer, in terms an operator can act on. Called
+# only after the real request has already failed, so the extra round trip costs
+# nothing that matters -- and unlike that request it keeps the body, which is
+# where nginx (or the router) explains itself.
+diagnose_router() {
+  local url="$1" rc="$2" code bodyf errf
+  bodyf="$(mktemp)"; errf="$(mktemp)"
+  code="$(curl -sS -m "$PROBE_TIMEOUT" -o "$bodyf" -w '%{http_code}' \
+          -X POST "${url}/routing/refresh" 2>"$errf")" || true
+  [[ "$code" =~ ^[0-9]{3}$ && "$code" != "000" ]] || code=""
+
+  if [[ -n "$code" ]]; then
+    note "The router at ${url} is reachable, but answered HTTP ${code}."
+  else
+    note "Could not reach the router at ${url} (curl exit ${rc})."
+  fi
+  [[ -s "$errf" ]] && sed 's/^/    /' "$errf" >&2
+  [[ -s "$bodyf" ]] && head -c 300 "$bodyf" | sed 's/^/    /' >&2
+
+  case "$code" in
+    400)
+      note "  A 400 that mentions HTTPS means this port belongs to the nginx TLS"
+      note "  front end, not to the router. The router's own port is"
+      note "  ROUTER_BIND_PORT in ${ENV_FILE} (8010 on a TLS install)." ;;
+    401|403)
+      note "  Something in front of the router is demanding credentials." ;;
+    404)
+      note "  Nothing serves /routing/refresh there: either this router.py"
+      note "  predates the endpoint, or nginx does not proxy /routing/ to it." ;;
+    5*)
+      note "  The router is up but failing the request."
+      note "  Check:  journalctl -u ollama-router -n 50" ;;
+    *)
+      case "$rc" in
+        7)  note "  Connection refused -- nothing is listening on that port." ;;
+        28) note "  Timed out after ${ROUTER_TIMEOUT}s." ;;
+      esac
+      note "  Check it is running:  systemctl status ollama-router" ;;
+  esac
+  note "  Or point elsewhere:   ROUTER_URL=http://host:8010 $0 discover"
+  rm -f "$bodyf" "$errf"
+}
+
 cmd_discover() {
-  local body rc=0
-  echo "Asking the router to re-poll every configured host..."
-  body="$(curl -fsS -X POST "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
+  local url body rc=0
+  url="$(resolve_router_url)"
+  echo "Asking the router at ${url} to re-poll every configured host..."
+  body="$(curl -fsS -m "$ROUTER_TIMEOUT" -X POST "${url}/routing/refresh" 2>/dev/null)" || rc=$?
   if (( rc != 0 )) || [[ -z "$body" ]]; then
-    note "Could not reach the router at ${ROUTER_URL} (curl exit ${rc})."
-    note "  Check it is running:  systemctl status ollama-router"
-    note "  Or point elsewhere:   ROUTER_URL=http://host:8000 $0 discover"
+    diagnose_router "$url" "$rc"
     return 1
   fi
   # NOTE: %-formatting, not f-strings. This code is embedded in a shell-quoted

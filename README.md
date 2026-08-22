@@ -13,7 +13,7 @@ hardened `ollama-router` user:
 |---|---|---|---|
 | nginx (TLS front end) | `nginx.service` | 8080, 8000 | Terminates HTTPS for both public ports |
 | Open WebUI (chat UI) | `open-webui.service` | 8088 | Loopback only; reached through nginx |
-| Smart Router (OpenAI API) | `ollama-router.service` | 8010 | Loopback only; reached through nginx |
+| Smart Router (OpenAI API) | `ollama-router.service` | 8010 | Loopback only; reached through nginx. In-container callers use this port, not 8000 |
 | LiteLLM proxy | `litellm-proxy.service` | 4000 | Localhost only; load balances backends |
 | Health monitor | `ollama-monitor.service` | — | Probes backends, alerts to Mattermost |
 
@@ -743,7 +743,9 @@ dial that changes it.
 it, so a hypothesis formed from the log can be tested directly:
 
 ```bash
-curl -s localhost:8000/routing/explain \
+# 8010 is ROUTER_BIND_PORT — from inside the container, 8000 is nginx's TLS
+# port and a plain-HTTP request there returns 400, not a routing decision.
+curl -s localhost:8010/routing/explain \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "prove that the algorithm terminates"}' | jq
 ```
@@ -843,8 +845,8 @@ config repo and `systemctl daemon-reload`.
 systemctl status open-webui ollama-router litellm-proxy ollama-monitor
 journalctl -u ollama-router -f
 
-# API base URL (external)
-http://<container-ip>:8000/v1
+# API base URL (external; http:// only when TLS_ENABLED=false)
+https://<container-ip>:8000/v1
 
 # Chat UI — create the admin account on first visit
 http://<container-ip>:8080

@@ -236,8 +236,12 @@ Nesting also permits Docker/Podman inside the container.
 
 ### 4.1 Smart Router (`ollama-router.service`) — the core
 
-FastAPI/uvicorn service on `:8000`. The only component that makes routing
-decisions.
+FastAPI/uvicorn service, the only component that makes routing decisions. It
+binds `ROUTER_BIND_HOST:ROUTER_BIND_PORT` from `router.env` — `127.0.0.1:8010`
+behind the TLS front end, `0.0.0.0:8000` when `TLS_ENABLED=false`. Clients see
+`:8000` either way; whether that port is the router itself or nginx in front of
+it is decided entirely by `TLS_ENABLED`, which is why anything *inside* the
+container must read the bind port rather than assume 8000 (see §8).
 
 | Endpoint | Purpose |
 |---|---|
@@ -813,10 +817,15 @@ fails at service start.
 
 ## 8. Network and ports
 
+Ports below are the `TLS_ENABLED=true` default. With TLS off there is no
+nginx, and the two applications bind the public ports directly over plain HTTP.
+
 | Port | Service | Binding | Exposure |
 |---|---|---|---|
-| 8000 | Smart Router | `0.0.0.0` | LAN — the OpenAI-compatible API |
-| 8080 | Open WebUI | `0.0.0.0` | LAN — browser UI |
+| 8000 | nginx → Smart Router | `0.0.0.0` | LAN — the OpenAI-compatible API, **HTTPS** |
+| 8080 | nginx → Open WebUI | `0.0.0.0` | LAN — browser UI, **HTTPS** |
+| 8010 | Smart Router | `127.0.0.1` | **Container-local**; `ROUTER_BIND_PORT` |
+| 8088 | Open WebUI | `127.0.0.1` | **Container-local**; `OPENWEBUI_BIND_PORT` |
 | 4000 | LiteLLM | `127.0.0.1` | **Container-local only** |
 | 11434 | Ollama hosts | outbound | Router and monitor → model pool |
 | 9993/udp | ZeroTier | `0.0.0.0` | Internet — peers and root servers |
@@ -824,6 +833,15 @@ fails at service start.
 When the container firewall is enabled, the installer writes explicit accept
 rules for 8000 and 8080 from a trusted CIDR. LiteLLM needs no rule because it
 never leaves the loopback interface.
+
+> **In-container callers must use the bind port, not 8000.** A plain-HTTP
+> request to the TLS port gets nginx's `400 The plain HTTP request was sent to
+> HTTPS port`. `curl -f` collapses that into **exit 22**, which reads exactly
+> like the service being down — `manage-model-servers discover` reported
+> precisely that against a router that was running normally. `resolve_router_url`
+> now reads `ROUTER_BIND_HOST`/`ROUTER_BIND_PORT` out of `router.env` rather
+> than assuming the public port, and the failure path prints the status and the
+> response body instead of one guess about the cause.
 
 The ZeroTier rule is the exception to the CIDR pattern and is written whenever
 the firewall is on, **unscoped by source** — peers and root servers arrive from
