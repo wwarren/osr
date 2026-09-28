@@ -1,0 +1,37 @@
+[Unit]
+Description=Ollama Cluster Resilience Health Monitor
+# The monitor polls the Ollama hosts directly and posts to Mattermost; it never
+# talks to LiteLLM, so a hard dependency only made it collateral damage of a
+# LiteLLM failure. Start ordering is kept, the binding is not.
+After=network-online.target litellm-proxy.service
+Wants=network-online.target litellm-proxy.service
+[Service]
+Type=simple
+User=ollama-router
+Group=ollama-router
+WorkingDirectory=/app/router
+EnvironmentFile=/app/router/.env
+# Secrets (MATTERMOST_WEBHOOK_URL) live outside the config repo. The leading
+# '-' keeps the unit starting when the file does not exist yet.
+EnvironmentFile=-/app/router/secrets.env
+ExecStart=/app/router/venv/bin/python monitor.py
+Restart=always
+RestartSec=10
+# --- sandboxing (same model as the llama.cpp target units) ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+# /var/lib/ollama-monitor holds the startup-notice timestamp.
+StateDirectory=ollama-monitor
+Environment=MONITOR_STATE_DIR=/var/lib/ollama-monitor
+Environment=PYTHONDONTWRITEBYTECODE=1
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+[Install]
+WantedBy=multi-user.target

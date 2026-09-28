@@ -1,0 +1,21 @@
+model_list:
+  - model_name: fast
+    litellm_params:
+      model: ollama/qwen2.5-coder
+      api_base: http://192.168.11.15:11434
+  - model_name: medium
+    litellm_params:
+      model: ollama/qwen3.6:35b
+      api_base: http://192.168.11.14:11434
+  - model_name: large
+    litellm_params:
+      model: ollama/qwen3.6:35b
+      api_base: http://192.168.11.14:11434
+router_settings:
+  fallbacks:
+    - fast: ["medium", "large"]
+    - medium: ["fast"]
+    - large: ["fast"]
+  routing_strategy: latency-based-routing
+  num_retries: 2
+  timeout: 600

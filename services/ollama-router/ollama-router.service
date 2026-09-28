@@ -1,0 +1,38 @@
+[Unit]
+Description=Intelligent Ollama Prompt Complexity Router Middleware
+# LiteLLM is the *fallback* dispatch path, not a hard requirement: the router
+# serves traffic from its own live discovery inventory and only forwards to
+# LiteLLM when discovery is off or the inventory is empty. Wants= keeps the
+# start ordering (After= still holds LiteLLM first) without the binding, so a
+# crash-looping litellm-proxy degrades routing to discovery-only. With
+# Requires=, every LiteLLM restart propagated a stop up through this unit to
+# open-webui, and the UI never stayed up long enough to bind :8080.
+After=network-online.target litellm-proxy.service
+Wants=network-online.target litellm-proxy.service
+[Service]
+Type=simple
+User=ollama-router
+Group=ollama-router
+WorkingDirectory=/app/router
+EnvironmentFile=/app/router/.env
+# ROUTER_API_KEY (optional bearer token for the API) lives outside the repo.
+EnvironmentFile=-/app/router/secrets.env
+ExecStart=/app/router/venv/bin/python router.py
+Restart=always
+RestartSec=3
+# --- sandboxing (same model as the llama.cpp target units) ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+# Writes nothing; bytecode caching is turned off instead of granting a path.
+Environment=PYTHONDONTWRITEBYTECODE=1
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+[Install]
+WantedBy=multi-user.target

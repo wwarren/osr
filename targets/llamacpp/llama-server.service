@@ -1,0 +1,35 @@
+[Unit]
+Description=llama.cpp resident model on the inference target
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=llama-target
+Group=llama-target
+WorkingDirectory=/var/lib/llama-target
+EnvironmentFile=/etc/llama-target/llama-server.env
+ExecStartPre=/usr/bin/test -r ${MODEL_PATH}
+# $LLAMA_EXTRA_ARGS (unbraced) is split into separate arguments; empty adds none.
+ExecStart=/opt/llama-target/bin/llama-server --host 127.0.0.1 --port 8081 --model ${MODEL_PATH} --alias ${MODEL_ALIAS} --ctx-size ${CONTEXT_SIZE} --parallel ${PARALLEL_SLOTS} --threads ${THREADS} --n-gpu-layers ${GPU_LAYERS} --jinja $LLAMA_EXTRA_ARGS
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+KillSignal=SIGINT
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llama-target
+PrivateTmp=true
+# Keep passed-through GPU devices visible. Access is restricted by CT devN entries.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Environment=HOME=/var/lib/llama-target
+
+[Install]
+WantedBy=multi-user.target

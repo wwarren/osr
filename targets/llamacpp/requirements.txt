@@ -1,0 +1,4 @@
+# Direct runtime dependencies; deliberately exclude development/test packages.
+fastapi==0.141.1
+httpx==0.28.1
+uvicorn==0.53.0

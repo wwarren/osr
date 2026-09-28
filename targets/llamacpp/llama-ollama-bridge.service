@@ -1,0 +1,31 @@
+[Unit]
+Description=Ollama and OpenAI compatibility API on the llama.cpp target
+Wants=llama-server.service
+After=network.target llama-server.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=llama-target
+Group=llama-target
+WorkingDirectory=/opt/llama-target
+EnvironmentFile=/etc/llama-target/bridge.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/llama-target/venv/bin/uvicorn bridge:app --host 0.0.0.0 --port 11434 --workers 1 --no-proxy-headers
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

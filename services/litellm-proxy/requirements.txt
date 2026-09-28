@@ -1,0 +1,13 @@
+# LiteLLM runs in its OWN venv (/app/litellm/venv). The [proxy] extra is what
+# `litellm --config` needs (backoff, orjson, apscheduler, ...); without it the
+# proxy dies at import with "Missing dependency ... pip install 'litellm[proxy]'".
+# It also pins fastapi/uvicorn versions that conflict with the router's, which is
+# why it cannot share /app/router/venv.
+#
+# requirements.lock (next to this file) is the hash-locked resolution of this
+# pin and is preferred at install time (pip --require-hashes). Regenerate it
+# after changing the pin:
+#   uv pip compile requirements.txt --generate-hashes --python-version 3.13 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements.lock
+# Never move to 1.82.7 or 1.82.8: both were malicious uploads (March 2026).
+litellm[proxy]==1.75.5.post1

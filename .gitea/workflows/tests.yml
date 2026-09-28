@@ -1,0 +1,52 @@
+# Runs every test suite, shellcheck and ruff on each push and pull request.
+# Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image;
+# nothing here talks to Proxmox, Gitea, Ollama or the network beyond PyPI.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The router container runs Debian 13's Python 3.13.
+          python-version: "3.13"
+
+      - name: Tooling (pytest, ruff, shellcheck, PyYAML)
+        run: python -m pip install -r tests/requirements-dev.txt
+
+      # The router and the llama.cpp bridge pin different fastapi versions,
+      # so each gets its own venv built from its real requirements file.
+      - name: Router + monitor venv
+        run: |
+          python -m venv .venv-router
+          .venv-router/bin/pip install -r services/ollama-router/requirements.txt \
+            -r services/ollama-monitor/requirements.txt -r tests/requirements-dev.txt
+
+      - name: Bridge venv
+        run: |
+          python -m venv .venv-bridge
+          .venv-bridge/bin/pip install -r targets/llamacpp/requirements.txt \
+            -r tests/requirements-dev.txt
+
+      - name: Test suites
+        env:
+          ROUTER_PYTHON: ${{ github.workspace }}/.venv-router/bin/python
+          BRIDGE_PYTHON: ${{ github.workspace }}/.venv-bridge/bin/python
+        run: bash tests/run-tests.sh </dev/null
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning ollama-smart-router-install.sh manage-model-servers.sh install/manage-model-servers.sh \
+            install/apply-config.sh install_nvidia_580_173_02.sh tests/run-tests.sh tests/test-repo.sh \
+            tests/test-nvidia.sh targets/llamacpp/install-target.sh \
+            targets/llamacpp/provision-lxc.sh targets/llamacpp/test-upgrade.sh
+
+      - name: ruff
+        run: ruff check --select E,F,W,B --ignore E501 services targets tools tests

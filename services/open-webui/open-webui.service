@@ -1,0 +1,39 @@
+[Unit]
+Description=Open WebUI (chat frontend for the smart router)
+# This Requires= is deliberate and stays: the router is the UI's only backend,
+# so Open WebUI has nothing to serve without it. Contrast the router and monitor
+# units, which only Want= litellm-proxy.
+After=network-online.target ollama-router.service
+Wants=network-online.target
+Requires=ollama-router.service
+[Service]
+Type=simple
+User=ollama-router
+Group=ollama-router
+WorkingDirectory=/app/openwebui
+EnvironmentFile=/app/openwebui/.env
+# OPENAI_API_KEYS (the router API key) lives outside the repo and overrides
+# the placeholder in .env. Open WebUI reads it on first start only; see
+# `manage-model-servers set-api-key`.
+EnvironmentFile=-/app/router/secrets.env
+ExecStart=/app/openwebui/venv/bin/open-webui serve
+Restart=always
+RestartSec=5
+# First start downloads a local embedding model; give it room before timeout.
+TimeoutStartSec=600
+# --- sandboxing (same model as the llama.cpp target units) ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+# DATA_DIR (the SQLite database, uploads) and the model cache.
+ReadWritePaths=/app/openwebui
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+[Install]
+WantedBy=multi-user.target
