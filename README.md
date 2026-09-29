@@ -115,7 +115,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `TIER_FAST_SERVERS` / `TIER_MEDIUM_SERVERS` / `TIER_LARGE_SERVERS` / `TIER_XLARGE_SERVERS` (e.g. `1,3`)
 - `MODEL_FAST` / `MODEL_MEDIUM` / `MODEL_LARGE` / `MODEL_XLARGE` — model tag per tier
 - `NONINTERACTIVE` (false) — take every default and skip all prompts
-- `GITEA_SERVER_URL` (`https://git.bancs.net`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
+- `GITEA_SERVER_URL` (`https://git.example.net`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
 - `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`)
 - `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
 - `OPENWEBUI_PORT` (8080)
@@ -321,7 +321,7 @@ while — it is a large dependency tree.
   Gitea runs as a **TurnKey Gitea 18.0-1 appliance**, which serves through
   nginx on **80/443** — Gitea's own port 3000 is bound to localhost *inside*
   that container and is not reachable from outside, so the URL is
-  `https://git.bancs.net` with no port.
+  `https://git.example.net` with no port.
 
   TurnKey ships a **self-signed certificate**, so `prompt_gitea_credentials`
   sets `GITEA_VERIFY_TLS=false` unconditionally — certificate verification is
@@ -635,7 +635,7 @@ updated repository into the container and run `install/update-router.sh`
 there. From the PVE host:
 
 ```bash
-tar -C ~/gitea-ollama-smart-router --exclude=.git -czf - . |
+tar -C ~/osr --exclude=.git -czf - . |
   pct exec <CT> -- sh -c 'rm -rf /root/osr-src && mkdir /root/osr-src && tar -C /root/osr-src -xzf -'
 pct exec <CT> -- bash /root/osr-src/install/update-router.sh --dry-run --diff   # review
 pct exec <CT> -- bash /root/osr-src/install/update-router.sh

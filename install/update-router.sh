@@ -47,7 +47,7 @@ Usage: update-router.sh [options] [SOURCE_DIR]
 SOURCE_DIR is a directory holding the updated repository (default: the
 checkout this script lives in). Copy one into the container first, e.g. from
 the PVE host:
-  tar -C ~/gitea-ollama-smart-router --exclude=.git -czf - . |
+  tar -C ~/osr --exclude=.git -czf - . |
     pct exec <CT> -- sh -c 'rm -rf /root/osr-src && mkdir /root/osr-src && tar -C /root/osr-src -xzf -'
 
 Options:
