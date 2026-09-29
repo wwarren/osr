@@ -50,10 +50,29 @@ assert_file_contains "the monitor loads the secrets file" \
   "EnvironmentFile=-/app/router/secrets.env" "${ROOT}/services/ollama-monitor/ollama-monitor.service"
 
 describe unit_hardening
-for unit in "${ROOT}"/services/*/*.service "${ROOT}"/targets/llamacpp/*.service; do
+for unit in "${ROOT}"/services/*/*.service "${ROOT}"/targets/*/*.service; do
   assert_file_contains "$(basename "$unit") is ProtectSystem=strict" "ProtectSystem=strict" "$unit"
   assert_file_contains "$(basename "$unit") drops capabilities" "CapabilityBoundingSet=" "$unit"
 done
+
+describe inference_targets
+for dir in "${ROOT}"/targets/*/; do
+  name=$(basename "$dir")
+  assert_fail "targets/${name} is not a nested git repository" test -e "${dir}.git"
+  assert_ok "targets/${name} has an install-target.sh" test -f "${dir}install-target.sh"
+  assert_ok "targets/${name} has a provision-lxc.sh" test -f "${dir}provision-lxc.sh"
+done
+dropin="${ROOT}/targets/ollama/ollama-target.conf"
+assert_file_contains "the Ollama drop-in is ProtectSystem=strict" "ProtectSystem=strict" "$dropin"
+assert_file_contains "the Ollama drop-in drops capabilities" "CapabilityBoundingSet=" "$dropin"
+assert_file_contains "the Ollama drop-in runs unprivileged" "User=ollama" "$dropin"
+assert_ok "the Ollama target starts from the community script" \
+  grep -q 'community-scripts/ProxmoxVE/main/ct/ollama.sh' "${ROOT}/targets/ollama/provision-lxc.sh"
+airllm="${ROOT}/targets/airllm"
+assert_ok "the AirLLM target installs from a hash lock" grep -q -- '--require-hashes' "${airllm}/install-target.sh"
+assert_fail "the AirLLM requirements are exact pins" grep -Eq '^[A-Za-z].*(>=|~=|<)' "${airllm}/requirements.txt"
+pin="$(sed -nE 's/^airllm==([^[:space:]#]+).*/\1/p' "${airllm}/requirements.txt")"
+assert_ok "the AirLLM lock matches its pin" grep -q "^airllm==${pin} " "${airllm}/requirements.lock"
 
 describe single_management_tool
 assert_ok "the root script only wraps install/" grep -q 'exec bash "\$target"' "${ROOT}/manage-model-servers.sh"

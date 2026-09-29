@@ -1,10 +1,8 @@
-# Unit tests
+# Shell unit tests
 
 Unit tests for every function in `ollama-smart-router-install.sh` and
-`manage-model-servers.sh`, plus the alerting rules in the `monitor.py` the
-installer generates. Nothing here touches a Proxmox host, a Gitea server, an
-Ollama backend or a real deployment — every external command is stubbed and the
-Python suite replaces the webhook and the clock.
+`manage-model-servers.sh`. Nothing here touches a Proxmox host, a Gitea server,
+an Ollama backend or a real deployment — every external command is stubbed.
 
 ## Running
 
@@ -13,7 +11,6 @@ cd tests
 ./run-tests.sh                 # every suite + coverage report
 ./run-tests.sh installer       # one suite
 ./run-tests.sh manage
-./run-tests.sh monitor
 ./run-tests.sh --coverage      # coverage only, no tests
 ./run-tests.sh --list          # list suite names
 ```
@@ -23,20 +20,35 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **847 assertions, 74/74 + 53/53 functions covered** (plus an integration
-tests for the generated `apply-config.sh` and the four systemd units, which are
-not functions).
+Current state: **736 assertions in the two main suites, 156/156 functions covered.**
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 74 | 490 |
-| `manage` | `manage-model-servers.sh` | 53 | 239 |
-| `monitor` | generated `monitor.py` | — | 51 |
-| `router` | generated `router.py` | — | 67 |
+| `installer` | `ollama-smart-router-install.sh` | 63 | 296 |
+| `manage` | `install/manage-model-servers.sh` | 93 | 440 |
 
-The coverage gate is a *shell* gate: it enumerates bash functions, so the Python
-suite sits outside it. `monitor` and `router` are listed in `PY_SUITES` and run
-after the others.
+`run-tests.sh` also runs these suites, which have no per-function coverage:
+
+| Suite | What it checks |
+|---|---|
+| `repo` | installer heredocs match the repo files (`tools/sync-embedded.py --check`), the installer-owned code list, no CRLF files, no secrets in `env/*.env`, every unit hardened, every `targets/*` has the standard scripts and no nested `.git`, the Ollama drop-in is hardened, the AirLLM hash lock, a single management tool, LiteLLM's own venv, `[proxy]` extra and hash lock |
+| `update` | `tests/test-update.sh`: `install/update-router.sh` against a temporary config repo — owned-file list parsed as text, CRLF/syntax refusals, dry run, tunables and env kept, venv refresh, undo on a failed apply or pip install (end-to-end cases need root) |
+| `nvidia` | `tests/test-nvidia.sh`: driver version parsing, host/LXC match check, headers package, verified `.part` download, idempotent re-runs |
+| `llamacpp-*` | each `targets/llamacpp/test-*.sh`, including `test-upgrade.sh` (end-to-end `--upgrade` with rollback, needs root) |
+| `bridge` | `targets/llamacpp/test_bridge.py` with pytest (skipped when pytest/fastapi/httpx are missing) |
+| `ollama-*` | `targets/ollama/test-install.sh` (adopting a community-script CT, re-runs, `--upgrade` with checksum checks and rollback; end-to-end cases need root) and `test-provision.sh` (dry-run plans for the community script and presets) |
+| `airllm-*` | `targets/airllm/test-install.sh` (helpers, fresh install, legacy migration, `--upgrade` with rollback; end-to-end cases need root) and `test-provision.sh` (dry-run plans) |
+| `airllm` | `targets/airllm/test_server.py` with pytest: packet shapes, readiness gating, context-window fitting, cancellation, load-failure exit (airllm/torch are stubbed; runs under `BRIDGE_PYTHON`) |
+| `router` | `tests/test_router.py`: keyword matching, classification scope, failover, header hygiene, vision handling and capability probing, API key, LM Studio discovery (v1/v0/OpenAI) and dispatch (pytest) |
+| `monitor` | `tests/test_monitor.py`: host/service discovery, debounce, per-host alerts, delivery retry, parallel probes, keep-alive thread, LM Studio probes and token (pytest) |
+
+Set `ROUTER_PYTHON` / `BRIDGE_PYTHON` to run the pytest suites under a
+specific interpreter; the router and the bridge pin different fastapi versions.
+CI (`.gitea/workflows/tests.yml`) builds one venv for each. Test tooling is
+pinned in `tests/requirements-dev.txt`.
+
+Every suite starts with `exec </dev/null`, so a prompt under test that is not
+fed input explicitly fails instead of blocking on the runner's stdin.
 
 ## Layout
 
@@ -45,8 +57,6 @@ tests/
 ├── run-tests.sh              # runner + coverage gate
 ├── test-installer.sh         # suite for the installer
 ├── test-manage.sh            # suite for the management script
-├── test-monitor.py           # suite for the generated monitor.py
-├── test-router.py            # suite for the generated router.py
 └── lib/
     ├── extract-functions.py  # heredoc-aware function extractor
     ├── assert.sh             # assertions, counters, summary
@@ -75,7 +85,7 @@ Verify the extraction independently:
 
 ```bash
 python3 lib/extract-functions.py ../ollama-smart-router-install.sh --list
-python3 lib/extract-functions.py ../manage-model-servers.sh --only cmd_add
+python3 lib/extract-functions.py ../install/manage-model-servers.sh --only cmd_add
 ```
 
 ## Mocks
@@ -162,25 +172,6 @@ bugs in this family have been found by these tests.
 | `git_push_authenticated` continued with an empty remote | only the exit status of `git remote get-url` was checked |
 | `large` selected the 70B model that defines `xlarge` | band ceilings were inclusive, so adjacent bands overlapped, and the size bias rewarded absolute size rather than position in the band |
 | `prompt_until_valid` hung forever on exhausted stdin | `read` returning EOF was not distinguished from an empty answer, so an invalid default re-tested itself in an infinite loop |
-| One down host posted four identical Mattermost alerts | health was keyed by `(tier, url)`, and a single-server deployment points all four tiers at the same URL |
-| A slow backend posted a down/up pair every polling cycle | a single failed probe was treated as an outage; no consecutive-failure threshold |
-| An ongoing outage was re-announced on every service restart | health lived only in memory and defaulted to "up", and `Restart=always` restarts every 10s |
-| Open WebUI never came up on a fresh install, dying on `duplicate column name: info_json` | Open WebUI's own first-run migration, upstream. The installer now starts it alone, waits for the port, and resets the empty database once — `Requires=` was a real but *separate* bug, and blaming it first cost a whole diagnosis cycle |
-| The installer's embedded copy of `manage-model-servers.sh` drifted from the standalone one | only the embedded copy reaches the container, so the file next to the installer can be edited and the deployment never sees it — now pinned byte-for-byte by `describe embedded_manage_script` |
-| Every request through the TLS proxy returned 502 on a clean install | `open-webui serve` has *literal* defaults `host="0.0.0.0", port=8080` and ignores `HOST`/`PORT` entirely, so it bound the port nginx owned, died with "address already in use", and nothing was listening where nginx proxied |
-| Every fresh install printed "nginx rejected the configuration" and then worked | the certificate was generated *after* `apply-config.sh` installed the site that names it, so `nginx -t` could not load it — a spurious warning that teaches you to ignore the real one |
-| `TLS_EXTRA_SAN` with a single name did nothing at all | the split loop used a bare `read`, and `tr` leaves no newline after the last field — so the last name was always dropped, and a one-entry list is entirely last |
-| `rank_meta` reported every candidate as "tied" whenever nothing was in band | it compared scores only, but `rank_candidates` groups ties by *distance first, then score* — and in the distance-ranked case every score floors to 0.0, so the tie-group metric was wrong precisely when it mattered |
-| Provisioning reported success over a dead UI | `systemctl enable --now` on a `Type=simple` unit returns as soon as the process is forked; nothing checked that the port ever opened |
-| `set-webhook --username <name>` rejected every value, including valid ones | the guard was written `(( $# >= 2 && -n "$2" ))`; inside `(( ))` that is *minus variable n* followed by a bare string, which is an arithmetic syntax error, so the test was always false |
-| `remove 1 1` refused to run against the server minimum | the same server counted twice toward `remaining_count`, so the check saw one more removal than would actually happen |
-| Every service crash-looped with `status=226/NAMESPACE`, and the only symptom was nginx returning 502 | `PrivateTmp=`/`ProtectSystem=`/`ProtectHome=` are a private *mount namespace*, and a container that may not build one does not run the unit unhardened — it does not run it at all. The installer had *asserted* in its comments that `nesting=1` made them safe; it now probes with a real transient unit and rewrites the units when the answer is no |
-| `ip_in_same_subnet` reported "gateway is fine" for input it could not parse | `except Exception: sys.exit(0)` plus `2>/dev/null` made the check fail OPEN and unobservable — `192.168.11.10/99` and `notanip` both returned "inside". The mirror image was live too: with no `python3` the command exits 127, which the caller read as "definitely outside" and reported as a confident, wrong claim. Now three states: 0 inside, 1 outside, 2 could-not-determine, each reported differently |
-| A path with an apostrophe could execute as root inside the container | four `run_ct bash -c` bodies interpolated `'${VAR}'` into a double-quoted string. Those single quotes are part of the script TEXT, so a value containing one closes them — in `push_local_config_tree`, two lines above `rm -rf`. Bodies are single-quoted now and values travel as positional arguments |
-| The optional ZeroTier install could destroy a fully provisioned container | it was called bare, after Open WebUI's migrations, while `CT_CREATED` was still set and the ERR trap still armed — so a transient failure fetching `install.zerotier.com` ran `pct destroy`. Same for `configure_lxc_tun_device`, whose `return 1` fired straight into the trap. Both now use the `TLS_OK` pattern |
-| An HTTP error page could be piped into a root shell | `curl -s … \| sudo bash` — `-s` suppresses the message AND exits 0 on a 404, so the error body is what gets executed. Now `curl -fsSL --proto "=https"`, and no `sudo` in the pipeline: `pct exec` is already root. The `sudo` package stays installed, for the operator at a container shell rather than for the installer |
-| A repair run listed all four units as `active` and then announced that some were not | `pct exec` goes through `lxc-attach`, which allocates a pty whenever the host's stdout is a terminal; ONLCR then makes `is-active` return `active\r`. That PRINTS as `active` and compares equal to nothing. In `ct_wait_for_port` it was worse — `activating\r` matched no keep-waiting case, so the installer gave up on a service that was merely slow. Every captured value now goes through `ct_out` |
-| A second outage after a recovery was silently swallowed | the test harness saved state before `announce()` but not after, so the recovery never cleared the last-posted fingerprint — a harness bug, but the same omission in the daemon loop would lose real alerts |
 
 Each fix is in place and pinned by a regression assertion.
 
@@ -194,54 +185,3 @@ Each fix is in place and pinned by a regression assertion.
 
 Adding a function to either script without a `describe` block makes
 `./run-tests.sh` exit non-zero.
-
-## The Python suite
-
-The `start_openwebui_verified` block is worth reading as a pattern: it drives
-the whole recover-and-retry path with a `pct` stub that changes its answer once
-the `mv` has happened, so the retry is exercised rather than assumed. It also
-re-learns the subshell rule — the function sets `OPENWEBUI_RESET`, so it must
-be run with output redirected to a file, never inside `$(...)`.
-
-`describe verify_service_executables` deliberately asserts on the *message*, not
-just the return code. A failure there trips the installer's `ERR` trap, which
-destroys the container — so if the diagnosis is not printed before the function
-returns, the only evidence of which executable the service account could not run
-goes with it.
-
-The TLS tests run `openssl` for real rather than asserting on a command line:
-a certificate is only worth checking if openssl made it, and the assertions
-that matter — the key matching the certificate, `serverAuth` being present, the
-IP being an `IP:` entry — are properties of the artefact, not of the arguments.
-Note also that `ct_tls_ok` is tested by stubbing `pct`, never `bash`: a stub
-named `bash` on PATH would replace the shell every later assertion in the file
-runs its command with.
-
-`test-router.py` covers the scoring and the decision log. The assertion that
-earns its keep is `sum(terms) == score`: the log is only trustworthy if the
-itemised terms reconcile exactly with the number that decided the routing, and
-an early draft rounded the terms inside `score_breakdown`, so they did not.
-Rounding now happens once, in `explain_candidates`, where the record is built.
-
-`test-monitor.py` extracts `monitor.py` and `monitor.ini` from the installer's
-heredocs into a temp dir, imports the module with `post_mattermost` replaced by
-a list-appender, and calls `evaluate_cycle` / `announce` directly with a
-scripted list of probe results and an explicit timestamp. Nothing sleeps and
-nothing resolves a hostname, so a two-hour outage runs in milliseconds.
-
-Two traps specific to it:
-
-**`os.environ` is process-global.** Each case re-imports the module to simulate
-a restart, so an override left behind by one case silently configures the next.
-`start()` clears every key in `OVERRIDES` first — an early draft "passed" a
-threshold assertion purely on a leaked `MONITOR_FAILURE_THRESHOLD=1`.
-
-**State is a file, so cases must not share one.** Every case passes its own
-`state_file`; reusing the default would let one case's remembered outage
-suppress the next case's alert.
-
-`cycles()` mirrors `run_health_checks()`'s body exactly, including the second
-`save_state()` after `announce()` — that write persists the last-posted
-fingerprint. An earlier draft omitted it and a legitimate second outage looked
-suppressed, because the recovery that should have cleared the fingerprint never
-reached disk.

@@ -110,14 +110,14 @@ def main():
 
     print("# Auto-extracted from %s — do not edit." % args.script)
     seen = set()
-    for name, source in functions:
+    for name, _source in functions:
         # Later definitions win in bash; keep the last one, as the shell would.
         if name in seen:
             continue
         seen.add(name)
     # Emit in file order, but only the final definition of each name.
     last = {}
-    for idx, (name, source) in enumerate(functions):
+    for idx, (name, _source) in enumerate(functions):
         last[name] = idx
     for idx, (name, source) in enumerate(functions):
         if last[name] == idx:

@@ -33,7 +33,7 @@ LLAMA_CPP_REF is optional; omitted/empty uses install-target.sh's pinned release
 Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
           CORES=4, MEMORY_MB=16384, SWAP_MB=0, ROOTFS_GB=64, ONBOOT=0,
           SSH_PUBLIC_KEY=<file>, GPU_DEVICES=<space-separated exact /dev paths>,
-          INSTALL_TARGET=0, BACKEND=cuda, BUILD_JOBS=4, GPU_LAYERS=999,
+          INSTALL_TARGET=0, BACKEND=cuda, BUILD_JOBS=4, GPU_LAYERS=auto,
           CONTEXT_SIZE=8192, PARALLEL_SLOTS=1, THREADS=4, LLAMA_EXTRA_ARGS=,
            MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
            MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
@@ -407,7 +407,7 @@ BUILD_JOBS=${BUILD_JOBS:-4}
 CONTEXT_SIZE=${CONTEXT_SIZE:-8192}
 PARALLEL_SLOTS=${PARALLEL_SLOTS:-1}
 THREADS=${THREADS:-4}
-if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-999}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
+if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
 MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
@@ -419,7 +419,8 @@ LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
 [[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
 configure_gpu_devices
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
-for name in SWAP_MB GPU_LAYERS; do [[ ${!name} =~ ^(0|[1-9][0-9]{0,8})$ ]] || die "$name must be a nonnegative integer."; done
+[[ $SWAP_MB =~ ^(0|[1-9][0-9]{0,8})$ ]] || die 'SWAP_MB must be a nonnegative integer.'
+[[ $GPU_LAYERS == auto || $GPU_LAYERS == all || $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
 [[ $ONBOOT =~ ^[01]$ ]] || die 'ONBOOT must be 0 or 1.'
 [[ -z $NAMESERVER ]] || ipv4 "$NAMESERVER" || die 'NAMESERVER must be one IPv4 address.'
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi

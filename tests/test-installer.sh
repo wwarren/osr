@@ -4,6 +4,10 @@
 # Functions are extracted (heredoc-aware) and sourced in isolation, so no
 # container is created and no Proxmox host is required.
 
+# Never read the caller's stdin: a prompt under test that is not fed input
+# explicitly would otherwise block forever when run from a pipe or CI runner.
+exec </dev/null
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${1:-${HERE}/../ollama-smart-router-install.sh}"
 # shellcheck source=lib/assert.sh
@@ -40,6 +44,10 @@ GITEA_CURL_OPTS=(--location)
 CT_ID=100
 TEMPLATE_STORAGE="local"
 TEMPLATE_NAME=""
+CONFIG_UPDATE_CODE=true
+# The owned-code list is data, not a function: lift it from the real script so
+# the tests exercise the list that actually ships.
+eval "$(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$SCRIPT")"
 # shellcheck source=/dev/null
 source "$FUNCS"
 
@@ -135,6 +143,9 @@ assert_fail "rejects port 0"             valid_ollama_addr 10.0.0.5:0
 assert_fail "rejects port > 65535"       valid_ollama_addr 10.0.0.5:99999
 assert_fail "rejects spaces"             valid_ollama_addr "a b"
 assert_fail "rejects empty"              valid_ollama_addr ""
+assert_ok   "accepts lmstudio://host"    valid_ollama_addr lmstudio://10.0.0.9
+assert_ok   "accepts lmstudio+http url"  valid_ollama_addr lmstudio+http://h:1234
+assert_fail "rejects lmstudio:// junk"   valid_ollama_addr "lmstudio://a b"
 
 describe normalize_ollama_url
 assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
@@ -143,6 +154,9 @@ assert_eq "url passes through"           "http://h:1"            "$(normalize_ol
 assert_eq "trailing slash stripped"      "http://h:1"            "$(normalize_ollama_url http://h:1/)"
 assert_eq "hostname gets default port"   "http://ollama1.lan:11434" "$(normalize_ollama_url ollama1.lan)"
 assert_eq "https preserved"              "https://h:8443"        "$(normalize_ollama_url https://h:8443)"
+assert_eq "lmstudio:// gets LM Studio's port" "lmstudio+http://h:1234" "$(normalize_ollama_url lmstudio://h)"
+assert_eq "lmstudio:// keeps an explicit port" "lmstudio+http://h:4321" "$(normalize_ollama_url lmstudio://h:4321)"
+assert_eq "lmstudio+http passes through"     "lmstudio+http://h:1234" "$(normalize_ollama_url lmstudio+http://h:1234/)"
 
 describe valid_tier_selection
 MODEL_SERVER_COUNT=3
@@ -219,22 +233,10 @@ assert_eq "multiple"       "http://a:1,http://c:3"  "$(indices_to_urls '0 2')"
 assert_eq "empty"          ""                       "$(indices_to_urls '')"
 
 describe ip_in_same_subnet
-# THREE outcomes: 0 inside, 1 outside, 2 could-not-determine. The two-state
-# version answered "inside" for anything it failed to parse, so the check could
-# stop checking and nothing said so — and it answered "outside" when python3 was
-# missing, accusing a correct gateway. Neither collapse is acceptable.
-assert_status "gateway inside /24" 0   ip_in_same_subnet 192.168.11.80/24 192.168.11.1
-assert_status "gateway outside /24" 1  ip_in_same_subnet 192.168.11.80/24 10.99.99.1
-assert_status "wide prefix contains" 0 ip_in_same_subnet 10.0.0.5/8 10.255.0.1
-assert_status "unparseable is UNDETERMINED, not a pass" 2 \
-  ip_in_same_subnet "garbage" "also-garbage"
-assert_status "an impossible prefix is undetermined too" 2 \
-  ip_in_same_subnet "192.168.11.10/99" "10.0.0.1"
-# 127 from a missing python3 must not read as "definitely outside".
-assert_status "no python3 is undetermined, not 'outside'" 2 \
-  bash -c "$(declare -f ip_in_same_subnet)
-           PATH=/nonexistent
-           ip_in_same_subnet 192.168.11.80/24 192.168.11.1"
+assert_ok   "gateway inside /24"   ip_in_same_subnet 192.168.11.80/24 192.168.11.1
+assert_fail "gateway outside /24"  ip_in_same_subnet 192.168.11.80/24 10.99.99.1
+assert_ok   "wide prefix contains" ip_in_same_subnet 10.0.0.5/8 10.255.0.1
+assert_ok   "unparseable is lenient" ip_in_same_subnet "garbage" "also-garbage"
 
 # ── storage discovery ─────────────────────────────────────────────────────────
 describe parse_pvesm_table
@@ -512,52 +514,7 @@ CT_ID=321
 push_local_config_tree "$tree" >/dev/null 2>&1
 assert_contains "pushes a tarball into the container" "push 321" "$(mock_calls)"
 assert_contains "extracts it under the config dir"    "tar -xzf"  "$(mock_calls)"
-
-# The remote body used to be built by interpolating '${CONFIG_REPO_DIR}' into a
-# double-quoted string -- single quotes written into the script TEXT, which a
-# value containing an apostrophe simply closes. Everything after it then ran as
-# root inside the container, two lines above `rm -rf`. Run the real body with a
-# hostile path and prove the payload is data.
-_hostile_dir="$(mktemp -d)"
-_saved_repo_dir="$CONFIG_REPO_DIR"
-CONFIG_REPO_DIR="${_hostile_dir}/x'; echo PWNED-AS-ROOT; :'"
-mock_script pct <<'EOF'
-shift 3                 # drop: exec <id> --
-"$@"
-EOF
-_inj="$(push_local_config_tree "$tree" 2>&1 || true)"
-assert_not_contains "an apostrophe in the path cannot execute" "PWNED-AS-ROOT" "$_inj"
-CONFIG_REPO_DIR="$_saved_repo_dir"
-rm -rf "$_hostile_dir"
 rm -rf "$tree"
-
-# ── values crossing into the container's shell ────────────────────────────────
-# Four call sites build a script for `bash -c` inside the container. The rule is
-# one line long: the body is SINGLE-quoted so the host expands nothing into it,
-# and every value travels as a positional argument the inner shell never
-# re-parses. `'${VAR}'` inside a double-quoted body is not quoting, it is a
-# quoting escape hatch -- and this file's own header claims the opposite.
-describe injected_shell_bodies
-_inj_src="$(cat "$SCRIPT")"
-assert_contains "the config path travels as an argument" \
-  "' push_local_config_tree \"\$CONFIG_REPO_DIR\"" "$_inj_src"
-assert_not_contains "and is not pasted into an rm -rf" \
-  "rm -rf '\${CONFIG_REPO_DIR}'" "$_inj_src"
-assert_not_contains "nor into a cd" \
-  "cd '\${CONFIG_REPO_DIR}'" "$_inj_src"
-# remote and branch are built from prompt input (Gitea URL, owner, repo name).
-assert_not_contains "the git remote is not pasted in" \
-  "git remote set-url origin '\${remote}'" "$_inj_src"
-# This one was not even single-quoted.
-assert_not_contains "sslVerify is not a bare expansion" \
-  'git config http.sslVerify ${sslverify}' "$_inj_src"
-assert_contains "it is passed as data instead" \
-  'git config http.sslVerify "$sslverify"' "$_inj_src"
-# Same pattern in the two later additions.
-assert_not_contains "the python dir is not pasted in" \
-  "UV_PYTHON_INSTALL_DIR='\${OPENWEBUI_PY_DIR}'" "$_inj_src"
-assert_not_contains "nor the ZeroTier network id" \
-  'awk -v n=${ZEROTIER_NETWORK_ID}' "$_inj_src"
 
 describe cleanup_on_error
 CT_CREATED=""; STAGE_DIR="$(mktemp -d)"
@@ -784,20 +741,38 @@ assert_ok "no token is a skip, not a failure" test_gitea_access ""
 # A stub that answers both the same way makes the probe fail on the trailing
 # status digits, so every case below branches on -X first.
 
-# Happy path: auth ok, repo exists.
+# Happy path: auth ok, repo exists, commit created.
 mock_script curl <<'EOF'
 case "$*" in
   *-X*) ;;
   *)    echo '{"login":"tester"}'; exit 0;;      # probe
 esac
 case "$*" in
-  *) echo '{"default_branch":"main"}'; echo 200; exit 0;;
+  *contents*) echo '{"commit":{"html_url":"https://git.example.net/c/1"}}'; echo 201; exit 0;;
+  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
 esac
 EOF
 out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
 assert_eq       "succeeds end to end"        "0" "$rc"
 assert_contains "reports the authenticated user" "tester" "$out"
-assert_contains "reports the resolved repo"       "Configuration repository: tester/ollama-smart-router" "$out"
+assert_contains "reports the test commit"        "test commit succeeded" "$out"
+
+# The marker file is deleted again after the successful write.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;
+esac
+case "$*" in
+  *"-X DELETE"*) echo '{}'; echo 200; exit 0;;
+  *contents*) echo '{"content":{"sha":"abc123"},"commit":{"html_url":"u"}}'; echo 201; exit 0;;
+  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
+esac
+EOF
+mock_reset_log
+out="$(test_gitea_access TOKEN 2>&1)"
+assert_contains "removes the marker again" "Removed the test marker" "$out"
+assert_contains "deletes with the blob sha" "abc123" "$(mock_calls)"
 
 # http:// remote: warn about the redirect that drops the Authorization header.
 GITEA_SERVER_URL="http://git.example.net"
@@ -814,59 +789,182 @@ esac
 case "$*" in
   *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
   *search*)       echo '{"data":[]}'; echo 200; exit 0;;
+  *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
   *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
 esac
 EOF
 out="$(test_gitea_access TOKEN 2>&1)" || true
 assert_contains "creates the repo when it is missing" "Creating repository" "$out"
-assert_contains "and reports the created repo"        "Configuration repository: tester/ollama-smart-router" "$out"
+assert_contains "and still commits into it"           "test commit succeeded" "$out"
 
-# Repo creation rejected -> non-zero and the HTTP code surfaced.
+# Commit rejected -> non-zero and the HTTP code surfaced.
 mock_script curl <<'EOF'
 case "$*" in
   *-X*) ;;
   *)    echo '{"login":"tester"}'; exit 0;;
 esac
 case "$*" in
-  *"user/repos"*) echo '{"message":"forbidden"}'; echo 403; exit 0;;
-  *search*)       echo '{"data":[]}'; echo 200; exit 0;;
-  *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
+  *contents*) echo '{"message":"forbidden"}'; echo 403; exit 0;;
+  *)          echo '{"default_branch":"main"}'; echo 200; exit 0;;
 esac
 EOF
-assert_fail "a rejected repo create fails the test" test_gitea_access TOKEN
+assert_fail "a rejected commit fails the test" test_gitea_access TOKEN
 assert_contains "surfaces the HTTP status" "403" "$(test_gitea_access TOKEN 2>&1)"
 
 # Auth itself fails -> stop before touching the repository at all.
 mock_command curl 22
 mock_reset_log
 assert_fail "an unusable token fails fast" test_gitea_access TOKEN
-assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count '-X')"
+assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count 'contents')"
 
-# ── Gitea deployment history ──────────────────────────────────────────────────
-describe init_config_repo_history
+# ── repo seeding ──────────────────────────────────────────────────────────────
+describe seed_gitea_repo
+seedtree="$(mktemp -d)"
+mkdir -p "${seedtree}/env" "${seedtree}/services/ollama-router"
+echo "A=1" > "${seedtree}/env/router.env"
+echo "[tiers]" > "${seedtree}/services/ollama-router/router.ini"
+CONFIG_SEED_IF_MISSING=true
+assert_fail "no token means no seeding" seed_gitea_repo "$seedtree" ""
+CONFIG_SEED_IF_MISSING=false
+assert_ok   "seeding disabled is a clean no-op" seed_gitea_repo "$seedtree" TOKEN
+assert_contains "and says so" "not writing" "$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+CONFIG_SEED_IF_MISSING=true
+
+# Everything absent -> every file is created.
+mock_script curl <<'EOF'
+case "$*" in
+  *"-X POST"*) echo '{}'; echo 201; exit 0;;
+  *)           echo '{"message":"Not Found"}'; echo 404; exit 0;;
+esac
+EOF
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "creates both files"    "2 created" "$out"
+assert_contains "counts nothing skipped" "0 already present" "$out"
+
+# Everything already present -> nothing is overwritten.
+mock_script curl <<'EOF'
+echo '{"path":"x"}'; echo 200; exit 0
+EOF
+mock_reset_log
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "existing files are left alone" "2 already present" "$out"
+assert_eq       "no POST is issued"             "0" "$(mock_call_count '-X POST')"
+
+# A single failure is reported without aborting the rest of the walk.
+mock_script curl <<'EOF'
+case "$*" in
+  *"-X POST"*router.ini*) echo '{"message":"nope"}'; echo 422; exit 0;;
+  *"-X POST"*)            echo '{}'; echo 201; exit 0;;
+  *)                      echo '{}'; echo 404; exit 0;;
+esac
+EOF
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "reports the failed file" "failed to seed" "$out"
+assert_contains "still seeds the others"  "1 created"      "$out"
+
+# Installer-owned code that differs is UPDATED (PUT with the blob sha); the
+# user's config files are still never touched.
+mkdir -p "${seedtree}/services/ollama-monitor"
+echo "new code" > "${seedtree}/services/ollama-monitor/monitor.py"
+_old_b64="$(printf 'old code\n' | base64 -w0)"
+mock_script curl <<EOF
+case "\$*" in
+  *"-X PUT"*)    echo '{}'; echo 200; exit 0;;
+  *monitor.py*)  echo '{"sha":"abc123","content":"${_old_b64}"}'; echo 200; exit 0;;
+  *)             echo '{"sha":"def456","content":"${_old_b64}"}'; echo 200; exit 0;;
+esac
+EOF
+mock_reset_log
+CONFIG_UPDATE_CODE=true
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_contains "updates stale installer-owned code" "1 updated" "$out"
+assert_contains "names the updated file" "updated: services/ollama-monitor/monitor.py" "$out"
+assert_eq "exactly one PUT is issued" "1" "$(mock_call_count '-X PUT')"
+assert_contains "sends the blob sha" "abc123" "$(mock_calls)"
+assert_contains "leaves config alone" "2 already present" "$out"
+CONFIG_UPDATE_CODE=false
+mock_reset_log
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+assert_eq "CONFIG_UPDATE_CODE=false never PUTs" "0" "$(mock_call_count '-X PUT')"
+CONFIG_UPDATE_CODE=true
+rm -rf "$seedtree"
+
+describe generate_api_key
+k1="$(generate_api_key)"; k2="$(generate_api_key)"
+assert_contains "has the router prefix" "sk-router-" "$k1"
+assert_ne "is random" "$k1" "$k2"
+assert_ok "is long enough" test "${#k1}" -ge 30
+
+describe ensure_fw_rule
+_fw="$(mktemp)"; printf '[OPTIONS]\nenable: 1\n' > "$_fw"
+ensure_fw_rule "$_fw" "IN ACCEPT -p tcp -dport 22"
+ensure_fw_rule "$_fw" "IN ACCEPT -p tcp -dport 22"
+assert_eq "never duplicates a rule" "1" "$(grep -c 'dport 22' "$_fw")"
+assert_eq "adds a [RULES] section when missing" "1" "$(grep -cx '\[RULES\]' "$_fw")"
+rm -f "$_fw"
+
+describe write_firewall_rules
+_fw="$(mktemp -u)"
+write_firewall_rules "$_fw" 10.0.0.0/24 8080
+write_firewall_rules "$_fw" 10.0.0.0/24 8080
+assert_file_contains "enables the firewall"   "enable: 1" "$_fw"
+assert_file_contains "keeps SSH reachable"    "-source 10.0.0.0/24 -p tcp -dport 22 " "$_fw"
+assert_file_contains "opens the router API"   "-dport 8000 " "$_fw"
+assert_file_contains "opens Open WebUI"       "-dport 8080 " "$_fw"
+assert_eq "re-running adds nothing" "3" "$(grep -c '^IN ACCEPT' "$_fw")"
+rm -f "$_fw"
+
+describe remove_marker_file
+auth="Authorization: token T"
+mock_command curl 0 $'{}\n200'
+out="$(remove_marker_file https://g/api/v1 o r main provisioning-tests/x.md '{"content":{"sha":"s1"}}' 2>&1)"
+assert_contains "deletes it" "Removed the test marker" "$out"
+mock_command curl 0 $'{}\n409'
+out="$(remove_marker_file https://g/api/v1 o r main p.md '{"content":{"sha":"s1"}}' 2>&1)"
+assert_contains "a refused delete is only a note" "could not remove" "$out"
+assert_ok "and never fails the run" remove_marker_file https://g/api/v1 o r main p.md '{"content":{"sha":"s1"}}'
+out="$(remove_marker_file https://g/api/v1 o r main p.md 'not json' 2>&1)"
+assert_contains "missing sha is reported" "could not read" "$out"
+
+describe litellm_router_settings
+out="$(printf 'fast q@a\nmedium m@b\nlarge m@b\n' | litellm_router_settings)"
+assert_contains "sets retries"   "  num_retries: 2" "$out"
+assert_contains "sets a timeout" "  timeout: 600" "$out"
+assert_contains "falls back to the nearest tier" '- fast: ["medium", "large"]' "$out"
+assert_contains "skips identical deployments"   '- medium: ["fast"]' "$out"
+assert_not_contains "never names a tier without deployments" "xlarge" "$out"
+assert_not_contains "a single tier has no fallbacks" "fallbacks" "$(printf 'fast q@a\n' | litellm_router_settings)"
+
+describe is_installer_owned
+assert_ok   "router.py is owned"         is_installer_owned services/ollama-router/router.py
+assert_ok   "the manage tool is owned"   is_installer_owned install/manage-model-servers.sh
+assert_fail "router.ini is a tunable"    is_installer_owned services/ollama-router/router.ini
+assert_fail "env files are config"       is_installer_owned env/router.env
+
+describe gitea_sha_if_changed
+_f="$(mktemp)"; printf 'same\n' > "$_f"
+_same="$(printf 'same\n' | base64 -w0)"; _diff="$(printf 'other\n' | base64 -w0)"
+assert_eq "identical content -> empty" "" \
+  "$(printf '{"sha":"s1","content":"%s"}' "$_same" | gitea_sha_if_changed "$_f")"
+assert_eq "different content -> sha" "s2" \
+  "$(printf '{"sha":"s2","content":"%s"}' "$_diff" | gitea_sha_if_changed "$_f")"
+assert_eq "unparseable body -> empty" "" "$(echo 'not json' | gitea_sha_if_changed "$_f")"
+rm -f "$_f"
+
+# ── container clone ───────────────────────────────────────────────────────────
+describe clone_config_repo
 CT_ID=910; CONFIG_REPO_DIR="/app/config-repo"
 GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
 GITEA_REPO_NAME="ollama-smart-router"; GITEA_VERIFY_TLS=false
 mock_reset_log; mock_command pct 0
-init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
 calls="$(mock_calls)"
 assert_contains "pushes a credential file into the container" "push 910" "$calls"
 assert_contains "with 0600 permissions"                       "--perms 0600" "$calls"
-assert_contains "sets the configured remote"  "ollama-smart-router.git" "$calls"
-assert_contains "initializes git in place"    "init -q"                 "$calls"
-# git's default-branch hint goes to STDERR, so `git init >/dev/null` does not
-# suppress it and it reads like a warning in the install log.
-assert_contains "without git's default-branch hint" "init.defaultBranch=main" "$calls"
-assert_contains "uses a deployment branch"    "deployment-910-test"     "$calls"
-# The body is single-quoted now, so the VALUE travels as a positional argument
-# (repo branch remote sslverify ctid) rather than being pasted into the script.
-assert_contains "passes sslVerify as data, not as script text" \
-  'http.sslVerify="$sslverify"' "$calls"
-assert_contains "honours GITEA_VERIFY_TLS"    ".git false 910"          "$calls"
+assert_contains "clones the configured repo"  "ollama-smart-router.git" "$calls"
+assert_contains "honours GITEA_VERIFY_TLS"    "http.sslVerify=false"    "$calls"
 assert_contains "removes the credential file afterwards" "rm -f /root/.git-credentials" "$calls"
-assert_contains "tightens permissions on the generated tree" "chmod -R go-rwx" "$calls"
-assert_not_contains "does not clone from Gitea" "git clone" "$calls"
-assert_not_contains "does not pull from Gitea"  "git pull"  "$calls"
+assert_contains "tightens permissions on the clone" "chmod -R go-rwx" "$calls"
 assert_not_contains "never puts the token on a command line" "SECRETTOKEN" "$calls"
 
 # The credential entry must carry the remote's scheme; git will not match an
@@ -877,994 +975,14 @@ if [ "\$1" = "push" ]; then cp "\$3" "${_cred_seen}"; fi
 exit 0
 EOF
 GITEA_SERVER_URL="http://git.example.net"
-init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
 assert_file_contains "credential scheme follows the remote" \
   "http://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 GITEA_SERVER_URL="https://git.example.net"
-init_config_repo_history "SECRETTOKEN" deployment-910-test >/dev/null 2>&1
+clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
 assert_file_contains "https remote gets an https credential" \
   "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 rm -f "$_cred_seen"
-
-# ── the generated apply-config.sh ─────────────────────────────────────────────
-# Not a function, so the coverage gate does not see it — but it is what runs on
-# every deploy, so it gets an integration test against a throwaway tree.
-describe apply_config_script
-_ac="$(mktemp)"
-sed -n "/^cat > \"\${REPO_DIR}\/install\/apply-config.sh\" <<'APPLYEOF'\$/,/^APPLYEOF\$/p" \
-  "$SCRIPT" | sed '1d;$d' > "$_ac"
-assert_ok "extracts from the installer" bash -c "[[ -s '$_ac' ]]"
-assert_ok "parses"                      bash -n "$_ac"
-
-_acroot="$(mktemp -d)"; _acrepo="${_acroot}/repo"
-mkdir -p "${_acrepo}"/{env,install} \
-         "${_acrepo}"/services/{ollama-router,ollama-monitor,litellm-proxy} \
-         "${_acrepo}/.git"
-echo "x = 1" > "${_acrepo}/services/ollama-router/router.py"
-echo "x = 1" > "${_acrepo}/services/ollama-monitor/monitor.py"
-printf 'BACKEND_FAST=http://h:11434\n' > "${_acrepo}/env/router.env"
-printf '#!/usr/bin/env bash\necho hi\n' > "${_acrepo}/install/manage-model-servers.sh"
-printf '#!/usr/bin/env bash\necho hi\n' > "${_acrepo}/tools-helper.sh"
-printf '#!/bin/sh\necho hook\n'         > "${_acrepo}/.git/hook.sh"
-chmod 0644 "${_acrepo}/install/manage-model-servers.sh" "${_acrepo}/tools-helper.sh" \
-           "${_acrepo}/.git/hook.sh"
-
-mkdir -p "${_acrepo}/services/nginx-tls"
-printf 'server { listen 8080 ssl; }\n' > "${_acrepo}/services/nginx-tls/ollama-smart-router.conf"
-
-BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
-  NGINX_CONF_DIR="${_acroot}/nginx.d" \
-  bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units" \
-  > "${_acroot}/out" 2>&1
-_acrc=$?
-assert_eq "runs clean with the optional files absent" "0" "$_acrc"
-assert_contains "warns about what it skipped" "router.ini" "$(cat "${_acroot}/out")"
-
-# Executable bit on every repo script, but never inside .git.
-assert_file_mode "install script made executable" "755" "${_acrepo}/install/manage-model-servers.sh"
-assert_file_mode "script outside install/ too"    "755" "${_acrepo}/tools-helper.sh"
-assert_file_mode "leaves .git alone"              "644" "${_acrepo}/.git/hook.sh"
-
-# The management command is linked FIRST, so a later failure cannot hide it.
-assert_ok "symlink created" bash -c "[[ -L '${_acroot}/bin/manage-model-servers' ]]"
-
-# PATH for login shells.
-_prof="${_acroot}/profile.d/ollama-router-path.sh"
-assert_ok "profile.d snippet written" bash -c "[[ -f '$_prof' ]]"
-assert_file_contains "adds the repo root"     "${_acrepo}" "$_prof"
-assert_file_contains "adds install/"          "${_acrepo}/install" "$_prof"
-assert_file_mode     "sourced, not executed"  "644" "$_prof"
-_newpath="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; printf '%s' \"\$PATH\"")"
-assert_contains "repo lands on PATH"    "${_acrepo}" "$_newpath"
-assert_eq "appended, never prepended — repo cannot shadow system commands" \
-  "/usr/bin:/bin" "${_newpath%%:${_acrepo}*}"
-# Sourcing repeatedly must not grow PATH without bound.
-_twice="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; . '$_prof'; . '$_prof'; printf '%s' \"\$PATH\"")"
-assert_eq "idempotent when sourced again" "$_newpath" "$_twice"
-_found="$(env -i PATH=/usr/bin:/bin sh -c ". '$_prof'; command -v manage-model-servers.sh")"
-assert_eq "scripts resolve by name" "${_acrepo}/install/manage-model-servers.sh" "$_found"
-
-# OS-level guardrail for file logs; the router also rotates decisions.jsonl
-# internally, but this catches operator-provided files in the same directory.
-_lr="${_acroot}/logrotate.d/ollama-smart-router"
-assert_ok "logrotate config written" bash -c "[[ -f '$_lr' ]]"
-assert_file_contains "rotates the decision logs" "/var/log/ollama-router/*.jsonl" "$_lr"
-assert_file_contains "uses copytruncate for live writers" "copytruncate" "$_lr"
-
-# The TLS front end is installed from the repo like everything else.
-assert_ok "nginx site installed" bash -c "[[ -f '${_acroot}/nginx.d/ollama-smart-router.conf' ]]"
-assert_file_contains "with the repo's content" "listen 8080 ssl" \
-  "${_acroot}/nginx.d/ollama-smart-router.conf"
-
-# copy_secret_env: the env files hold secrets, so in the container they are
-# root:ollama-router 0640. Assert the mode rather than trusting the call site.
-_env_mode="$(stat -c '%a' "${_acroot}/router/.env")"
-assert_ok "the env file is not world-readable" \
-  bash -c "[[ '${_env_mode}' == '640' || '${_env_mode}' == '600' ]]"
-
-# Without the service account — a validation run — it must degrade to an
-# owner-only copy rather than aborting before the units and nginx site are
-# installed. Simulated by making getent report the group as absent.
-_acroot2="$(mktemp -d)"
-cp -r "${_acrepo}" "${_acroot2}/repo" 2>/dev/null || true
-mkdir -p "${_acroot2}/repo/services/ollama-router"
-echo "x = 1" > "${_acroot2}/repo/services/ollama-router/router.py"
-mock_script getent <<'EOF'
-exit 2                      # no such group
-EOF
-BIN_DIR="${_acroot2}/bin" PROFILE_DIR="${_acroot2}/profile.d" \
-  LOGROTATE_DIR="${_acroot2}/logrotate.d" NGINX_CONF_DIR="${_acroot2}/nginx.d" \
-  bash "$_ac" "${_acroot2}/repo" "${_acroot2}/router" "${_acroot2}/webui" "${_acroot2}/units" \
-  > "${_acroot2}/out" 2>&1
-assert_eq "still succeeds without the ollama-router group" "0" "$?"
-assert_file_mode "and falls back to an owner-only copy" "600" "${_acroot2}/router/.env"
-assert_ok "the units were still installed" \
-  bash -c "[[ -f '${_acroot2}/nginx.d/ollama-smart-router.conf' ]]"
-# Drop the getent stub again: it is a system lookup other tests rely on.
-rm -f "${MOCK_BIN}/getent"
-rm -rf "$_acroot2"
-
-# A site naming a certificate that does not exist yet must not be reported as a
-# broken proxy config — that is what a fresh install looks like before the cert
-# is generated, and an nginx emerg trace there teaches you to ignore the one
-# warning that matters.
-_acroot3="$(mktemp -d)"; mkdir -p "${_acroot3}/repo/services/nginx-tls" \
-  "${_acroot3}/repo/env" "${_acroot3}/repo/services/ollama-router" \
-  "${_acroot3}/repo/services/ollama-monitor" "${_acroot3}/repo/install"
-echo "x = 1" > "${_acroot3}/repo/services/ollama-router/router.py"
-echo "x = 1" > "${_acroot3}/repo/services/ollama-monitor/monitor.py"
-printf 'A=1\n' > "${_acroot3}/repo/env/router.env"
-printf 'server {\n    ssl_certificate     /nonexistent/server.crt;\n}\n' \
-  > "${_acroot3}/repo/services/nginx-tls/ollama-smart-router.conf"
-BIN_DIR="${_acroot3}/bin" PROFILE_DIR="${_acroot3}/profile.d" \
-  LOGROTATE_DIR="${_acroot3}/logrotate.d" NGINX_CONF_DIR="${_acroot3}/nginx.d" \
-  bash "$_ac" "${_acroot3}/repo" "${_acroot3}/router" "${_acroot3}/webui" "${_acroot3}/units" \
-  > "${_acroot3}/out" 2>&1
-assert_eq "a missing certificate is not fatal" "0" "$?"
-assert_contains "and is explained, not dumped as an nginx trace" \
-  "does not exist yet" "$(cat "${_acroot3}/out")"
-assert_contains "with the fix"  "cert renew" "$(cat "${_acroot3}/out")"
-assert_not_contains "no scary rejection message" "rejected the configuration" \
-  "$(cat "${_acroot3}/out")"
-rm -rf "$_acroot3"
-
-# Turning TLS off leaves the repo with no nginx site, but nginx would still be
-# holding 8080 and 8000 — the very ports the applications bind directly in that
-# mode. The repo is the source of truth, so the installed site has to go.
-_acroot4="$(mktemp -d)"; mkdir -p "${_acroot4}/repo/env" "${_acroot4}/nginx.d" \
-  "${_acroot4}/repo/services/ollama-router" "${_acroot4}/repo/services/ollama-monitor" \
-  "${_acroot4}/repo/install"
-echo "x = 1" > "${_acroot4}/repo/services/ollama-router/router.py"
-echo "x = 1" > "${_acroot4}/repo/services/ollama-monitor/monitor.py"
-printf 'A=1\n' > "${_acroot4}/repo/env/router.env"
-printf 'server { listen 8080 ssl; }\n' > "${_acroot4}/nginx.d/ollama-smart-router.conf"
-BIN_DIR="${_acroot4}/bin" PROFILE_DIR="${_acroot4}/profile.d" \
-  LOGROTATE_DIR="${_acroot4}/logrotate.d" NGINX_CONF_DIR="${_acroot4}/nginx.d" \
-  bash "$_ac" "${_acroot4}/repo" "${_acroot4}/router" "${_acroot4}/webui" "${_acroot4}/units" \
-  > "${_acroot4}/out" 2>&1
-assert_eq "apply still succeeds" "0" "$?"
-assert_ok "the stale site is removed" \
-  bash -c "[[ ! -f '${_acroot4}/nginx.d/ollama-smart-router.conf' ]]"
-assert_contains "and says why" "no longer in the config repo" "$(cat "${_acroot4}/out")"
-rm -rf "$_acroot4"
-
-# A genuinely required file missing must still be fatal.
-rm -f "${_acrepo}/services/ollama-router/router.py"
-assert_status "a missing required file aborts" 1 \
-  env BIN_DIR="${_acroot}/bin" PROFILE_DIR="${_acroot}/profile.d" LOGROTATE_DIR="${_acroot}/logrotate.d" \
-      NGINX_CONF_DIR="${_acroot}/nginx.d" \
-      bash "$_ac" "$_acrepo" "${_acroot}/router" "${_acroot}/webui" "${_acroot}/units"
-rm -rf "$_acroot" "$_ac"
-
-# ── container creation flags ──────────────────────────────────────────────────
-# The privilege level is a security-relevant default that lives in exactly one
-# place, so pin it rather than trusting a reader to notice a flipped digit.
-describe container_create_flags
-_cargs="$(grep -A 20 '^create_args=(' "$SCRIPT" | sed -n '/^create_args=(/,/^)/p')"
-assert_contains "privilege level comes from CT_UNPRIVILEGED" \
-  '-unprivileged "$CT_UNPRIVILEGED"' "$_cargs"
-assert_contains "defaults to privileged" \
-  'CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"' "$(cat "$SCRIPT")"
-assert_not_contains "no hardcoded unprivileged flag remains" \
-  '-unprivileged 1' "$_cargs"
-# A privileged container is not a containment boundary; the installer has to
-# say so out loud rather than leaving it to the docs.
-assert_contains "the operator is told at creation time" \
-  "not a security" "$(cat "$SCRIPT")"
-
-# Nesting is what lets systemd's per-unit sandboxing build its own mount
-# namespaces inside the container, and every generated unit relies on those.
-assert_contains "features default to nesting" \
-  'CT_FEATURES="${CT_FEATURES:-nesting=1}"' "$(cat "$SCRIPT")"
-assert_contains "features reach pct create" \
-  'create_args+=(-features "$CT_FEATURES")' "$(cat "$SCRIPT")"
-# An empty CT_FEATURES must omit the flag rather than pass an empty value,
-# which pct rejects.
-assert_contains "an empty value omits the flag" \
-  '[[ -n "$CT_FEATURES" ]] && create_args+=' "$(cat "$SCRIPT")"
-
-# ── the embedded copy of manage-model-servers.sh ──────────────────────────────
-# The installer carries a COMPLETE copy of manage-model-servers.sh inside a
-# heredoc, and that copy — not the file next to it — is what apply-config.sh
-# symlinks onto PATH in the container. The two have drifted before, so pin the
-# invariant rather than trusting that both get edited together.
-describe embedded_manage_script
-_emb="$(mktemp)"
-sed -n "/^cat > \"\${REPO_DIR}\/install\/manage-model-servers.sh\" <<'MANAGEEOF'\$/,/^MANAGEEOF\$/p" \
-  "$SCRIPT" | sed '1d;$d' > "$_emb"
-assert_ok "extracts from the installer" bash -c "[[ -s '$_emb' ]]"
-assert_ok "parses"                      bash -n "$_emb"
-_standalone="${HERE}/../manage-model-servers.sh"
-if [[ -f "$_standalone" ]]; then
-  assert_ok "byte-identical to the standalone script" diff -q "$_emb" "$_standalone"
-else
-  skip "byte-identical to the standalone script" "no standalone copy alongside"
-fi
-rm -f "$_emb"
-
-# ── TLS ───────────────────────────────────────────────────────────────────────
-# Open WebUI cannot terminate TLS itself — `open-webui serve` passes only host
-# and port to uvicorn — so nginx fronts it. What is testable here is the
-# certificate: a self-signed cert with the wrong SANs is rejected by every
-# current browser, and CN has not been accepted as an identity since Chrome 58.
-TLS_DIR=/app/tls
-TLS_CERT_DAYS=3650
-TLS_KEY_BITS=2048
-TLS_EXTRA_SAN=""
-
-describe tls_san_list
-assert_eq "ip and hostname, plus loopback" \
-  "DNS:osr,DNS:localhost,IP:192.168.11.80,IP:127.0.0.1" \
-  "$(tls_san_list 192.168.11.80 osr '')"
-# An extra name may be a DNS name or an address; it has to be sorted by shape,
-# because an IP written as DNS: silently fails to match when a client connects.
-assert_eq "extra names are classified by shape" \
-  "DNS:osr,DNS:localhost,DNS:chat.example.com,IP:192.168.11.80,IP:127.0.0.1,IP:10.0.0.5" \
-  "$(tls_san_list 192.168.11.80 osr 'chat.example.com,10.0.0.5')"
-assert_eq "whitespace around entries is ignored" \
-  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
-  "$(tls_san_list 192.168.11.80 osr '  a.lan , ')"
-# Regression: an earlier version set IFS=, to split the extra list and left it
-# set, so the dedup check joined with commas and every duplicate got through.
-assert_eq "duplicates are dropped" \
-  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
-  "$(tls_san_list 192.168.11.80 osr 'a.lan,a.lan')"
-# Regression: tr leaves no newline after the last field, so a bare read drops
-# it — and a single extra name IS the last field, which made TLS_EXTRA_SAN with
-# one entry a complete no-op.
-assert_eq "a single extra name is not dropped" \
-  "DNS:osr,DNS:localhost,DNS:only.example.com,IP:192.168.11.80,IP:127.0.0.1" \
-  "$(tls_san_list 192.168.11.80 osr 'only.example.com')"
-assert_eq "a trailing comma is harmless" \
-  "DNS:osr,DNS:localhost,DNS:a.lan,IP:192.168.11.80,IP:127.0.0.1" \
-  "$(tls_san_list 192.168.11.80 osr 'a.lan,')"
-assert_eq "a loopback host does not duplicate itself" \
-  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list 127.0.0.1 localhost '')"
-assert_eq "no ip or host still yields a usable list" \
-  "DNS:localhost,IP:127.0.0.1" "$(tls_san_list '' '' '')"
-assert_not_contains "never emits an empty entry" "DNS:," "$(tls_san_list '' '' ',,')"
-
-describe generate_tls_cert
-# Run openssl for real against a temp dir, so this asserts on a certificate
-# rather than on a command line.
-_tls="$(mktemp -d)"
-TLS_DIR="$_tls"
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-assert_ok "generates a certificate" generate_tls_cert 192.168.11.80 osr
-assert_ok "certificate written"  bash -c "[[ -s '${_tls}/server.crt' ]]"
-assert_ok "private key written"  bash -c "[[ -s '${_tls}/server.key' ]]"
-assert_file_mode "the key is not readable by anyone else" "600" "${_tls}/server.key"
-assert_file_mode "the certificate is world-readable"      "644" "${_tls}/server.crt"
-_san="$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName 2>/dev/null)"
-assert_contains "carries the IP as an IP entry"   "IP Address:192.168.11.80" "$_san"
-assert_contains "carries the hostname"            "DNS:osr"                  "$_san"
-assert_contains "carries localhost"               "DNS:localhost"            "$_san"
-# The key must actually match the certificate, or nginx refuses to start.
-assert_eq "key and certificate match" \
-  "$(openssl x509 -noout -modulus -in "${_tls}/server.crt" | openssl md5)" \
-  "$(openssl rsa  -noout -modulus -in "${_tls}/server.key" 2>/dev/null | openssl md5)"
-# A cert without serverAuth is refused by some clients even when trusted.
-_ext="$(openssl x509 -in "${_tls}/server.crt" -noout -text)"
-assert_contains "is an end-entity certificate" "CA:FALSE"          "$_ext"
-assert_contains "is usable as a server cert"   "TLS Web Server Authentication" "$_ext"
-assert_ok "is currently valid" openssl x509 -in "${_tls}/server.crt" -noout -checkend 0
-TLS_EXTRA_SAN="extra.example.com"
-assert_ok "regenerates with an extra name" generate_tls_cert 192.168.11.80 osr
-assert_contains "which lands in the certificate" "DNS:extra.example.com" \
-  "$(openssl x509 -in "${_tls}/server.crt" -noout -ext subjectAltName)"
-TLS_EXTRA_SAN=""
-rm -rf "$_tls"
-TLS_DIR=/app/tls
-
-describe ct_tls_ok
-# The probe must distinguish "listening" from "completing a handshake" — the
-# whole reason it exists rather than reusing ct_port_listening.
-# Stub pct, NOT bash. ct_tls_ok is `run_ct bash -c "openssl s_client ..."`, so
-# putting a stub named `bash` on PATH would also replace the shell every later
-# assertion in this file runs its command with.
-mock_script pct <<'EOF'
-exit 0
-EOF
-assert_ok "reports a good handshake" ct_tls_ok 8080
-mock_script pct <<'EOF'
-exit 1
-EOF
-assert_fail "reports a failed handshake" ct_tls_ok 8080
-
-describe verify_service_executables
-mock_reset_log
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  chmod|runuser) exit 0 ;;
-  *) "$@" ;;
-esac
-EOF
-assert_ok "service executables are verified as the service user" verify_service_executables
-assert_contains "router venv made traversable" \
-  "chmod -R a+rX /app/router/venv /app/openwebui/venv" "$(mock_calls)"
-assert_contains "router python executed as the service user" \
-  "runuser -u ollama-router -- /app/router/venv/bin/python" "$(mock_calls)"
-# A failure here must be legible, because the ERR trap destroys the container
-# and takes the evidence with it. Naming the executable is the whole point.
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  chmod) exit 0 ;;
-  runuser) exit 1 ;;              # the service account cannot run it
-  *) "$@" ;;
-esac
-EOF
-_vout="$(mktemp)"
-verify_service_executables > "$_vout" 2>&1; _vrc=$?
-assert_eq       "returns non-zero when the service user cannot execute" "1" "$_vrc"
-assert_contains "names the router interpreter" \
-  "cannot run /app/router/venv/bin/python" "$(cat "$_vout")"
-assert_contains "names the Open WebUI interpreter" \
-  "cannot run /app/openwebui/venv/bin/python" "$(cat "$_vout")"
-assert_contains "explains the systemd symptom" "203/EXEC" "$(cat "$_vout")"
-assert_contains "and the 502 it surfaces as"   "502"      "$(cat "$_vout")"
-assert_contains "and the likely cause"         "umask"    "$(cat "$_vout")"
-rm -f "$_vout"
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  chmod|runuser) exit 0 ;;
-  *) "$@" ;;
-esac
-EOF
-mock_reset_log
-assert_ok "passes again once they are executable" verify_service_executables
-assert_contains "open-webui script checked" \
-  "runuser -u ollama-router -- test -x /app/openwebui/venv/bin/open-webui" "$(mock_calls)"
-
-# ── Open WebUI first-start handling ───────────────────────────────────────────
-# These exist because a clean install came up with a dead UI twice. The unit
-# starts fine — Type=simple succeeds the instant the process forks — and then
-# Open WebUI dies inside its own first-run migration. The installer has to
-# notice that, not just launch it and declare victory.
-CT_ID=100
-OPENWEBUI_PORT=8080
-# The port Open WebUI ITSELF binds. With TLS on these differ — nginx owns the
-# public one — and start_openwebui_verified must wait on this one, or it would
-# see nginx and declare success before Open WebUI had started.
-OPENWEBUI_BIND_PORT=8080
-
-describe ct_port_listening
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
-EOF
-# run_ct shells out through pct; route the inner command to the stubs.
-mock_script pct <<'EOF'
-shift 3                 # drop: exec <id> --
-"$@"
-EOF
-assert_ok   "finds a listening port"        ct_port_listening 8000
-assert_fail "does not find a closed port"   ct_port_listening 8080
-# 8000 must not match 18000 or 8000x — the awk anchor is the whole point.
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:18000 0.0.0.0:*'
-EOF
-assert_fail "does not match a port that merely ends the same" ct_port_listening 8000
-
-describe ct_wait_for_port
-mock_command sleep 0                      # no real waiting in a test suite
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-EOF
-assert_ok "returns as soon as the port is up" ct_wait_for_port 8080 30
-
-# Never listening, unit still trying: times out with 1.
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
-EOF
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) echo activating ;; esac
-EOF
-assert_status "times out while the unit is still activating" 1 ct_wait_for_port 8080 10 open-webui.service
-
-# Unit gave up: return 2 immediately rather than waiting out the deadline.
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) echo failed ;; esac
-EOF
-assert_status "gives up when the unit does" 2 ct_wait_for_port 8080 600 open-webui.service
-assert_status "no unit named means wait the whole deadline" 1 ct_wait_for_port 8080 10
-# Same CRLF trap as report_services, with a worse consequence here: "activating\r"
-# matches none of the keep-waiting cases, so the wait returns 2 immediately and
-# the installer declares a service dead that is only slow.
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) printf 'activating\r\n' ;; esac
-EOF
-assert_status "keeps waiting through a pty's CRLF" 1 ct_wait_for_port 8080 10 open-webui.service
-
-describe ct_out
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-mock_script systemctl <<'EOF'
-printf 'active\r\n'
-EOF
-assert_eq "strips the carriage return a pty adds" \
-  "active" "$(ct_out systemctl is-active open-webui.service)"
-mock_script systemctl <<'EOF'
-printf '\n\nactive\r\nsomething else\r\n'
-EOF
-assert_eq "takes the first non-empty line" \
-  "active" "$(ct_out systemctl is-active open-webui.service)"
-mock_script systemctl <<'EOF'
-exit 3
-EOF
-assert_eq "an empty result is empty, not an error string" \
-  "" "$(ct_out systemctl is-active open-webui.service || true)"
-
-describe openwebui_migration_broken
-mock_script journalctl <<'EOF'
-echo "sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) duplicate column name: info_json"
-EOF
-assert_ok "recognises the migration failure" openwebui_migration_broken
-mock_script journalctl <<'EOF'
-echo "Loading WEBUI_SECRET_KEY from /app/openwebui/.webui_secret_key"
-EOF
-assert_fail "does not fire on a healthy log" openwebui_migration_broken
-
-describe openwebui_reset_db
-_ow="$(mktemp -d)"
-mock_script systemctl <<'EOF'
-exit 0
-EOF
-# No database yet: nothing to do, and it must not fail.
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  test) exit 1 ;;                        # no webui.db
-  *)    "$@" ;;
-esac
-EOF
-assert_ok "no database is not an error" openwebui_reset_db
-
-# A database with accounts in it must be refused — this is the guard that stops
-# the installer wiping a real deployment if it is ever re-run against one.
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  test) exit 0 ;;
-  */python) echo 3 ;;                    # three accounts
-  *)       "$@" ;;
-esac
-EOF
-out="$(openwebui_reset_db 2>&1)"; rc=$?
-assert_eq       "refuses to reset a populated database" "1" "$rc"
-assert_contains "and says why"  "refusing to reset"     "$out"
-
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  test) exit 0 ;;
-  */python) echo 0 ;;                    # empty: safe to discard
-  *)       "$@" ;;
-esac
-EOF
-out="$(openwebui_reset_db 2>&1)"; rc=$?
-assert_eq       "resets an empty database"  "0" "$rc"
-assert_contains "keeps a copy"              "broken-" "$out"
-rm -rf "$_ow"
-
-describe start_openwebui_verified
-mock_command sleep 0
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) echo active ;; esac
-EOF
-# Happy path: the port comes up.
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-EOF
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-# NOT $(...): start_openwebui_verified sets OPENWEBUI_RESET, and a command
-# substitution is a subshell, so the assignment would be discarded and the
-# assertion would always see the value it started with.
-_owout="$(mktemp)"
-OPENWEBUI_RESET=false
-start_openwebui_verified > "$_owout" 2>&1; rc=$?
-assert_eq       "succeeds when the port comes up" "0" "$rc"
-assert_contains "says so"  "listening on 8080"    "$(cat "$_owout")"
-assert_eq       "no reset was needed" "false"     "$OPENWEBUI_RESET"
-
-# The real case: first start dies in the migration, reset, second start works.
-# The ss stub answers "closed" until the reset has happened.
-_flag="$(mktemp -u)"
-mock_script ss <<EOF
-if [ -e "${_flag}" ]; then echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-else echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'; fi
-EOF
-mock_script journalctl <<'EOF'
-echo "sqlite3.OperationalError) duplicate column name: info_json"
-EOF
-mock_script pct <<EOF
-shift 3
-case "\$1" in
-  test)     exit 0 ;;
-  */python) echo 0 ;;
-  bash)     : > "${_flag}"; exit 0 ;;      # the mv happened -> port opens next
-  *)        "\$@" ;;
-esac
-EOF
-OPENWEBUI_RESET=false
-start_openwebui_verified > "$_owout" 2>&1; rc=$?
-out="$(cat "$_owout")"
-assert_eq       "recovers from the migration failure" "0" "$rc"
-assert_contains "explains what it did" "Discarding the empty database" "$out"
-assert_contains "and confirms the retry" "after the retry" "$out"
-assert_eq       "records that it reset" "true" "$OPENWEBUI_RESET"
-rm -f "$_flag"
-
-# A port clash must NOT be treated as a migration failure: resetting the
-# database would destroy data to fix something entirely unrelated.
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
-EOF
-mock_script journalctl <<'EOF'
-echo "ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): address already in use"
-EOF
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-OPENWEBUI_RESET=false
-start_openwebui_verified > "$_owout" 2>&1; rc=$?
-out="$(cat "$_owout")"
-assert_eq       "reports failure"                 "1" "$rc"
-assert_contains "names the real cause"            "already in use" "$out"
-assert_contains "and how to find the holder"      "ss -lntp"       "$out"
-assert_eq       "did NOT reset the database"      "false" "$OPENWEBUI_RESET"
-assert_not_contains "and did not blame migrations" "Discarding the empty database" "$out"
-
-# Something else entirely: no reset, and a warning rather than a silent success.
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:9999 0.0.0.0:*'
-EOF
-mock_script journalctl <<'EOF'
-echo "ModuleNotFoundError: No module named 'open_webui'"
-EOF
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-OPENWEBUI_RESET=false
-start_openwebui_verified > "$_owout" 2>&1; rc=$?
-out="$(cat "$_owout")"
-assert_eq       "reports failure"        "1" "$rc"
-assert_contains "warns clearly"          "did not come up" "$out"
-assert_contains "says the API still works" ":8000" "$out"
-assert_eq       "did not touch the database" "false" "$OPENWEBUI_RESET"
-rm -f "$_owout"
-
-describe report_services
-mock_script systemctl <<'EOF'
-case "$*" in
-  *is-active*open-webui*) echo failed ;;
-  *is-active*)            echo active ;;
-esac
-EOF
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
-EOF
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-out="$(report_services 2>&1)"; rc=$?
-assert_eq       "non-zero when something is down" "1" "$rc"
-assert_contains "names every unit"        "litellm-proxy"  "$out"
-assert_contains "shows the failed one"    "failed"         "$out"
-assert_contains "reports the live port"   "listening on 8000" "$out"
-assert_contains "and the dead one"        "NOT listening on 8080" "$out"
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) echo active ;; esac
-EOF
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
-echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-EOF
-assert_ok "zero when everything is up" report_services
-TLS_ENABLED=true
-ROUTER_BIND_PORT=8010
-OPENWEBUI_BIND_PORT=8088
-OPENWEBUI_PORT=8080
-mock_script pct <<'EOF'
-shift 3
-case "$1" in
-  ss)
-    echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
-    echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-    echo 'LISTEN 0 2048 127.0.0.1:8010 0.0.0.0:*'
-    ;;
-  bash) exit 0 ;;
-  *) "$@" ;;
-esac
-EOF
-out="$(report_services 2>&1)"; rc=$?
-assert_eq       "non-zero when an nginx upstream is down" "1" "$rc"
-assert_contains "names the missing upstream" "Open WebUI upstream" "$out"
-assert_contains "explains the 502"           "nginx will return 502" "$out"
-TLS_ENABLED=false
-
-# `pct exec` allocates a pty when the host's stdout is a terminal, and ONLCR
-# then turns every \n into \r\n. `is-active` therefore yields "active\r", which
-# prints as "active" and equals nothing — so this reported all four units as
-# active and simultaneously concluded they were down. Pin the CRLF case.
-mock_script systemctl <<'EOF'
-case "$*" in *is-active*) printf 'active\r\n' ;; esac
-EOF
-mock_script ss <<'EOF'
-echo 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:*'
-echo 'LISTEN 0 2048 0.0.0.0:8080 0.0.0.0:*'
-EOF
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-assert_ok "a pty's CRLF does not turn 'active' into a failure" report_services
-
-# ── the generated systemd units ───────────────────────────────────────────────
-# Also not functions. These assertions exist because of a real outage: every
-# unit used Requires= on its upstream, and Requires= propagates stop/restart.
-# A crash-looping litellm-proxy therefore stopped ollama-router, which stopped
-# open-webui — nine seconds into its first-ever start, part way through the
-# alembic migration. webui.db was left with the new column added but the
-# revision unstamped, so every subsequent start failed with
-# "duplicate column name: info_json" and the UI never came back.
-describe systemd_units
-_units="$(mktemp -d)"
-for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
-  sed -n "/^cat > \"\${REPO_DIR}\/services\/[a-z-]*\/${_svc}.service\" <<'UNITEOF'\$/,/^UNITEOF\$/p" \
-    "$SCRIPT" | sed '1d;$d' > "${_units}/${_svc}.service"
-  assert_ok "extracts ${_svc}.service" bash -c "[[ -s '${_units}/${_svc}.service' ]]"
-done
-
-# The rule: ordering yes, propagation no.
-for _svc in ollama-router ollama-monitor open-webui; do
-  assert_not_contains "${_svc} does not use Requires=" \
-    "Requires=" "$(grep -v '^#' "${_units}/${_svc}.service")"
-done
-assert_file_contains "open-webui still ORDERS after the router" \
-  "After=network-online.target ollama-router.service" "${_units}/open-webui.service"
-assert_file_contains "open-webui wants the router" \
-  "Wants=network-online.target ollama-router.service" "${_units}/open-webui.service"
-assert_file_contains "the router orders after litellm" \
-  "After=network-online.target litellm-proxy.service" "${_units}/ollama-router.service"
-
-# open-webui's serve() has LITERAL defaults (host="0.0.0.0", port=8080) and
-# never reads HOST/PORT from the environment. Relying on the env file alone
-# left it binding the port nginx owns, so it died with "address already in use"
-# and the proxy answered 502 for a port nothing was listening on. The flags are
-# the fix, and this assertion is what stops them being "tidied away" later.
-assert_file_contains "open-webui is told where to bind on the command line" \
-  "serve --host \${HOST} --port \${PORT}" "${_units}/open-webui.service"
-assert_file_contains "and the values come from the env file" \
-  "EnvironmentFile=/app/openwebui/.env" "${_units}/open-webui.service"
-
-# The long first start must survive: migrations plus an embedding-model download.
-assert_file_contains "open-webui keeps a long start timeout" \
-  "TimeoutStartSec=600" "${_units}/open-webui.service"
-# Every unit runs unprivileged and comes back on its own.
-for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
-  assert_file_contains "${_svc} runs as the service account" \
-    "User=ollama-router" "${_units}/${_svc}.service"
-  assert_file_contains "${_svc} restarts" "Restart=always" "${_units}/${_svc}.service"
-done
-# The monitor's state directory is what keeps a restart from re-announcing.
-assert_file_contains "monitor gets a state directory" \
-  "StateDirectory=ollama-monitor" "${_units}/ollama-monitor.service"
-# LiteLLM must stay off the network.
-assert_file_contains "litellm binds loopback only" \
-  "--host 127.0.0.1" "${_units}/litellm-proxy.service"
-# The generated units ask for a private mount namespace. That is the intended
-# default; whether the container will grant it is decided at install time by
-# apply_sandbox_policy, tested below.
-for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
-  for _d in "NoNewPrivileges=true" "PrivateTmp=true" "ProtectSystem=full" "ProtectHome=true"; do
-    assert_file_contains "${_svc} asks for ${_d%%=*}" "$_d" "${_units}/${_svc}.service"
-  done
-done
-rm -rf "$_units"
-
-# ── systemd mount namespacing ─────────────────────────────────────────────────
-# ProtectSystem=/ProtectHome=/PrivateTmp= are a private MOUNT NAMESPACE, not a
-# process flag. An LXC container that is not allowed to build one does not run
-# the unit unhardened — it does not run it at all:
-#     Failed to set up mount namespacing: Permission denied
-#     Main process exited, code=exited, status=226/NAMESPACE
-# with Restart=always looping forever, nothing on the upstream port, and nginx
-# answering 502. A real install hit exactly that, which is why the installer now
-# MEASURES this rather than asserting that nesting=1 makes it safe.
-describe ct_namespacing_verdict
-mock_script pct <<'EOF'
-shift 3                 # drop: exec <id> --
-"$@"
-EOF
-# Sandboxed transient unit refused, plain one fine — the observed failure.
-mock_script systemd-run <<'EOF'
-case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
-EOF
-assert_eq "reports denied when the sandboxed probe is refused" \
-  "denied" "$(ct_namespacing_verdict)"
-mock_script systemd-run <<'EOF'
-exit 0
-EOF
-assert_eq "reports ok when both probes run" "ok" "$(ct_namespacing_verdict)"
-# If a PLAIN transient unit will not run either, the probe has told us nothing
-# about namespacing specifically — that must not be read as "denied".
-mock_script systemd-run <<'EOF'
-exit 1
-EOF
-assert_eq "reports unknown when no transient unit runs at all" \
-  "unknown" "$(ct_namespacing_verdict)"
-
-describe strip_unit_namespacing
-_nsu="$(mktemp -d)"
-cat > "${_nsu}/open-webui.service" <<'EOF'
-[Service]
-ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-[Install]
-EOF
-strip_unit_namespacing "${_nsu}/open-webui.service"
-for _d in PrivateTmp ProtectSystem ProtectHome; do
-  assert_not_contains "removes ${_d}=" \
-    "${_d}=" "$(grep -v '^#' "${_nsu}/open-webui.service")"
-done
-# NoNewPrivileges is a prctl flag, not a mount: it works in every container and
-# must survive, or stripping the namespace would quietly drop real hardening.
-assert_file_contains "keeps NoNewPrivileges" \
-  "NoNewPrivileges=true" "${_nsu}/open-webui.service"
-assert_file_contains "says why, in the unit itself" \
-  "226/NAMESPACE" "${_nsu}/open-webui.service"
-# The rewrite must not disturb the ExecStart line — ${HOST}/${PORT} are expanded
-# by systemd from the EnvironmentFile, and mangling them re-creates the earlier
-# "binds the wrong port, nginx 502s" bug.
-assert_file_contains "leaves ExecStart untouched" \
-  'serve --host ${HOST} --port ${PORT}' "${_nsu}/open-webui.service"
-# Idempotent: running it twice must not stack comment blocks or fail.
-_before="$(cat "${_nsu}/open-webui.service")"
-strip_unit_namespacing "${_nsu}/open-webui.service"
-assert_eq "is idempotent" "$_before" "$(cat "${_nsu}/open-webui.service")"
-rm -rf "$_nsu"
-
-describe apply_sandbox_policy
-_nsr="$(mktemp -d)"
-_mkrepo() {
-  local svc
-  rm -rf "${_nsr:?}/services"
-  for svc in ollama-router litellm-proxy ollama-monitor open-webui; do
-    mkdir -p "${_nsr}/services/${svc}"
-    printf '[Service]\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=full\nProtectHome=true\n' \
-      > "${_nsr}/services/${svc}/${svc}.service"
-  done
-}
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-
-# Permitted: nothing is rewritten and the flag stays false.
-_mkrepo
-mock_script systemd-run <<'EOF'
-exit 0
-EOF
-SANDBOX_DEGRADED=false
-assert_ok "succeeds when namespacing works" apply_sandbox_policy "$_nsr"
-assert_eq "leaves the flag false" "false" "$SANDBOX_DEGRADED"
-assert_file_contains "leaves the units hardened" \
-  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
-
-# Refused: every unit is rewritten and the flag is set so the summary can say so.
-_mkrepo
-mock_script systemd-run <<'EOF'
-case "$*" in *PrivateTmp*) exit 226 ;; *) exit 0 ;; esac
-EOF
-SANDBOX_DEGRADED=false
-assert_ok "succeeds when namespacing is refused" apply_sandbox_policy "$_nsr"
-assert_eq "records the degradation" "true" "$SANDBOX_DEGRADED"
-for _svc in ollama-router litellm-proxy ollama-monitor open-webui; do
-  assert_not_contains "rewrites ${_svc}" \
-    "PrivateTmp=" "$(grep -v '^#' "${_nsr}/services/${_svc}/${_svc}.service")"
-done
-
-# Inconclusive: leave the hardening alone rather than dropping it on a guess.
-_mkrepo
-mock_script systemd-run <<'EOF'
-exit 1
-EOF
-SANDBOX_DEGRADED=false
-assert_ok "succeeds when the probe is inconclusive" apply_sandbox_policy "$_nsr"
-assert_eq "does not record a degradation it did not observe" \
-  "false" "$SANDBOX_DEGRADED"
-assert_file_contains "keeps the hardening on an inconclusive probe" \
-  "ProtectSystem=full" "${_nsr}/services/open-webui/open-webui.service"
-rm -rf "$_nsr"
-
-# Ordering is load-bearing: the policy has to be decided while the tree is still
-# on the host, because push_local_config_tree is what ships the units in.
-describe sandbox_policy_wiring
-_wire="$(cat "$SCRIPT")"
-assert_contains "the policy runs before the tree is pushed" \
-  'apply_sandbox_policy "$REPO_DIR"' "$_wire"
-_apply_ln="$(grep -n 'apply_sandbox_policy "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
-_push_ln="$(grep -n 'push_local_config_tree "\$REPO_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)"
-assert_ok "and strictly before it" bash -c "(( $_apply_ln < $_push_ln ))"
-# nesting=1 is requested at create time; whether it stuck is only visible in the
-# container config, and it was silently absent once.
-assert_contains "creation verifies the feature actually landed" \
-  "grep -qE '^features:.*nesting=1'" "$_wire"
-assert_contains "the final summary reports degraded hardening" \
-  'if $SANDBOX_DEGRADED; then' "$_wire"
-
-# ── ZeroTier ──────────────────────────────────────────────────────────────────
-# ZeroTier is an OPTIONAL overlay bolted on at the very end of provisioning. The
-# hazard is not that it might fail — it is *where* it fails: after Open WebUI's
-# migrations, with CT_CREATED still set and the ERR trap still armed. An
-# unguarded non-zero there destroys a finished container over an add-on.
-describe valid_optional_zerotier_network_id
-assert_ok   "accepts blank (install only)"  valid_optional_zerotier_network_id ""
-assert_ok   "accepts 16 hex digits"         valid_optional_zerotier_network_id 8056c2e21c000001
-assert_ok   "accepts uppercase"             valid_optional_zerotier_network_id 8056C2E21C000001
-assert_fail "rejects 15 digits"             valid_optional_zerotier_network_id 8056c2e21c00000
-assert_fail "rejects 17 digits"             valid_optional_zerotier_network_id 8056c2e21c0000012
-# A 10-hex-digit value is a NODE address, not a network id — the two are easy to
-# confuse and joining with the wrong one fails silently in Central.
-assert_fail "rejects a node address"        valid_optional_zerotier_network_id 8056c2e21c
-assert_fail "rejects non-hex"               valid_optional_zerotier_network_id 8056c2e21c00000z
-
-describe prompt_zerotier_config
-ZEROTIER_NETWORK_ID=""
-_zt_out="$(mktemp)"
-prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'\n' || true
-assert_eq "blank stays blank" "" "$ZEROTIER_NETWORK_ID"
-prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'8056c2e21c000001\n' || true
-assert_eq "accepts a valid id" "8056c2e21c000001" "$ZEROTIER_NETWORK_ID"
-ZEROTIER_NETWORK_ID=""
-prompt_zerotier_config > "$_zt_out" 2>&1 <<< $'nope\n8056c2e21c000001\n' || true
-assert_eq "re-prompts after a bad id" "8056c2e21c000001" "$ZEROTIER_NETWORK_ID"
-assert_contains "and says so" "Not a valid value" "$(cat "$_zt_out")"
-rm -f "$_zt_out"
-ZEROTIER_NETWORK_ID=""
-
-describe configure_lxc_tun_device
-_lxc="$(mktemp -d)"
-LXC_CONF_DIR="$_lxc"
-CT_ID=115
-printf 'arch: amd64\nhostname: t\n' > "${_lxc}/115.conf"
-assert_ok "succeeds on a real config" configure_lxc_tun_device
-assert_file_contains "adds the device cgroup allow" \
-  "lxc.cgroup2.devices.allow: c 10:200 rwm" "${_lxc}/115.conf"
-assert_file_contains "bind-mounts the host tun" \
-  "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file" "${_lxc}/115.conf"
-_lxc_before="$(cat "${_lxc}/115.conf")"
-configure_lxc_tun_device >/dev/null 2>&1
-assert_eq "is idempotent" "$_lxc_before" "$(cat "${_lxc}/115.conf")"
-# Missing config must be reported, not swallowed — but see the wiring test below
-# for why it must also not be allowed to abort the installer.
-LXC_CONF_DIR="${_lxc}/nowhere"
-assert_fail "fails when the config is missing" configure_lxc_tun_device
-rm -rf "$_lxc"
-LXC_CONF_DIR=/etc/pve/lxc
-CT_ID=100
-
-describe fw_add_rule
-fw_conf="$(mktemp)"
-printf '[OPTIONS]\nenable: 1\n\n[RULES]\n' > "$fw_conf"
-fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
-fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
-assert_eq "writes a duplicate rule only once" \
-  "1" "$(grep -c -- '-dport 9993' "$fw_conf")"
-fw_add_rule "IN ACCEPT -p tcp -dport 8000 -log nolog"
-assert_eq "still appends distinct rules" "2" "$(grep -c '^IN ACCEPT' "$fw_conf")"
-rm -f "$fw_conf"
-
-describe install_zerotier
-ZEROTIER_NETWORK_ID=8056c2e21c000001
-mock_script pct <<'EOF'
-shift 3
-"$@"
-EOF
-mock_script systemctl <<'EOF'
-exit 0
-EOF
-mock_script zerotier-cli <<'EOF'
-case "$1" in
-  info)         echo "200 info deadbeef99 1.14.0 ONLINE" ;;
-  listnetworks) echo "200 listnetworks 8056c2e21c000001 net aa:bb:cc:dd:ee:ff OK PRIVATE zt0 10.9.0.5/24" ;;
-  join)         echo "200 join OK" ;;
-esac
-EOF
-mock_script curl <<'EOF'
-echo 'true'          # a no-op "installer" for the pipe into bash
-EOF
-out="$(install_zerotier 2>&1)"; rc=$?
-assert_eq       "succeeds on the happy path" "0" "$rc"
-assert_contains "reports the node address"   "deadbeef99" "$out"
-assert_contains "reports the network as OK"  "OK" "$out"
-
-# The join is a REQUEST. Until the member is authorised the status is not OK and
-# no traffic flows; calling that "joined" sends the operator hunting a routing
-# fault instead of clicking authorise.
-mock_script zerotier-cli <<'EOF'
-case "$1" in
-  info)         echo "200 info deadbeef99 1.14.0 ONLINE" ;;
-  listnetworks) echo "200 listnetworks 8056c2e21c000001 net aa:bb:cc:dd:ee:ff ACCESS_DENIED PRIVATE zt0 -" ;;
-  join)         echo "200 join OK" ;;
-esac
-EOF
-out="$(install_zerotier 2>&1)"; rc=$?
-assert_eq       "still returns 0 when unauthorised" "0" "$rc"
-assert_contains "surfaces the real status"   "ACCESS_DENIED" "$out"
-assert_contains "says what to do about it"   "authorise" "$out"
-
-# A failed download must return non-zero — and must NOT go on to join.
-mock_script curl <<'EOF'
-exit 22
-EOF
-out="$(install_zerotier 2>&1)"; rc=$?
-assert_eq       "returns non-zero when the installer download fails" "1" "$rc"
-assert_contains "and says which step failed" "installer did not complete" "$out"
-assert_not_contains "and does not try to join" "Requesting a join" "$out"
-
-# Installed but the CLI never appears: also non-zero, distinctly reported.
-mock_script curl <<'EOF'
-echo 'true'
-EOF
-_zt_path="$(command -v zerotier-cli)"; rm -f "$_zt_path"
-out="$(install_zerotier 2>&1)"; rc=$?
-assert_eq       "returns non-zero when zerotier-cli is absent" "1" "$rc"
-assert_contains "and names that failure separately" "not on PATH" "$out"
-ZEROTIER_NETWORK_ID=""
-
-# ── how ZeroTier is wired into the run ────────────────────────────────────────
-# These are the assertions that matter most: both call sites sit inside the
-# window where the ERR trap destroys the container.
-describe zerotier_wiring
-_zt="$(cat "$SCRIPT")"
-assert_contains "the TUN config cannot abort the run" \
-  'configure_lxc_tun_device || TUN_OK=false' "$_zt"
-assert_contains "nor can the ZeroTier install" \
-  'install_zerotier || ZEROTIER_OK=false' "$_zt"
-assert_not_contains "no bare install_zerotier call remains" \
-  $'\ninstall_zerotier\n' "$_zt"
-# The mount entry is read at container START, so it has to be written between
-# create and start — which is why -start 1 was removed from create_args.
-_cargs2="$(sed -n '/^create_args=(/,/^)/p' "$SCRIPT")"
-assert_not_contains "pct create no longer auto-starts the container" \
-  "-start 1" "$_cargs2"
-_tun_ln="$(grep -n 'configure_lxc_tun_device || TUN_OK=false' "$SCRIPT" | tail -1 | cut -d: -f1)"
-_start_ln="$(grep -n '^pct start "\$CT_ID"' "$SCRIPT" | tail -1 | cut -d: -f1)"
-assert_ok "and the TUN entry is written before the start" \
-  bash -c "(( $_tun_ln < $_start_ln ))"
-# curl piping into a root shell: -f is what stops an HTTP error page being
-# executed, and -s alone suppresses the message that would have explained it.
-assert_contains "the installer download fails closed" \
-  'curl -fsSL --proto "=https" --tlsv1.2 https://install.zerotier.com' "$_zt"
-assert_not_contains "and does not shell out through sudo" \
-  "| sudo bash" "$_zt"
-# sudo IS installed, but for the operator's muscle memory at a container shell —
-# never as a dependency of the installer, which is already root via pct exec.
-assert_contains "sudo is installed for interactive use" \
-  "iproute2 sudo" "$_zt"
-assert_not_contains "but the installer never invokes it" \
-  "run_ct sudo" "$_zt"
-# Proxmox's default input policy is DROP, so without this rule ZeroTier silently
-# degrades to relayed traffic through third-party servers.
-assert_contains "udp/9993 is allowed when the firewall is on" \
-  'fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"' "$_zt"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"

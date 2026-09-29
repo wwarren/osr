@@ -34,6 +34,9 @@ check() {
                 [[ $output != *'+ pct exec 250 -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL %s: CPU install executed the NVIDIA helper\n' "$label" >&2; exit 1; }
             else
                 [[ $output == *'+ pct exec 250 -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'*'+ pct exec 250 -- env '*'bash /root/llama-target-deploy/install-target.sh'* ]] || { printf 'FAIL %s: NVIDIA helper did not execute before the CUDA target installer\n' "$label" >&2; exit 1; }
+                if [[ $output != *'GPU_LAYERS=all'* && $output != *'GPU_LAYERS='[0-9]* ]]; then
+                    [[ $output == *'GPU_LAYERS=auto'* ]] || { printf 'FAIL %s: CUDA install did not preserve automatic GPU-layer fitting\n' "$label" >&2; exit 1; }
+                fi
             fi
             if [[ $mode == install-url ]]; then
                 [[ $output == *'NONINTERACTIVE=true'* && $output == *'MODEL_DOWNLOAD_URL=https://huggingface.co/'* ]] || { printf 'FAIL %s: download URL was not forwarded to the guest\n' "$label" >&2; exit 1; }
@@ -68,6 +71,7 @@ check success 'explicit GPU paths and CUDA fleet architectures' create CUDA_ARCH
 check success 'install plan includes required model settings' install LLAMA_CPP_REF=b9999 MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'install permits the default release without an override' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'install permits a full commit override' install LLAMA_CPP_REF=7fe450e19305b828c199d602c23a8337aaa1f03b MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
+check success 'CUDA install accepts an intentional all-layers override' install GPU_LAYERS=all MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'CPU install skips the NVIDIA user-space helper' install BACKEND=cpu GPU_DEVICES= GPU_LAYERS=0 MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'install URL-only source is forwarded to the noninteractive guest' install-url MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf?download=true
 check success 'install URL can use an explicit custom model path' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf MODEL_PATH=/mnt/models/local.gguf
@@ -94,6 +98,8 @@ check failure 'guest install rejects model traversal' install MODEL_ALIAS=llama3
 check failure 'guest install rejects an unsafe model download URL' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/blob/main/model.gguf
 check failure 'guest install rejects a noncanonical Hugging Face host' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.com/org/repo/resolve/main/model.gguf
 check failure 'guest install rejects an unpinned build ref' install LLAMA_CPP_REF=main MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
+check failure 'invalid GPU layer policy is rejected' install GPU_LAYERS=maximum MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
+check failure 'CPU install requires zero GPU layers' install BACKEND=cpu GPU_DEVICES= GPU_LAYERS=auto MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'guest template must match supported OS' create TEMPLATE=local:vztmpl/debian-13-standard_test_amd64.tar.zst
 
 "$bash_bin" -n "$provision"

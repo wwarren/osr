@@ -29,7 +29,7 @@ NONINTERACTIVE=true disables prompts and requires MODEL_ALIAS plus a GGUF file
 setting or a valid MODEL_DOWNLOAD_URL.
 Optional: LLAMA_CPP_REF=<release-tag-or-full-commit> ($LLAMA_CPP_DEFAULT_REF),
           BACKEND=cuda|cpu (cuda), BUILD_JOBS=4, CONTEXT_SIZE=8192,
-          PARALLEL_SLOTS=1, THREADS=4, GPU_LAYERS=999 (0 for cpu),
+          PARALLEL_SLOTS=1, THREADS=4, GPU_LAYERS=auto (0 for cpu),
           MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
           MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
           CUDA_ARCHITECTURES=native (or 86;89;120), CUDA_COMPILER=<nvcc-path>
@@ -589,7 +589,7 @@ BUILD_JOBS=${BUILD_JOBS:-4}
 CONTEXT_SIZE=${CONTEXT_SIZE:-8192}
 PARALLEL_SLOTS=${PARALLEL_SLOTS:-1}
 THREADS=${THREADS:-4}
-if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-999}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
+if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
 MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
@@ -600,7 +600,7 @@ LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
 
 positive_int() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
-[[ $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'GPU_LAYERS must be a nonnegative integer.'
+[[ $GPU_LAYERS == auto || $GPU_LAYERS == all || $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
 [[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
 [[ $BACKEND == cuda || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
 [[ $LLAMA_CPP_REF =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Use a release tag or full 40-character commit, without a refs/ prefix.'

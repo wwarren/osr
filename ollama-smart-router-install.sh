@@ -21,11 +21,11 @@ set -euo pipefail
 #     container ships a chat UI in addition to the OpenAI-compatible API.
 #   * A login MOTD lists every service, IP, port and config path.
 #   * Container resources bumped to accommodate Open WebUI.
-#   * Configuration is generated locally and applied directly. If Gitea is
-#     available, the generated tree is initialized as a git repository afterward
-#     and pushed as deployment history; Gitea is never provisioning input.
-#   * ZeroTier is installed inside the container, with optional automatic
-#     network join from ZEROTIER_NETWORK_ID.
+#   * Configuration is version controlled: the installer builds a per-service
+#     config tree, seeds it into the Gitea repo (missing files only, so your
+#     commits win), then the container clones it and injects the files via
+#     install/apply-config.sh. Pull happens ONCE at provisioning time, so a
+#     Gitea outage can never block a service start.
 #   * Routing thresholds/keywords moved out of router.py into router.ini, and
 #     monitor polling into monitor.ini, so behaviour is configurable per commit.
 # ==============================================================================
@@ -64,46 +64,6 @@ OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 # Change it later on a running container with:
 #   manage-model-servers set-webui-version <version|latest> --apply
 OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.11.0}"
-# Log levels for the two services that do their own logging. The router and the
-# monitor read theirs from their .ini files instead, so they can be changed by
-# commit rather than by editing the environment.
-LITELLM_LOG="${LITELLM_LOG:-ERROR}"
-OPENWEBUI_LOG_LEVEL="${OPENWEBUI_LOG_LEVEL:-INFO}"
-
-# --- TLS ----------------------------------------------------------------------
-# nginx terminates TLS on the SAME ports the services used to serve plainly
-# (8080 for the UI, 8000 for the API), and the applications move to loopback.
-# Keeping the public ports means existing bookmarks, API base URLs and firewall
-# rules keep working -- only the scheme changes.
-#
-# Open WebUI cannot do this itself: `open-webui serve` passes only host and port
-# to uvicorn and exposes no --ssl-* options, which is why its own documentation
-# recommends a reverse proxy.
-TLS_ENABLED="${TLS_ENABLED:-true}"
-TLS_DIR="${TLS_DIR:-/app/tls}"
-TLS_CERT_DAYS="${TLS_CERT_DAYS:-3650}"
-# Extra names to put in subjectAltName, comma separated. The container IP, its
-# hostname and localhost are always included. Add a DNS name here if you reach
-# the box by one -- a certificate without it will fail hostname verification
-# for every client that checks, which is most of them.
-TLS_EXTRA_SAN="${TLS_EXTRA_SAN:-}"
-TLS_KEY_BITS="${TLS_KEY_BITS:-4096}"
-# Loopback ports the applications move to once nginx owns the public ones.
-OPENWEBUI_INTERNAL_PORT="${OPENWEBUI_INTERNAL_PORT:-8088}"
-ROUTER_INTERNAL_PORT="${ROUTER_INTERNAL_PORT:-8010}"
-
-# Resolve where each application actually binds, and what a browser will see.
-# With TLS off, everything stays exactly where it was — this whole feature is
-# then a no-op, which is what makes TLS_ENABLED=false a safe escape hatch.
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  OPENWEBUI_BIND_HOST="127.0.0.1"; OPENWEBUI_BIND_PORT="$OPENWEBUI_INTERNAL_PORT"
-  ROUTER_BIND_HOST="127.0.0.1";    ROUTER_BIND_PORT="$ROUTER_INTERNAL_PORT"
-  URL_SCHEME="https"
-else
-  OPENWEBUI_BIND_HOST="0.0.0.0";   OPENWEBUI_BIND_PORT="$OPENWEBUI_PORT"
-  ROUTER_BIND_HOST="0.0.0.0";      ROUTER_BIND_PORT="8000"
-  URL_SCHEME="http"
-fi
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-ant-hp-nfs-backups}"
@@ -111,12 +71,11 @@ TEMPLATE_NAME="${TEMPLATE_NAME:-}"
 # Minimum free space wanted on the storage that holds the container template.
 TEMPLATE_MIN_GIB="${TEMPLATE_MIN_GIB:-2}"
 FIREWALL="${FIREWALL:-1}"
+# Bearer token required by the router API (8000). Blank = generate one. Stored
+# only in /app/router/secrets.env; change it later with
+#   manage-model-servers set-api-key [key|--generate|--off]
+ROUTER_API_KEY="${ROUTER_API_KEY:-}"
 API_ALLOW_CIDR="${API_ALLOW_CIDR:-}"  # if FIREWALL=1, allow 8000 from this CIDR
-# ZeroTier is installed near the end of provisioning. Set this to a 16-character
-# network ID to join automatically; leave blank to install ZeroTier only.
-ZEROTIER_NETWORK_ID="${ZEROTIER_NETWORK_ID:-}"
-# Proxmox LXC config directory. Exposed for tests; production uses /etc/pve/lxc.
-LXC_CONF_DIR="${LXC_CONF_DIR:-/etc/pve/lxc}"
 # --- Ollama model servers ---------------------------------------------------
 # Everything here is only a DEFAULT offered at the prompts; set any of these in
 # the environment to pre-fill (or, with NONINTERACTIVE=true, to skip) a prompt.
@@ -164,37 +123,7 @@ TIER_XLARGE_IDX=""
 # Gitea runs as a TurnKey appliance behind nginx on 443/80 — Gitea's own port
 # 3000 is bound to localhost inside that container and is NOT reachable from
 # outside, so the URL is the plain hostname with no port.
-# Container privilege level. 0 = PRIVILEGED (container root is real host root),
-# 1 = unprivileged (root is mapped to an unused high host UID).
-#
-# Privileged is the default here because it is what device passthrough, bind
-# mounts of host paths and NFS shares need — an unprivileged container's UID
-# shift makes those awkward or impossible. The cost is real: a privileged
-# container is NOT a security boundary against a determined root process inside
-# it. Everything else in this system still applies least privilege (services run
-# as a non-login account, systemd hardening, loopback-only internals), but the
-# container itself no longer adds a layer. Set CT_UNPRIVILEGED=1 to go back.
-CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-0}"
-# Container features, passed to `pct create -features`.
-#
-# nesting=1 permits nested user namespaces inside the container and selects a
-# more permissive AppArmor profile on the host. It is what lets you run
-# Docker/Podman in here, and it is USUALLY what lets systemd's per-unit
-# sandboxing (ProtectSystem=, PrivateTmp=, ProtectHome=) build its mount
-# namespaces -- every unit this installer writes asks for those.
-#
-# "Usually" is doing real work in that sentence. Whether the mount namespace is
-# permitted also depends on the privilege level and the host kernel, and when it
-# is refused the units do not degrade, they fail to start at all with
-# status=226/NAMESPACE. So the installer does not take this on faith: it runs a
-# transient probe unit inside the finished container and rewrites the generated
-# units if the answer is no. See apply_sandbox_policy.
-#
-# Extend the string rather than adding another flag to create_args; it is
-# comma separated, e.g. "nesting=1,keyctl=1". Setting CT_FEATURES="" omits
-# -features entirely.
-CT_FEATURES="${CT_FEATURES:-nesting=1}"
-GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.test.com}"
+GITEA_SERVER_URL="${GITEA_SERVER_URL:-https://git.bancs.net}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
 GITEA_REPO_NAME="${GITEA_REPO_NAME:-ollama-smart-router}"
@@ -209,10 +138,35 @@ GITEA_REPO_PRIVATE="${GITEA_REPO_PRIVATE:-true}"
 # there (not here) if you have installed the appliance's CA or a real
 # certificate and want verification enforced.
 GITEA_VERIFY_TLS="${GITEA_VERIFY_TLS:-false}"
-# Where the local config tree lives inside the container. It may be initialized
-# as a git repository for history, but provisioning never clones or pulls from
-# Gitea.
+# Where the config repo is cloned inside the container. Config is pulled ONCE,
+# at provisioning time — services never depend on Gitea being up to start.
 CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-/app/config-repo}"
+# Auto-seed policy: push generated defaults only for files the repo does not
+# already have, so committed edits always win. Set to "false" to require a
+# pre-populated repo instead.
+CONFIG_SEED_IF_MISSING="${CONFIG_SEED_IF_MISSING:-true}"
+# Installer-OWNED code is different: it is not yours to tune, and a repo left
+# holding an old copy silently runs old code forever (router.py, units and the
+# management tool drifted exactly this way). With CONFIG_UPDATE_CODE=true these
+# paths are updated in the repo whenever the installer's copy differs; git
+# history keeps the previous version. Tunables (router.ini, monitor.ini), env
+# files and litellm_config.yaml stay seed-if-missing. Keep this list in step
+# with tools/sync-embedded.py (tests/test-repo.sh checks it).
+CONFIG_UPDATE_CODE="${CONFIG_UPDATE_CODE:-true}"
+INSTALLER_OWNED_CODE=(
+  services/ollama-router/router.py
+  services/ollama-router/requirements.txt
+  services/ollama-router/ollama-router.service
+  services/ollama-monitor/monitor.py
+  services/ollama-monitor/requirements.txt
+  services/ollama-monitor/ollama-monitor.service
+  services/litellm-proxy/requirements.txt
+  services/litellm-proxy/requirements.lock
+  services/litellm-proxy/litellm-proxy.service
+  services/open-webui/open-webui.service
+  install/apply-config.sh
+  install/manage-model-servers.sh
+)
 # Repo owner: discovered from the deploy token at runtime; this is the fallback.
 GITEA_OWNER="${GITEA_ADMIN_USER}"
 MATTERMOST_WEBHOOK_URL="${MATTERMOST_WEBHOOK_URL:-}"
@@ -221,6 +175,60 @@ MATTERMOST_CHANNEL="${MATTERMOST_CHANNEL:-ollama-monitor}"
 # Verification is ON by default. An internal Mattermost behind a self-signed
 # certificate needs this false, or every alert fails as a transport error.
 MATTERMOST_VERIFY_TLS="${MATTERMOST_VERIFY_TLS:-true}"
+
+# --- small helpers -------------------------------------------------------------
+# router_settings for litellm_config.yaml. Input on stdin: one line per tier
+# that has deployments, in size order: "<model_name> <signature>". Each tier
+# falls back to the nearest other tiers (smaller first on a tie), skipping a
+# tier with identical deployments -- the same model on the same host cannot
+# succeed where the original just failed. Same rule as manage-model-servers.
+litellm_router_settings() {
+  python3 -c '
+import json, sys
+tiers = []
+for line in sys.stdin.read().splitlines():
+    if line.strip():
+        name, _, sig = line.partition(" ")
+        tiers.append((name, sig))
+print("router_settings:")
+print("  routing_strategy: latency-based-routing")
+print("  num_retries: 2")
+print("  timeout: 600")
+rows = []
+for i, (name, sig) in enumerate(tiers):
+    others = [(abs(i - j), j, o) for j, (o, osig) in enumerate(tiers) if o != name and osig != sig]
+    if others:
+        rows.append("    - %s: %s" % (name, json.dumps([o for _, _, o in sorted(others)])))
+if rows:
+    print("  fallbacks:")
+    print("\n".join(rows))
+'
+}
+
+generate_api_key() {
+  printf 'sk-router-%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+}
+
+# Append one rule line to a PVE firewall file unless it is already there, and
+# make sure it lands in a [RULES] section. Re-running the installer therefore
+# never duplicates rules.
+ensure_fw_rule() {
+  local file="$1" rule="$2"
+  grep -qxF -- "$rule" "$file" 2>/dev/null && return 0
+  grep -qx '\[RULES\]' "$file" 2>/dev/null || printf '\n[RULES]\n' >> "$file"
+  printf '%s\n' "$rule" >> "$file"
+}
+
+# Write the CT firewall rules: SSH, the router API and Open WebUI from the
+# trusted CIDR. SSH is included because enabling the CT firewall switches the
+# default inbound policy to DROP -- without it the container locks you out.
+write_firewall_rules() {
+  local file="$1" cidr="$2" webui_port="$3" port
+  [[ -f "$file" ]] || printf '[OPTIONS]\nenable: 1\n\n[RULES]\n' > "$file"
+  for port in 22 8000 "$webui_port"; do
+    ensure_fw_rule "$file" "IN ACCEPT -source ${cidr} -p tcp -dport ${port} -log nolog"
+  done
+}
 
 # --- cleanup on failure -------------------------------------------------------
 CT_CREATED=""
@@ -647,9 +655,6 @@ valid_optional_url() {   # blank is allowed (feature simply stays off)
 valid_optional_ipv4() {
   [[ -z "$1" ]] || valid_ipv4 "$1"
 }
-valid_optional_zerotier_network_id() {
-  [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f]{16}$ ]]
-}
 valid_nonempty() {
   [[ -n "$1" ]]
 }
@@ -672,6 +677,9 @@ valid_keep_alive() {
 valid_ollama_addr() {
   local raw="$1" port
   [[ -n "$raw" ]] || return 1
+  # An LM Studio server: lmstudio://host[:port] or lmstudio+http(s)://...
+  raw="${raw#lmstudio+}"
+  [[ "$raw" == lmstudio://* ]] && raw="${raw#lmstudio://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     valid_http_url "$raw"; return $?
   fi
@@ -684,14 +692,22 @@ valid_ollama_addr() {
   valid_hostname_or_ip "$raw"
 }
 # Normalise any accepted form to a base URL with an explicit port.
+# Stored form: http://host:port for Ollama, lmstudio+http://host:port for an
+# LM Studio server (default port 1234), the same convention as
+# manage-model-servers, router.py and monitor.py.
 normalize_ollama_url() {
-  local raw="${1%/}"
+  local raw="${1%/}" prefix="" port="$OLLAMA_PORT"
+  if [[ "$raw" == lmstudio+* ]]; then
+    prefix="lmstudio+"; raw="${raw#lmstudio+}"; port="${LMSTUDIO_PORT:-1234}"
+  elif [[ "$raw" == lmstudio://* ]]; then
+    prefix="lmstudio+"; raw="${raw#lmstudio://}"; port="${LMSTUDIO_PORT:-1234}"
+  fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
-    printf '%s\n' "$raw"
+    printf '%s%s\n' "$prefix" "$raw"
   elif [[ "$raw" == *:* ]]; then
-    printf 'http://%s\n' "$raw"
+    printf '%shttp://%s\n' "$prefix" "$raw"
   else
-    printf 'http://%s:%s\n' "$raw" "$OLLAMA_PORT"
+    printf '%shttp://%s:%s\n' "$prefix" "$raw" "$port"
   fi
 }
 # Comma-separated 1-based server numbers, each within range.
@@ -753,63 +769,23 @@ prompt_network_config() {
                                                  NAMESERVER "$NAMESERVER" valid_optional_ipv4
   # A gateway outside the router's subnet is almost always a typo, and the
   # container would come up with no route off-link.
-  # Three outcomes, reported as three different things. Collapsing "could not
-  # determine" into either of the others is what made this check untrustworthy:
-  # one way it stayed silent about a real typo, the other it accused a correct
-  # gateway of being wrong.
-  ip_in_same_subnet "$IP_CIDR" "$GATEWAY"
-  case $? in
-    1)
-      echo "WARNING: gateway ${GATEWAY} is outside ${IP_CIDR}." >&2
-      echo "         The container will have no working default route." >&2
-      ;;
-    2)
-      echo "NOTE: could not check whether ${GATEWAY} is inside ${IP_CIDR}" >&2
-      echo "      (python3 unavailable, or the values did not parse). Verify" >&2
-      echo "      the gateway by hand — this check was skipped, not passed." >&2
-      ;;
-  esac
-}
-
-prompt_zerotier_config() {
-  echo
-  echo "--- ZeroTier (optional) ---"
-  prompt_until_valid "ZeroTier network ID (blank = install only)" \
-    ZEROTIER_NETWORK_ID "$ZEROTIER_NETWORK_ID" valid_optional_zerotier_network_id
+  if ! ip_in_same_subnet "$IP_CIDR" "$GATEWAY"; then
+    echo "WARNING: gateway ${GATEWAY} is outside ${IP_CIDR}." >&2
+    echo "         The container will have no working default route." >&2
+  fi
 }
 
 # True when $2 (an IPv4) falls inside the network described by $1 (addr/prefix).
-# Is $2 (an IPv4) inside the network described by $1 (addr/prefix)?
-#
-# THREE outcomes, not two:
-#   0 = yes, definitely inside
-#   1 = no, definitely outside
-#   2 = could not determine
-#
-# The two-state version was fail-OPEN: `except Exception: sys.exit(0)` turned
-# every unparseable input -- and every future bug in this snippet -- into
-# "looks fine", with `2>/dev/null` guaranteeing nobody could ever see that the
-# check had stopped checking. `192.168.11.10/99` and `notanip` both returned
-# "fine" when measured.
-#
-# The opposite error was live too: with no python3 on the host the command
-# exits 127, which the caller read as "definitely outside" and reported as a
-# confident, wrong claim about the operator's gateway. A check that cannot run
-# has to say so rather than pick a side.
 ip_in_same_subnet() {
-  local cidr="$1" gw="$2" rc
+  local cidr="$1" gw="$2"
   python3 - "$cidr" "$gw" <<'PY' 2>/dev/null
 import ipaddress, sys
 try:
     net = ipaddress.ip_interface(sys.argv[1]).network
     sys.exit(0 if ipaddress.ip_address(sys.argv[2]) in net else 1)
 except Exception:
-    sys.exit(2)   # undetermined -- say so, never "fine"
+    sys.exit(0)   # unparseable: don't second-guess, the field validators ran
 PY
-  rc=$?
-  # 127 (no python3), 126, a signal: all "could not determine", not "outside".
-  (( rc == 0 || rc == 1 )) || rc=2
-  return "$rc"
 }
 
 prompt_storage_config() {
@@ -960,10 +936,10 @@ prompt_model_servers() {
     # suggesting the previous server's address would let a stray Enter create a
     # duplicate deployment, which silently double-weights that host.
     if [[ -n "$default_addr" ]]; then
-      prompt_until_valid "  Server ${i} (IP, host:port or URL)" raw "$default_addr" valid_ollama_addr
+      prompt_until_valid "  Server ${i} (IP, host:port, URL, or lmstudio://host for LM Studio)" raw "$default_addr" valid_ollama_addr
     else
       while true; do
-        read -r -p "  Server ${i} (IP, host:port or URL): " raw
+        read -r -p "  Server ${i} (IP, host:port, URL, or lmstudio://host for LM Studio): " raw
         valid_ollama_addr "$raw" && break
         echo "    Not a valid address — try again." >&2
       done
@@ -1042,9 +1018,9 @@ prompt_model_servers() {
 # Prompt for the Gitea username and auth token, validating the pair against the
 # server before provisioning starts — a bad token discovered here costs seconds,
 # whereas discovering it after the container is built costs the whole run.
-# Leaving the token blank still installs the generated config locally, just
-# without Gitea history.
-CONFIG_SOURCE="gitea"
+# Leaving the token blank falls back to installing the generated config locally
+# (CONFIG_SOURCE=local), which keeps provisioning working without Gitea.
+CONFIG_SOURCE="repo"
 prompt_gitea_credentials() {
   local attempt=0 max_attempts=3 login=""
   echo
@@ -1056,8 +1032,8 @@ prompt_gitea_credentials() {
 
   # The TurnKey Gitea appliance ships a self-signed certificate, so certificate
   # verification is turned off for every Gitea call. Set here — before
-  # init_gitea_curl_opts — so the credential check, repo resolution and history
-  # push all use the same setting.
+  # init_gitea_curl_opts — so the credential check, the repo resolution, the
+  # seeding API calls and the container's `git clone` all use the same setting.
   # Trade-off: the deploy token is sent over a connection whose certificate is
   # not authenticated. Install the appliance's CA (or a real certificate) and
   # change this to "true" if that path isn't a network you trust.
@@ -1071,7 +1047,7 @@ prompt_gitea_credentials() {
     fi
     if [[ -z "$GITEA_DEPLOY_TOKEN" ]]; then
       echo "No token supplied — configuration will be installed directly and NOT" >&2
-      echo "mirrored to Gitea history. Re-run with a token to enable history." >&2
+      echo "version controlled. Re-run with a token to use the Gitea repo." >&2
       CONFIG_SOURCE="local"
       return 0
     fi
@@ -1106,521 +1082,26 @@ push_local_config_tree() {
   tar -C "$tree" -czf "$tarball" .
   pct push "$CT_ID" "$tarball" /tmp/config-tree.tar.gz --perms 0600
   rm -f "$tarball"
-  # The script body is SINGLE-quoted, so the host expands nothing into it, and
-  # the path arrives as an argument the inner shell never re-parses.
-  #
-  # It used to be interpolated as '${CONFIG_REPO_DIR}' inside a double-quoted
-  # string: single quotes written into the script TEXT, which a value containing
-  # a single quote closes -- everything after it then runs as root inside the
-  # container, two lines above `rm -rf`. This file's own header claims values
-  # are "never re-parsed by an inner shell -- no quoting escape hatch"; that was
-  # true of the secrets and untrue right here. Arguments cannot be quoted wrong.
-  run_ct bash -c '
+  run_ct bash -c "
     set -e
-    repo="$1"
-    rm -rf "$repo"
-    mkdir -p "$repo"
-    tar -xzf /tmp/config-tree.tar.gz -C "$repo"
+    rm -rf '${CONFIG_REPO_DIR}'
+    mkdir -p '${CONFIG_REPO_DIR}'
+    tar -xzf /tmp/config-tree.tar.gz -C '${CONFIG_REPO_DIR}'
     rm -f /tmp/config-tree.tar.gz
-    chown -R root:root "$repo"
-    chmod -R go-rwx "$repo"
-  ' push_local_config_tree "$CONFIG_REPO_DIR"
+    chown -R root:root '${CONFIG_REPO_DIR}'
+    chmod -R go-rwx '${CONFIG_REPO_DIR}'
+  "
 }
 
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
-
-# Expose the host's /dev/net/tun inside the container so ZeroTier can create its
-# overlay interface.
-#
-# This MUST run between `pct create` and `pct start` -- LXC reads the config once,
-# at container start, so a mount entry added to a running container does nothing
-# until it is restarted. That is why `-start 1` was removed from create_args.
-#
-# Returns non-zero if the config file could not be written. The caller must not
-# let that abort the run: see the TUN_OK call site.
-configure_lxc_tun_device() {
-  local conf="${LXC_CONF_DIR}/${CT_ID}.conf"
-  local allow_line="lxc.cgroup2.devices.allow: c 10:200 rwm"
-  local mount_line="lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file"
-
-  if [[ ! -c /dev/net/tun ]] && command -v modprobe >/dev/null 2>&1; then
-    modprobe tun >/dev/null 2>&1 || true
-  fi
-  if [[ ! -c /dev/net/tun ]]; then
-    echo "WARNING: host /dev/net/tun is not available." >&2
-    echo "         The LXC config will still be written, but ZeroTier overlay" >&2
-    echo "         traffic needs the host TUN device to exist." >&2
-  fi
-  if [[ ! -f "$conf" ]]; then
-    echo "WARNING: cannot find ${conf}; /dev/net/tun was not added." >&2
-    return 1
-  fi
-
-  grep -qxF "$allow_line" "$conf" || printf '%s\n' "$allow_line" >> "$conf"
-  grep -qxF "$mount_line" "$conf" || printf '%s\n' "$mount_line" >> "$conf"
-  echo "  /dev/net/tun will be exposed inside the container."
-}
-
-# Run a command inside the container and capture ONE line of its output, with
-# carriage returns removed.
-#
-# This is not defensive tidying. `pct exec` goes through lxc-attach, which
-# allocates a pty when the host's stdout is a terminal -- i.e. every interactive
-# run of this installer. The pty's ONLCR turns each \n into \r\n. Command
-# substitution strips the trailing newline but NOT the \r, so
-#     state="$(run_ct systemctl is-active open-webui.service)"
-# yields "active\r", which PRINTS as "active" and COMPARES equal to nothing.
-# The symptom is a script that lists a unit as active and then declares it
-# failed in the next breath, which is exactly what happened. Three call sites
-# below already stripped \r ad hoc; routing every captured value through one
-# helper is what stops the next one forgetting.
-ct_out() {
-  run_ct "$@" 2>/dev/null | tr -d '\r' | awk 'NF {print; exit}'
-}
-
-# --- systemd sandboxing: measure, do not assume ---------------------------------
-#
-# ProtectSystem=, ProtectHome= and PrivateTmp= are not flags on a process, they
-# are a private MOUNT NAMESPACE that systemd builds before exec. Whether a
-# container is allowed to build one is decided by the AppArmor profile the
-# Proxmox host applies, which depends on the container's `features` (nesting)
-# and its privilege level, and on the host kernel.
-#
-# When it is not allowed the failure is total, not graceful:
-#     open-webui.service: Failed to set up mount namespacing: Permission denied
-#     open-webui.service: Failed at step NAMESPACE spawning ...: Permission denied
-#     open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
-# systemd never runs the binary, Restart=always spins forever, nothing binds the
-# upstream port, and the only thing an operator sees is nginx returning
-# 502 Bad Gateway. An earlier revision of this file asserted in its comments that
-# nesting=1 makes the hardening "genuinely in force"; a real install disproved
-# that, so the assertion has been replaced by a measurement.
-#
-# Two probes, because "the sandbox was refused" and "the probe itself did not
-# work" call for opposite decisions:
-#   plain fails                -> we learned nothing; keep the hardening
-#   plain ok, sandboxed fails  -> namespacing is genuinely denied; strip it
-#   both ok                    -> keep the hardening, it is real
-# Prints one of: ok | denied | unknown
-SANDBOX_DEGRADED=false
-ct_namespacing_verdict() {
-  # --collect removes the transient unit afterwards even when it failed, so a
-  # rerun of the installer does not trip over a leftover name.
-  if ! run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-plain \
-       /bin/true >/dev/null 2>&1; then
-    echo "unknown"
-    return 0
-  fi
-  if run_ct systemd-run --quiet --wait --collect --unit=osr-ns-probe-sandbox \
-       -p PrivateTmp=yes -p ProtectSystem=full -p ProtectHome=yes \
-       /bin/true >/dev/null 2>&1; then
-    echo "ok"
-  else
-    echo "denied"
-  fi
-}
-
-# Remove the three mount-namespace directives from one unit file, leaving a
-# comment where they were. NoNewPrivileges= deliberately stays: it is a prctl
-# flag, not a mount, and it works in every container.
-strip_unit_namespacing() {
-  local unit="$1" tmp="${1}.tmp"
-  # Nothing to remove means nothing to say: without this guard a second pass
-  # would append the explanatory comment again on every run.
-  grep -qE '^(PrivateTmp|ProtectSystem|ProtectHome)=' "$unit" || return 0
-  awk '
-    /^(PrivateTmp|ProtectSystem|ProtectHome)=/ { next }
-    /^NoNewPrivileges=/ {
-      print
-      print "# PrivateTmp=, ProtectSystem= and ProtectHome= were removed by the"
-      print "# installer: this container denies systemd the mount namespacing they"
-      print "# are built from, so a unit that asks for them does not start AT ALL"
-      print "# (status=226/NAMESPACE) -- it does not merely run unhardened."
-      print "# NoNewPrivileges= is a process flag rather than a mount, so it stays."
-      print "# To get the hardening back, give the container nesting=1 (or make it"
-      print "# unprivileged) and re-run the installer; it re-tests on every install."
-      next
-    }
-    { print }
-  ' "$unit" > "$tmp" && mv "$tmp" "$unit"
-}
-
-# Decide the sandboxing policy for the generated units and rewrite them if the
-# container cannot honour it. Must run AFTER the units are written and BEFORE
-# they are shipped into the container.
-apply_sandbox_policy() {
-  local repo="$1" verdict unit count=0
-  echo "Testing whether systemd can build mount namespaces in this container."
-  verdict="$(ct_namespacing_verdict)"
-  case "$verdict" in
-    ok)
-      echo "  it can — per-unit sandboxing (PrivateTmp/ProtectSystem/ProtectHome)"
-      echo "  stays enabled on all four services."
-      return 0
-      ;;
-    unknown)
-      echo "WARNING: could not test mount namespacing — no transient unit would" >&2
-      echo "         run at all. Leaving the sandboxing directives in place; if" >&2
-      echo "         the services then fail with status=226/NAMESPACE, run" >&2
-      echo "         fix-service-namespacing.sh against this container." >&2
-      return 0
-      ;;
-  esac
-
-  SANDBOX_DEGRADED=true
-  echo "WARNING: this container refuses systemd's mount namespacing." >&2
-  echo "         PrivateTmp=, ProtectSystem= and ProtectHome= are implemented as" >&2
-  echo "         mount namespaces, and a unit asking for one here does not start" >&2
-  echo "         at all (status=226/NAMESPACE) — it crash-loops, nothing binds" >&2
-  echo "         the upstream ports, and nginx answers 502 Bad Gateway." >&2
-  echo "         Removing those three directives from the generated units so the" >&2
-  echo "         services can run. The services keep every other restriction:" >&2
-  echo "         non-login system account, NoNewPrivileges, loopback-only binds." >&2
-  echo "         To restore them: give the container 'nesting=1' (pct set ${CT_ID}" >&2
-  echo "         -features nesting=1), reboot it, and re-run the installer." >&2
-  for unit in "$repo"/services/*/*.service; do
-    [[ -f "$unit" ]] || continue
-    strip_unit_namespacing "$unit"
-    count=$(( count + 1 ))
-  done
-  echo "         Rewrote ${count} unit file(s)." >&2
-  return 0
-}
-
-# --- TLS certificate ----------------------------------------------------------
-# Build the subjectAltName list. A self-signed certificate with no SAN is
-# rejected outright by every current browser -- CN alone has not been accepted
-# since Chrome 58 -- so this is not decoration. IP addresses have to go in as
-# IP: entries, not DNS:, or connecting by address still fails.
-tls_san_list() {
-  local ip="$1" host="$2" extra="${3:-}" entry
-  local -a names=() ips=() out=()
-
-  # NOTE: no `local IFS=,` here. An earlier version set it to split $extra and
-  # left it set, so the `${out[*]}` dedup check below joined with commas instead
-  # of spaces and every duplicate slipped through. Splitting is done with tr and
-  # a read loop instead, which cannot leak into the rest of the function.
-  [[ -n "$host" ]] && names+=("$host")
-  names+=("localhost")
-  [[ -n "$ip" ]] && ips+=("$ip")
-  ips+=("127.0.0.1")
-
-  # An operator-supplied name may be either kind; sort it by shape rather than
-  # asking, since getting this wrong stays silent until a client refuses to
-  # connect.
-  # `|| [[ -n "$entry" ]]` is load-bearing: tr leaves no newline after the last
-  # field, and a bare `read` returns non-zero on it and drops it. Without this
-  # the LAST name in TLS_EXTRA_SAN silently never reaches the certificate --
-  # and a single-entry list is entirely last, so it did nothing at all.
-  while IFS= read -r entry || [[ -n "$entry" ]]; do
-    entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
-    [[ -n "$entry" ]] || continue
-    if [[ "$entry" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then ips+=("$entry")
-    else names+=("$entry"); fi
-  done < <(printf '%s' "$extra" | tr ',' '\n')
-
-  # Deduplicate, keeping order: the first DNS entry is what most tools display,
-  # and that should be the name the operator actually types.
-  local candidate seen
-  for candidate in "${names[@]/#/DNS:}" "${ips[@]/#/IP:}"; do
-    seen=false
-    for entry in ${out[@]+"${out[@]}"}; do
-      [[ "$entry" == "$candidate" ]] && { seen=true; break; }
-    done
-    $seen || out+=("$candidate")
-  done
-  (IFS=,; printf '%s' "${out[*]}")
-}
-
-# Generate the key and certificate INSIDE the container, so the private key is
-# never written to the Proxmox host's filesystem or passed on a command line.
-generate_tls_cert() {
-  local ip="$1" host="$2" san
-  san="$(tls_san_list "$ip" "$host" "$TLS_EXTRA_SAN")"
-  echo "Generating a self-signed certificate (${TLS_CERT_DAYS} days)."
-  echo "  subjectAltName: ${san}"
-  run_ct install -d -m 0750 -o root -g ollama-router "$TLS_DIR"
-  # -nodes: no passphrase, because nginx must start unattended at boot.
-  # -addext subjectAltName: one shot, no openssl.cnf to template.
-  if ! run_ct openssl req -x509 -newkey "rsa:${TLS_KEY_BITS}" -sha256 \
-        -days "$TLS_CERT_DAYS" -nodes \
-        -keyout "${TLS_DIR}/server.key" -out "${TLS_DIR}/server.crt" \
-        -subj "/CN=${host:-ollama-smart-router}/O=ollama-smart-router" \
-        -addext "subjectAltName=${san}" \
-        -addext "basicConstraints=critical,CA:FALSE" \
-        -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-        -addext "extendedKeyUsage=serverAuth"; then
-    echo "ERROR: could not generate the TLS certificate." >&2
-    return 1
-  fi
-  # nginx reads both as root before dropping privileges, so the key never needs
-  # to be group- or world-readable.
-  run_ct chmod 0600 "${TLS_DIR}/server.key"
-  run_ct chmod 0644 "${TLS_DIR}/server.crt"
-  run_ct chown root:root "${TLS_DIR}/server.key" "${TLS_DIR}/server.crt"
-  echo "  ${TLS_DIR}/server.crt"
-  return 0
-}
-
-# --- Open WebUI first-start handling -------------------------------------------
-# Open WebUI's own first run creates its SQLite schema and then runs alembic
-# over it. On this platform that combination fails on a BRAND NEW database:
-#
-#   sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
-#       duplicate column name: info_json
-#   [SQL: ALTER TABLE user ADD COLUMN info_json JSON]
-#
-# The column is already there, the alembic revision that adds it is not
-# stamped, and the process dies. It cannot recover on its own: every later
-# start repeats the same ALTER. The database is worthless at that point --
-# there is no account in it and no data -- so the fix is to discard it and let
-# a second start build it cleanly, which works.
-#
-# This is an upstream bug, not a configuration error, so the installer treats
-# it as an expected condition rather than something the operator has to know
-# about. It is bounded: one reset, one retry, and the evidence is printed.
-OPENWEBUI_OK=true
-OPENWEBUI_RESET=false
-TLS_OK=true
-TUN_OK=true
-ZEROTIER_OK=true
-ZEROTIER_NODE_ID=""
-ZEROTIER_NET_STATUS=""
-
-# Does anything inside the container listen on this TCP port?
-ct_port_listening() {
-  local port="$1"
-  run_ct ss -lnt 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {found=1} END {exit !found}'
-}
-
-# Wait up to $2 seconds for $1 to be listening. Returns 1 on timeout, and 2 if
-# the unit gave up first -- waiting out a ten-minute deadline on a service that
-# has already failed helps nobody.
-ct_wait_for_port() {
-  local port="$1" deadline="${2:-600}" unit="${3:-}" waited=0 state
-  while (( waited < deadline )); do
-    if ct_port_listening "$port"; then return 0; fi
-    if [[ -n "$unit" ]]; then
-      state="$(ct_out systemctl is-active "$unit" || true)"
-      case "$state" in
-        active|activating|reloading) ;;
-        *) return 2 ;;
-      esac
-    fi
-    sleep 5
-    waited=$(( waited + 5 ))
-    (( waited % 60 == 0 )) && echo "  still starting (${waited}s)..."
-  done
-  return 1
-}
-
-# Is the failure the known first-run migration bug, rather than something else?
-openwebui_migration_broken() {
-  run_ct journalctl -u open-webui -n 200 --no-pager 2>/dev/null \
-    | grep -qE "duplicate column name|already exists|OperationalError"
-}
-
-# Throw away a database that has never held anything, keeping a copy.
-openwebui_reset_db() {
-  local stamp
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  run_ct systemctl stop open-webui.service >/dev/null 2>&1 || true
-  # Belt and braces: only ever reset a database with no accounts in it. A
-  # populated one means this is not a fresh install and discarding it would
-  # destroy real data.
-  if run_ct test -f /app/openwebui/data/webui.db; then
-    local users
-    users="$(run_ct /app/openwebui/venv/bin/python -c \
-      "import sqlite3;print(sqlite3.connect('/app/openwebui/data/webui.db').execute('SELECT count(*) FROM user').fetchone()[0])" \
-      2>/dev/null | tr -d '\r')"
-    if [[ -n "$users" && "$users" != "0" ]]; then
-      echo "WARNING: ${users} account(s) in webui.db — refusing to reset it." >&2
-      return 1
-    fi
-    run_ct bash -c "for f in /app/openwebui/data/webui.db /app/openwebui/data/webui.db-wal /app/openwebui/data/webui.db-shm; do [ -e \"\$f\" ] && mv \"\$f\" \"\${f}.broken-${stamp}\"; done; true"
-    echo "  reset the half-migrated database (kept as *.broken-${stamp})"
-  fi
-  return 0
-}
-
-# A listening socket is not a working endpoint. `openssl s_client` completes a
-# real handshake and reports the certificate, which is the only check that
-# distinguishes "nginx is up" from "nginx is up and serving the cert we made".
-ct_tls_ok() {
-  local port="$1"
-  run_ct bash -c "printf 'HEAD / HTTP/1.0\r\n\r\n' | timeout 10 openssl s_client -quiet -verify_quiet \
-      -connect 127.0.0.1:${port} -servername localhost >/dev/null 2>&1"
-}
-
-verify_service_executables() {
-  echo "Verifying service executables."
-  # The config tree is built under umask 077 because it contains secrets. Venvs
-  # are runtime code, not secrets; make their traversable/executable bits
-  # explicit so systemd does not fail later with status=203/EXEC.
-  run_ct chmod 0755 /app /app/router /app/openwebui
-  run_ct chmod -R a+rX /app/router/venv /app/openwebui/venv
-
-  # Each check names itself BEFORE it can fail. A bare `set -e` abort here trips
-  # the ERR trap, which destroys the container -- taking with it the only
-  # evidence of which executable the service account could not run. The whole
-  # point of this function is to make that failure legible, so it must not be
-  # the thing that hides it.
-  local ok=true
-  if ! run_ct runuser -u ollama-router -- /app/router/venv/bin/python -c 'import sys' \
-       >/dev/null 2>&1; then
-    echo "FATAL: ollama-router cannot run /app/router/venv/bin/python" >&2
-    ok=false
-  fi
-  if ! run_ct runuser -u ollama-router -- /app/openwebui/venv/bin/python -c 'import sys' \
-       >/dev/null 2>&1; then
-    echo "FATAL: ollama-router cannot run /app/openwebui/venv/bin/python" >&2
-    ok=false
-  fi
-  if ! run_ct runuser -u ollama-router -- test -x /app/openwebui/venv/bin/open-webui; then
-    echo "FATAL: /app/openwebui/venv/bin/open-webui is not executable by ollama-router" >&2
-    ok=false
-  fi
-  if ! $ok; then
-    echo "       systemd reports this as status=203/EXEC, and with TLS on the" >&2
-    echo "       only visible symptom is nginx returning 502 with nothing" >&2
-    echo "       listening behind it. The usual cause is a umask that stripped" >&2
-    echo "       the executable bits while the virtualenv was being built." >&2
-    return 1
-  fi
-  echo "  the service account can run both interpreters."
-}
-
-# Install ZeroTier in the container and, if a network ID was given, request a
-# join. Every step names itself before it can fail, and the function returns
-# non-zero rather than letting `set -e` abort: this runs AFTER the whole system
-# is provisioned, so an unguarded failure here would reach the ERR trap and
-# destroy a working deployment over an optional overlay network.
-install_zerotier() {
-  echo "Installing ZeroTier inside the container."
-  if ! run_ct test -c /dev/net/tun; then
-    echo "WARNING: /dev/net/tun is not visible inside the container." >&2
-    echo "         ZeroTier will install but cannot carry overlay traffic. The" >&2
-    echo "         mount entry is applied at container START, so if it was added" >&2
-    echo "         to a running container, reboot it:  pct reboot ${CT_ID}" >&2
-  fi
-
-  # -fsSL, not -s. With -s alone curl prints nothing AND exits 0 on an HTTP
-  # error, so a 404 or a captive-portal page is piped into a root shell and
-  # executed. -f makes the transfer fail on an error status, -S restores the
-  # error message, -L follows the redirect the installer URL actually issues.
-  # --proto '=https' refuses a plaintext redirect.
-  #
-  # No `sudo`: pct exec is already root inside the container, and requiring it
-  # meant installing a package purely to satisfy this one pipeline.
-  if ! run_ct bash -c 'set -euo pipefail
-    curl -fsSL --proto "=https" --tlsv1.2 https://install.zerotier.com | bash'; then
-    echo "WARNING: the ZeroTier installer did not complete." >&2
-    return 1
-  fi
-  if ! run_ct bash -c 'command -v zerotier-cli >/dev/null'; then
-    echo "WARNING: the ZeroTier installer ran but zerotier-cli is not on PATH." >&2
-    return 1
-  fi
-  # The vendor installer already enables and starts the unit; this is only a
-  # guard for the case where it did not.
-  run_ct systemctl enable --now zerotier-one.service >/dev/null 2>&1 || true
-  # The service needs a moment to generate its identity before the CLI works.
-  if ! run_ct bash -c 'for _ in $(seq 1 30); do
-         zerotier-cli info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'; then
-    echo "WARNING: zerotier-one did not become ready. Check:" >&2
-    echo "         pct exec ${CT_ID} -- journalctl -u zerotier-one -n 50" >&2
-    return 1
-  fi
-
-  # The node address is what you have to authorise in ZeroTier Central. Printing
-  # it here saves going to look for it, and proves the daemon really answered.
-  ZEROTIER_NODE_ID="$(ct_out zerotier-cli info | awk '{print $3}' || true)"
-  [[ -n "$ZEROTIER_NODE_ID" ]] && echo "  ZeroTier node address: ${ZEROTIER_NODE_ID}"
-
-  if [[ -z "$ZEROTIER_NETWORK_ID" ]]; then
-    echo "  installed; no ZEROTIER_NETWORK_ID was given. Join later with:"
-    echo "    pct exec ${CT_ID} -- zerotier-cli join <network-id>"
-    return 0
-  fi
-
-  echo "Requesting a join to ZeroTier network ${ZEROTIER_NETWORK_ID}."
-  if ! run_ct zerotier-cli join "$ZEROTIER_NETWORK_ID"; then
-    echo "WARNING: the join request was rejected." >&2
-    return 1
-  fi
-  # A join is a REQUEST, not membership. Until the member is authorised in
-  # ZeroTier Central the status is REQUESTING_CONFIGURATION or ACCESS_DENIED and
-  # no traffic flows -- reporting "joined" here would be a lie the operator only
-  # discovers when nothing is reachable.
-  # Argument, not interpolation. The id is validated as 16 hex digits so nothing
-  # can go wrong today — but the escaping in the interpolated form was already
-  # dense enough to hide a mistake, and one pattern is easier to keep right than
-  # two. Same rule as push_local_config_tree.
-  ZEROTIER_NET_STATUS="$(ct_out bash -c \
-    'zerotier-cli listnetworks | awk -v n="$1" "\$3 == n {print \$6}"' \
-    install_zerotier "$ZEROTIER_NETWORK_ID" || true)"
-  case "$ZEROTIER_NET_STATUS" in
-    OK) echo "  network ${ZEROTIER_NETWORK_ID}: OK" ;;
-    "") echo "  join requested; status not readable yet." ;;
-    *)  echo "  network ${ZEROTIER_NETWORK_ID}: ${ZEROTIER_NET_STATUS}"
-        echo "  -> authorise node ${ZEROTIER_NODE_ID} in ZeroTier Central; until"
-        echo "     then this member carries no traffic." ;;
-  esac
-  return 0
-}
-
-start_openwebui_verified() {
-  local rc
-  echo "Starting Open WebUI (first start runs migrations and downloads an"
-  echo "embedding model — this takes several minutes)."
-  run_ct systemctl start open-webui.service || true
-  # Wait on the port Open WebUI ITSELF binds, not the public one. With TLS on,
-  # nginx is already listening on the public port, so waiting there would
-  # report success the instant provisioning started.
-  ct_wait_for_port "$OPENWEBUI_BIND_PORT" 600 open-webui.service; rc=$?
-  if (( rc == 0 )); then
-    echo "  Open WebUI is listening on ${OPENWEBUI_BIND_PORT}."
-    return 0
-  fi
-
-  # A port clash is not a migration failure, and resetting the database for it
-  # would destroy data to fix something unrelated. Check for it first.
-  if run_ct journalctl -u open-webui -n 200 --no-pager 2>/dev/null \
-       | grep -qiE "address already in use|error while attempting to bind"; then
-    echo "WARNING: Open WebUI could not bind ${OPENWEBUI_BIND_HOST}:${OPENWEBUI_BIND_PORT}" >&2
-    echo "         — the address is already in use. Something else holds it;" >&2
-    echo "         check with:  pct exec ${CT_ID} -- ss -lntp" >&2
-    return 1
-  fi
-
-  if openwebui_migration_broken; then
-    echo "  Open WebUI failed its first-run database migration (a known upstream"
-    echo "  bug: the schema is created, then alembic re-adds a column that is"
-    echo "  already there). Discarding the empty database and retrying once."
-    openwebui_reset_db || return 1
-    OPENWEBUI_RESET=true
-    run_ct systemctl start open-webui.service || true
-    ct_wait_for_port "$OPENWEBUI_BIND_PORT" 600 open-webui.service; rc=$?
-    if (( rc == 0 )); then
-      echo "  Open WebUI is listening on ${OPENWEBUI_BIND_PORT} after the retry."
-      return 0
-    fi
-  fi
-
-  echo "WARNING: Open WebUI did not come up on port ${OPENWEBUI_BIND_PORT}." >&2
-  echo "         The rest of the system is unaffected — the API on :8000 works" >&2
-  echo "         without it. Last 30 log lines:" >&2
-  run_ct journalctl -u open-webui -n 30 --no-pager 2>/dev/null | sed 's/^/         /' >&2
-  return 1
-}
 
 # Wait until the container's userspace is actually ready (systemd + DNS).
 wait_for_ct_ready() {
   local state
   echo "Waiting for container to become ready."
   for _ in $(seq 1 60); do
-    state="$(ct_out systemctl is-system-running || true)"
+    state="$(run_ct systemctl is-system-running 2>/dev/null || true)"
     # 'running' or 'degraded' both mean userspace is up enough to proceed.
     if [[ "$state" == "running" || "$state" == "degraded" ]]; then
       # also make sure name resolution works before we hit apt mirrors
@@ -1694,22 +1175,18 @@ ensure_openwebui_python() {
   # cosmetic problems (e.g. it declines to overwrite an unmanaged python3.12
   # shim in ~/.local/bin) even though the interpreter installed fine. Let the
   # `uv python find` below be the arbiter instead of aborting provisioning.
-  # Arguments, not interpolation — OPENWEBUI_PY_DIR and OPENWEBUI_PY_VERSION are
-  # both operator-settable, and '${var}' inside a double-quoted body is a quoting
-  # escape hatch, not quoting. See push_local_config_tree.
-  run_ct bash -c '
+  run_ct bash -c "
     set -e
-    export UV_PYTHON_INSTALL_DIR="$1"
     python3 -m venv /opt/uv-bootstrap
     /opt/uv-bootstrap/bin/pip install --no-cache-dir --quiet --upgrade pip
     /opt/uv-bootstrap/bin/pip install --no-cache-dir --quiet uv
-    /opt/uv-bootstrap/bin/uv python install "$2" || true
-  ' ensure_openwebui_python "$OPENWEBUI_PY_DIR" "$want" >&2
-  interp="$(run_ct bash -c '
-    UV_PYTHON_INSTALL_DIR="$1" \
-      /opt/uv-bootstrap/bin/uv python find "$2" 2>/dev/null
-  ' ensure_openwebui_python "$OPENWEBUI_PY_DIR" "$want" \
-    | tr -d '\r' | awk 'NF {print; exit}')"
+    UV_PYTHON_INSTALL_DIR='${OPENWEBUI_PY_DIR}' \
+      /opt/uv-bootstrap/bin/uv python install '${want}' || true
+  " >&2
+  interp="$(run_ct bash -c "
+    UV_PYTHON_INSTALL_DIR='${OPENWEBUI_PY_DIR}' \
+      /opt/uv-bootstrap/bin/uv python find '${want}' 2>/dev/null
+  " | tr -d '\r' | awk 'NF {print; exit}')"
   if [[ -z "$interp" ]]; then
     echo "Failed to provision a Python ${want} interpreter for Open WebUI." >&2
     echo "Set OPENWEBUI_PY_VERSION, or install a 3.11/3.12 interpreter manually." >&2
@@ -1796,70 +1273,156 @@ gitea_api() {
   fi
 }
 
-# Initialize the generated local config as a git repository and push it as
-# deployment history. This deliberately does not clone, pull or fetch from Gitea:
-# the installer-generated files remain the only provisioning input.
-init_config_repo_history() {
-  local token="$1" branch="${2:-}" host cred_tmp scheme sslverify remote
+is_installer_owned() {
+  local want="$1" path
+  for path in "${INSTALLER_OWNED_CODE[@]}"; do [[ "$path" == "$want" ]] && return 0; done
+  return 1
+}
+
+# Given a Gitea contents-API JSON body on stdin and a local file, print the
+# blob sha when the remote content DIFFERS from the file; print nothing when
+# they are identical (or the body is unparseable).
+gitea_sha_if_changed() {
+  python3 -c '
+import base64, json, sys
+try:
+    meta = json.load(sys.stdin)
+    remote = base64.b64decode(meta.get("content") or "")
+except Exception:
+    sys.exit(0)
+with open(sys.argv[1], "rb") as fh:
+    local = fh.read()
+if remote != local and meta.get("sha"):
+    print(meta["sha"])
+' "$1"
+}
+
+# Push the generated tree to the repo via the Gitea contents API.
+#   * a file the repo lacks is created (anything you committed by hand wins);
+#   * an INSTALLER-OWNED code file that differs is updated in place, when
+#     CONFIG_UPDATE_CODE=true, so a re-install never leaves stale code behind.
+# $2 is the deploy token.
+seed_gitea_repo() {
+  local tree="$1" token="$2"
+  local base api auth owner resp http body sha rel content_b64 payload
+  local created=0 skipped=0 updated=0
   if [[ -z "$token" ]]; then
-    echo "No Gitea token; skipping deployment history push." >&2
+    echo "No Gitea token; skipping repo seeding (using local config only)." >&2
     return 1
   fi
+  if [[ "$CONFIG_SEED_IF_MISSING" != "true" ]]; then
+    echo "CONFIG_SEED_IF_MISSING=false; not writing to the repository." >&2
+    return 0
+  fi
+  base="${GITEA_SERVER_URL%/}"; api="${base}/api/v1"
+  auth="Authorization: token ${token}"
+  owner="$GITEA_OWNER"
 
-  branch="${branch:-deployment-${CT_ID}-$(date -u +%Y%m%dT%H%M%SZ)}"
-  remote="${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}.git"
+  # Walk the generated tree deterministically.
+  while IFS= read -r rel; do
+    resp="$(gitea_api GET "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}")"
+    http="${resp##*$'\n'}"
+    content_b64="$(base64 -w0 < "${tree}/${rel}")"
+    if [[ "$http" == "200" ]]; then
+      sha=""
+      if [[ "$CONFIG_UPDATE_CODE" == "true" ]] && is_installer_owned "$rel"; then
+        body="${resp%$'\n'*}"
+        sha="$(printf '%s' "$body" | gitea_sha_if_changed "${tree}/${rel}")"
+      fi
+      if [[ -z "$sha" ]]; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+      payload="$(python3 -c '
+import json,sys
+print(json.dumps({"message": "Update %s from installer" % sys.argv[1],
+                  "content": sys.argv[2], "sha": sys.argv[3]}))' "$rel" "$content_b64" "$sha")"
+      resp="$(gitea_api PUT "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}" "$payload")"
+      http="${resp##*$'\n'}"
+      if [[ "$http" == "200" ]]; then
+        updated=$((updated + 1))
+        echo "  updated: ${rel}" >&2
+      else
+        echo "  WARNING: failed to update ${rel} (HTTP ${http})" >&2
+      fi
+      continue
+    fi
+    payload="$(python3 -c '
+import json,sys
+print(json.dumps({"message": "Seed %s from installer" % sys.argv[1],
+                  "content": sys.argv[2]}))' "$rel" "$content_b64")"
+    resp="$(gitea_api POST "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}" "$payload")"
+    http="${resp##*$'\n'}"
+    if [[ "$http" == "201" ]]; then
+      created=$((created + 1))
+      echo "  seeded: ${rel}" >&2
+    else
+      echo "  WARNING: failed to seed ${rel} (HTTP ${http})" >&2
+    fi
+  done < <(cd "$tree" && find . -type f -printf '%P\n' | sort)
+
+  echo "Repo seeding complete: ${created} created, ${updated} updated, ${skipped} already present." >&2
+  return 0
+}
+
+# Clone the config repo into the container. The token is written to a file and
+# pushed in (never placed on a command line, where it would show up in `ps` on
+# the Proxmox host), then removed once the clone finishes.
+clone_config_repo() {
+  local token="$1" host cred_tmp
   host="${GITEA_SERVER_URL%/}"
   host="${host#*://}"
-  scheme="${GITEA_SERVER_URL%%://*}"
-  sslverify="true"
-  [[ "$GITEA_VERIFY_TLS" == "true" ]] || sslverify="false"
-
   cred_tmp="$(mktemp)"
-  # git credential store format: <scheme>://user:token@host. The scheme must
-  # match the remote exactly or git will ignore the credential.
+  # git credential store format: <scheme>://user:token@host
+  # The scheme must match the remote exactly — git will not match an https://
+  # credential against an http:// request, and the clone then fails as though
+  # no credential were stored at all.
+  local scheme="${GITEA_SERVER_URL%%://*}"
   printf '%s://%s:%s@%s\n' "$scheme" "$GITEA_OWNER" "$token" "$host" > "$cred_tmp"
   pct push "$CT_ID" "$cred_tmp" /root/.git-credentials --perms 0600
   rm -f "$cred_tmp"
 
-  # Same rule as push_local_config_tree, and it matters more here: `remote` is
-  # built from the Gitea URL, owner and repo name -- all operator input from the
-  # prompts -- and `branch` carries the container id. Interpolating any of them
-  # into shell text puts a quoting bug one apostrophe away from arbitrary root
-  # execution inside the container. The sslVerify line was not even quoted --
-  # a bare expansion pasted straight into the remote script.
-  #
-  # Single-quoted body, values as positional arguments. $0 is a label that shows
-  # up in any error message the inner shell prints.
-  run_ct bash -c '
+  local sslverify="true"
+  [[ "$GITEA_VERIFY_TLS" == "true" ]] || sslverify="false"
+
+  run_ct bash -c "
     set -e
-    repo="$1"; branch="$2"; remote="$3"; sslverify="$4"; ctid="$5"
-    trap "rm -f /root/.git-credentials" EXIT
-    cd "$repo"
-    git -c init.defaultBranch=main init -q
-    git checkout -B "$branch" >/dev/null
-    if git remote get-url origin >/dev/null 2>&1; then
-      git remote set-url origin "$remote"
-    else
-      git remote add origin "$remote"
-    fi
-    git config http.sslVerify "$sslverify"
-    git config user.name "ollama-smart-router"
-    git config user.email "router@localhost"
-    git add -A
-    if git diff --cached --quiet; then
-      git commit --allow-empty -q -m "Record deployment ${ctid}"
-    else
-      git commit -q -m "Record deployment ${ctid}"
-    fi
-    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
-      git -c credential.helper="store --file=/root/.git-credentials" \
-          -c http.sslVerify="$sslverify" \
-          push -u origin "HEAD:${branch}"
-    chown -R root:root "$repo"
-    chmod -R go-rwx "$repo"
-  ' init_config_repo_history \
-    "$CONFIG_REPO_DIR" "$branch" "$remote" "$sslverify" "$CT_ID"
-  echo "Deployment history pushed to ${GITEA_OWNER}/${GITEA_REPO_NAME}:${branch}."
+    rm -rf '${CONFIG_REPO_DIR}'
+    git -c credential.helper='store --file=/root/.git-credentials' \
+        -c http.sslVerify=${sslverify} \
+        clone '${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}.git' \
+        '${CONFIG_REPO_DIR}'
+    # Keep pulls working later without re-supplying credentials interactively,
+    # but drop the stored password file itself.
+    git -C '${CONFIG_REPO_DIR}' config http.sslVerify ${sslverify}
+    rm -f /root/.git-credentials
+    # git clone writes 0644 files. The repo contains env/router.env with real
+    # secrets, so the working tree must not be world-readable — otherwise the
+    # clone would be laxer than the 0640 runtime copy it feeds.
+    chown -R root:root '${CONFIG_REPO_DIR}'
+    chmod -R go-rwx '${CONFIG_REPO_DIR}'
+  "
+}
+
+# Delete the provisioning test file just created. $6 is the create response,
+# which carries the blob sha the contents API needs. Best effort: a failure
+# only leaves the marker behind, so it is reported but never fatal.
+remove_marker_file() {
+  local api="$1" owner="$2" repo="$3" branch="$4" path="$5" created="$6" sha payload resp http
+  sha="$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content",{}).get("sha",""))' 2>/dev/null || true)"
+  if [[ -z "$sha" ]]; then
+    echo "NOTE: could not read the test file's sha; ${path} stays in the repo." >&2
+    return 0
+  fi
+  payload="$(printf '{"message":"Remove provisioning test marker","sha":"%s","branch":"%s"}' "$sha" "$branch")"
+  resp="$(gitea_api DELETE "${api}/repos/${owner}/${repo}/contents/${path}" "$payload")"
+  http="${resp##*$'\n'}"
+  if [[ "$http" == "200" ]]; then
+    echo "Removed the test marker ${path}." >&2
+  else
+    echo "NOTE: could not remove ${path} (HTTP ${http}); delete it by hand if unwanted." >&2
+  fi
+  return 0
 }
 
 # Work out which repository to use, and set GITEA_OWNER to its real owner.
@@ -1934,18 +1497,18 @@ for repo in (data.get("data") or []):
   return 2
 }
 
-# Verify Gitea access by authenticating and ensuring the history repository
-# exists. The actual write check is the deployment-history push after the local
-# generated config has been installed.
+# Verify Gitea access by ensuring this service's repo exists and pushing a test
+# commit through the API. Non-fatal: warns and returns non-zero on failure.
 test_gitea_access() {
-  local token="$1" base api auth owner resp http body payload
+  local token="$1" base api auth owner resp http body branch ts filepath content_b64 payload commit_url
   local repo_name="$GITEA_REPO_NAME"
   if [[ -z "$token" ]]; then
-    echo "No Gitea deploy token provided; skipping Gitea access check." >&2
+    echo "No Gitea deploy token provided; skipping Gitea access/commit test." >&2
     return 0
   fi
   require_command curl
   require_command python3
+  require_command base64
   base="${GITEA_SERVER_URL%/}"
   api="${base}/api/v1"
   auth="Authorization: token ${token}"
@@ -1960,7 +1523,7 @@ test_gitea_access() {
   # 1) Authenticate and discover the token owner.
   owner="$(gitea_probe_user "$token")" || return 1
   [[ -z "$owner" ]] && owner="$GITEA_ADMIN_USER"
-  GITEA_OWNER="$owner"   # used later for the deployment-history remote
+  GITEA_OWNER="$owner"   # used later by seeding and by the container clone
   echo "Authenticated to Gitea as: ${owner}"
 
   # 2) Resolve the repository (reuse it wherever it lives), else create it.
@@ -1992,7 +1555,30 @@ test_gitea_access() {
       ;;
   esac
   echo "Configuration repository: ${GITEA_OWNER}/${repo_name}"
-  return 0
+
+  # 3) Determine the default branch, then push a unique test commit.
+  resp="$(gitea_api GET "${api}/repos/${owner}/${repo_name}")"
+  body="${resp%$'\n'*}"
+  branch="$(printf '%s' "$body" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch") or "main")' 2>/dev/null || true)"
+  [[ -z "$branch" ]] && branch="main"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  filepath="provisioning-tests/${ts}.md"
+  content_b64="$(printf 'Provisioning test commit\nCreated (UTC): %s\nProxmox host: %s\nService: ollama-smart-router\n' \
+    "$ts" "$(hostname)" | base64 -w0)"
+  payload="$(printf '{"message":"Provisioning test commit %s","content":"%s","branch":"%s"}' \
+    "$ts" "$content_b64" "$branch")"
+  resp="$(gitea_api POST "${api}/repos/${owner}/${repo_name}/contents/${filepath}" "$payload")"
+  http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  if [[ "$http" == "201" ]]; then
+    commit_url="$(printf '%s' "$body" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",{}).get("html_url",""))' 2>/dev/null || true)"
+    echo "Gitea test commit succeeded on branch '${branch}': ${commit_url:-${base}/${owner}/${repo_name}}"
+    # The write access is proven; remove the marker again so every
+    # provisioning run does not leave a provisioning-tests/<ts>.md behind.
+    remove_marker_file "$api" "$owner" "$repo_name" "$branch" "$filepath" "$body"
+    return 0
+  fi
+  echo "WARNING: Gitea test commit returned HTTP ${http}: ${body}" >&2
+  return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -2014,7 +1600,6 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 # a typo costs a re-prompt rather than a failed provisioning run. Every prompt
 # offers a default (Enter accepts); NONINTERACTIVE=true takes all defaults.
 prompt_network_config
-prompt_zerotier_config
 prompt_storage_config
 
 # Ask for the Gitea URL, username + auth token and verify them against the
@@ -2025,9 +1610,9 @@ prompt_gitea_credentials
 prompt_mattermost_config
 prompt_model_servers
 
-# Ensure the history repo exists. Non-fatal: on failure we still install the
-# generated configuration locally, without Gitea history.
-if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
+# Ensure the config repo exists and that the token can write to it. Non-fatal:
+# on failure we fall back to installing the configuration locally.
+if [[ "$CONFIG_SOURCE" == "repo" ]]; then
   if ! test_gitea_access "$GITEA_DEPLOY_TOKEN"; then
     echo "Gitea repo check failed — falling back to a local configuration." >&2
     CONFIG_SOURCE="local"
@@ -2064,14 +1649,7 @@ else
   TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${DOWNLOAD_TEMPLATE_NAME}"
 fi
 
-if [[ "$CT_UNPRIVILEGED" == "0" ]]; then
-  echo "Creating PRIVILEGED Proxmox container ${CT_ID} (${CT_NAME})."
-  echo "  Container root is real host root; the container is not a security"
-  echo "  boundary. Set CT_UNPRIVILEGED=1 for an unprivileged container."
-else
-  echo "Creating unprivileged Proxmox container ${CT_ID} (${CT_NAME})."
-fi
-[[ -n "$CT_FEATURES" ]] && echo "  Features: ${CT_FEATURES}"
+echo "Creating Proxmox container ${CT_ID} (${CT_NAME})."
 # Note: password is intentionally NOT passed here (would be visible in `ps`).
 create_args=(
   "$CT_ID" "$TEMPLATE_REF"
@@ -2083,37 +1661,14 @@ create_args=(
   -storage "$STORAGE"
   -rootfs "${STORAGE}:${ROOTFS_GB}"
   -net0 "name=eth0,bridge=${BRIDGE},ip=${IP_CIDR},gw=${GATEWAY},firewall=${FIREWALL}"
-  -unprivileged "$CT_UNPRIVILEGED"
+  -unprivileged 1
   -onboot 1
+  -start 1
 )
-[[ -n "$CT_FEATURES" ]] && create_args+=(-features "$CT_FEATURES")
 [[ -n "$NAMESERVER" ]] && create_args+=(-nameserver "$NAMESERVER")
 pct create "${create_args[@]}"
 CT_CREATED=1
 
-# NOT a bare call. `CT_CREATED=1` is already set, so an uncaught non-zero here
-# reaches the ERR trap, which DESTROYS the container that was just created --
-# for the optional TUN device, before a single service exists. Same pattern as
-# generate_tls_cert/TLS_OK: record the failure, carry on, report it at the end.
-TUN_OK=true
-configure_lxc_tun_device || TUN_OK=false
-
-# Confirm the features actually landed rather than trusting that they did.
-# `pct create` accepts -features on a privileged container but the resulting
-# config is the only place that says whether it stuck, and nesting is what
-# selects the AppArmor profile that permits systemd's mount namespacing.
-if [[ "$CT_FEATURES" == *nesting=1* ]]; then
-  if pct config "$CT_ID" 2>/dev/null | grep -qE '^features:.*nesting=1'; then
-    echo "  nesting=1 confirmed in the container configuration."
-  else
-    echo "WARNING: nesting=1 was requested but is not present in 'pct config ${CT_ID}'." >&2
-    echo "         systemd's per-unit sandboxing may be refused; the installer" >&2
-    echo "         tests for that later and adapts the units if so." >&2
-  fi
-fi
-
-echo "Starting container ${CT_ID}."
-pct start "$CT_ID"
 wait_for_ct_ready
 
 echo "Setting container root password."
@@ -2122,15 +1677,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-# `sudo` is here for the operator, not for this script -- nothing the installer
-# runs needs it, because `pct exec` and `pct enter` are already root. It earns
-# its place by making a reflexive `sudo systemctl restart ...` typed at a
-# container shell work instead of failing with "command not found".
-base_packages=(python3 python3-pip python3-venv curl ca-certificates logrotate iproute2 sudo)
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  base_packages+=(openssl nginx)
-fi
-apt_get install -y "${base_packages[@]}"
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router
@@ -2167,20 +1714,13 @@ mkdir -p \
 cat > "${REPO_DIR}/env/router.env" <<EOF
 GITEA_SERVER_URL=${GITEA_SERVER_URL}
 GITEA_ADMIN_USER=${GITEA_ADMIN_USER}
-GITEA_DEPLOY_TOKEN=${GITEA_DEPLOY_TOKEN}
 GITEA_VERIFY_TLS=${GITEA_VERIFY_TLS}
-MATTERMOST_WEBHOOK_URL=${MATTERMOST_WEBHOOK_URL}
 MATTERMOST_MONITOR_USER=${MATTERMOST_MONITOR_USER}
 MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL}
 MATTERMOST_VERIFY_TLS=${MATTERMOST_VERIFY_TLS}
-ROUTER_BIND_HOST=${ROUTER_BIND_HOST}
-ROUTER_BIND_PORT=${ROUTER_BIND_PORT}
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
 LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
-# LiteLLM reads this itself: ERROR / WARNING / INFO / DEBUG. DEBUG prints the
-# full request and response for every call, so keep it off unless diagnosing.
-LITELLM_LOG=${LITELLM_LOG}
 BACKEND_FAST=$(indices_to_urls "$TIER_FAST_IDX")
 BACKEND_MEDIUM=$(indices_to_urls "$TIER_MEDIUM_IDX")
 BACKEND_LARGE=$(indices_to_urls "$TIER_LARGE_IDX")
@@ -2195,9 +1735,23 @@ OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
 KEEP_ALIVE_REFRESH_SECONDS=${KEEP_ALIVE_REFRESH_SECONDS}
 TORCH_CPU_ONLY=${TORCH_CPU_ONLY}
 MONITOR_INTERVAL_SECONDS=15
+OPENWEBUI_HEALTH_URL=http://127.0.0.1:${OPENWEBUI_PORT}/health
 EOF
-# The generated env file now holds the token; keep one copy in memory for the
-# optional history push below, then clear the original.
+# --- secrets.env (NOT part of the repo tree) ---
+# The deploy token and the webhook URL (whose path is itself a credential) never
+# enter the config repo. They are pushed straight into the container as
+# /app/router/secrets.env (0640 root:ollama-router) after apply-config.sh runs,
+# and loaded by the units that need them via a second EnvironmentFile=.
+SECRETS_STAGE="${STAGE_DIR}/secrets.env"
+# The router API is authenticated from the first boot. Open WebUI is handed the
+# same key as its OpenAI connection key (it persists it on first start).
+[[ -n "$ROUTER_API_KEY" ]] || ROUTER_API_KEY="$(generate_api_key)"
+( umask 077
+  printf 'GITEA_DEPLOY_TOKEN=%s\nMATTERMOST_WEBHOOK_URL=%s\nROUTER_API_KEY=%s\nOPENAI_API_KEYS=%s\n' \
+    "$GITEA_DEPLOY_TOKEN" "$MATTERMOST_WEBHOOK_URL" "$ROUTER_API_KEY" "$ROUTER_API_KEY" \
+    > "$SECRETS_STAGE" )
+# Keep one copy of the token in memory for the seeding + clone steps below,
+# then clear the original.
 GITEA_DEPLOY_TOKEN_KEEP="$GITEA_DEPLOY_TOKEN"
 unset GITEA_DEPLOY_TOKEN
 
@@ -2205,20 +1759,25 @@ unset GITEA_DEPLOY_TOKEN
 cat > "${REPO_DIR}/services/ollama-router/router.py" <<'PYEOF'
 import asyncio
 import configparser
+import hmac
+import ipaddress
 import json
 import logging
-import logging.handlers
 import os
 import re
-import sys
 import time
-import uuid
+from contextlib import asynccontextmanager
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse, JSONResponse
 
-app = FastAPI(title="Intelligent Ollama Complexity Router")
+logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("router")
+# httpx logs every request at INFO; the router logs its own decisions instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # The router is a drop-in OpenAI endpoint in front of the LiteLLM proxy.
 # /v1/chat/completions has its model chosen by complexity analysis; every other
@@ -2230,12 +1789,18 @@ LITELLM_URL = os.getenv("LITELLM_URL", f"{LITELLM_BASE}/v1/chat/completions")
 # Routing behaviour lives in router.ini (version controlled) so thresholds,
 # keyword lists and discovery heuristics can change without editing this file.
 # Built-in defaults keep the service working if the ini is missing or partial.
+# Code signals. Bare "class " / "import " / "def " matched prose ("first class
+# ticket", "import my contacts"), so those are regexes for their code shapes.
+CODE_KEYWORD_DEFAULTS = [
+    r"re:\bdef\s+\w+\s*\(", r"re:\bfn\s+\w+\s*\(", r"re:\bclass\s+\w+\s*[:({]",
+    r"re:^\s*(?:from\s+\S+\s+)?import\s+[\w.]+", r"re:```", "function", "sql",
+    "script", "code", "bug", "error", "compile", "stack trace", "regex",
+]
 _DEFAULTS = {
     "thresholds": {"xlarge": "2000", "large": "800", "medium": "250"},
     "keywords": {
         "code_first": "true",
-        "code": json.dumps(["def ", "fn ", "function", "class ", "import ",
-                            "sql", "script", "code", "bug", "error", "compile"]),
+        "code": json.dumps(CODE_KEYWORD_DEFAULTS),
         "large": json.dumps(["analyze", "evaluate", "optimise", "optimize",
                              "architecture", "mathematics", "calculate",
                              "summarise this article"]),
@@ -2246,12 +1811,38 @@ _DEFAULTS = {
     },
     "tiers": {"fast": "fast", "medium": "medium", "large": "large",
               "xlarge": "xlarge"},
+    "classification": {
+        # What the keyword and length heuristics look at:
+        #   last_user    -- the newest user message only (default). A system
+        #                   prompt or an old turn can no longer pin every
+        #                   request of a conversation to one tier.
+        #   conversation -- every message, the pre-2026-09 behaviour.
+        "scope": "last_user",
+        # true: a request carrying an image fails with HTTP 400 when no
+        # discovered model looks vision-capable. false: route it anyway and
+        # flag it with an X-Router-Warning header.
+        "vision_strict": "false",
+    },
+    "http": {
+        # Seconds to establish a TCP connection to a backend. Short on purpose:
+        # this is how long a dead host delays failover to the next candidate.
+        "connect_timeout_seconds": "3",
+        # Seconds allowed between bytes of a response (generation can be slow).
+        "read_timeout_seconds": "300",
+    },
     "discovery": {
         "enabled": "true",
         "refresh_seconds": "60",
         "timeout_seconds": "5",
         # Comma-separated Ollama base URLs. Blank -> derive from BACKEND_* env.
         "servers": "",
+        # Ask each server's /api/show for a model's real capabilities (vision,
+        # embedding). Name matching below is the fallback.
+        "capability_probe": "true",
+        # LM Studio servers (MODEL_SERVERS entries written lmstudio+http://...)
+        # load models on demand. true: only route to models already loaded
+        # there (no multi-second JIT load on the request path).
+        "lmstudio_loaded_only": "false",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -2282,19 +1873,9 @@ _DEFAULTS = {
         # Candidates within this score of the best are treated as equivalent and
         # rotated through, so identical models on several hosts share load.
         "tie_epsilon": "0.05",
-    },
-    "logging": {
-        "level": "INFO",
-        "decisions": "true",
-        # systemd's LogsDirectory= creates and owns this; the literal path is
-        # only reached when router.py is run by hand.
-        "decision_file": "",
-        "max_bytes": "20000000",
-        "backup_count": "5",
-        # Characters of prompt text kept in each record. 0 logs no text at all,
-        # only the derived features.
-        "prompt_chars": "200",
-        "log_candidates": "10",
+        # Bonus for a model that is already resident in memory (LM Studio
+        # reports this per model; Ollama entries are neutral).
+        "loaded_bonus": "0.1",
     },
 }
 ROUTER_INI = os.getenv(
@@ -2304,34 +1885,66 @@ ROUTER_INI = os.getenv(
 
 
 def _load_config(path: str) -> configparser.ConfigParser:
-    """Built-in defaults, overlaid with router.ini if it parses.
-
-    A malformed ini -- a duplicated section header is the easy one to write by
-    hand -- must not stop the router. Falling back to the defaults and saying
-    so loudly beats a service that crash-loops on a config typo, which is a
-    much harder failure to read from the outside.
-    """
     cp = configparser.ConfigParser()
     cp.read_dict(_DEFAULTS)
     if os.path.exists(path):
-        try:
-            cp.read(path)
-        except configparser.Error as exc:
-            sys.stderr.write(
-                "WARNING: %s is malformed (%s); using built-in defaults for "
-                "everything it would have set.\n" % (path, exc))
-            cp = configparser.ConfigParser()
-            cp.read_dict(_DEFAULTS)
+        cp.read(path)
     return cp
 
 
 def _json_list(cp: configparser.ConfigParser, section: str, option: str) -> list:
     # JSON array keeps exact spacing ("def " must not match "default").
     raw = cp.get(section, option)
+
+    def norm(k):
+        k = str(k)
+        # Regex entries keep their case: lowering "\S" would turn it into "\s".
+        return k if k.startswith("re:") else k.lower()
     try:
-        return [str(k).lower() for k in json.loads(raw)]
+        return [norm(k) for k in json.loads(raw)]
     except (ValueError, TypeError):
-        return [k.strip().lower() for k in raw.split(",") if k.strip()]
+        return [norm(k.strip()) for k in raw.split(",") if k.strip()]
+
+
+def keyword_pattern(keywords: list):
+    """Compile keywords into one case-insensitive, word-bounded regex.
+
+    Plain substring matching misrouted ordinary prose: "script" matched
+    "description"/"subscription", "code" matched "encode", "prove" matched
+    "improve". Each keyword now has to start at a word boundary and end at one,
+    allowing only a simple plural/past suffix ("bugs", "compiled"). A keyword
+    written with a trailing space ("def ") must be followed by whitespace,
+    preserving the old meaning of that convention. Spaces inside a phrase match
+    any run of whitespace. An entry starting with "re:" is a regular expression
+    (matched case-insensitively), for code shapes such as "class Foo:".
+    """
+    parts = []
+    for raw in keywords:
+        word = str(raw)
+        if word.startswith("re:"):
+            # A regular expression, for shapes a word list cannot express
+            # (e.g. "class Foo:" as code but not "first class ticket").
+            try:
+                re.compile(word[3:])
+            except re.error as exc:
+                log.warning("ignoring invalid keyword regex %r: %s", raw, exc)
+                continue
+            parts.append("(?:%s)" % word[3:])
+            continue
+        word = word.lower()
+        core = word.strip()
+        if not core:
+            continue
+        body = r"\s+".join(re.escape(piece) for piece in core.split())
+        tail = r"\s" if word.endswith(" ") else r"(?:s|es|d|ed)?(?![\w])"
+        parts.append(r"(?<![\w])" + body + tail)
+    if not parts:
+        return None
+    return re.compile("|".join(parts), re.IGNORECASE | re.MULTILINE)
+
+
+def matches_keywords(pattern, text: str) -> bool:
+    return bool(pattern and pattern.search(text))
 
 
 def _band(cp: configparser.ConfigParser, option: str) -> tuple:
@@ -2351,6 +1964,9 @@ CODE_FIRST = _cfg.getboolean("keywords", "code_first")
 CODE_KEYWORDS = _json_list(_cfg, "keywords", "code")
 LARGE_KEYWORDS = _json_list(_cfg, "keywords", "large")
 XLARGE_KEYWORDS = _json_list(_cfg, "keywords", "xlarge")
+CODE_RE = keyword_pattern(CODE_KEYWORDS)
+LARGE_RE = keyword_pattern(LARGE_KEYWORDS)
+XLARGE_RE = keyword_pattern(XLARGE_KEYWORDS)
 TIER_FAST = _cfg.get("tiers", "fast")
 TIER_MEDIUM = _cfg.get("tiers", "medium")
 TIER_LARGE = _cfg.get("tiers", "large")
@@ -2361,6 +1977,8 @@ TIER_NAMES = {TIER_FAST: "fast", TIER_MEDIUM: "medium", TIER_LARGE: "large",
 DISCOVERY_ENABLED = _cfg.getboolean("discovery", "enabled")
 DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
+CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
+LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
 BANDS = {
     "fast": _band(_cfg, "fast_params"),
     "medium": _band(_cfg, "medium_params"),
@@ -2385,98 +2003,54 @@ W_SMALLER = _cfg.getfloat("weights", "prefer_smaller")
 W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
 W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
+W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 
-# --- logging ------------------------------------------------------------------
-# Two sinks with different jobs:
-#
-#   the journal    one human-readable line per request, for watching live
-#   decisions.jsonl  one machine-readable object per request, for answering
-#                    "is the scoring any good?" after the fact
-#
-# The JSONL file is the reason this exists. Judging routing quality means
-# comparing what was asked for against what every candidate scored, across
-# hundreds of requests -- that is a query, not something you read in a terminal.
-LOG_LEVEL = _cfg.get("logging", "level", fallback="INFO").strip().upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("router")
-
-LOG_DECISIONS = _cfg.getboolean("logging", "decisions", fallback=True)
-PROMPT_CHARS = _cfg.getint("logging", "prompt_chars", fallback=200)
-LOG_CANDIDATES = _cfg.getint("logging", "log_candidates", fallback=10)
-_LOG_DIR = os.getenv("LOGS_DIRECTORY", "/var/log/ollama-router")
-DECISION_FILE = (os.getenv("ROUTER_DECISION_FILE")
-                 or _cfg.get("logging", "decision_file", fallback="").strip()
-                 or os.path.join(_LOG_DIR, "decisions.jsonl"))
-
-_decision_log = None
+# --- server kinds -----------------------------------------------------------------
+# A server entry is a base URL. An LM Studio server is written with a scheme
+# prefix -- lmstudio+http://host:1234 -- so the one MODEL_SERVERS / BACKEND_*
+# list can mix both kinds and every consumer (router, monitor, manage tool,
+# LiteLLM config) knows how to talk to each entry.
+LMSTUDIO_PREFIX = "lmstudio+"
+# Optional bearer token for LM Studio servers with authentication enabled
+# (LM Studio 0.4+ "Require authentication"). Lives in secrets.env.
+LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
 
 
-def _init_decision_log():
-    """A rotating JSONL sink, or None if it cannot be opened.
-
-    Never fatal: a router that refuses to start because it cannot write a log
-    is worse than one that routes without one. The failure is reported once.
-    """
-    global _decision_log, LOG_DECISIONS
-    if not LOG_DECISIONS:
-        return None
-    try:
-        os.makedirs(os.path.dirname(DECISION_FILE) or ".", exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
-            DECISION_FILE,
-            maxBytes=_cfg.getint("logging", "max_bytes", fallback=20_000_000),
-            backupCount=_cfg.getint("logging", "backup_count", fallback=5),
-            encoding="utf-8",
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))  # the record IS the line
-        # The records carry prompt text, so tighten the mode explicitly rather
-        # than inheriting the process umask (0644 under systemd's default). The
-        # directory is already 0750 via LogsDirectoryMode, but the file's own
-        # mode is what a future bind-mount or backup job will honour -- and it
-        # is what the logrotate policy claims. Rotated backups too: the handler
-        # renames them, so each was once the live file.
-        try:
-            os.chmod(DECISION_FILE, 0o640)
-        except OSError:
-            pass
-        logger = logging.getLogger("router.decisions")
-        logger.setLevel(logging.INFO)
-        logger.propagate = False          # never duplicate JSON into the journal
-        logger.handlers = [handler]
-        _decision_log = logger
-        log.info("Decision log: %s", DECISION_FILE)
-    except Exception as exc:  # noqa: BLE001
-        LOG_DECISIONS = False
-        log.warning("Cannot open the decision log at %s (%s). Routing continues; "
-                    "set logging.decision_file in router.ini to a writable path.",
-                    DECISION_FILE, exc)
-    return _decision_log
+def server_kind(server: str) -> str:
+    return "lmstudio" if server.startswith(LMSTUDIO_PREFIX) else "ollama"
 
 
-def record_decision(payload: dict) -> None:
-    """Append one decision record. Silently no-ops when logging is off."""
-    if not LOG_DECISIONS or _decision_log is None:
-        return
-    try:
-        _decision_log.info(json.dumps(payload, separators=(",", ":"), default=str))
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Could not write a decision record: %s", exc)
+def server_base(server: str) -> str:
+    """The plain http(s) base URL of a server entry."""
+    return server[len(LMSTUDIO_PREFIX):] if server.startswith(LMSTUDIO_PREFIX) else server
 
 
-def redact_prompt(text: str) -> str:
-    """Prompt text for the log, truncated to prompt_chars (0 = keep none)."""
-    if PROMPT_CHARS <= 0 or not text:
-        return ""
-    text = " ".join(text.split())            # collapse newlines: one JSON line
-    if len(text) <= PROMPT_CHARS:
-        return text
-    return text[:PROMPT_CHARS] + "..."
+def backend_headers(server: str) -> dict:
+    """Credentials the ROUTER adds for a backend (never the client's own)."""
+    if server_kind(server) == "lmstudio" and LMSTUDIO_API_TOKEN:
+        return {"Authorization": f"Bearer {LMSTUDIO_API_TOKEN}"}
+    return {}
 
+CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
+VISION_STRICT = _cfg.getboolean("classification", "vision_strict")
+CONNECT_TIMEOUT = _cfg.getfloat("http", "connect_timeout_seconds")
+READ_TIMEOUT = _cfg.getfloat("http", "read_timeout_seconds")
+
+# Request headers never forwarded upstream.
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
-              "transfer-encoding", "upgrade"}
+              "transfer-encoding", "upgrade", "proxy-connection", "te",
+              "trailer", "proxy-authorization", "proxy-authenticate"}
+# Response headers never copied onto our own (re-framed) streaming response.
+# The body is re-chunked by the ASGI server, so the upstream framing headers
+# would contradict what is actually sent. content-encoding is kept because the
+# raw (still-encoded) bytes are passed through unchanged.
+RESPONSE_HOP_BY_HOP = HOP_BY_HOP | {"date", "server"}
+
+# Optional bearer token. When set, every endpoint except /healthz requires
+# "Authorization: Bearer <key>". Lives in /app/router/secrets.env.
+ROUTER_API_KEY = (os.getenv("ROUTER_API_KEY") or "").strip()
+ROUTER_HOST = os.getenv("ROUTER_HOST", "0.0.0.0")
+ROUTER_PORT = int(os.getenv("ROUTER_PORT", "8000"))
 
 
 # Historical names for each tier's backend env key, newest first. The keys
@@ -2536,10 +2110,11 @@ _rotation = {}
 
 
 def parse_params_billions(text) -> float:
-    """'7.6B' -> 7.6, '134M' -> 0.134. Returns 0.0 when unparseable."""
+    """'7.6B' -> 7.6, '134M' -> 0.134. A mixture-of-experts label such as
+    LM Studio's '26B-A4B' counts its total size (26). 0.0 when unparseable."""
     if not text:
         return 0.0
-    match = re.match(r"^\s*([0-9.]+)\s*([bBmM])\s*$", str(text))
+    match = re.match(r"^\s*([0-9.]+)\s*([bBmM])(?:\s*$|[-_ ])", str(text))
     if not match:
         return 0.0
     try:
@@ -2564,7 +2139,12 @@ def _matches_any(haystack: str, needles: list) -> bool:
     return any(n in haystack for n in needles)
 
 
-def build_entry(server: str, raw: dict) -> dict:
+def build_entry(server: str, raw: dict, capabilities=None) -> dict:
+    """One discovered (server, model). `capabilities` is Ollama's own list from
+    /api/show ("completion", "vision", "embedding", "tools", ...). When known it
+    decides vision/embedding outright; the name heuristics are the fallback
+    for servers that do not report it, and still drive is_code (Ollama has no
+    "code" capability)."""
     name = raw.get("name") or raw.get("model") or ""
     details = raw.get("details") or {}
     families = [str(f).lower() for f in (details.get("families") or [])]
@@ -2575,6 +2155,14 @@ def build_entry(server: str, raw: dict) -> dict:
     if params <= 0:
         params = params_from_name(name)
     lowered = name.lower()
+    is_vision = (_matches_any(lowered, VISION_MODELS)
+                 or any(f in VISION_FAMILIES for f in families))
+    is_embedding = (_matches_any(lowered, EMBEDDING_MODELS)
+                    or any(f in EMBEDDING_FAMILIES for f in families))
+    caps = [str(c).lower() for c in capabilities] if capabilities else []
+    if caps:
+        is_vision = "vision" in caps
+        is_embedding = "embedding" in caps and "completion" not in caps
     return {
         "server": server,
         "name": name,
@@ -2582,22 +2170,138 @@ def build_entry(server: str, raw: dict) -> dict:
         "quantization": details.get("quantization_level") or "",
         "families": families,
         "size_bytes": raw.get("size") or 0,
+        "capabilities": caps,
         "is_code": _matches_any(lowered, CODE_MODELS),
-        "is_vision": (_matches_any(lowered, VISION_MODELS)
-                      or any(f in VISION_FAMILIES for f in families)),
-        "is_embedding": (_matches_any(lowered, EMBEDDING_MODELS)
-                         or any(f in EMBEDDING_FAMILIES for f in families)),
+        "is_vision": is_vision,
+        "is_embedding": is_embedding,
+        # True/False when the server reports residency (LM Studio); None
+        # when it does not (Ollama loads on demand and is not asked).
+        "loaded": raw.get("loaded"),
+        "kind": server_kind(server),
     }
 
 
+# (server, model name, digest) -> capability list, or None when the server
+# does not report one. Keyed by digest so a re-pulled model is re-probed.
+_CAPABILITIES = {}
+
+
+async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
+                             limit: asyncio.Semaphore = None):
+    """Ollama's capability list for one model via POST /api/show, cached."""
+    name = raw.get("name") or raw.get("model") or ""
+    key = (server, name, raw.get("digest") or raw.get("modified_at") or "")
+    if key in _CAPABILITIES:
+        return _CAPABILITIES[key]
+    caps = None
+    try:
+        async with (limit or asyncio.Semaphore(1)):
+            response = await client.post(f"{server}/api/show", json={"model": name},
+                                         timeout=DISCOVERY_TIMEOUT)
+        if response.status_code == 200:
+            found = response.json().get("capabilities")
+            if isinstance(found, list):
+                caps = [str(c) for c in found]
+        # Only a definite answer is cached; a transient failure is retried
+        # on the next poll.
+        if response.status_code in (200, 400, 404, 405, 501):
+            _CAPABILITIES[key] = caps
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return caps
+
+
+def _lmstudio_v1_models(payload: dict) -> list:
+    """LM Studio 0.4+ GET /api/v1/models -> raw entries build_entry accepts."""
+    out = []
+    for m in payload.get("models") or []:
+        if not isinstance(m, dict) or not m.get("key"):
+            continue
+        caps = ["embedding"] if m.get("type") == "embedding" else ["completion"]
+        features = m.get("capabilities") or {}
+        if features.get("vision"):
+            caps.append("vision")
+        if features.get("trained_for_tool_use"):
+            caps.append("tools")
+        quant = m.get("quantization") or {}
+        out.append({
+            "name": m["key"],
+            "size": m.get("size_bytes") or 0,
+            "details": {"parameter_size": m.get("params_string") or "",
+                        "family": m.get("architecture") or "",
+                        "quantization_level": quant.get("name") if isinstance(quant, dict) else quant},
+            "capabilities": caps,
+            "loaded": bool(m.get("loaded_instances")),
+        })
+    return out
+
+
+def _lmstudio_v0_models(payload: dict) -> list:
+    """LM Studio 0.3.x GET /api/v0/models -> raw entries (type llm|vlm|embeddings)."""
+    out = []
+    for m in payload.get("data") or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        kind = m.get("type")
+        caps = (["embedding"] if kind in ("embeddings", "embedding")
+                else ["completion", "vision"] if kind == "vlm" else ["completion"])
+        out.append({
+            "name": m["id"],
+            "details": {"family": m.get("arch") or "",
+                        "quantization_level": m.get("quantization") or ""},
+            "capabilities": caps,
+            "loaded": m.get("state") == "loaded",
+        })
+    return out
+
+
+async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple:
+    """Newest native API first; the OpenAI-compatible /v1/models (names only)
+    is the last resort, e.g. for an older LM Studio."""
+    base, headers = server_base(server), backend_headers(server)
+    last_error = None
+    for path, convert in (("/api/v1/models", _lmstudio_v1_models),
+                          ("/api/v0/models", _lmstudio_v0_models),
+                          ("/v1/models", None)):
+        try:
+            response = await client.get(f"{base}{path}", headers=headers,
+                                        timeout=DISCOVERY_TIMEOUT)
+            if response.status_code in (404, 405):
+                continue
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            return server, None, f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - try the next API flavour
+            last_error = f"{path}: {type(exc).__name__}: {exc}"
+            continue
+        if convert is None:
+            raws = [{"name": m.get("id")} for m in (payload.get("data") or [])
+                    if isinstance(m, dict) and m.get("id")]
+        else:
+            raws = convert(payload)
+        entries = [build_entry(server, raw, raw.get("capabilities")) for raw in raws]
+        return server, [e for e in entries if e["name"]], None
+    return server, None, last_error or "no LM Studio model API answered"
+
+
 async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
+    if server_kind(server) == "lmstudio":
+        return await fetch_lmstudio_models(client, server)
     try:
         response = await client.get(f"{server}/api/tags", timeout=DISCOVERY_TIMEOUT)
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:  # noqa: BLE001 - any failure means "server is down"
         return server, None, f"{type(exc).__name__}: {exc}"
-    entries = [build_entry(server, m) for m in (payload.get("models") or [])]
+    raws = [m for m in (payload.get("models") or []) if isinstance(m, dict)]
+    if CAPABILITY_PROBE:
+        limit = asyncio.Semaphore(8)   # per poll, so no cross-event-loop state
+        caps = await asyncio.gather(*[model_capabilities(client, server, m, limit)
+                                      for m in raws])
+    else:
+        caps = [None] * len(raws)
+    entries = [build_entry(server, m, c) for m, c in zip(raws, caps, strict=True)]
     return server, [e for e in entries if e["name"]], None
 
 
@@ -2608,11 +2312,10 @@ async def refresh_inventory() -> dict:
         INVENTORY = {"models": [], "servers": {}, "updated_at": time.time(),
                      "errors": {"config": "no servers configured"}}
         return INVENTORY
-    async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(
-            *[fetch_server_models(client, s) for s in SERVERS],
-            return_exceptions=True,
-        )
+    results = await asyncio.gather(
+        *[fetch_server_models(http_client(), s) for s in SERVERS],
+        return_exceptions=True,
+    )
     models, servers, errors = [], {}, {}
     for result in results:
         if isinstance(result, Exception):
@@ -2621,136 +2324,177 @@ async def refresh_inventory() -> dict:
         if error is not None:
             servers[server] = {"up": False, "model_count": 0}
             errors[server] = error
+            if INVENTORY.get("servers", {}).get(server, {}).get("up", True):
+                log.warning("discovery: %s is down (%s)", server, error)
             continue
+        if not INVENTORY.get("servers", {}).get(server, {}).get("up", True):
+            log.info("discovery: %s is back (%d models)", server, len(entries))
         servers[server] = {"up": True, "model_count": len(entries)}
         models.extend(entries)
-    previous = INVENTORY
     INVENTORY = {"models": models, "servers": servers,
                  "updated_at": time.time(), "errors": errors}
-    # Log the DIFF, not the poll. A line every refresh_seconds would bury the
-    # one thing worth seeing: the inventory changing under a running router,
-    # which is the usual explanation for "it routed differently this time".
-    was = {(e["server"], e["name"]) for e in previous.get("models", [])}
-    now = {(e["server"], e["name"]) for e in models}
-    if was != now:
-        added = sorted(f"{m}@{sv}" for sv, m in now - was)
-        gone = sorted(f"{m}@{sv}" for sv, m in was - now)
-        log.info("inventory changed: %d model(s) on %d/%d host(s)%s%s",
-                 len(models), sum(1 for v in servers.values() if v["up"]),
-                 len(servers),
-                 f"; added {', '.join(added)}" if added else "",
-                 f"; gone {', '.join(gone)}" if gone else "")
-    for server, message in errors.items():
-        if previous.get("errors", {}).get(server) != message:
-            log.warning("discovery: %s is not answering: %s", server, message)
-    for server, status in servers.items():
-        if status["up"] and previous.get("errors", {}).get(server):
-            log.info("discovery: %s is answering again (%d models)",
-                     server, status["model_count"])
-    log.debug("inventory refreshed: %d models, %d servers, %d error(s)",
-              len(models), len(servers), len(errors))
     return INVENTORY
+
+
+def mark_server_down(server: str, reason: str) -> None:
+    """Take a host out of rotation right now, instead of waiting up to
+    refresh_seconds for the next poll. The next successful poll restores it."""
+    global INVENTORY
+    servers = dict(INVENTORY.get("servers", {}))
+    previous = servers.get(server, {})
+    if not previous.get("up", True):
+        return
+    servers[server] = dict(previous, up=False)
+    errors = dict(INVENTORY.get("errors", {}), **{server: reason})
+    INVENTORY = dict(INVENTORY, servers=servers, errors=errors)
+    log.warning("dispatch: %s marked down until the next discovery poll (%s)",
+                server, reason)
 
 
 async def _discovery_loop() -> None:
     while True:
+        await asyncio.sleep(max(5, DISCOVERY_REFRESH))
         try:
             await refresh_inventory()
-        except Exception as exc:  # noqa: BLE001 - never let the loop die
-            log.warning("discovery refresh failed: %s", exc)
-        await asyncio.sleep(max(5, DISCOVERY_REFRESH))
+        except Exception:  # noqa: BLE001 - never let the loop die
+            log.exception("discovery: refresh failed")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    _init_decision_log()
-    log.info("Router starting: discovery=%s, %d configured server(s), "
-             "log level %s", DISCOVERY_ENABLED, len(SERVERS), LOG_LEVEL)
-    log.info("Bands: %s", ", ".join(
-        f"{name} {low:g}-{high:g}B" for name, (low, high) in sorted(BANDS.items())))
-    log.info("Weights: band=%.2f code=%.2f vision=%.2f larger=%.2f smaller=%.2f "
-             "unknown=%.2f offtask=%.2f tie=%.3f",
-             W_BAND, W_CODE, W_VISION, W_LARGER, W_SMALLER, W_UNKNOWN,
-             W_OFFTASK, TIE_EPSILON)
-    if not SERVERS:
-        log.warning("No discovery targets. Every request will take the LiteLLM "
-                    "fallback path — check BACKEND_* in router.env.")
+# --- shared HTTP client + lifespan ---------------------------------------------
+# One pooled client for every upstream call. Tests swap the transport.
+_HTTP = {"client": None, "transport": None, "task": None}
+
+
+def http_client() -> httpx.AsyncClient:
+    if _HTTP["client"] is None:
+        _HTTP["client"] = httpx.AsyncClient(
+            timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=40),
+            transport=_HTTP["transport"],
+        )
+    return _HTTP["client"]
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ("localhost", ""):
+        return host == "localhost"
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    http_client()
+    if not ROUTER_API_KEY and not _is_loopback(ROUTER_HOST):
+        log.warning("ROUTER_API_KEY is not set and the router listens on %s: "
+                    "anyone who can reach port %d can use every backend. Set "
+                    "it with `manage-model-servers set-api-key`.",
+                    ROUTER_HOST, ROUTER_PORT)
     if DISCOVERY_ENABLED and SERVERS:
         await refresh_inventory()
-        asyncio.create_task(_discovery_loop())
+        # Keep the reference: a bare create_task() can be garbage-collected.
+        _HTTP["task"] = asyncio.create_task(_discovery_loop())
+    log.info("router ready: discovery=%s servers=%d scope=%s auth=%s",
+             DISCOVERY_ENABLED, len(SERVERS), CLASSIFY_SCOPE,
+             "on" if ROUTER_API_KEY else "off")
+    try:
+        yield
+    finally:
+        task = _HTTP.get("task")
+        if task:
+            task.cancel()
+        if _HTTP["client"] is not None:
+            await _HTTP["client"].aclose()
+            _HTTP["client"] = None
+
+
+app = FastAPI(title="Intelligent Ollama Complexity Router", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if ROUTER_API_KEY and request.url.path != "/healthz":
+        supplied = request.headers.get("authorization", "")
+        token = supplied[7:].strip() if supplied.lower().startswith("bearer ") else ""
+        if not hmac.compare_digest(token.encode(), ROUTER_API_KEY.encode()):
+            return JSONResponse(
+                {"error": {"message": "Missing or invalid router API key.",
+                           "type": "invalid_request_error",
+                           "code": "invalid_api_key"}},
+                status_code=401)
+    return await call_next(request)
 
 
 # --- request analysis ---------------------------------------------------------
+_CLASS_TO_TIER = {"fast": "TIER_FAST", "medium": "TIER_MEDIUM",
+                  "large": "TIER_LARGE", "xlarge": "TIER_XLARGE"}
+
+
+def classify_text(text: str) -> dict:
+    """Request class for one block of text. The single source of the keyword
+    and length heuristics, shared by discovery routing and the LiteLLM path."""
+    approx_tokens = len(text.split()) * 1.3
+    is_code = matches_keywords(CODE_RE, text)
+    if CODE_FIRST and is_code:
+        request_class = "fast"
+    elif approx_tokens > TOKEN_THRESHOLD_XLARGE or matches_keywords(XLARGE_RE, text):
+        request_class = "xlarge"
+    elif approx_tokens > TOKEN_THRESHOLD_LARGE or matches_keywords(LARGE_RE, text):
+        request_class = "large"
+    elif approx_tokens > TOKEN_THRESHOLD_MEDIUM:
+        request_class = "medium"
+    else:
+        request_class = "fast"
+    return {"class": request_class, "code": is_code,
+            "approx_tokens": round(approx_tokens)}
+
+
 def analyze_complexity(prompt: str) -> str:
-    """Legacy tier name, kept so the LiteLLM fallback path behaves as before."""
-    text_lower = prompt.lower()
-    approx_tokens = len(text_lower.split()) * 1.3
-    if CODE_FIRST and any(kw in text_lower for kw in CODE_KEYWORDS):
-        return TIER_FAST
-    if approx_tokens > TOKEN_THRESHOLD_XLARGE or any(kw in text_lower for kw in XLARGE_KEYWORDS):
-        return TIER_XLARGE
-    if approx_tokens > TOKEN_THRESHOLD_LARGE or any(kw in text_lower for kw in LARGE_KEYWORDS):
-        return TIER_LARGE
-    if approx_tokens > TOKEN_THRESHOLD_MEDIUM:
-        return TIER_MEDIUM
-    if not CODE_FIRST and any(kw in text_lower for kw in CODE_KEYWORDS):
-        return TIER_FAST
-    return TIER_FAST
+    """Tier alias (a LiteLLM model_name) for a prompt -- the LiteLLM path."""
+    return globals()[_CLASS_TO_TIER[classify_text(prompt)["class"]]]
+
+
+def _message_parts(message) -> tuple:
+    """(text, has_image) for one OpenAI chat message."""
+    if not isinstance(message, dict):
+        return "", False
+    content = message.get("content")
+    if isinstance(content, str):
+        return content, False
+    texts, has_image = [], False
+    if isinstance(content, list):
+        # OpenAI multimodal form: [{"type":"text"...},{"type":"image_url"...}]
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif part.get("type") in ("image_url", "input_image", "image"):
+                has_image = True
+    return " ".join(texts), has_image
+
+
+def routing_text(messages: list) -> str:
+    """The text the heuristics judge, per [classification] scope."""
+    messages = [m for m in (messages or []) if isinstance(m, dict)]
+    if CLASSIFY_SCOPE != "conversation":
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return _message_parts(message)[0]
+    # Scope "conversation", or no user turn at all (then judge everything).
+    return " ".join(_message_parts(m)[0] for m in messages)
 
 
 def classify_request(messages: list) -> dict:
-    """Turn the conversation into routing requirements."""
-    text_parts, has_image = [], False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            # OpenAI multimodal form: [{"type":"text"...},{"type":"image_url"...}]
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "text" and isinstance(part.get("text"), str):
-                    text_parts.append(part["text"])
-                elif part.get("type") in ("image_url", "input_image", "image"):
-                    has_image = True
-    text = " ".join(text_parts)
-    lowered = text.lower()
-    approx_tokens = len(lowered.split()) * 1.3
-    # Keep the keywords that actually fired, not just the boolean. When a short
-    # prompt lands in xlarge, "which word did that?" is the whole question, and
-    # a bare True/False cannot answer it.
-    hit_code = [kw for kw in CODE_KEYWORDS if kw in lowered]
-    hit_large = [kw for kw in LARGE_KEYWORDS if kw in lowered]
-    hit_xlarge = [kw for kw in XLARGE_KEYWORDS if kw in lowered]
-    is_code = bool(hit_code)
-    if CODE_FIRST and is_code:
-        request_class, reason = "fast", "code keyword (code_first)"
-    elif approx_tokens > TOKEN_THRESHOLD_XLARGE:
-        request_class, reason = "xlarge", f"length > {TOKEN_THRESHOLD_XLARGE}"
-    elif hit_xlarge:
-        request_class, reason = "xlarge", "xlarge keyword"
-    elif approx_tokens > TOKEN_THRESHOLD_LARGE:
-        request_class, reason = "large", f"length > {TOKEN_THRESHOLD_LARGE}"
-    elif hit_large:
-        request_class, reason = "large", "large keyword"
-    elif approx_tokens > TOKEN_THRESHOLD_MEDIUM:
-        request_class, reason = "medium", f"length > {TOKEN_THRESHOLD_MEDIUM}"
-    elif is_code:
-        request_class, reason = "fast", "code keyword"
-    else:
-        request_class, reason = "fast", "default"
-    return {"class": request_class, "code": is_code, "vision": has_image,
-            "approx_tokens": round(approx_tokens),
-            # Everything below is for the log and /routing/explain. Nothing in
-            # the routing path reads it.
-            "reason": reason,
-            "chars": len(text),
-            "messages": len(messages or []),
-            "matched": {"code": hit_code, "large": hit_large, "xlarge": hit_xlarge},
-            "prompt": redact_prompt(text)}
+    """Turn the conversation into routing requirements.
+
+    Images are looked for in EVERY message: a follow-up question about an
+    image sent earlier still needs a vision model to see it."""
+    need = classify_text(routing_text(messages))
+    need["vision"] = any(_message_parts(m)[1] for m in (messages or []))
+    return need
 
 
 def _in_band(params: float, low: float, high: float) -> bool:
@@ -2769,13 +2513,14 @@ def band_distance(entry: dict, need: dict) -> float:
     """How far outside the requested band a model sits, in billions (0 = in).
 
     Used to order candidates when nothing is in band at all -- see
-    rank_candidates. A model of unknown size returns 0.0 because it cannot be
-    placed on the axis, not because it fits; that matches the benefit of the
-    doubt score_entry already gives it via unknown_params.
+    rank_candidates. A model of unknown size sorts after known out-of-band
+    models, but remains eligible when no known-size model exists.
     """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
-    if params <= 0 or _in_band(params, low, high):
+    if params <= 0:
+        return float("inf")
+    if _in_band(params, low, high):
         return 0.0
     return (low - params) if params < low else (params - high)
 
@@ -2783,9 +2528,10 @@ def band_distance(entry: dict, need: dict) -> float:
 def in_requested_band(entry: dict, need: dict) -> bool:
     """Does this model's size genuinely fall inside the requested band?
 
-    Distinct from `band_distance(...) == 0.0`, which is also true for a model
-    of unknown size. Keeping them separate matters: one unknown-size model in
-    the pool must not switch off distance ranking for every other candidate.
+    Distinct from `band_distance(...) == 0.0`, which means a known model is
+    inside the requested band. Keeping them separate matters: one unknown-size
+    model in the pool must not switch off distance ranking for every other
+    candidate.
     """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     return entry["params_b"] > 0 and _in_band(entry["params_b"], low, high)
@@ -2793,18 +2539,6 @@ def in_requested_band(entry: dict, need: dict) -> bool:
 
 def score_entry(entry: dict, need: dict) -> float:
     """Heuristic fit of one discovered (server, model) pair to one request."""
-    return score_breakdown(entry, need)["score"]
-
-
-def score_breakdown(entry: dict, need: dict) -> dict:
-    """score_entry, with every term kept separately.
-
-    The total is the only thing routing uses; the terms are what make the log
-    worth having. "qwen3:14b beat qwen3:32b" is not actionable -- "it beat it
-    by 0.6 because the request matched a code keyword and 14b is the coder"
-    is. score_entry() is a thin wrapper so there is exactly one implementation
-    of the arithmetic and the two can never disagree.
-    """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
     in_band = _in_band(params, low, high)
@@ -2815,23 +2549,20 @@ def score_breakdown(entry: dict, need: dict) -> dict:
     else:
         distance = (low - params) if params < low else (params - high)
         fit = max(0.0, 1.0 - (distance / BAND_FALLOFF))
-    band_term = W_BAND * fit
-    code_term = 0.0
-    vision_term = 0.0
-    size_term = 0.0
+    score = W_BAND * fit
 
     if need["code"]:
-        code_term = W_CODE if entry["is_code"] else 0.0
+        score += W_CODE if entry["is_code"] else 0.0
     elif entry["is_code"]:
         # A code model on a general request is usable but not preferred.
-        code_term = -W_CODE * W_OFFTASK
+        score -= W_CODE * W_OFFTASK
 
     if need["vision"]:
-        vision_term = W_VISION if entry["is_vision"] else -W_VISION
+        score += W_VISION if entry["is_vision"] else -W_VISION
     elif entry["is_vision"]:
         # A vision model answers text fine, but it is tuned for something else
         # and is usually the wrong pick when an equal-sized text model exists.
-        vision_term = -W_VISION * W_OFFTASK
+        score -= W_VISION * W_OFFTASK
 
     # Within a band, bias toward the extreme the class actually wants. The bias
     # is a position WITHIN the band (0 at the floor, 1 at the ceiling) and is
@@ -2840,32 +2571,17 @@ def score_breakdown(entry: dict, need: dict) -> dict:
     # large's exclusive ceiling, so the gentle falloff still scores it ~1.0, and
     # an unbounded size bonus would push it past the 32B that actually belongs
     # to the tier.
-    position = None
     if params > 0 and in_band:
         span = high - low
         position = (params - low) / span if span > 0 else 1.0
         position = max(0.0, min(position, 1.0))
         if need["class"] in ("large", "xlarge"):
-            size_term = W_LARGER * position
+            score += W_LARGER * position
         elif need["class"] == "fast":
-            size_term = W_SMALLER * (1.0 - position)
-
-    # Unrounded on purpose: sum(terms) == score has to hold exactly, or the
-    # breakdown is not a breakdown. Rounding for display happens in
-    # explain_candidates, once, at the point the record is built.
-    return {
-        "score": band_term + code_term + vision_term + size_term,
-        "band_fit": fit,
-        "in_band": bool(params > 0 and in_band),
-        "band_distance": band_distance(entry, need),
-        "band_position": position,
-        "terms": {
-            "band": band_term,
-            "code": code_term,
-            "vision": vision_term,
-            "size": size_term,
-        },
-    }
+            score += W_SMALLER * (1.0 - position)
+    if entry.get("loaded"):
+        score += W_LOADED
+    return score
 
 
 def rank_candidates(need: dict, inventory: dict = None) -> list:
@@ -2877,6 +2593,8 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
             continue  # embedding models cannot serve chat completions
         if not inv.get("servers", {}).get(entry["server"], {}).get("up", True):
             continue
+        if LMSTUDIO_LOADED_ONLY and entry.get("loaded") is False:
+            continue  # would trigger a just-in-time load on LM Studio
         scored.append((score_entry(entry, need), entry))
     if not scored:
         return []
@@ -2919,64 +2637,6 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
     return tied + rest
 
 
-def explain_candidates(need: dict, candidates: list, limit: int = None) -> list:
-    """Per-candidate score breakdowns, in the order they were ranked.
-
-    Recomputed rather than threaded out of rank_candidates: scoring is pure and
-    cheap, and keeping rank_candidates' signature unchanged means the routing
-    path and its tests are untouched by logging.
-    """
-    limit = LOG_CANDIDATES if limit is None else limit
-    out = []
-    for rank, entry in enumerate(candidates[:limit] if limit > 0 else candidates):
-        detail = score_breakdown(entry, need)
-        out.append({
-            "rank": rank,
-            "model": entry["name"],
-            "server": entry["server"],
-            "params_b": entry["params_b"],
-            "is_code": entry["is_code"],
-            "is_vision": entry["is_vision"],
-            "score": round(detail["score"], 4),
-            "in_band": detail["in_band"],
-            "band_fit": round(detail["band_fit"], 4),
-            "band_distance": round(detail["band_distance"], 3),
-            "band_position": (None if detail["band_position"] is None
-                              else round(detail["band_position"], 4)),
-            "terms": {k: round(v, 4) for k, v in detail["terms"].items()},
-        })
-    return out
-
-
-def rank_meta(need: dict, candidates: list) -> dict:
-    """Facts about the ranking itself, not about any one candidate.
-
-    `tied` is the size of the group the rotation shuffles: a persistently large
-    tie group means tie_epsilon is too wide and load is being spread across
-    models that are not really equivalent. `distance_ranked` true means nothing
-    in the pool was in band -- the clearest signal that the bands and the
-    models actually installed have drifted apart.
-    """
-    if not candidates:
-        return {"candidates": 0, "tied": 0, "distance_ranked": False}
-    distance_ranked = not any(in_requested_band(e, need) for e in candidates)
-    scores = [score_entry(e, need) for e in candidates]
-    best = scores[0]
-    if distance_ranked:
-        best_distance = band_distance(candidates[0], need)
-        tied = sum(
-            1 for sc, entry in zip(scores, candidates)
-            if band_distance(entry, need) == best_distance and best - sc <= TIE_EPSILON
-        )
-    else:
-        tied = sum(1 for sc in scores if best - sc <= TIE_EPSILON)
-    return {
-        "candidates": len(candidates),
-        "tied": tied,
-        "distance_ranked": distance_ranked,
-    }
-
-
 def find_named_model(model_name: str) -> list:
     """Servers hosting an explicitly requested model, best first."""
     wanted = (model_name or "").strip().lower()
@@ -2984,11 +2644,13 @@ def find_named_model(model_name: str) -> list:
         return []
     matches = [e for e in INVENTORY.get("models", [])
                if e["name"].lower() == wanted
+               and not e["is_embedding"]
                and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
     if not matches:
         # Allow the bare name without its tag, e.g. "qwen3" -> "qwen3:14b".
         matches = [e for e in INVENTORY.get("models", [])
                    if e["name"].lower().split(":", 1)[0] == wanted
+                   and not e["is_embedding"]
                    and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
     if len(matches) > 1:
         index = _rotation.get(wanted, 0) % len(matches)
@@ -2997,140 +2659,127 @@ def find_named_model(model_name: str) -> list:
     return matches
 
 
-# --- proxying -----------------------------------------------------------------
-def _forward_headers(request: Request) -> dict:
-    return {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+def embedding_only_match(model_name: str):
+    """The inventory name when an explicitly requested model exists ONLY as an
+    embedding model (exact name first, then the bare name without its tag);
+    None when it is unknown or any host serves it for chat.
 
-
-async def close_upstream(response: httpx.Response, client: httpx.AsyncClient) -> None:
-    await response.aclose()
-    await client.aclose()
-
-
-async def finish_and_record(response: httpx.Response, client: httpx.AsyncClient,
-                            record: dict, started: float) -> None:
-    """Close the upstream, then write the decision record.
-
-    Runs as the response's BackgroundTask, i.e. after the last byte has been
-    streamed -- which is the only point at which total_ms is knowable. The
-    record is written here rather than at dispatch so it carries the full
-    latency; the one-line journal summary is emitted at dispatch so live
-    tailing still shows the decision immediately.
+    Such a request cannot be answered by the chat endpoint. Rerouting it to
+    some other chat model would silently answer with a model the client did
+    not ask for, so the caller rejects it instead.
     """
-    await close_upstream(response, client)
-    record["total_ms"] = round((time.monotonic() - started) * 1000, 1)
-    record_decision(record)
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return None
+    models = INVENTORY.get("models", [])
+    matches = [e for e in models if e["name"].lower() == wanted]
+    if not matches:
+        matches = [e for e in models if e["name"].lower().split(":", 1)[0] == wanted]
+    if matches and all(e["is_embedding"] for e in matches):
+        return matches[0]["name"]
+    return None
+
+
+# --- proxying -----------------------------------------------------------------
+def _forward_headers(request: Request, drop_auth: bool = False) -> dict:
+    """Request headers to send upstream. drop_auth strips Authorization, so the
+    router's own API key is never handed to an Ollama host."""
+    return {k: v for k, v in request.headers.items()
+            if k.lower() not in HOP_BY_HOP
+            and not (drop_auth and k.lower() == "authorization")}
+
+
+def _response_headers(upstream: httpx.Response, extra: dict = None) -> dict:
+    headers = {k: v for k, v in upstream.headers.items()
+               if k.lower() not in RESPONSE_HOP_BY_HOP}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+async def close_upstream(response: httpx.Response) -> None:
+    await response.aclose()
 
 
 async def _stream_upstream(method: str, url: str, headers: dict,
                            json_body=None, content=None,
                            extra_headers: dict = None) -> StreamingResponse:
-    client = httpx.AsyncClient(timeout=300.0)
+    client = http_client()
     try:
         upstream_request = client.build_request(
             method, url, headers=headers, json=json_body, content=content
         )
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
-        await client.aclose()
         raise HTTPException(status_code=502, detail=f"Router core disconnect: {exc}") from exc
-    response_headers = dict(upstream_response.headers)
-    if extra_headers:
-        response_headers.update(extra_headers)
     return StreamingResponse(
         upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,
-        headers=response_headers,
-        background=BackgroundTask(close_upstream, upstream_response, client),
+        headers=_response_headers(upstream_response, extra_headers),
+        background=BackgroundTask(close_upstream, upstream_response),
     )
 
 
+# Upstream statuses that mean "try the next candidate": the host is failing
+# (5xx) or no longer has the model (404, e.g. removed since the last poll).
+RETRYABLE_STATUS = {404} | set(range(500, 600))
+
+
 async def _dispatch_direct(candidates: list, body: dict, headers: dict,
-                           need: dict, record: dict = None) -> StreamingResponse:
+                           need: dict, extra_headers: dict = None) -> StreamingResponse:
     """Send to the best candidate, falling forward through the ranked list on
-    connection errors or upstream 5xx. Retrying is only safe before any body has
-    been streamed, which is why the status is checked before returning."""
-    record = record if record is not None else {}
-    attempts = record.setdefault("attempts", [])
-    started = time.monotonic()
+    connection errors, 404 or 5xx. Retrying is only safe before any body has
+    been streamed, which is why the status is checked before returning. A host
+    that refuses or times out the CONNECTION is marked down immediately so the
+    next request skips it too."""
+    client = http_client()
     last_error = None
     for position, entry in enumerate(candidates):
+        if not INVENTORY.get("servers", {}).get(entry["server"], {}).get("up", True):
+            last_error = f"{entry['server']}: marked down"
+            continue
         attempt_body = dict(body)
         attempt_body["model"] = entry["name"]
-        client = httpx.AsyncClient(timeout=300.0)
-        url = f"{entry['server']}/v1/chat/completions"
-        attempt_started = time.monotonic()
+        url = f"{server_base(entry['server'])}/v1/chat/completions"
         try:
             upstream_request = client.build_request(
-                "POST", url, headers=headers, json=attempt_body
+                "POST", url, headers=dict(headers, **backend_headers(entry["server"])),
+                json=attempt_body
             )
             upstream_response = await client.send(upstream_request, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+            mark_server_down(entry["server"], last_error)
+            continue
         except httpx.RequestError as exc:
-            await client.aclose()
-            last_error = f"{entry['server']}: {exc}"
-            attempts.append({"rank": position, "server": entry["server"],
-                             "model": entry["name"], "outcome": "connect_error",
-                             "error": str(exc),
-                             "ms": round((time.monotonic() - attempt_started) * 1000, 1)})
-            log.warning("fall-forward: %s (%s) unreachable: %s",
-                        entry["server"], entry["name"], exc)
+            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+            log.warning("dispatch: %s", last_error)
             continue
-        if upstream_response.status_code >= 500 and position < len(candidates) - 1:
+        is_last = position == len(candidates) - 1
+        if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
             await upstream_response.aclose()
-            await client.aclose()
             last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
-            attempts.append({"rank": position, "server": entry["server"],
-                             "model": entry["name"], "outcome": "http_5xx",
-                             "status": upstream_response.status_code,
-                             "ms": round((time.monotonic() - attempt_started) * 1000, 1)})
-            log.warning("fall-forward: %s (%s) returned HTTP %s",
-                        entry["server"], entry["name"], upstream_response.status_code)
+            log.warning("dispatch: %s for %s; trying the next candidate",
+                        last_error, entry["name"])
             continue
-        ttfb = round((time.monotonic() - attempt_started) * 1000, 1)
-        attempts.append({"rank": position, "server": entry["server"],
-                         "model": entry["name"], "outcome": "served",
-                         "status": upstream_response.status_code, "ms": ttfb})
-        record.update({
-            "mode": "discovery",
-            "chosen": {"model": entry["name"], "server": entry["server"],
-                       "params_b": entry["params_b"], "rank": position,
-                       "score": round(score_entry(entry, need), 4)},
-            "status": upstream_response.status_code,
-            "ttfb_ms": ttfb,
-            "fell_forward": position,
-        })
-        # The live view. One line, everything needed to see whether the pick
-        # was sane, without opening the JSONL.
-        log.info("route %s class=%s%s%s -> %s @ %s (score %.3f, rank %d/%d, "
-                 "%s, %.0fms, status %s)",
-                 record.get("id", "-"), need["class"],
-                 " code" if need["code"] else "", " vision" if need["vision"] else "",
-                 entry["name"], entry["server"],
-                 record["chosen"]["score"], position + 1, len(candidates),
-                 "in band" if in_requested_band(entry, need) else "OUT OF BAND",
-                 ttfb, upstream_response.status_code)
-        response_headers = dict(upstream_response.headers)
-        response_headers.update({
+        log.info("route class=%s code=%s vision=%s tokens~%s -> %s @ %s (%d/%d)",
+                 need["class"], need["code"], need["vision"],
+                 need.get("approx_tokens"), entry["name"], entry["server"],
+                 position + 1, len(candidates))
+        router_headers = {
             "X-Router-Model": entry["name"],
             "X-Router-Server": entry["server"],
             "X-Router-Class": need["class"],
             "X-Router-Mode": "discovery",
             "X-Router-Candidates": str(len(candidates)),
-            "X-Router-Request-Id": str(record.get("id", "")),
-        })
+        }
+        router_headers.update(extra_headers or {})
         return StreamingResponse(
             upstream_response.aiter_raw(),
             status_code=upstream_response.status_code,
-            headers=response_headers,
-            background=BackgroundTask(finish_and_record, upstream_response,
-                                      client, record, started),
+            headers=_response_headers(upstream_response, router_headers),
+            background=BackgroundTask(close_upstream, upstream_response),
         )
-    record.update({"mode": "discovery", "outcome": "no_usable_target",
-                   "status": 502, "error": last_error,
-                   "total_ms": round((time.monotonic() - started) * 1000, 1)})
-    record_decision(record)
-    log.error("no usable Ollama target for class=%s after %d candidate(s): %s",
-              need["class"], len(candidates), last_error)
     raise HTTPException(status_code=502,
                         detail=f"No usable Ollama target. Last error: {last_error}")
 
@@ -3172,21 +2821,22 @@ async def routing_explain(request: Request):
         messages = [{"role": "user", "content": body["prompt"]}]
     need = classify_request(messages or [])
     candidates = rank_candidates(need)
-    # Deliberately the SAME shape the decision log records, so a hypothesis
-    # formed here can be checked against real traffic without translating
-    # between two formats.
-    limit = int(body.get("limit") or 10)
     return JSONResponse({
         "request": need,
-        "legacy_tier": analyze_complexity(
-            " ".join(m.get("content", "") for m in (messages or [])
-                     if isinstance(m, dict) and isinstance(m.get("content"), str))
-        ),
-        "ranking": rank_meta(need, candidates),
+        "legacy_tier": analyze_complexity(routing_text(messages or [])),
         "chosen": ({"model": candidates[0]["name"], "server": candidates[0]["server"]}
                    if candidates else None),
-        "candidates": explain_candidates(need, candidates, limit),
+        "candidates": [
+            {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
+             "score": round(score_entry(e, need), 4)}
+            for e in candidates[:10]
+        ],
     })
+
+
+def _error(status: int, message: str, code: str) -> JSONResponse:
+    return JSONResponse({"error": {"message": message, "type": "invalid_request_error",
+                                   "code": code}}, status_code=status)
 
 
 @app.post("/v1/chat/completions")
@@ -3195,78 +2845,55 @@ async def route_chat_completion(request: Request):
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
-    messages = body.get("messages", [])
-    headers = _forward_headers(request)
+    if not isinstance(body, dict):
+        return _error(400, "Request body must be a JSON object.", "invalid_body")
+    messages = body.get("messages") or []
     requested = str(body.get("model") or "").strip()
-    # A short id ties the journal line, the response header and the JSONL
-    # record together, so a user report ("this answer was terrible") can be
-    # traced to the exact decision that produced it.
-    request_id = uuid.uuid4().hex[:12]
-    record = {
-        "id": request_id,
-        "ts": time.time(),
-        "requested_model": requested or None,
-        "stream": bool(body.get("stream")),
-    }
+    need = classify_request(messages)
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
-        need = classify_request(messages)
         # An explicitly requested real model is honoured; tier aliases and
         # "auto" mean "decide for me".
-        candidates = []
-        selection = "auto"
+        candidates, explicit = [], False
         if requested and requested.lower() not in ("auto", "") \
                 and requested not in TIER_NAMES:
             candidates = find_named_model(requested)
-            if candidates:
-                selection = "explicit_model"
-            else:
-                log.info("requested model %r is not in the inventory; routing on "
-                         "merit instead", requested)
+            explicit = bool(candidates)
+            embedding = None if candidates else embedding_only_match(requested)
+            if embedding:
+                log.warning("route: %s is embedding-only; rejecting the chat request", embedding)
+                return _error(
+                    400,
+                    f"Model '{embedding}' is an embedding-only model and cannot answer chat "
+                    "completions. Send embedding requests to /v1/embeddings, or choose a chat "
+                    "model (see /v1/models) or 'auto'.",
+                    "embedding_model_not_chat")
         if not candidates:
             if requested in TIER_NAMES:
                 need = dict(need, **{"class": TIER_NAMES[requested]})
-                selection = "tier_alias"
             candidates = rank_candidates(need)
-        record.update({
-            "selection": selection,
-            "request": need,
-            "ranking": rank_meta(need, candidates),
-            "candidates": explain_candidates(need, candidates),
-            "inventory_age_s": round(time.time() - (INVENTORY.get("updated_at") or 0), 1),
-        })
+        extra = {}
+        if need["vision"] and not explicit and candidates \
+                and not any(e["is_vision"] for e in candidates):
+            message = ("The request contains an image, but no discovered model "
+                       "looks vision-capable (see [discovery] vision_models).")
+            if VISION_STRICT:
+                return _error(400, message, "no_vision_model")
+            log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
+            extra["X-Router-Warning"] = "no-vision-model"
         if candidates:
-            return await _dispatch_direct(candidates, body, headers, need, record)
-        log.warning("discovery is on but no candidate survived filtering "
-                    "(class=%s); falling back to LiteLLM", need["class"])
+            return await _dispatch_direct(
+                candidates, body, _forward_headers(request, drop_auth=True),
+                need, extra)
 
     # Fallback: the original static path through LiteLLM, which keeps its own
     # latency routing and cross-tier fallbacks.
-    full_prompt_context = " ".join(
-        msg.get("content", "") for msg in messages
-        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+    body["model"] = globals()[_CLASS_TO_TIER[need["class"]]]
+    log.info("route class=%s -> LiteLLM %s", need["class"], body["model"])
+    return await _stream_upstream(
+        "POST", LITELLM_URL, _forward_headers(request, drop_auth=True), json_body=body,
+        extra_headers={"X-Router-Mode": "litellm", "X-Router-Model": body["model"]},
     )
-    body["model"] = analyze_complexity(full_prompt_context)
-    started = time.monotonic()
-    record.update({
-        "mode": "litellm",
-        "reason": ("discovery disabled" if not DISCOVERY_ENABLED
-                   else "empty inventory" if not INVENTORY.get("models")
-                   else "no candidate"),
-        "chosen": {"model": body["model"], "server": LITELLM_BASE},
-        "request": record.get("request") or classify_request(messages),
-    })
-    log.info("route %s -> LiteLLM tier %s (%s)",
-             request_id, body["model"], record["reason"])
-    response = await _stream_upstream(
-        "POST", LITELLM_URL, headers, json_body=body,
-        extra_headers={"X-Router-Mode": "litellm", "X-Router-Model": body["model"],
-                       "X-Router-Request-Id": request_id},
-    )
-    record["ttfb_ms"] = round((time.monotonic() - started) * 1000, 1)
-    record["status"] = response.status_code
-    record_decision(record)
-    return response
 
 
 @app.get("/v1/models")
@@ -3305,17 +2932,17 @@ async def list_models(request: Request):
     # real model names are still offered. An alias already emitted is never
     # displaced by a stale entry of the same name.
     try:
-        async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT) as client:
-            response = await client.get(f"{LITELLM_BASE}/v1/models",
-                                        headers=_forward_headers(request))
+        response = await http_client().get(
+            f"{LITELLM_BASE}/v1/models",
+            headers=_forward_headers(request, drop_auth=True),
+            timeout=DISCOVERY_TIMEOUT)
         for entry in (response.json().get("data") or []):
             name = str(entry.get("id") or "").strip()
             if name and name not in seen:
                 seen.add(name)
                 data.append({"id": name, "object": "model", "owned_by": "litellm"})
     except Exception as exc:  # noqa: BLE001 - the alias list must still be served
-        print("model list: LiteLLM unreachable (%s); serving aliases only" % exc,
-              file=sys.stderr, flush=True)
+        log.warning("model list: LiteLLM unreachable (%s); serving aliases only", exc)
     return JSONResponse({"object": "list", "data": data})
 
 
@@ -3327,35 +2954,43 @@ async def proxy_openai(path: str, request: Request):
         url = f"{url}?{request.url.query}"
     raw = await request.body()
     return await _stream_upstream(
-        request.method, url, _forward_headers(request), content=raw or None
+        request.method, url, _forward_headers(request, drop_auth=True),
+        content=raw or None
     )
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Loopback by default when nginx fronts us: the public port belongs to the
-    # proxy, and a second listener on 0.0.0.0 would quietly serve the same API
-    # without TLS.
-    uvicorn.run(app,
-                host=os.getenv("ROUTER_BIND_HOST", "0.0.0.0"),
-                port=int(os.getenv("ROUTER_BIND_PORT", "8000")))
+    uvicorn.run(app, host=ROUTER_HOST, port=ROUTER_PORT)
 PYEOF
 
 # --- monitor.py (probes each Ollama backend directly) ---
 cat > "${REPO_DIR}/services/ollama-monitor/monitor.py" <<'PYEOF'
+"""Health monitor for the smart-router stack.
+
+Watches every Ollama host the router can route to (MODEL_SERVERS plus the
+per-tier BACKEND_* lists) and the three local services (LiteLLM, the router,
+Open WebUI), and posts state changes to Mattermost.
+
+  * Probes run in parallel, so one dead host cannot stretch the cycle.
+  * A state change is only reported after N consecutive failed (or passed)
+    checks, so a single dropped probe does not page anyone.
+  * One alert per HOST, naming every tier it serves -- not one per tier.
+  * An alert that fails to deliver is retried every cycle until it lands.
+  * Keep-alive pinning runs in its own thread: loading a cold model can take
+    minutes and must never delay health checks.
+"""
 import configparser
-import json
 import logging
 import os
 import socket
-import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import httpx
 
-# Configured properly further down, once monitor.ini has been read; this call
-# only guarantees that anything logged during config parsing is not lost.
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
-                    level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 MATTERMOST_WEBHOOK_URL = os.getenv("MATTERMOST_WEBHOOK_URL")
 MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OllamaMonitor")
@@ -3364,9 +2999,18 @@ MATTERMOST_VERIFY_TLS = os.getenv("MATTERMOST_VERIFY_TLS", "true").lower() == "t
 
 # Polling behaviour comes from monitor.ini (version controlled); environment
 # variables still win, so an operator can override without a commit.
-_DEFAULTS = {"polling": {"interval_seconds": "15", "timeout_seconds": "5",
-                         "health_path": "/api/tags"},
-             "logging": {"level": "INFO"}}
+_DEFAULTS = {
+    "polling": {"interval_seconds": "15", "timeout_seconds": "5",
+                "health_path": "/api/tags"},
+    "alerting": {"fail_threshold": "3", "recover_threshold": "2"},
+    "startup": {"notice_interval_seconds": "3600"},
+    "local_services": {
+        "enabled": "true",
+        "litellm-proxy": "http://127.0.0.1:4000/health/liveliness",
+        "ollama-router": "http://127.0.0.1:8000/healthz",
+        "open-webui": "http://127.0.0.1:8080/health",
+    },
+}
 MONITOR_INI = os.getenv(
     "MONITOR_INI",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.ini"),
@@ -3376,70 +3020,20 @@ _cfg.read_dict(_DEFAULTS)
 if os.path.exists(MONITOR_INI):
     _cfg.read(MONITOR_INI)
 
-
-def _ini(section: str, option: str, default: str) -> str:
-    """Read one setting, tolerating a missing SECTION.
-
-    ConfigParser.get()'s `fallback` only covers a missing *option* -- a missing
-    section still raises NoSectionError. Reading a hand-trimmed monitor.ini
-    that has no [keep_alive] or [alerting] would therefore kill the daemon at
-    import time, and systemd would restart it into the same crash forever.
-    """
-    try:
-        return _cfg.get(section, option, fallback=default)
-    except configparser.NoSectionError:
-        return default
-
-
 CHECK_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",
-                               _ini("polling", "interval_seconds", "15")))
+                               _cfg.get("polling", "interval_seconds")))
 CHECK_TIMEOUT = float(os.getenv("MONITOR_TIMEOUT_SECONDS",
-                                _ini("polling", "timeout_seconds", "5")))
-HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH",
-                        _ini("polling", "health_path", "/api/tags"))
-
-LOG_LEVEL = (os.getenv("MONITOR_LOG_LEVEL")
-             or _ini("logging", "level", "INFO")).strip().upper()
-logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-
-# --- alerting behaviour -------------------------------------------------------
-# Everything here exists to make the channel quiet when nothing has changed.
-# The daemon is EDGE-triggered: it posts on a transition, never on a state.
-#
-#   failure_threshold / recovery_threshold
-#       consecutive probes required before a transition is believed. Without
-#       these a backend that answers slowly -- one probe timing out, the next
-#       succeeding -- alternates down/up every cycle and posts forever.
-#   repeat_seconds
-#       0 (default) means a host that stays down is reported exactly once. Set
-#       it to re-post a reminder while an outage continues.
-#   startup_notice
-#       auto  -> only on the first ever start, or when the watched set changes
-#       always/never -> as they say
-def _int_ini(section, option, default, env=None):
-    raw = (os.getenv(env) if env else None) or _ini(section, option, default)
-    try:
-        return int(str(raw).strip())
-    except (TypeError, ValueError):
-        logging.warning("%s.%s=%r is not an integer; using %s",
-                        section, option, raw, default)
-        return int(default)
-
-
-ALERT_FAILURES = max(1, _int_ini("alerting", "failure_threshold", "3",
-                                 "MONITOR_FAILURE_THRESHOLD"))
-ALERT_RECOVERIES = max(1, _int_ini("alerting", "recovery_threshold", "2",
-                                   "MONITOR_RECOVERY_THRESHOLD"))
-REPEAT_SECONDS = max(0, _int_ini("alerting", "repeat_seconds", "0",
-                                 "MONITOR_REPEAT_SECONDS"))
-STARTUP_NOTICE = (os.getenv("MONITOR_STARTUP_NOTICE")
-                  or _ini("alerting", "startup_notice", "auto")).strip().lower()
-# systemd's StateDirectory= creates and chowns this for us and exports the path;
-# the literal is only reached when the daemon is run by hand.
-_STATE_DIR = os.getenv("STATE_DIRECTORY", "/var/lib/ollama-monitor")
-STATE_FILE = os.getenv("MONITOR_STATE_FILE",
-                       _ini("alerting", "state_file",
-                            os.path.join(_STATE_DIR, "state.json")))
+                                _cfg.get("polling", "timeout_seconds")))
+HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH", _cfg.get("polling", "health_path"))
+FAIL_THRESHOLD = max(1, int(os.getenv("MONITOR_FAIL_THRESHOLD",
+                                      _cfg.get("alerting", "fail_threshold"))))
+RECOVER_THRESHOLD = max(1, int(os.getenv("MONITOR_RECOVER_THRESHOLD",
+                                         _cfg.get("alerting", "recover_threshold"))))
+# The startup notice is posted at most once per this many seconds, so a crash
+# loop (Restart=always) does not flood the channel. The timestamp lives in the
+# unit's StateDirectory; without one, every start posts as before.
+NOTICE_INTERVAL = int(_cfg.get("startup", "notice_interval_seconds"))
+STATE_DIR = os.getenv("MONITOR_STATE_DIR", "")
 
 # --- keep-alive maintenance ---------------------------------------------------
 # Ollama's OpenAI-compatible endpoint does not support a keep_alive field, so a
@@ -3448,10 +3042,11 @@ STATE_FILE = os.getenv("MONITOR_STATE_FILE",
 # does honour keep_alive: an empty-message request loads the model and (re)sets
 # its unload timer without generating anything.
 KEEP_ALIVE = (os.getenv("OLLAMA_KEEP_ALIVE", "") or "").strip()
-KEEP_ALIVE_MODE = _ini("keep_alive", "enabled", "auto").strip().lower()
+KEEP_ALIVE_MODE = _cfg.get("keep_alive", "enabled", fallback="auto").strip().lower()
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_REFRESH_SECONDS",
-                                    _ini("keep_alive", "refresh_seconds", "240")))
-KEEP_ALIVE_TIMEOUT = float(_ini("keep_alive", "timeout_seconds", "120"))
+                                    _cfg.get("keep_alive", "refresh_seconds",
+                                             fallback="240")))
+KEEP_ALIVE_TIMEOUT = float(_cfg.get("keep_alive", "timeout_seconds", fallback="120"))
 if KEEP_ALIVE_MODE == "auto":
     KEEP_ALIVE_ENABLED = bool(KEEP_ALIVE)
 else:
@@ -3475,39 +3070,6 @@ def _keep_alive_value():
         return KEEP_ALIVE
 
 
-def pin_model(url: str, model: str) -> bool:
-    """Load `model` on `url` and set its unload timer, generating nothing."""
-    payload = {"model": model, "messages": [], "keep_alive": _keep_alive_value()}
-    try:
-        with httpx.Client() as client:
-            resp = client.post(f"{url.rstrip('/')}/api/chat", json=payload,
-                               timeout=KEEP_ALIVE_TIMEOUT)
-            resp.raise_for_status()
-        return True
-    except Exception as exc:
-        logging.warning("keep-alive: %s on %s failed: %s", model, url, exc)
-        return False
-
-
-def refresh_keep_alive(health: dict) -> None:
-    """Pin each tier's model on every healthy host serving that tier."""
-    pinned = 0
-    for tier, urls in BACKENDS.items():
-        model = TIER_MODELS.get(tier, "")
-        if not model:
-            continue
-        for url in urls:
-            if not health.get(url, False):
-                continue          # don't wait on a host we already know is down
-            if pin_model(url, model):
-                pinned += 1
-    if pinned:
-        logging.info("keep-alive: refreshed %d model(s) with keep_alive=%s",
-                     pinned, KEEP_ALIVE)
-
-# tier -> [Ollama backend base URLs]. A tier may have several servers (LiteLLM
-# load-balances across them), so each env var is a comma-separated list and every
-# individual server is tracked and alerted on separately.
 def _url_list(value: str) -> list:
     return [u.strip().rstrip("/") for u in (value or "").split(",") if u.strip()]
 
@@ -3534,83 +3096,107 @@ def _tier_env(tier: str) -> str:
     return ""
 
 
-BACKENDS = {
-    "fast": _url_list(_tier_env("fast")),
-    "medium": _url_list(_tier_env("medium")),
-    "large": _url_list(_tier_env("large")),
-    "xlarge": _url_list(_tier_env("xlarge")),
-}
+BACKENDS = {tier: _url_list(_tier_env(tier)) for tier in ("fast", "medium", "large", "xlarge")}
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 
-# url -> [tiers it backs]. Health is a property of the HOST, not of the tier, so
-# state is keyed by URL. Keying it by (tier, url) meant one unreachable box
-# produced one alert per tier it served -- and with a single-server deployment
-# every tier points at the same URL, so a single outage posted four identical
-# messages, then four more on recovery.
-SERVER_TIERS = {}
-for _tier, _urls in BACKENDS.items():
-    for _url in _urls:
-        SERVER_TIERS.setdefault(_url, []).append(_tier)
 
-# Consecutive-probe counters. Deliberately NOT persisted: they are evidence
-# about the current process's observations, and a restart should re-observe.
-fail_streak = {url: 0 for url in SERVER_TIERS}
-ok_streak = {url: 0 for url in SERVER_TIERS}
+# An LM Studio server is written lmstudio+http://host:1234 in MODEL_SERVERS and
+# BACKEND_* (see router.py). It has no Ollama /api/tags, so it is probed on
+# its OpenAI-compatible /v1/models, with LMSTUDIO_API_TOKEN when LM Studio
+# requires authentication.
+LMSTUDIO_PREFIX = "lmstudio+"
+LMSTUDIO_HEALTH_PATH = os.getenv("MONITOR_LMSTUDIO_HEALTH_PATH", "/v1/models")
+LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
 
 
-def _tier_label(url: str) -> str:
-    tiers = SERVER_TIERS.get(url, [])
-    return "%s `%s`" % ("tiers" if len(tiers) > 1 else "tier",
-                        "`, `".join(tiers)) if tiers else "no tier"
+def server_kind(server: str) -> str:
+    return "lmstudio" if server.startswith(LMSTUDIO_PREFIX) else "ollama"
 
 
-# --- persistent state ---------------------------------------------------------
-# Health has to survive a restart. Held only in memory it defaulted to "everything
-# is up", so each restart re-discovered the same outage and re-announced it --
-# which, with Restart=always, turns one down backend into a message every
-# RestartSec for as long as the outage lasts.
-_state_writable = True
+def server_base(server: str) -> str:
+    return server[len(LMSTUDIO_PREFIX):] if server.startswith(LMSTUDIO_PREFIX) else server
 
 
-def load_state() -> dict:
-    """{"servers": {url: {"healthy": bool, "since": ts, "last_alert": ts}},
-        "watched": [url, ...]}  -- empty dict when there is no usable file."""
-    try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict) and isinstance(data.get("servers"), dict):
-            return data
-        logging.warning("Ignoring malformed state file %s.", STATE_FILE)
-    except FileNotFoundError:
-        pass
-    except Exception as exc:  # noqa: BLE001 - a bad state file must not be fatal
-        logging.warning("Could not read state file %s: %s", STATE_FILE, exc)
-    return {}
+def ollama_hosts() -> dict:
+    """host URL -> tiers it serves. Includes every MODEL_SERVERS host, even one
+    assigned to no tier: the router's discovery routes to it all the same."""
+    hosts = {}
+    for url in _url_list(os.getenv("MODEL_SERVERS", "")):
+        hosts.setdefault(url, [])
+    for tier, urls in BACKENDS.items():
+        for url in urls:
+            hosts.setdefault(url, []).append(tier)
+    return hosts
 
 
-def save_state(state: dict) -> None:
-    """Write atomically, and degrade to memory-only rather than dying."""
-    global _state_writable
-    if not _state_writable:
-        return
-    try:
-        directory = os.path.dirname(STATE_FILE) or "."
-        os.makedirs(directory, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".state-", suffix=".json")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, indent=2, sort_keys=True)
-            os.replace(tmp, STATE_FILE)      # atomic: never a half-written file
-        except Exception:
-            os.unlink(tmp)
-            raise
-    except Exception as exc:  # noqa: BLE001
-        _state_writable = False
-        logging.warning(
-            "Cannot persist state to %s (%s). Alerting still works, but a "
-            "restart during an outage will re-announce it. Set state_file in "
-            "monitor.ini to a writable path, or add StateDirectory= to the "
-            "unit.", STATE_FILE, exc)
+def local_services() -> dict:
+    """name -> health URL for the services running next to the monitor.
+    OPENWEBUI_HEALTH_URL (written by the installer) overrides the ini default,
+    because the Open WebUI port is chosen at install time."""
+    if not _cfg.getboolean("local_services", "enabled"):
+        return {}
+    services = {name: url.strip() for name, url in _cfg.items("local_services")
+                if name != "enabled" and url.strip()}
+    override = (os.getenv("OPENWEBUI_HEALTH_URL") or "").strip()
+    if override and "open-webui" in services:
+        services["open-webui"] = override
+    return services
+
+
+class Check:
+    """One monitored endpoint with debounced state.
+
+    status   -- the confirmed state after the thresholds ('up' / 'down')
+    notified -- the last state successfully delivered to Mattermost
+    The two differ exactly when an alert still has to go out."""
+
+    def __init__(self, key: str, url: str, label: str, headers: dict = None):
+        self.key, self.url, self.label = key, url, label
+        self.headers = headers or {}
+        self.status = self.notified = "up"
+        self.fails = self.passes = 0
+        self.last_error = ""
+
+    def record(self, ok: bool, error: str = "") -> None:
+        if ok:
+            self.passes, self.fails = self.passes + 1, 0
+            if self.status == "down" and self.passes >= RECOVER_THRESHOLD:
+                self.status = "up"
+        else:
+            self.fails, self.passes = self.fails + 1, 0
+            self.last_error = error
+            if self.status == "up" and self.fails >= FAIL_THRESHOLD:
+                self.status = "down"
+
+    @property
+    def pending(self) -> bool:
+        return self.status != self.notified
+
+    def message(self) -> tuple:
+        if self.status == "down":
+            detail = f" ({self.last_error})" if self.last_error else ""
+            return (f"Infrastructure Alert: {self.label} is unavailable after "
+                    f"{FAIL_THRESHOLD} failed checks{detail}.", ":warning:")
+        return (f"Recovery Notice: {self.label} is operational again.",
+                ":white_check_mark:")
+
+
+def build_checks() -> list:
+    checks = []
+    for url, tiers in ollama_hosts().items():
+        served = ", ".join(tiers) if tiers else "no tier (discovery only)"
+        if server_kind(url) == "lmstudio":
+            headers = ({"Authorization": f"Bearer {LMSTUDIO_API_TOKEN}"}
+                       if LMSTUDIO_API_TOKEN else {})
+            checks.append(Check(url, f"{server_base(url)}{LMSTUDIO_HEALTH_PATH}",
+                                f"LM Studio host `{server_base(url)}` (serving: {served})",
+                                headers))
+        else:
+            checks.append(Check(url, f"{url}{HEALTH_PATH}",
+                                f"Ollama host `{url}` (serving: {served})"))
+    for name, url in local_services().items():
+        checks.append(Check(name, url, f"local service `{name}` ({url})"))
+    return checks
 
 
 def _post_once(payload: dict) -> tuple:
@@ -3674,38 +3260,52 @@ def post_mattermost(message: str, emoji: str = ":warning:") -> bool:
     return False
 
 
-def send_startup_notice(state: dict) -> None:
-    """Announce a start -- but only when the start is news.
+def _notice_stamp() -> str:
+    return os.path.join(STATE_DIR, "last-startup-notice") if STATE_DIR else ""
 
-    This message is a webhook self-test, so it is genuinely useful the first
-    time and after a reconfiguration. Posting it on EVERY start is what turns a
-    restart loop into a channel flood, so under the default `auto` it fires
-    only when there is no prior state or the watched set has changed.
-    """
-    watched = sorted(SERVER_TIERS)
-    if STARTUP_NOTICE == "never":
+
+def startup_notice_due(now: float = None) -> bool:
+    """False when a startup notice was delivered less than NOTICE_INTERVAL ago."""
+    stamp = _notice_stamp()
+    if not stamp or NOTICE_INTERVAL <= 0:
+        return True
+    try:
+        with open(stamp) as fh:
+            last = float(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return True
+    return ((now or time.time()) - last) >= NOTICE_INTERVAL
+
+
+def record_startup_notice(now: float = None) -> None:
+    stamp = _notice_stamp()
+    if not stamp:
         return
-    if STARTUP_NOTICE != "always":
-        if state.get("servers") and state.get("watched") == watched:
-            logging.info("Restart with an unchanged configuration; startup "
-                         "notice suppressed (startup_notice=auto).")
-            return
+    try:
+        with open(stamp, "w") as fh:
+            fh.write("%f\n" % (now or time.time()))
+    except OSError as exc:
+        logging.warning("could not record the startup notice time: %s", exc)
+
+
+def send_startup_notice(checks: list) -> None:
     host = socket.gethostname()
-    tiers = ", ".join(
-        f"{tier} -> {', '.join(urls)}" for tier, urls in BACKENDS.items()
-    ) or "none configured"
-    reason = ("configuration changed" if state.get("servers")
-              else "first start on this host")
+    watched = ", ".join(c.key for c in checks) or "nothing configured"
     message = (
-        f"Ollama monitor online on `{host}` — health alerting is active "
-        f"({reason}). Watching tiers: {tiers}. "
+        f"Ollama monitor online on `{host}` — health alerting is active. "
+        f"Watching: {watched}. "
         f"(This is a startup test message confirming webhook access to "
         f"#{MATTERMOST_CHANNEL}.)"
     )
     if not MATTERMOST_WEBHOOK_URL:
         logging.warning("No MATTERMOST_WEBHOOK_URL set; skipping startup notice.")
         return
+    if not startup_notice_due():
+        logging.info("Startup notice skipped: one was sent within the last %ds "
+                     "([startup] notice_interval_seconds).", NOTICE_INTERVAL)
+        return
     if post_mattermost(message, emoji=":white_check_mark:"):
+        record_startup_notice()
         logging.info("Startup notice delivered to #%s.", MATTERMOST_CHANNEL)
     else:
         logging.error(
@@ -3715,215 +3315,115 @@ def send_startup_notice(state: dict) -> None:
         )
 
 
-def backend_healthy(url: str) -> bool:
-    """One probe. Timed, because a host that answers slowly is the thing that
-    used to produce alert/recovery churn, and the latency is the evidence."""
-    started = time.monotonic()
+def probe(url: str, client: httpx.Client, headers: dict = None) -> tuple:
+    """(ok, error) for one health URL. A 401/403 counts as down: an LM Studio
+    that rejects the token cannot serve the router either."""
+    try:
+        resp = client.get(url, timeout=CHECK_TIMEOUT, headers=headers or {})
+        resp.raise_for_status()
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 - any failure is "unhealthy"
+        return False, f"{type(exc).__name__}: {exc}"[:200]
+
+
+def run_cycle(checks: list, client: httpx.Client, pool: ThreadPoolExecutor,
+              notify=None) -> None:
+    """Probe every check in parallel, update state, deliver pending alerts.
+    An undelivered alert stays pending and is retried on the next cycle."""
+    notify = notify or post_mattermost
+    results = list(pool.map(lambda c: probe(c.url, client, c.headers), checks))
+    for check, (ok, error) in zip(checks, results, strict=True):
+        before = check.status
+        check.record(ok, error)
+        if check.status != before:
+            logging.warning("%s is now %s", check.label, check.status.upper())
+        if check.pending:
+            text, emoji = check.message()
+            if notify(text, emoji):
+                check.notified = check.status
+            else:
+                logging.warning("alert for %s not delivered; will retry", check.key)
+
+
+# --- keep-alive thread --------------------------------------------------------
+def pin_model(url: str, model: str) -> bool:
+    """Load `model` on `url` and set its unload timer, generating nothing."""
+    payload = {"model": model, "messages": [], "keep_alive": _keep_alive_value()}
     try:
         with httpx.Client() as client:
-            resp = client.get(f"{url.rstrip('/')}{HEALTH_PATH}", timeout=CHECK_TIMEOUT)
+            resp = client.post(f"{url.rstrip('/')}/api/chat", json=payload,
+                               timeout=KEEP_ALIVE_TIMEOUT)
             resp.raise_for_status()
-        elapsed = (time.monotonic() - started) * 1000
-        logging.debug("probe %s -> HTTP %s in %.0fms", url, resp.status_code, elapsed)
-        # A probe close to the timeout is a future false alarm. Say so now,
-        # while it is still only slow.
-        if elapsed > CHECK_TIMEOUT * 1000 * 0.6:
-            logging.warning("probe %s took %.0fms (timeout is %.0fms) — close to "
-                            "being counted as a failure", url, elapsed,
-                            CHECK_TIMEOUT * 1000)
         return True
-    except Exception as exc:
-        logging.info("probe %s failed after %.0fms: %s", url,
-                     (time.monotonic() - started) * 1000, exc)
+    except Exception as exc:  # noqa: BLE001 - reported, the loop carries on
+        logging.warning("keep-alive: %s on %s failed: %s", model, url, exc)
         return False
 
 
-def evaluate_cycle(health: dict, state: dict, now: float) -> tuple:
-    """Fold one round of probe results into `state`.
-
-    Returns (went_down, came_up, still_down, changed) where the first three are
-    lists of URLs to announce and `changed` says whether `state` needs writing.
-    Pure apart from the streak counters, so the alerting rules can be exercised
-    without a network, a clock, or a webhook.
-    """
-    servers = state.setdefault("servers", {})
-    went_down, came_up, still_down = [], [], []
-    changed = False
-
-    for url in sorted(SERVER_TIERS):
-        if url not in health:
+def refresh_keep_alive(is_up) -> int:
+    """Pin each tier's model on every host serving that tier that is up.
+    is_up(url) -> bool comes from the health checks."""
+    pinned = 0
+    for tier, urls in BACKENDS.items():
+        model = TIER_MODELS.get(tier, "")
+        if not model:
             continue
-        entry = servers.get(url)
-        if entry is None:
-            # A URL we have never seen starts optimistic, so adding a server
-            # does not immediately announce it as down.
-            entry = {"healthy": True, "since": now, "last_alert": 0.0}
-            servers[url] = entry
-            changed = True
-        if health[url]:
-            ok_streak[url] = ok_streak.get(url, 0) + 1
-            fail_streak[url] = 0
-        else:
-            fail_streak[url] = fail_streak.get(url, 0) + 1
-            ok_streak[url] = 0
-
-        if entry.get("healthy", True):
-            # Require several consecutive failures. One slow probe is not an
-            # outage, and treating it as one produces a down/up pair per cycle.
-            if fail_streak[url] >= ALERT_FAILURES:
-                entry.update(healthy=False, since=now, last_alert=now)
-                went_down.append(url)
-                changed = True
-        else:
-            if ok_streak[url] >= ALERT_RECOVERIES:
-                entry.update(healthy=True, since=now, last_alert=now)
-                came_up.append(url)
-                changed = True
-            elif REPEAT_SECONDS and now - entry.get("last_alert", 0.0) >= REPEAT_SECONDS:
-                entry["last_alert"] = now
-                still_down.append(url)
-                changed = True
-
-    # Drop servers that are no longer configured, so the file does not grow
-    # forever and a removed-then-readded host starts clean.
-    for url in [u for u in servers if u not in SERVER_TIERS]:
-        del servers[url]
-        changed = True
-
-    watched = sorted(SERVER_TIERS)
-    if state.get("watched") != watched:
-        state["watched"] = watched
-        changed = True
-
-    # Record what this check actually saw, separately from what we believe.
-    # `servers` is the DEBOUNCED view (post-threshold); this is the raw probe
-    # result, which is what an operator wants when asking "what did it see just
-    # now?" It rides along with whatever write the loop was already going to do
-    # rather than forcing one per cycle -- a flapping host would otherwise
-    # rewrite the file every interval to record a bounce we deliberately ignore.
-    state["last_check"] = {url: bool(up) for url, up in sorted(health.items())}
-    state["last_check_at"] = now
-    return went_down, came_up, still_down, changed
+        for url in urls:
+            if server_kind(url) == "lmstudio":
+                # LM Studio has no keep_alive: it loads on demand and unloads
+                # on its own idle TTL (configure that in LM Studio itself).
+                continue
+            if not is_up(url):
+                continue          # don't wait on a host we already know is down
+            if pin_model(url, model):
+                pinned += 1
+    if pinned:
+        logging.info("keep-alive: refreshed %d model(s) with keep_alive=%s",
+                     pinned, KEEP_ALIVE)
+    return pinned
 
 
-def _outage_line(url: str, entry: dict, now: float) -> str:
-    since = entry.get("since", now)
-    minutes = max(0, int((now - since) // 60))
-    return f"`{url}` ({_tier_label(url)}), down {minutes}m"
+def keep_alive_loop(checks: list, stop: threading.Event) -> None:
+    by_url = {c.key: c for c in checks}
 
+    def is_up(url):
+        check = by_url.get(url)
+        return check is None or check.status == "up"
 
-def cluster_digest(state: dict) -> str:
-    """A one-line fingerprint of what we currently believe about every host."""
-    servers = state.get("servers", {})
-    return "|".join(
-        "%s=%s" % (url, "up" if servers.get(url, {}).get("healthy", True) else "down")
-        for url in sorted(SERVER_TIERS)
-    )
-
-
-def announce(went_down: list, came_up: list, still_down: list,
-             state: dict, now: float) -> bool:
-    """Post the transitions for this cycle. Returns True if anything was sent.
-
-    At most one message per transition kind, so a rack losing power is one
-    line-item list rather than one message per affected host.
-
-    The last announced fingerprint is stored in the state file and re-checked
-    here, so an unchanged cluster CANNOT produce a post -- whatever happens
-    upstream. The threshold and restart logic should already make that
-    impossible; this is the backstop that makes it true by construction, and it
-    is the one rule that survives a bug anywhere else in this file.
-    """
-    servers = state.get("servers", {})
-    digest = cluster_digest(state)
-    if digest == state.get("last_posted_digest") and (went_down or came_up):
-        # Nothing about the cluster differs from the last thing we said about
-        # it. Whatever produced these lists, saying it again would be noise.
-        logging.debug("Suppressed a message: cluster unchanged since the last "
-                      "post (%s).", digest)
-        went_down, came_up = [], []
-    if not (went_down or came_up or still_down):
-        return False
-
-    if went_down:
-        body = "\n".join(f"- `{u}` serving {_tier_label(u)}" for u in went_down)
-        post_mattermost(
-            f"**Infrastructure Alert** — {len(went_down)} backend(s) "
-            f"unavailable after {ALERT_FAILURES} consecutive failed probes:\n{body}"
-        )
-    if came_up:
-        body = "\n".join(f"- `{u}` serving {_tier_label(u)}" for u in came_up)
-        post_mattermost(
-            f"**Recovery Notice** — {len(came_up)} backend(s) operational "
-            f"again:\n{body}",
-            emoji=":white_check_mark:",
-        )
-    if still_down:
-        # The single deliberate exception to the rule above: repeat_seconds is
-        # an explicit opt-in to re-stating an UNCHANGED state, and it is off by
-        # default precisely because it breaks that guarantee.
-        body = "\n".join(_outage_line(u, servers.get(u, {}), now) for u in still_down)
-        post_mattermost(f"**Still down** — outage continues:\n{body}")
-
-    state["last_posted_digest"] = digest
-    state["last_posted_at"] = now
-    return True
+    while not stop.is_set():
+        try:
+            refresh_keep_alive(is_up)
+        except Exception:  # noqa: BLE001 - never let the thread die
+            logging.exception("keep-alive: refresh failed")
+        stop.wait(KEEP_ALIVE_INTERVAL)
 
 
 def run_health_checks() -> None:
-    if not BACKENDS:
-        logging.error("No BACKEND_* URLs configured; nothing to monitor.")
+    checks = build_checks()
+    if not checks:
+        logging.error("No Ollama hosts or local services configured; nothing to monitor.")
         return
-    summary = ", ".join(f"{t}({len(u)})" for t, u in BACKENDS.items())
-    logging.info("Monitoring daemon initialized for tiers: %s", summary)
-    logging.info("Alerting: %d consecutive failure(s) to open, %d to close, "
-                 "reminders %s, state in %s",
-                 ALERT_FAILURES, ALERT_RECOVERIES,
-                 f"every {REPEAT_SECONDS}s" if REPEAT_SECONDS else "off",
-                 STATE_FILE)
+    logging.info("Monitoring %d endpoint(s): %s (alert after %d failures, "
+                 "recover after %d passes)", len(checks),
+                 ", ".join(c.key for c in checks), FAIL_THRESHOLD, RECOVER_THRESHOLD)
+    stop = threading.Event()
     if KEEP_ALIVE_ENABLED:
         logging.info("keep-alive maintainer active: keep_alive=%s every %ds",
                      KEEP_ALIVE, KEEP_ALIVE_INTERVAL)
+        threading.Thread(target=keep_alive_loop, args=(checks, stop),
+                         name="keep-alive", daemon=True).start()
     elif KEEP_ALIVE:
         logging.info("keep-alive configured (%s) but the maintainer is disabled.",
                      KEEP_ALIVE)
     else:
         logging.info("No OLLAMA_KEEP_ALIVE set; each server's own setting applies.")
-    state = load_state()
-    # Confirm on startup that the webhook works and has channel permission --
-    # but only when this start is not just a restart of the same thing.
-    send_startup_notice(state)
-    down_at_start = [u for u, e in state.get("servers", {}).items()
-                     if not e.get("healthy", True) and u in SERVER_TIERS]
-    if down_at_start:
-        logging.info("Resuming with %d backend(s) already known down: %s",
-                     len(down_at_start), ", ".join(sorted(down_at_start)))
-
-    last_pin = 0.0
-    while True:
-        # Probe each distinct host once per cycle, even when several tiers
-        # share it, then apply the result to every tier that uses it.
-        health = {url: backend_healthy(url) for url in SERVER_TIERS}
-        now = time.time()
-        went_down, came_up, still_down, changed = evaluate_cycle(health, state, now)
-        logging.debug("cycle: %s", ", ".join(
-            "%s=%s(f%d/o%d)" % (u, "up" if health[u] else "DOWN",
-                                fail_streak.get(u, 0), ok_streak.get(u, 0))
-            for u in sorted(health)))
-        # Persist BEFORE announcing: if the post hangs and the unit is killed,
-        # a duplicate alert on restart is worse than a missing one.
-        if changed:
-            save_state(state)
-        # Then again after, so the "what did we last say" fingerprint is on disk
-        # too. Both writes only happen on a cycle that changed something, which
-        # in steady state is never.
-        if announce(went_down, came_up, still_down, state, now):
-            save_state(state)
-
-        if KEEP_ALIVE_ENABLED and (time.monotonic() - last_pin) >= KEEP_ALIVE_INTERVAL:
-            refresh_keep_alive(health)
-            last_pin = time.monotonic()
-        time.sleep(CHECK_INTERVAL)
+    # Confirm on startup that the webhook works and has channel permission.
+    send_startup_notice(checks)
+    with httpx.Client() as client, ThreadPoolExecutor(max_workers=min(16, len(checks))) as pool:
+        while True:
+            started = time.monotonic()
+            run_cycle(checks, client, pool)
+            time.sleep(max(1.0, CHECK_INTERVAL - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":
@@ -3939,35 +3439,37 @@ PYEOF
   emit_tier_deployments() {           # $1=model_name  $2=model tag  $3=indices
     local name="$1" tag="$2" indices="$3" idx
     for idx in $indices; do
+      local url="${MODEL_SERVERS[$idx]}"
       printf '  - model_name: %s\n' "$name"
       printf '    litellm_params:\n'
-      printf '      model: ollama/%s\n' "$tag"
-      printf '      api_base: %s\n' "${MODEL_SERVERS[$idx]}"
-      # LiteLLM talks to Ollama's NATIVE api, which does honour keep_alive
-      # (merged upstream in litellm PR #7079).
-      [[ -n "$OLLAMA_KEEP_ALIVE" ]] && printf '      keep_alive: %s\n' "$OLLAMA_KEEP_ALIVE"
+      if [[ "$url" == lmstudio+* ]]; then
+        # LM Studio: LiteLLM's lm_studio provider on its OpenAI-compatible /v1.
+        printf '      model: lm_studio/%s\n' "$tag"
+        printf '      api_base: %s/v1\n' "${url#lmstudio+}"
+      else
+        printf '      model: ollama/%s\n' "$tag"
+        printf '      api_base: %s\n' "$url"
+        # LiteLLM talks to Ollama's NATIVE api, which does honour keep_alive
+        # (merged upstream in litellm PR #7079).
+        [[ -n "$OLLAMA_KEEP_ALIVE" ]] && printf '      keep_alive: %s\n' "$OLLAMA_KEEP_ALIVE"
+      fi
     done
   }
   emit_tier_deployments fast   "$MODEL_FAST"   "$TIER_FAST_IDX"
   emit_tier_deployments medium "$MODEL_MEDIUM" "$TIER_MEDIUM_IDX"
   emit_tier_deployments large  "$MODEL_LARGE"  "$TIER_LARGE_IDX"
   emit_tier_deployments xlarge "$MODEL_XLARGE" "$TIER_XLARGE_IDX"
-  cat <<'YAMLEOF'
-router_settings:
-  routing_strategy: latency-based-routing
-  fallbacks:
-    - xlarge: ["large", "medium", "fast"]
-    - large: ["xlarge", "medium", "fast"]
-    - medium: ["large", "fast"]
-    - fast: ["medium", "large"]
-YAMLEOF
+  # Fallbacks only between tiers that actually have deployments (a fallback
+  # to an empty tier fails LiteLLM's config and `manage apply` validation).
+  for _t in fast:"$MODEL_FAST":"$TIER_FAST_IDX" medium:"$MODEL_MEDIUM":"$TIER_MEDIUM_IDX" \
+            large:"$MODEL_LARGE":"$TIER_LARGE_IDX" xlarge:"$MODEL_XLARGE":"$TIER_XLARGE_IDX"; do
+    IFS=: read -r _name _tag _idx <<< "$_t"
+    [[ -n "${_idx// /}" ]] || continue
+    printf '%s %s@%s\n' "$_name" "$_tag" "$(indices_to_urls "$_idx")"
+  done | litellm_router_settings
 } > "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 
 # --- Open WebUI environment ---
-# Only computable here: IP_CIDR is not final until the prompts have run.
-ROUTER_IP="${IP_CIDR%/*}"
-WEBUI_PUBLIC_URL="${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
-
 # Open WebUI talks to the *complexity router* (port 8000) as an OpenAI-
 # compatible backend, so chats are smart-routed by prompt complexity. The
 # router proxies /v1/models through to LiteLLM so the model list still
@@ -3975,16 +3477,14 @@ WEBUI_PUBLIC_URL="${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
 # picked in the UI is overridden — the dropdown reflects what LiteLLM exposes,
 # not what actually served the reply. To let the UI pick the model manually
 # instead, point OPENAI_API_BASE_URLS at http://127.0.0.1:4000/v1 (LiteLLM
-# direct). Router/LiteLLM have no master key, so the API key is a placeholder.
+# direct). The real router API key is NOT written here: it lives in
+# /app/router/secrets.env (OPENAI_API_KEYS), which the unit loads after this
+# file. The value below is only a placeholder for a router without a key.
 cat > "${REPO_DIR}/env/openwebui.env" <<EOF
-HOST=${OPENWEBUI_BIND_HOST}
-PORT=${OPENWEBUI_BIND_PORT}
+HOST=0.0.0.0
+PORT=${OPENWEBUI_PORT}
 DATA_DIR=/app/openwebui/data
-OPENAI_API_BASE_URLS=http://127.0.0.1:${ROUTER_BIND_PORT}/v1
-# The public origin, as a browser sees it. Open WebUI builds absolute URLs and
-# decides cookie flags from this; left unset behind a TLS proxy it emits http://
-# links and non-Secure cookies on an https:// page.
-WEBUI_URL=${WEBUI_PUBLIC_URL}
+OPENAI_API_BASE_URLS=http://127.0.0.1:8000/v1
 OPENAI_API_KEYS=sk-router-local
 ENABLE_OPENAI_API=true
 ENABLE_OLLAMA_API=false
@@ -3994,105 +3494,8 @@ DO_NOT_TRACK=true
 SCARF_NO_ANALYTICS=true
 HF_HOME=/app/openwebui/cache
 SENTENCE_TRANSFORMERS_HOME=/app/openwebui/cache
-# Open WebUI's own logging. GLOBAL_LOG_LEVEL sets the floor; the per-area
-# variables are the ones worth raising when a specific part misbehaves.
-GLOBAL_LOG_LEVEL=${OPENWEBUI_LOG_LEVEL}
 EOF
 
-
-# --- nginx TLS front end ---
-# nginx owns the two public ports and proxies to the loopback applications.
-# Everything here is in the config repo, so the TLS front end changes by commit
-# like the rest of the system. The certificate itself is NOT: a private key does
-# not belong in git, so it lives only in ${TLS_DIR} inside the container.
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  mkdir -p "${REPO_DIR}/services/nginx-tls"
-  cat > "${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf" <<NGINXEOF
-# Managed by ollama-smart-router. Installed to /etc/nginx/conf.d/ by
-# install/apply-config.sh; edit it in the repo, not in place.
-
-# Shared proxy behaviour. Two things here are not optional:
-#   - the Upgrade/Connection pair, without which Open WebUI's socket.io falls
-#     back to long-polling and chat feels broken rather than fails outright;
-#   - proxy_buffering off, without which nginx holds the SSE token stream until
-#     a buffer fills and replies arrive in bursts instead of word by word.
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-server {
-    # IPv4 only, deliberately. A `listen [::]` line in a container whose
-    # network has no IPv6 makes nginx fail with "Address family not supported"
-    # and refuse to start at all -- and nginx not starting means no UI, which
-    # is a far worse outcome than no IPv6. The installer only ever configures
-    # an IPv4 address (IP_CIDR), so this matches what the container has.
-    listen ${OPENWEBUI_PORT} ssl;
-    server_name _;
-    # No HTTP/2. WebSocket upgrade is an HTTP/1.1 mechanism, which is what Open
-    # WebUI's socket.io needs, and "http2 on" only exists from nginx 1.25.1 --
-    # on anything older the whole file is rejected and the front end never
-    # reloads. Nothing here benefits enough from h2 to be worth that.
-
-    ssl_certificate     ${TLS_DIR}/server.crt;
-    ssl_certificate_key ${TLS_DIR}/server.key;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 1d;
-
-    # Model output is generated slowly; a default 60s read timeout cuts long
-    # answers off mid-sentence.
-    proxy_read_timeout  1h;
-    proxy_send_timeout  1h;
-    # Uploads for RAG. Open WebUI's own limit is what should reject a file,
-    # not an nginx 413.
-    client_max_body_size 200m;
-
-    location / {
-        proxy_pass http://127.0.0.1:${OPENWEBUI_INTERNAL_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade    \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$host;
-        proxy_set_header X-Forwarded-Port  \$server_port;
-        proxy_buffering off;
-        proxy_cache off;
-    }
-}
-
-server {
-    listen 8000 ssl;
-    server_name _;
-
-    ssl_certificate     ${TLS_DIR}/server.crt;
-    ssl_certificate_key ${TLS_DIR}/server.key;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    proxy_read_timeout  1h;
-    proxy_send_timeout  1h;
-    client_max_body_size 200m;
-
-    location / {
-        proxy_pass http://127.0.0.1:${ROUTER_INTERNAL_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        # Token streaming again: an OpenAI client reading a stream must get
-        # each chunk as it is produced.
-        proxy_buffering off;
-        proxy_cache off;
-    }
-}
-NGINXEOF
-fi
 
 # --- per-service requirements (each venv is built from these, so dependency
 #     pins are version controlled per service) ---
@@ -4104,7 +3507,19 @@ python-dotenv==1.1.1
 REQEOF
 
 cat > "${REPO_DIR}/services/litellm-proxy/requirements.txt" <<'REQEOF'
-litellm==1.75.5.post1
+# LiteLLM runs in its OWN venv (/app/litellm/venv). The [proxy] extra is what
+# `litellm --config` needs (backoff, orjson, apscheduler, ...); without it the
+# proxy dies at import with "Missing dependency ... pip install 'litellm[proxy]'".
+# It also pins fastapi/uvicorn versions that conflict with the router's, which is
+# why it cannot share /app/router/venv.
+#
+# requirements.lock (next to this file) is the hash-locked resolution of this
+# pin and is preferred at install time (pip --require-hashes). Regenerate it
+# after changing the pin:
+#   uv pip compile requirements.txt --generate-hashes --python-version 3.13 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements.lock
+# Never move to 1.82.7 or 1.82.8: both were malicious uploads (March 2026).
+litellm[proxy]==1.75.5.post1
 REQEOF
 
 cat > "${REPO_DIR}/services/ollama-monitor/requirements.txt" <<'REQEOF'
@@ -4114,6 +3529,14 @@ REQEOF
 cat > "${REPO_DIR}/services/open-webui/requirements.txt" <<EOF
 open-webui==${OPENWEBUI_VERSION}
 EOF
+
+# The hash lock for LiteLLM is too large to embed here. When the installer is
+# run from a checkout of this repo, carry it along so it is seeded and used.
+_installer_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_installer_dir}/services/litellm-proxy/requirements.lock" ]]; then
+  cp "${_installer_dir}/services/litellm-proxy/requirements.lock" \
+     "${REPO_DIR}/services/litellm-proxy/requirements.lock"
+fi
 
 # --- routing tunables moved out of code into version-controlled ini ---
 cat > "${REPO_DIR}/services/ollama-router/router.ini" <<'INIEOF'
@@ -4127,11 +3550,16 @@ large = 800
 medium = 250
 
 [keywords]
-# JSON arrays, so exact spacing is preserved — a trailing space is significant
-# ("def " must not match "default"). Matched as case-insensitive substrings.
-# code_first=true means a code match wins regardless of prompt length.
+# JSON arrays, so exact spacing is preserved. Matched case-insensitively as
+# WHOLE WORDS (a plural/past suffix is allowed: "bug" matches "bugs"), so
+# "script" no longer matches "description" and "prove" no longer matches
+# "improve". A trailing space is significant: "def " must be followed by
+# whitespace. An entry starting with "re:" is a regular expression (JSON-escape
+# backslashes: "re:\\bclass\\s+\\w+"), used for code SHAPES so that "first
+# class ticket" or "import my contacts" are not mistaken for code.
+# code_first=true means a code match wins regardless of length.
 code_first = true
-code = ["def ", "fn ", "function", "class ", "import ", "sql", "script", "code", "bug", "error", "compile"]
+code = ["re:\\bdef\\s+\\w+\\s*\\(", "re:\\bfn\\s+\\w+\\s*\\(", "re:\\bclass\\s+\\w+\\s*[:({]", "re:^\\s*(?:from\\s+\\S+\\s+)?import\\s+[\\w.]+", "re:```", "function", "sql", "script", "code", "bug", "error", "compile", "stack trace", "regex"]
 large = ["analyze", "evaluate", "optimise", "optimize", "architecture", "mathematics", "calculate", "summarise this article"]
 # Checked before the large list: work that wants the deepest model available.
 xlarge = ["prove", "derive", "rigorous", "comprehensive", "exhaustive", "step by step proof", "entire codebase", "whole repository", "research report", "literature review"]
@@ -4141,6 +3569,24 @@ fast = fast
 medium = medium
 large = large
 xlarge = xlarge
+
+[classification]
+# What the keyword and length heuristics judge:
+#   last_user    -- the newest user message only. A system prompt or an old
+#                   turn can no longer pin a whole conversation to one tier.
+#   conversation -- every message (the old behaviour).
+# Images are always looked for in every message.
+scope = last_user
+# true: an image request fails with HTTP 400 when no discovered model looks
+# vision-capable. false: route it anyway, flagged with X-Router-Warning.
+vision_strict = false
+
+[http]
+# Seconds to open a connection to a backend. This is how long a dead host can
+# delay failover to the next candidate, so keep it short.
+connect_timeout_seconds = 3
+# Seconds allowed between bytes of a response (slow generation is fine).
+read_timeout_seconds = 300
 
 [discovery]
 # Poll each Ollama target's /api/tags for the models it is actually serving,
@@ -4152,6 +3598,18 @@ timeout_seconds = 5
 # Targets to poll. Blank derives them from the BACKEND_* entries in the env
 # file, which already list every configured server.
 servers =
+# Ask each server's /api/show for the capabilities Ollama reports per model
+# ("vision", "embedding", ...), cached per model digest. This catches vision
+# models whose names give nothing away (gemma3, mistral-small3.1, qwen2.5vl).
+# The *_models / *_families name lists below are the fallback for servers that
+# do not report capabilities.
+capability_probe = true
+# LM Studio servers (entries written lmstudio+http://host:1234) are polled via
+# LM Studio's own model API, which reports vision/embedding and whether each
+# model is loaded. true: never route to a model that is not loaded there, so a
+# request never waits for LM Studio's just-in-time load (and never evicts
+# another model to make room).
+lmstudio_loaded_only = false
 # Parameter-count bands (billions) each request class prefers: low:high
 fast_params = 0:9
 medium_params = 9:20
@@ -4180,45 +3638,45 @@ offtask_penalty = 0.25
 # Candidates within this score of the best are rotated through, so the same
 # model on several hosts shares load.
 tie_epsilon = 0.05
-
-[logging]
-# Level for the service log (journalctl -u ollama-router). DEBUG adds a line
-# per discovery poll; INFO logs one line per routed request plus inventory
-# changes.
-level = INFO
-
-# Per-request decision records, one JSON object per line. This is what makes
-# routing quality measurable: every candidate's score and its component terms
-# are kept, so you can ask "what else was available and why did it lose?"
-# rather than guessing from the model that answered.
-#   manage-model-servers routing-stats        <- summary
-#   jq 'select(.request.class=="xlarge")' ... <- anything else
-decisions = true
-# Blank uses $LOGS_DIRECTORY (systemd LogsDirectory=), i.e.
-# /var/log/ollama-router/decisions.jsonl.
-decision_file =
-# Rotation: 20 MB per file, five old files kept.
-max_bytes = 20000000
-backup_count = 5
-
-# Characters of prompt text stored in each record. The prompt is the thing you
-# are judging the routing against, so some of it has to be kept -- but the
-# whole conversation does not. 0 stores no text at all, only the derived
-# features (length, token estimate, matched keywords, code/vision flags).
-# NOTE: whatever is kept here has the same sensitivity as the chat itself.
-prompt_chars = 200
-# How many ranked candidates to record per request. 0 = all of them.
-log_candidates = 10
+# Bonus for a model that is already resident (LM Studio reports this; Ollama
+# entries are neutral). Small: it breaks near-ties, it does not override fit.
+loaded_bonus = 0.1
 INIEOF
 
 cat > "${REPO_DIR}/services/ollama-monitor/monitor.ini" <<'INIEOF'
-# Health-monitor tunables. Backend URLs and the webhook stay in env/router.env;
-# only polling behaviour lives here.
+# Health-monitor tunables. Backend URLs stay in env/router.env and the webhook
+# in /app/router/secrets.env; only polling/alerting behaviour lives here.
+# Every Ollama host in MODEL_SERVERS and the BACKEND_* lists is watched.
 [polling]
 interval_seconds = 15
 timeout_seconds = 5
-# Path appended to each backend URL for the health probe.
+# Path appended to each Ollama backend URL for the health probe. LM Studio
+# servers (lmstudio+http://... entries) are probed on /v1/models instead,
+# with LMSTUDIO_API_TOKEN when set, and are skipped by the keep-alive pinner.
 health_path = /api/tags
+
+[alerting]
+# Consecutive failed checks before a host/service is reported DOWN, and
+# consecutive passing checks before it is reported back UP. With the default
+# 15 s interval, 3 failures = an alert after ~45 s of real outage, and a single
+# dropped probe never pages anyone. An alert that fails to deliver is retried
+# every cycle until Mattermost accepts it.
+fail_threshold = 3
+recover_threshold = 2
+
+[startup]
+# The "monitor online" confirmation is posted at most once per this many
+# seconds, so a restart loop cannot flood the channel. 0 = on every start.
+notice_interval_seconds = 3600
+
+[local_services]
+# Services on this container, probed with the same thresholds. The Open WebUI
+# URL is overridden by OPENWEBUI_HEALTH_URL (router.env) when the installer
+# used a non-default port. Set enabled = false to watch the Ollama hosts only.
+enabled = true
+litellm-proxy = http://127.0.0.1:4000/health/liveliness
+ollama-router = http://127.0.0.1:8000/healthz
+open-webui = http://127.0.0.1:8080/health
 
 [keep_alive]
 # Ollama's OpenAI-compatible endpoint (/v1/chat/completions) does not accept a
@@ -4236,244 +3694,51 @@ enabled = auto
 refresh_seconds = 240
 # Seconds to wait for the load call (a cold model can take a while).
 timeout_seconds = 120
-
-[logging]
-# DEBUG logs every probe with its latency and the current failure/success
-# streaks — which is how you see a host flapping BEFORE it crosses a threshold.
-# INFO logs failed probes, transitions and slow-probe warnings only.
-level = INFO
-
-[alerting]
-# The monitor is EDGE-triggered: it posts when a backend CHANGES state, never
-# once per poll. Each cycle's raw result is recorded in the state file, along
-# with a fingerprint of the last thing that was actually posted; if the cluster
-# looks the same as the last announcement, nothing is sent. These settings
-# decide when a change is believed in the first place.
-#
-# Consecutive failed probes before a backend is declared down. A single slow
-# answer is not an outage — with a threshold of 1, a backend that times out on
-# alternate cycles posts a down/up pair every interval, forever.
-failure_threshold = 3
-# Consecutive successful probes before it is declared recovered.
-recovery_threshold = 2
-# Seconds between "still down" reminders while an outage continues.
-# 0 = report an outage exactly once, which is the quiet default. This is the
-# ONLY setting that can make the monitor re-state something it has already
-# said; leaving it at 0 means an unchanged cluster is guaranteed silent.
-repeat_seconds = 0
-# auto   -> post the "monitor online" webhook self-test only on the first start
-#           or after the watched backend set changes
-# always -> post on every start (noisy if the unit is restarting)
-# never  -> never post it
-startup_notice = auto
-# Where health is remembered across restarts, together with the last raw check
-# result and the fingerprint of the last message posted. Without this the daemon
-# would start believing everything is up and re-announce an ongoing outage on
-# every restart. systemd's StateDirectory= creates and owns the directory.
-state_file = /var/lib/ollama-monitor/state.json
 INIEOF
 
-# --- install/apply-config.sh: runs INSIDE the container, copies the local
-#     generated config into place. ---
+# --- install/apply-config.sh: runs INSIDE the container, copies the cloned
+#     config into place. Version controlled, so the layout is auditable. ---
 cat > "${REPO_DIR}/install/apply-config.sh" <<'APPLYEOF'
 #!/usr/bin/env bash
-# Copy configuration from the local config tree into its runtime locations.
-# Invoked by the installer during provisioning; safe to re-run by hand after
-# editing the config tree, followed by: systemctl daemon-reload &&
+# Copy configuration from the cloned repo into its runtime locations.
+# Invoked by the installer during provisioning; safe to re-run by hand after a
+# `git pull` in the repo directory, followed by: systemctl daemon-reload &&
 # systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
 set -euo pipefail
 REPO_DIR="${1:-/app/config-repo}"
 ROUTER_DIR="${2:-/app/router}"
 OPENWEBUI_DIR="${3:-/app/openwebui}"
 UNIT_DIR="${4:-/etc/systemd/system}"
-# Overridable so this script can be exercised without writing to system paths.
-BIN_DIR="${BIN_DIR:-/usr/local/bin}"
-PROFILE_DIR="${PROFILE_DIR:-/etc/profile.d}"
-LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
-NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 
 install -d -m 0755 "$ROUTER_DIR" "$OPENWEBUI_DIR"
 
-# Expose the server-management tool on PATH FIRST. A symlink (not a copy) means
-# edits in the local config tree update the command too. This is deliberately the
-# first step: under `set -e` any failure below would otherwise leave a
-# half-applied system with no management command to diagnose it with, which is
-# precisely when the command is most needed.
-if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
-  chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh" 2>/dev/null || true
-  install -d -m 0755 "$BIN_DIR"
-  ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" "${BIN_DIR}/manage-model-servers"
-fi
-
-# Tar/push and git history do not guarantee the executable bit for every script
-# an operator may add later, so restore it on every shell script in the repo, not
-# just the ones under install/.
-find "${REPO_DIR}" -type f -name '*.sh' -not -path "${REPO_DIR}/.git/*" \
-  -exec chmod 0755 {} + 2>/dev/null || true
-
-# Put the repo on PATH for login shells, so the scripts are runnable by name
-# from anywhere in the container. Appended, never prepended: a file committed
-# to the repo must not be able to shadow a system command.
-#
-# The repo is 0700 root:root because env/router.env holds real secrets, so in
-# practice only root can traverse it -- this is an operator convenience, not a
-# way to expose the tools to the service account. Note also that profile.d is
-# only read by LOGIN shells (`pct enter`), which is why the /usr/local/bin
-# symlink above still exists: that is what makes `pct exec <id> -- manage-...`
-# work from the Proxmox host.
-install -d -m 0755 "$PROFILE_DIR"
-cat > "${PROFILE_DIR}/ollama-router-path.sh" <<PROFILEEOF
-# Added by ollama-smart-router apply-config.sh. Sourced by /bin/sh: keep POSIX.
-for _osr_dir in "${REPO_DIR}" "${REPO_DIR}/install"; do
-    case ":\${PATH}:" in
-        *":\${_osr_dir}:"*) ;;
-        *) [ -d "\${_osr_dir}" ] && PATH="\${PATH}:\${_osr_dir}" ;;
-    esac
-done
-unset _osr_dir
-export PATH
-PROFILEEOF
-chmod 0644 "${PROFILE_DIR}/ollama-router-path.sh"
-
-# The router's decision log already uses Python's RotatingFileHandler, but keep
-# an OS-level policy too so an operator override under /var/log/ollama-router
-# cannot grow forever. copytruncate keeps the running process on the same inode.
-install -d -m 0755 "$LOGROTATE_DIR"
-cat > "${LOGROTATE_DIR}/ollama-smart-router" <<'LOGROTATEEOF'
-/var/log/ollama-router/*.jsonl {
-    daily
-    rotate 14
-    maxsize 50M
-    missingok
-    notifempty
-    compress
-    delaycompress
-    copytruncate
-    create 0640 ollama-router ollama-router
-}
-LOGROTATEEOF
-chmod 0644 "${LOGROTATE_DIR}/ollama-smart-router"
-
-missing=""
-# copy_required <src> <dest> [install-args...] -- absence is fatal.
-copy_required() {
-  local src="$1" dest="$2"; shift 2
-  [ -f "$src" ] || { echo "FATAL: required file missing: $src" >&2; exit 1; }
-  install "$@" "$src" "$dest"
-}
-# copy_optional <src> <dest> [install-args...] -- absence is reported, not fatal.
-# The .ini files carry built-in defaults inside router.py / monitor.py, so a
-# missing one degrades to those defaults instead of aborting the whole apply.
-copy_optional() {
-  local src="$1" dest="$2"; shift 2
-  if [ -f "$src" ]; then
-    install "$@" "$src" "$dest"
-  else
-    missing="${missing}${missing:+, }$(basename "$src")"
-  fi
-}
-# copy_secret_env <src> <dest> <required|optional>
-#
-# In the provisioned container these files must be root:ollama-router 0640 so
-# services can read them without making secrets world-readable. Tests and
-# staging runs may execute this script before that account exists, though; that
-# should not abort the whole apply before systemd/nginx config is installed.
-copy_secret_env() {
-  local src="$1" dest="$2" kind="$3"
-  if [ ! -f "$src" ]; then
-    if [ "$kind" = "required" ]; then
-      echo "FATAL: required file missing: $src" >&2
-      exit 1
-    fi
-    missing="${missing}${missing:+, }$(basename "$src")"
-    return 0
-  fi
-
-  if [ "$(id -u)" = "0" ] && getent group ollama-router >/dev/null 2>&1; then
-    install -m 0640 -o root -g ollama-router "$src" "$dest"
-  else
-    install -m 0600 "$src" "$dest"
-    # Running as root means this is a real container, not a validation run --
-    # so a missing group is a genuine problem: the services run as
-    # ollama-router and will not be able to read this file. Silence here would
-    # surface later as an unexplained permission error at service start.
-    if [ "$(id -u)" = "0" ]; then
-      echo "WARNING: no ollama-router group; $(basename "$dest") is root-only and" >&2
-      echo "         the services will not be able to read it." >&2
-    fi
-  fi
-}
-
 # Application code + per-service config
-copy_required "${REPO_DIR}/services/ollama-router/router.py"   "${ROUTER_DIR}/router.py"   -m 0644
-copy_required "${REPO_DIR}/services/ollama-monitor/monitor.py" "${ROUTER_DIR}/monitor.py"  -m 0644
-copy_optional "${REPO_DIR}/services/ollama-router/router.ini"  "${ROUTER_DIR}/router.ini"  -m 0644
-copy_optional "${REPO_DIR}/services/ollama-monitor/monitor.ini" "${ROUTER_DIR}/monitor.ini" -m 0644
-copy_optional "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml" \
-              "${ROUTER_DIR}/litellm_config.yaml" -m 0644
+install -m 0644 "${REPO_DIR}/services/ollama-router/router.py"   "${ROUTER_DIR}/router.py"
+install -m 0644 "${REPO_DIR}/services/ollama-router/router.ini"  "${ROUTER_DIR}/router.ini"
+install -m 0644 "${REPO_DIR}/services/ollama-monitor/monitor.py"  "${ROUTER_DIR}/monitor.py"
+install -m 0644 "${REPO_DIR}/services/ollama-monitor/monitor.ini" "${ROUTER_DIR}/monitor.ini"
+install -m 0644 "${REPO_DIR}/services/litellm-proxy/litellm_config.yaml" \
+                "${ROUTER_DIR}/litellm_config.yaml"
 
-# Environment files contain secrets. In the real container copy_secret_env uses
-# root:ollama-router 0640; in tests/staging without that group it degrades to an
-# owner-only copy so the rest of the apply can still be validated.
-copy_secret_env "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"    required
-copy_secret_env "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env" optional
+# Environment files (contain secrets -> root:ollama-router 0640)
+install -m 0640 -o root -g ollama-router "${REPO_DIR}/env/router.env"    "${ROUTER_DIR}/.env"
+install -m 0640 -o root -g ollama-router "${REPO_DIR}/env/openwebui.env" "${OPENWEBUI_DIR}/.env"
 
 # systemd units
 for unit in "${REPO_DIR}"/services/*/*.service; do
-  [ -f "$unit" ] || continue
   install -m 0644 "$unit" "${UNIT_DIR}/$(basename "$unit")"
 done
 
-# nginx TLS front end. Validated BEFORE it is reloaded: a bad proxy config that
-# passes `nginx -t` is a bug, but one that fails it must not take the running
-# front end down with it, because that is the only way in to the UI.
-nginx_site="${REPO_DIR}/services/nginx-tls/ollama-smart-router.conf"
-installed_site="${NGINX_CONF_DIR}/ollama-smart-router.conf"
-if [ ! -f "$nginx_site" ] && [ -f "$installed_site" ]; then
-  # TLS was turned off (or the site was deleted from the repo) but nginx is
-  # still holding 8080 and 8000. Leaving it there means the applications, which
-  # bind those ports directly with TLS off, cannot start at all.
-  echo "Removing the nginx TLS site: it is no longer in the config repo."
-  rm -f "$installed_site"
-  if [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] && command -v nginx >/dev/null 2>&1; then
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-  fi
-fi
-if [ -f "$nginx_site" ]; then
-  install -d -m 0755 "$NGINX_CONF_DIR"
-  install -m 0644 "$nginx_site" "${NGINX_CONF_DIR}/ollama-smart-router.conf"
-  # The site names a certificate, and `nginx -t` fails outright if that file is
-  # absent. Say so plainly instead of dumping an nginx emerg trace that reads
-  # like the proxy config is broken when it is only waiting for a certificate.
-  nginx_cert="$(sed -n 's/^[[:space:]]*ssl_certificate[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
-                 "$nginx_site" | head -1)"
-  reload_nginx=yes
-  if [ -n "$nginx_cert" ] && [ ! -f "$nginx_cert" ]; then
-    echo "NOTE: ${nginx_cert} does not exist yet, so nginx was not reloaded." >&2
-    echo "      Generate it with:  manage-model-servers cert renew" >&2
-    reload_nginx=no
-  fi
-  # Only talk to nginx when the file actually landed where nginx reads from.
-  # `nginx -t` validates the WHOLE system configuration, so with NGINX_CONF_DIR
-  # pointed elsewhere (a test, a staging copy) it would be reporting on a file
-  # this script did not write -- and failing the apply over it.
-  if [ "$reload_nginx" = "yes" ] && [ "$NGINX_CONF_DIR" = "/etc/nginx/conf.d" ] \
-     && command -v nginx >/dev/null 2>&1; then
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-    else
-      # Never fatal: a broken proxy config must not abort an apply that has
-      # already put the application config in place.
-      echo "WARNING: nginx rejected the configuration; leaving the running" >&2
-      echo "         front end untouched. Details:" >&2
-      nginx -t 2>&1 | sed 's/^/         /' >&2 || true
-    fi
-  fi
+# Seeding through the Gitea contents API does not preserve the executable bit,
+# so restore it on the repo's own scripts.
+chmod 0755 "${REPO_DIR}"/install/*.sh 2>/dev/null || true
+
+# Expose the server-management tool on PATH. A symlink (not a copy) means a
+# `git pull` in the repo updates the command too.
+if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
+  ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" /usr/local/bin/manage-model-servers
 fi
 
-if [ -n "$missing" ]; then
-  echo "WARNING: not in the repo, left at previous/default values: ${missing}" >&2
-fi
 echo "Configuration applied from ${REPO_DIR}."
 APPLYEOF
 chmod 0755 "${REPO_DIR}/install/apply-config.sh"
@@ -4507,15 +3772,45 @@ ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
-TLS_DIR="${TLS_DIR:-/app/tls}"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
+# Secrets never live in the config repo: they are kept beside the runtime copy
+# of the env file, readable by the service group only, and loaded by the units
+# that need them through a second EnvironmentFile=.
+SECRETS_FILE="${SECRETS_FILE:-${ROUTER_DIR}/secrets.env}"
+# LiteLLM runs from its own venv (see services/litellm-proxy/requirements.txt).
+LITELLM_DIR="${LITELLM_DIR:-/app/litellm}"
+LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
+LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+# LM Studio's server port. LM Studio servers are stored with a scheme prefix,
+# lmstudio+http://host:1234, so every consumer knows which API to speak.
+LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
+SERVER_TYPE="auto"   # --type ollama|lmstudio|auto for add / set-tier
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8000}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
 SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+# Snapshots of the runtime files taken before each apply (root-only).
+APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/ollama-smart-router}"
+APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
+# One config change at a time (this tool and install/update-router.sh share it).
+# The lock is an flock on this file: it lasts only as long as the process that
+# holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
+# seconds to wait for it (0 = fail at once); `clear-lock` deals with a hung holder.
+CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/ollama-smart-router-config.lock}"
+CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
+# Seconds clear-lock --force gives a holder to exit after SIGTERM before SIGKILL.
+LOCK_KILL_WAIT="${LOCK_KILL_WAIT:-10}"
+# Seconds a restarted service gets to pass its health check. Open WebUI's
+# first start downloads an embedding model, hence its longer allowance.
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
+OPENWEBUI_HEALTH_TIMEOUT="${OPENWEBUI_HEALTH_TIMEOUT:-300}"
+LITELLM_HEALTH_URL="${LITELLM_HEALTH_URL:-http://127.0.0.1:4000/health/liveliness}"
+APPLY_ALL=false
+CONFIG_LOCK_FD=""
 
 declare -A TIER_MODEL_OVERRIDE=()   # tier            -> model tag
 declare -A PAIR_MODEL_OVERRIDE=()   # "tier|server"   -> model tag
@@ -4526,6 +3821,7 @@ NO_PROBE=false
 AUTO_APPLY=false
 AUTO_COMMIT=false
 ASSUME_YES=false
+FORCE=false
 
 usage() {
   cat <<'USAGE'
@@ -4535,15 +3831,9 @@ Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
-  cert [show|renew] [--days n] [--san a,b]
-                             Show, or regenerate, the self-signed TLS
-                             certificate nginx serves. 'renew' keeps the
-                             existing subjectAltName unless --san is given
-  routing-stats [--last n] [--class c] [--file f] [--json]
-                             Summarise the router's decision log: what each
-                             request was classified as, which model answered,
-                             and whether the scoring actually discriminated
-  add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL
+  add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
+                             An LM Studio server is detected automatically, or
+                             write it lmstudio://host[:port] / use --type lmstudio
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
@@ -4553,7 +3843,10 @@ Commands:
                              (e.g. 30m, 2h, -1 = never unload, blank = use the
                              server's own OLLAMA_KEEP_ALIVE)
   models                     List every model available across the configured hosts
-  apply                      Apply the current config and restart services
+  apply [--all]              Validate the config, apply it, restart only the
+                             services whose files changed, health-check them,
+                             and roll back automatically if one fails.
+                             --all restarts every service regardless
   commit [message]           Commit and push the config repo to Gitea
   set-token [token]          Store/replace the Gitea deploy token used for
                              pushing (prompts if not given, then verifies it)
@@ -4563,18 +3856,31 @@ Commands:
                              Configure Mattermost alerting. An empty url
                              disables posting; an empty --channel posts to
                              whichever channel the webhook is bound to
+  set-lmstudio-token [token|--off]
+                             Bearer token for LM Studio servers that require
+                             authentication (stored in secrets.env)
+  set-api-key [key|--generate|--off]
+                             Require "Authorization: Bearer <key>" on the router
+                             API (Open WebUI is given the same key)
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
+  clear-lock [--force]       Show who holds the config lock. A crash or reboot
+                             never leaves it in force (it dies with its
+                             process); a live but hung holder is only stopped
+                             with --force (SIGTERM, then SIGKILL)
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
+  --type <ollama|lmstudio>   With 'add' / 'set-tier': the server's API (default:
+                             auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
   --no-probe                 Skip the reachability check when adding, and the
                              model-availability check when setting a model
   --dry-run                  Show what would change; write nothing
   --yes, -y                  Do not prompt for confirmation
+  --force                    With 'clear-lock': stop the process holding the lock
   -h, --help                 This help
 
 Examples:
@@ -4585,6 +3891,7 @@ Examples:
   manage-model-servers.sh models
   manage-model-servers.sh set-model large qwen3:32b --apply --commit
   manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
+  manage-model-servers.sh set-server-model medium 192.168.11.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
   manage-model-servers.sh set-keepalive 2h --apply
   manage-model-servers.sh set-webui-version latest --apply
 USAGE
@@ -4596,9 +3903,41 @@ note() { echo "$*" >&2; }
 # --- address handling ---------------------------------------------------------
 valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 
+# --- server kinds -------------------------------------------------------------
+server_kind() { [[ "$1" == lmstudio+* ]] && echo lmstudio || echo ollama; }
+server_base() { printf '%s\n' "${1#lmstudio+}"; }
+# LiteLLM provider prefix and api_base for a server entry. LM Studio is
+# OpenAI-compatible under /v1 and uses LiteLLM's lm_studio/ provider.
+litellm_provider() { [[ "$(server_kind "$1")" == lmstudio ]] && echo lm_studio || echo ollama; }
+litellm_api_base() {
+  if [[ "$(server_kind "$1")" == lmstudio ]]; then
+    printf '%s/v1\n' "$(server_base "$1")"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# curl against a server entry, with the LM Studio token when there is one.
+# The header goes through a file descriptor so the token never shows in `ps`.
+server_curl() {
+  local url="$1" path="$2" token=""
+  if [[ "$(server_kind "$url")" == lmstudio ]]; then
+    token="$(env_get LMSTUDIO_API_TOKEN 2>/dev/null)"
+  fi
+  if [[ -n "$token" ]]; then
+    curl -fsS --max-time "$PROBE_TIMEOUT" -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+      "$(server_base "$url")${path}"
+  else
+    curl -fsS --max-time "$PROBE_TIMEOUT" "$(server_base "$url")${path}"
+  fi
+}
+
 valid_addr() {
   local raw="$1" port
   [[ -n "$raw" ]] || return 1
+  # lmstudio://host[:port] and lmstudio+http(s)://... are LM Studio servers.
+  raw="${raw#lmstudio+}"
+  [[ "$raw" == lmstudio://* ]] && raw="${raw#lmstudio://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     [[ "$raw" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/.*)?$ ]]
     return $?
@@ -4613,39 +3952,178 @@ valid_addr() {
   valid_hostname_or_ip "$raw"
 }
 
-# Same normalisation the installer uses, so entries stay comparable.
+# Canonical form of an address: http://host:port for Ollama, and
+# lmstudio+http://host:port for LM Studio. $2 (or SERVER_TYPE) may force the
+# kind; the default port follows the kind (11434 / 1234).
 normalize_addr() {
-  local raw="${1%/}"
-  if [[ "$raw" == http://* || "$raw" == https://* ]]; then
-    printf '%s\n' "$raw"
-  elif [[ "$raw" == *:* ]]; then
-    printf 'http://%s\n' "$raw"
-  else
-    printf 'http://%s:%s\n' "$raw" "$OLLAMA_PORT"
+  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base
+  if [[ "$raw" == lmstudio+* ]]; then
+    kind=lmstudio; raw="${raw#lmstudio+}"
+  elif [[ "$raw" == lmstudio://* ]]; then
+    kind=lmstudio; raw="${raw#lmstudio://}"
   fi
+  [[ "$kind" == lmstudio ]] && port="$LMSTUDIO_PORT" || port="$OLLAMA_PORT"
+  if [[ "$raw" == http://* || "$raw" == https://* ]]; then
+    base="$raw"
+  elif [[ "$raw" == *:* ]]; then
+    base="http://${raw}"
+  else
+    base="http://${raw}:${port}"
+  fi
+  if [[ "$kind" == lmstudio ]]; then printf 'lmstudio+%s\n' "$base"; else printf '%s\n' "$base"; fi
+}
+
+# Which API answers at a plain http base URL: ollama, lmstudio, or nothing.
+detect_server_kind() {
+  local base="$1" body
+  if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/api/tags" 2>/dev/null)" &&
+     [[ "$body" == *'"models"'* ]]; then
+    echo ollama; return 0
+  fi
+  # LM Studio: its native model API (0.4+ /api/v1, 0.3 /api/v0). A 401 still
+  # identifies it: authentication is on and needs set-lmstudio-token.
+  local code path
+  for path in /api/v1/models /api/v0/models; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT" "${base}${path}" 2>/dev/null || true)"
+    if [[ "$code" == 200 || "$code" == 401 ]]; then echo lmstudio; return 0; fi
+  done
+  return 1
+}
+
+# The configured entry an address refers to, so "10.0.0.9:1234" finds a stored
+# lmstudio+http://10.0.0.9:1234 without the prefix having to be typed. Prints
+# the normalized form when nothing matches.
+configured_entry() {
+  local url alt
+  url="$(normalize_addr "$1")"
+  get_servers | contains_line "$url" && { printf '%s\n' "$url"; return 0; }
+  alt="$(normalize_addr "$1" lmstudio)"
+  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
+  alt="$(normalize_addr "$1" ollama)"
+  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
+  printf '%s\n' "$url"
+}
+
+# Resolve a user-supplied address to a stored server entry, probing to find
+# out what it is unless --type says so (or --no-probe is given, which assumes
+# Ollama unless the address says lmstudio). Prints the entry; returns 1 if
+# nothing usable answers.
+resolve_server() {
+  local addr="$1" url base kind alt
+  url="$(normalize_addr "$addr")"
+  [[ "$SERVER_TYPE" != auto || "$(server_kind "$url")" == lmstudio ]] && { printf '%s\n' "$url"; return 0; }
+  $NO_PROBE && { printf '%s\n' "$url"; return 0; }
+  base="$(server_base "$url")"
+  if kind="$(detect_server_kind "$base")"; then
+    normalize_addr "$base" "$kind"; return 0
+  fi
+  # A bare host got Ollama's port; LM Studio may be on its own port instead.
+  if [[ "$addr" != *:* ]]; then
+    alt="$(server_base "$(normalize_addr "$addr" lmstudio)")"
+    if kind="$(detect_server_kind "$alt")" && [[ "$kind" == lmstudio ]]; then
+      normalize_addr "$alt" lmstudio; return 0
+    fi
+  fi
+  return 1
 }
 
 # --- env file access ----------------------------------------------------------
+# Keys that must never be written to the version-controlled env file.
+secret_keys() {
+  printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS \
+    LMSTUDIO_API_TOKEN
+}
+is_secret_key() { secret_keys | grep -qx -- "$1"; }
+
+# Raw KEY=value access to one file. kv_get prints nothing for a missing key;
+# kv_has distinguishes "absent" from "present but empty".
+kv_has() { [[ -f "$1" ]] && grep -q "^${2}=" "$1"; }
+kv_get() {
+  [[ -f "$1" ]] || return 0
+  awk -v k="$2" -F= '$1==k {sub(/^[^=]*=/,""); print; exit}' "$1"
+}
+kv_set() {
+  local file="$1" key="$2" value="$3" tmp
+  tmp="$(mktemp)"
+  if kv_has "$file" "$key"; then
+    # ENVIRON, not -v: awk -v would interpret backslashes in the value.
+    KV_VALUE="$value" awk -v k="$key" -F= \
+      '{ if ($1==k) print k "=" ENVIRON["KV_VALUE"]; else print }' "$file" > "$tmp"
+  else
+    [[ -f "$file" ]] && cp "$file" "$tmp"
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  # Copy content rather than mv, so an existing file keeps its 0640
+  # root:ollama-router ownership and mode instead of inheriting the temp file's.
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+kv_del() {
+  local file="$1" key="$2" tmp
+  kv_has "$file" "$key" || return 0
+  tmp="$(mktemp)"
+  awk -v k="$key" -F= '$1!=k' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# Create the secrets file with service-group-only permissions if needed.
+ensure_secrets_file() {
+  [[ -f "$SECRETS_FILE" ]] && return 0
+  mkdir -p "$(dirname "$SECRETS_FILE")"
+  ( umask 027; : > "$SECRETS_FILE" )
+  chown root:ollama-router "$SECRETS_FILE" 2>/dev/null || true
+  chmod 0640 "$SECRETS_FILE"
+}
+
+# --- env file access ----------------------------------------------------------
+# Secret keys resolve from SECRETS_FILE first and fall back to the repo env file,
+# so a deployment that has not been migrated yet keeps working.
 env_get() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || die "env file not found: ${ENV_FILE}"
-  awk -v k="$key" -F= '$1==k {sub(/^[^=]*=/,""); print; exit}' "$ENV_FILE"
+  if is_secret_key "$key" && kv_has "$SECRETS_FILE" "$key"; then
+    kv_get "$SECRETS_FILE" "$key"
+    return 0
+  fi
+  kv_get "$ENV_FILE" "$key"
 }
 
 env_set() {
-  local key="$1" value="$2" tmp
-  $DRY_RUN && { echo "  [dry-run] ${key}=${value}"; return 0; }
-  tmp="$(mktemp)"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    awk -v k="$key" -v v="$value" -F= '{ if ($1==k) print k "=" v; else print }' "$ENV_FILE" > "$tmp"
-  else
-    cp "$ENV_FILE" "$tmp"
-    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  local key="$1" value="$2"
+  if is_secret_key "$key"; then
+    $DRY_RUN && { echo "  [dry-run] ${key}=<secret> -> ${SECRETS_FILE}"; return 0; }
+    ensure_secrets_file
+    kv_set "$SECRETS_FILE" "$key" "$value"
+    kv_del "$ENV_FILE" "$key"
+    return 0
   fi
-  # Copy content rather than mv, so the file keeps its 0640 root:ollama-router
-  # ownership and mode instead of inheriting the temp file's.
-  cat "$tmp" > "$ENV_FILE"
-  rm -f "$tmp"
+  $DRY_RUN && { echo "  [dry-run] ${key}=${value}"; return 0; }
+  kv_set "$ENV_FILE" "$key" "$value"
+}
+
+# Move any secret still sitting in the version-controlled env file into
+# SECRETS_FILE. Runs before every commit and apply, so a token can never be
+# committed again once this script has touched the deployment.
+migrate_secrets() {
+  local key value moved=0
+  $DRY_RUN && return 0
+  [[ -f "$ENV_FILE" ]] || return 0
+  for key in $(secret_keys); do
+    kv_has "$ENV_FILE" "$key" || continue
+    value="$(kv_get "$ENV_FILE" "$key")"
+    if [[ -n "$value" ]] && ! kv_has "$SECRETS_FILE" "$key"; then
+      ensure_secrets_file
+      kv_set "$SECRETS_FILE" "$key" "$value"
+    fi
+    kv_del "$ENV_FILE" "$key"
+    [[ -n "$value" ]] && moved=$((moved + 1))
+  done
+  if (( moved )); then
+    note "Moved ${moved} secret(s) out of $(basename "$ENV_FILE") into ${SECRETS_FILE}."
+    note "  They are still in the repo's git history: rotate the Gitea token and"
+    note "  the Mattermost webhook if the repo was ever pushed."
+  fi
 }
 
 # NOTE for callers: this dies on an unknown tier, but a `die` inside $(...)
@@ -4695,40 +4173,55 @@ contains_line() {  # $1 = needle, stdin = haystack
 }
 
 # --- reachability -------------------------------------------------------------
-probe_server() {  # prints model count, or "-" when unreachable
-  local url="$1" body
-  if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${url}/api/tags" 2>/dev/null)"; then
-    printf '%s' "$body" | python3 -c 'import sys,json
-try: print(len(json.load(sys.stdin).get("models") or []))
-except Exception: print("?")' 2>/dev/null || printf '?'
-  else
-    printf '%s' "-"
-  fi
+probe_server() {  # prints model count, "-" when unreachable, "?" when unreadable
+  local url="$1" names rc=0
+  names="$(server_models "$url")" || rc=$?
+  case "$rc" in
+    0) printf '%s' "$(printf '%s' "$names" | grep -c . || true)" ;;
+    3) printf '%s' "?" ;;
+    *) printf '%s' "-" ;;
+  esac
 }
 
-# Names of the models a host currently serves, one per line.
+# Chat-capable model names a server offers, one per line. Ollama: /api/tags.
+# LM Studio: its native /api/v1 (or /api/v0) model list without embedding
+# models, falling back to the OpenAI-compatible /v1/models.
+# Exit status: 1 unreachable, 3 answered but not parseable.
 server_models() {
-  curl -fsS --max-time "$PROBE_TIMEOUT" "${1}/api/tags" 2>/dev/null | python3 -c '
+  local url="$1" body path
+  if [[ "$(server_kind "$url")" == ollama ]]; then
+    body="$(server_curl "$url" /api/tags 2>/dev/null)" || return 1
+  else
+    for path in /api/v1/models /api/v0/models /v1/models; do
+      body="$(server_curl "$url" "$path" 2>/dev/null)" && break
+    done
+    [[ -n "$body" ]] || return 1
+  fi
+  printf '%s' "$body" | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
+    entries = data.get("models") or data.get("data") or []
 except Exception:
-    sys.exit(1)
-for entry in (data.get("models") or []):
-    name = entry.get("name") or ""
+    sys.exit(3)
+for entry in entries:
+    if not isinstance(entry, dict):
+        continue
+    if entry.get("type") in ("embedding", "embeddings"):
+        continue
+    name = entry.get("name") or entry.get("key") or entry.get("id") or ""
     if name:
         print(name)
 '
 }
 
-# 0 = present, 1 = absent, 2 = host unreachable.
 model_present_on() {
   local url="$1" tag="$2" names
   names="$(server_models "$url")" || return 2
   [[ -n "$names" ]] || return 2
   printf '%s\n' "$names" | grep -Fxq "$tag" && return 0
   # Ollama treats a bare name as ":latest", so accept that spelling too.
-  if [[ "$tag" != *:* ]]; then
+  if [[ "$(server_kind "$url")" == ollama && "$tag" != *:* ]]; then
     printf '%s\n' "$names" | grep -Fxq "${tag}:latest" && return 0
   fi
   return 1
@@ -4739,13 +4232,13 @@ model_present_on() {
 current_pair_tag() {
   local want_name="$1" want_base="$2"
   [[ -f "$LITELLM_YAML" ]] || return 0
-  awk -v want="$want_name" -v base="$want_base" '
+  awk -v want="$want_name" -v base="$(litellm_api_base "$want_base")" '
     /^[[:space:]]*-[[:space:]]*model_name:/ {
       n = $0; sub(/.*model_name:[[:space:]]*/, "", n); sub(/[[:space:]]*$/, "", n)
       tag = ""; next
     }
-    /^[[:space:]]*model:[[:space:]]*ollama\// {
-      tag = $0; sub(/.*model:[[:space:]]*ollama\//, "", tag); sub(/[[:space:]]*(#.*)?$/, "", tag); next
+    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio)\// {
+      tag = $0; sub(/.*model:[[:space:]]*(ollama|lm_studio)\//, "", tag); sub(/[[:space:]]*(#.*)?$/, "", tag); next
     }
     /^[[:space:]]*api_base:[[:space:]]*/ {
       b = $0; sub(/.*api_base:[[:space:]]*/, "", b); sub(/[[:space:]]*$/, "", b)
@@ -4761,8 +4254,8 @@ current_tier_tag() {
     /^[[:space:]]*-[[:space:]]*model_name:/ {
       n=$0; sub(/.*model_name:[[:space:]]*/,"",n); sub(/[[:space:]]*$/,"",n); next
     }
-    /^[[:space:]]*model:[[:space:]]*ollama\// && n==want {
-      t=$0; sub(/.*model:[[:space:]]*ollama\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t); print t; exit
+    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio)\// && n==want {
+      t=$0; sub(/.*model:[[:space:]]*(ollama|lm_studio)\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t); print t; exit
     }' "$LITELLM_YAML"
 }
 
@@ -4813,7 +4306,7 @@ cmd_list() {
       any=true
       tag="$(current_pair_tag "$alias" "$url")"
       [[ -n "$tag" ]] || tag="$(current_tier_tag "$alias")"
-      printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "$url" "ollama/${tag:-?}"
+      printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "$url" "$(litellm_provider "$url")/${tag:-?}"
     done < <(get_tier "$tier")
     $any || printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "<no servers>" "-"
   done
@@ -4822,7 +4315,14 @@ cmd_list() {
 cmd_discover() {
   local body rc=0
   echo "Asking the router to re-poll every configured host..."
-  body="$(curl -fsS -X POST "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
+  local key; key="$(env_get ROUTER_API_KEY)"
+  if [[ -n "$key" ]]; then
+    # Header read from a file descriptor, so the key never shows up in `ps`.
+    body="$(curl -fsS -X POST -H @<(printf 'Authorization: Bearer %s\n' "$key") \
+            "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
+  else
+    body="$(curl -fsS -X POST "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
+  fi
   if (( rc != 0 )) || [[ -z "$body" ]]; then
     note "Could not reach the router at ${ROUTER_URL} (curl exit ${rc})."
     note "  Check it is running:  systemctl status ollama-router"
@@ -4872,9 +4372,38 @@ else:
 }
 
 # --- mutations ----------------------------------------------------------------
+# Print a `  fallbacks:` block for router_settings. Input on stdin, one tier
+# per line in size order: "<model_name> <signature>", where the signature is
+# the sorted list of its deployments (tag@url). Each tier falls back to the
+# nearest other tiers, smaller first on a tie. A tier whose deployments are
+# IDENTICAL to this one's is skipped: falling back to the same model on the
+# same host cannot succeed where the original failed.
+litellm_fallbacks() {
+  python3 -c '
+import json, sys
+tiers = []
+for line in sys.stdin.read().splitlines():
+    if line.strip():
+        name, _, sig = line.partition(" ")
+        tiers.append((name, sig))
+rows = []
+for i, (name, sig) in enumerate(tiers):
+    others = [(abs(i - j), j, other) for j, (other, osig) in enumerate(tiers)
+              if other != name and osig != sig]
+    if others:
+        rows.append("    - %s: %s" % (name, json.dumps([o for _, _, o in sorted(others)])))
+if rows:
+    print("  fallbacks:")
+    print("\n".join(rows))
+'
+}
+
 regenerate_litellm() {
-  local tmp tier name tag tier_tag url tail_block keep_alive
+  local tmp tier name tag tier_tag url tail_block keep_alive fallbacks sig
+  local -a sig_lines=()
+  local lms_token
   keep_alive="$(env_get OLLAMA_KEEP_ALIVE)"
+  lms_token="$(env_get LMSTUDIO_API_TOKEN)"
   $DRY_RUN && { echo "  [dry-run] would regenerate ${LITELLM_YAML}"; return 0; }
   [[ -f "$LITELLM_YAML" ]] || die "missing ${LITELLM_YAML}"
   tmp="$(mktemp)"
@@ -4885,6 +4414,7 @@ regenerate_litellm() {
       tier_tag="${TIER_MODEL_OVERRIDE[$tier]:-}"
       [[ -n "$tier_tag" ]] || tier_tag="$(current_tier_tag "$name")"
       [[ -n "$tier_tag" ]] || tier_tag="$name"
+      sig=""
       while IFS= read -r url || [[ -n "$url" ]]; do
         [[ -n "$url" ]] || continue
         # Resolve the model for THIS (tier, server) pair, most specific first:
@@ -4901,26 +4431,33 @@ regenerate_litellm() {
         [[ -n "$tag" ]] || tag="$tier_tag"
         printf '  - model_name: %s\n' "$name"
         printf '    litellm_params:\n'
-        printf '      model: ollama/%s\n' "$tag"
-        printf '      api_base: %s\n' "$url"
-        [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
+        printf '      model: %s/%s\n' "$(litellm_provider "$url")" "$tag"
+        printf '      api_base: %s\n' "$(litellm_api_base "$url")"
+        if [[ "$(server_kind "$url")" == lmstudio ]]; then
+          # LM Studio: token only when set (secrets.env, loaded by the unit);
+          # keep_alive is an Ollama setting and is not sent.
+          [[ -n "$lms_token" ]] && printf '      api_key: os.environ/LMSTUDIO_API_TOKEN\n'
+        else
+          [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
+        fi
+        sig+="${tag}@${url} "
       done < <(get_tier "$tier")
+      if [[ -n "$sig" ]]; then
+        sig_lines+=("${name} $(tr ' ' '\n' <<< "$sig" | sed '/^$/d' | sort | paste -sd, -)")
+      fi
     done
-    # Carry the existing router_settings block through verbatim so hand edits
-    # to the strategy or fallbacks survive a regeneration.
+    # router_settings: every hand-edited key (strategy, retries, ...) is kept,
+    # but `fallbacks` is REGENERATED from the tiers that exist now. Carrying it
+    # verbatim left fallbacks pointing at renamed or removed tiers.
+    fallbacks="$( ((${#sig_lines[@]})) && printf '%s\n' "${sig_lines[@]}" | litellm_fallbacks)"
     tail_block="$(awk '/^router_settings:/{f=1} f' "$LITELLM_YAML")"
-    if [[ -n "$tail_block" ]]; then
-      printf '%s\n' "$tail_block"
-    else
-      cat <<'YAMLEOF'
-router_settings:
-  routing_strategy: latency-based-routing
-  fallbacks:
-    - large: ["medium", "fast"]
-    - medium: ["large", "fast"]
-    - fast: ["medium", "large"]
-YAMLEOF
-    fi
+    [[ -n "$tail_block" ]] || tail_block=$'router_settings:\n  routing_strategy: latency-based-routing\n  num_retries: 2\n  timeout: 600'
+    printf '%s\n' "$tail_block" | FALLBACKS="$fallbacks" awk '
+      /^router_settings:/ { print; if (ENVIRON["FALLBACKS"] != "") print ENVIRON["FALLBACKS"]; next }
+      skip && ($0 ~ /^   / || $0 ~ /^  -/) { next }
+      { skip = 0 }
+      /^  fallbacks:/ { skip = 1; next }
+      { print }'
   } > "$tmp"
   cat "$tmp" > "$LITELLM_YAML"
   rm -f "$tmp"
@@ -4936,273 +4473,6 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-cmd_routing_stats() {
-  local file="${ROUTER_DECISION_LOG:-/var/log/ollama-router/decisions.jsonl}"
-  local limit="" want_class="" as_json=false
-  while (( $# )); do
-    case "${1-}" in
-      --file)  file="${2-}"; shift 2 ;;
-      --last)  limit="${2-}"; shift 2 ;;
-      --class) want_class="${2-}"; shift 2 ;;
-      --json)  as_json=true; shift ;;
-      "")      shift ;;
-      *)       die "routing-stats: unknown argument '$1'" ;;
-    esac
-  done
-  [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || die "routing-stats: --last takes a number"
-  if [[ ! -r "$file" ]]; then
-    note "No decision log at ${file}."
-    note "  It is written by the router, so check:"
-    note "    systemctl status ollama-router"
-    note "    grep -A3 '\[logging\]' /app/router/router.ini    # decisions = true?"
-    note "  Or point at another copy:  $0 routing-stats --file <path>"
-    return 1
-  fi
-  # NOTE: %-formatting, not f-strings -- this is embedded in a shell-quoted
-  # string and a quote inside an f-string expression cannot be escaped.
-  python3 -c '
-import json, sys, collections
-
-path, limit, want_class, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
-rows, bad = [], 0
-with open(path, encoding="utf-8", errors="replace") as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            bad += 1          # a torn last line during rotation is normal
-if want_class:
-    rows = [r for r in rows if (r.get("request") or {}).get("class") == want_class]
-if limit:
-    rows = rows[-int(limit):]
-if not rows:
-    print("  no records matched")
-    raise SystemExit(0)
-
-def pct(numerator, denominator):
-    return 100.0 * numerator / denominator if denominator else 0.0
-
-def percentile(values, fraction):
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
-    return ordered[idx]
-
-total = len(rows)
-classes = collections.Counter((r.get("request") or {}).get("class", "?") for r in rows)
-reasons = collections.Counter((r.get("request") or {}).get("reason", "?") for r in rows)
-modes = collections.Counter(r.get("mode", "?") for r in rows)
-models = collections.Counter()
-servers = collections.Counter()
-in_band = out_band = 0
-distance_ranked = 0
-tie_sizes = []
-fellforward = 0
-errors = 0
-ttfb, totals = [], []
-margins = []
-
-for r in rows:
-    chosen = r.get("chosen") or {}
-    if chosen.get("model"):
-        models[chosen["model"]] += 1
-        servers[chosen.get("server", "?")] += 1
-    ranking = r.get("ranking") or {}
-    if ranking.get("distance_ranked"):
-        distance_ranked += 1
-    if ranking.get("tied"):
-        tie_sizes.append(ranking["tied"])
-    cands = r.get("candidates") or []
-    if cands:
-        top = cands[0]
-        if top.get("in_band"):
-            in_band += 1
-        else:
-            out_band += 1
-        if len(cands) > 1:
-            margins.append(round(top.get("score", 0) - cands[1].get("score", 0), 4))
-    if r.get("fell_forward"):
-        fellforward += 1
-    if r.get("outcome") == "no_usable_target" or (r.get("status") or 200) >= 500:
-        errors += 1
-    if isinstance(r.get("ttfb_ms"), (int, float)):
-        ttfb.append(r["ttfb_ms"])
-    if isinstance(r.get("total_ms"), (int, float)):
-        totals.append(r["total_ms"])
-
-if as_json:
-    print(json.dumps({
-        "records": total, "unparsable": bad,
-        "classes": dict(classes), "reasons": dict(reasons), "modes": dict(modes),
-        "models": dict(models), "servers": dict(servers),
-        "top_in_band_pct": round(pct(in_band, in_band + out_band), 1),
-        "distance_ranked_pct": round(pct(distance_ranked, total), 1),
-        "mean_tie_group": round(sum(tie_sizes) / len(tie_sizes), 2) if tie_sizes else 0,
-        "fell_forward_pct": round(pct(fellforward, total), 1),
-        "error_pct": round(pct(errors, total), 1),
-        "ttfb_ms": {"p50": percentile(ttfb, 0.5), "p95": percentile(ttfb, 0.95)},
-        "total_ms": {"p50": percentile(totals, 0.5), "p95": percentile(totals, 0.95)},
-        "median_margin": percentile(margins, 0.5),
-    }, indent=2))
-    raise SystemExit(0)
-
-print("Routing decisions: %d record(s)%s" % (total, " (%d unparsable)" % bad if bad else ""))
-print()
-print("  Request class          (what the classifier decided)")
-for name, count in classes.most_common():
-    print("    %-12s %5d  %5.1f%%" % (name, count, pct(count, total)))
-print("  Why")
-for name, count in reasons.most_common(6):
-    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
-print()
-print("  Model chosen           (what actually answered)")
-for name, count in models.most_common(10):
-    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
-print("  Host chosen")
-for name, count in servers.most_common(10):
-    print("    %-28s %5d  %5.1f%%" % (name, count, pct(count, total)))
-print()
-mean_tie = (sum(tie_sizes) / len(tie_sizes)) if tie_sizes else 0.0
-print("  Scoring quality")
-print("    top candidate in band     %6.1f%%   low = the bands and the models" %
-      pct(in_band, in_band + out_band))
-print("                                        installed have drifted apart")
-print("    distance-ranked requests  %6.1f%%   nothing was in band at all" %
-      pct(distance_ranked, total))
-print("    mean tie-group size       %6.2f    >2 consistently means" % mean_tie)
-print("                                        tie_epsilon is too wide")
-print("    median winning margin     %6.3f    ~0 means the score is not" %
-      percentile(margins, 0.5))
-print("                                        discriminating between models")
-print()
-print("  Delivery")
-print("    fell forward               %5.1f%%   (first choice refused the request)" % pct(fellforward, total))
-print("    errors / 5xx               %5.1f%%" % pct(errors, total))
-print("    time to first byte  p50 %8.0fms   p95 %8.0fms" % (percentile(ttfb, 0.5), percentile(ttfb, 0.95)))
-print("    total request time  p50 %8.0fms   p95 %8.0fms" % (percentile(totals, 0.5), percentile(totals, 0.95)))
-if modes.get("litellm"):
-    print()
-    print("    %d request(s) took the LiteLLM fallback path" % modes["litellm"])
-' "$file" "${limit:-0}" "$want_class" "$as_json"
-}
-
-cmd_cert() {
-  local action="${1:-show}" days="" san=""
-  shift || true
-  while (( $# )); do
-    case "${1-}" in
-      --days) days="${2-}"; shift 2 ;;
-      --san)  san="${2-}";  shift 2 ;;
-      "")     shift ;;
-      *)      die "cert: unknown argument '$1'" ;;
-    esac
-  done
-  [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || die "cert: --days takes a number"
-
-  local crt="${TLS_DIR}/server.crt" key="${TLS_DIR}/server.key"
-  # openssl is only installed when TLS is enabled, so on a plain-HTTP container
-  # this command has nothing to work with. Say that, rather than letting the
-  # shell report "openssl: command not found" from three frames down.
-  command -v openssl >/dev/null 2>&1 \
-    || die "openssl is not installed; this container was provisioned with TLS_ENABLED=false"
-  case "$action" in
-    show)
-      if [[ ! -r "$crt" ]]; then
-        note "No certificate at ${crt}."
-        note "  TLS is off, or this container predates it. Generate one with:"
-        note "    $0 cert renew"
-        return 1
-      fi
-      echo "Certificate: ${crt}"
-      openssl x509 -in "$crt" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
-      echo "  subjectAltName:"
-      openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
-        | grep -v 'X509v3 Subject Alternative Name' | sed 's/^ */    /'
-      echo "  fingerprint:"
-      openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^/    /'
-      # A certificate that expires next week is worth saying out loud rather
-      # than leaving in a date field to be read.
-      if openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
-        if ! openssl x509 -in "$crt" -noout -checkend 2592000 >/dev/null 2>&1; then
-          note "  WARNING: expires within 30 days. Renew with:  $0 cert renew"
-        fi
-      else
-        note "  WARNING: this certificate has EXPIRED. Renew with:  $0 cert renew"
-      fi
-      [[ -r "$key" ]] || note "  WARNING: the private key ${key} is missing or unreadable."
-      ;;
-    renew)
-      local ip host names
-      ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-      host="$(hostname 2>/dev/null)"
-      days="${days:-3650}"
-      # Carry the existing SANs forward unless new ones are given, so renewing
-      # never silently narrows the certificate and breaks a client that was
-      # reaching the box by a name someone added months ago.
-      if [[ -z "$san" && -r "$crt" ]]; then
-        names="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
-          | grep -oE '(DNS|IP Address):[^,]+' | sed 's/IP Address:/IP:/' | paste -sd, -)"
-      fi
-      if [[ -n "$san" ]]; then
-        local part
-        names=""
-        # Same trap as tls_san_list: tr leaves the last field without a
-        # newline, and a bare read discards it. A one-name --san would
-        # otherwise be dropped entirely.
-        while IFS= read -r part || [[ -n "$part" ]]; do
-          part="$(printf '%s' "$part" | tr -d '[:space:]')"
-          [[ -n "$part" ]] || continue
-          if [[ "$part" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then part="IP:${part}"
-          else part="DNS:${part}"; fi
-          names="${names}${names:+,}${part}"
-        done < <(printf '%s' "$san" | tr ',' '\n')
-        [[ -n "$ip" ]]   && names="${names},IP:${ip}"
-        [[ -n "$host" ]] && names="DNS:${host},${names}"
-        names="${names},DNS:localhost,IP:127.0.0.1"
-      fi
-      [[ -n "$names" ]] || names="DNS:${host:-ollama-smart-router},DNS:localhost,IP:${ip:-127.0.0.1},IP:127.0.0.1"
-      echo "Renewing the self-signed certificate (${days} days)."
-      echo "  subjectAltName: ${names}"
-      $DRY_RUN && { echo "  [dry-run] nothing written"; return 0; }
-      confirm "Replace ${crt}?" || { note "Aborted."; return 1; }
-      install -d -m 0750 "$TLS_DIR"
-      # Write to a temp pair and swap only once openssl has succeeded: a failed
-      # renewal must not leave nginx with a key that no longer matches the cert.
-      local tmpk tmpc
-      tmpk="$(mktemp "${TLS_DIR}/.key.XXXXXX")"; tmpc="$(mktemp "${TLS_DIR}/.crt.XXXXXX")"
-      if ! openssl req -x509 -newkey rsa:4096 -sha256 -days "$days" -nodes \
-            -keyout "$tmpk" -out "$tmpc" \
-            -subj "/CN=${host:-ollama-smart-router}/O=ollama-smart-router" \
-            -addext "subjectAltName=${names}" \
-            -addext "basicConstraints=critical,CA:FALSE" \
-            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-            -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
-        rm -f "$tmpk" "$tmpc"
-        die "openssl could not generate the certificate"
-      fi
-      mv "$tmpk" "$key"; mv "$tmpc" "$crt"
-      chmod 0600 "$key"; chmod 0644 "$crt"
-      echo "  wrote ${crt}"
-      if command -v nginx >/dev/null 2>&1; then
-        if nginx -t >/dev/null 2>&1; then
-          systemctl reload nginx >/dev/null 2>&1 && echo "  nginx reloaded"
-        else
-          note "  nginx rejected its configuration; not reloading:"
-          nginx -t 2>&1 | sed 's/^/    /' >&2
-        fi
-      fi
-      note "  Clients that trusted the old certificate must trust this one."
-      ;;
-    *)
-      die "cert: expected 'show' or 'renew', got '${action}'"
-      ;;
-  esac
-}
-
 cmd_add() {
   local -a wanted=("$@")
   local addr url current count tier
@@ -5213,7 +4483,10 @@ cmd_add() {
   local -a to_add=()
   for addr in "${wanted[@]}"; do
     valid_addr "$addr" || die "not a valid address: '${addr}'"
-    url="$(normalize_addr "$addr")"
+    if ! url="$(resolve_server "$addr")"; then
+      die "${addr} is not reachable as Ollama (/api/tags) or LM Studio (port ${LMSTUDIO_PORT}). Use --type and/or --no-probe to add anyway."
+    fi
+    [[ "$(server_kind "$url")" == lmstudio ]] && note "  ${addr}: LM Studio server -> ${url}"
     if get_servers | contains_line "$url"; then
       note "  already configured, skipping: ${url}"
       continue
@@ -5224,6 +4497,9 @@ cmd_add() {
     fi
     if ! $NO_PROBE; then
       if [[ "$(probe_server "$url")" == "-" ]]; then
+        if [[ "$(server_kind "$url")" == lmstudio ]]; then
+          die "${url} did not list its models. Is the LM Studio server running? If it requires authentication, run set-lmstudio-token first. Use --no-probe to add anyway."
+        fi
         die "${url} is not reachable (no /api/tags). Use --no-probe to add anyway."
       fi
     fi
@@ -5256,6 +4532,22 @@ cmd_add() {
       env_set "$key" "$existing"
       echo "  assigned to tier '${tier}'"
     done
+    # Model names differ between Ollama and LM Studio (qwen3:14b vs
+    # qwen/qwen3-14b), so the tier's tag is often wrong for a new LM Studio
+    # server. Say so now rather than at the first failed request.
+    local tag
+    for url in "${to_add[@]}"; do
+      [[ "$(server_kind "$url")" == lmstudio ]] || continue
+      for tier in $(csv_to_lines "$TIER_ARG"); do
+        tag="$(current_tier_tag "$(tier_model_name "$tier")")"
+        [[ -n "$tag" ]] || continue
+        if ! $NO_PROBE && ! model_present_on "$url" "$tag"; then
+          note "  NOTE: ${url} has no model '${tag}' (tier ${tier}). Pick one it serves:"
+          note "        $0 models"
+          note "        $0 set-server-model ${tier} ${url} <model>"
+        fi
+      done
+    done
   else
     note "  NOTE: not assigned to any tier. Discovery will still poll and can"
     note "        select it, but LiteLLM's static path will not use it."
@@ -5276,14 +4568,10 @@ cmd_remove() {
       [[ -n "$target" ]] || die "no server number ${addr} in the list"
     else
       valid_addr "$addr" || die "not a valid address: '${addr}'"
-      target="$(normalize_addr "$addr")"
+      target="$(configured_entry "$addr")"
     fi
     if ! get_servers | contains_line "$target"; then
       note "  not configured, skipping: ${target}"
-      continue
-    fi
-    if printf '%s\n' "${to_remove[@]:-}" | contains_line "$target"; then
-      note "  duplicate in arguments, skipping: ${target}"
       continue
     fi
     to_remove+=("$target")
@@ -5330,7 +4618,7 @@ cmd_set_tier() {
       [[ -n "$url" ]] || die "no server number ${addr} in the list"
     else
       valid_addr "$addr" || die "not a valid address: '${addr}'"
-      url="$(normalize_addr "$addr")"
+      url="$(configured_entry "$addr")"
     fi
     get_servers | contains_line "$url" || die "${url} is not a configured server; add it first."
     list="${list}${list:+,}${url}"
@@ -5358,7 +4646,7 @@ resolve_server_arg() {
     [[ -n "$url" ]] || die "no server number ${arg} in the list"
   else
     valid_addr "$arg" || die "not a valid address: '${arg}'"
-    url="$(normalize_addr "$arg")"
+    url="$(configured_entry "$arg")"
   fi
   get_servers | contains_line "$url" || die "${url} is not a configured server; add it first."
   printf '%s\n' "$url"
@@ -5371,7 +4659,8 @@ cmd_set_server_model() {
   tier_env_key "$tier" >/dev/null
   [[ -n "$server" ]] || die "set-server-model: no server given"
   [[ -n "$tag" ]]    || die "set-server-model: no model given (e.g. qwen3:32b)"
-  [[ "$tag" != */* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
+  # Namespace slashes belong to the model name; only the provider prefix is forbidden.
+  [[ "$tag" != ollama/* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
 
   url="$(resolve_server_arg "$server")"
   get_tier "$tier" | contains_line "$url" \
@@ -5489,11 +4778,8 @@ cmd_set_webui_version() {
 
   info="$(pypi_openwebui_info "$want")" || {
     note "Could not reach PyPI to check versions."
-    if [[ -n "$want" ]]; then
-      note "  Version changes are not written unless the release can be verified."
-      return 1
-    fi
-    info=$'\t\t'
+    [[ -n "$want" ]] || return 1
+    info=$'\t'"${want}"$'\t'
   }
   latest="$(printf '%s' "$info" | cut -f1)"
   target="$(printf '%s' "$info" | cut -f2)"
@@ -5561,6 +4847,8 @@ cmd_set_keepalive() {
   note "  NOTE: Ollama's OpenAI-compatible endpoint ignores keep_alive, so models"
   note "        served through the router are kept resident by the monitor, which"
   note "        re-pins them through the native API. Restart it to pick this up."
+  note "        LM Studio servers are not affected: LM Studio loads models on demand"
+  note "        and unloads them on its own idle TTL (set that in LM Studio)."
 }
 
 cmd_models() {
@@ -5575,7 +4863,7 @@ cmd_models() {
   done < <(get_servers)
   echo "Models available across ${count} configured host(s):"
   if [[ ! -s "$tmp" ]]; then
-    echo "  (none — no host answered /api/tags)"
+    echo "  (none — no host listed its models)"
     rm -f "$tmp"; return 0
   fi
   printf '  %-30s %s\n' "MODEL" "HOSTS"
@@ -5595,7 +4883,8 @@ cmd_set_model() {
   [[ -n "$tier" ]] || die "set-model: no tier given"
   tier_env_key "$tier" >/dev/null          # validates the tier name
   [[ -n "$tag" ]] || die "set-model: no model given (e.g. qwen3:32b)"
-  [[ "$tag" != */* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
+  # Namespace slashes belong to the model name; only the provider prefix is forbidden.
+  [[ "$tag" != ollama/* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
 
   alias="$(tier_model_name "$tier")"
   current="$(current_tier_tag "$alias")"
@@ -5685,14 +4974,385 @@ openwebui_install() {
   "$pip" install --no-cache-dir -r "$OPENWEBUI_REQ"
 }
 
+# --- LiteLLM venv ---------------------------------------------------------------
+litellm_pinned_version() {
+  [[ -f "$LITELLM_REQ" ]] || return 0
+  sed -nE 's/^[[:space:]]*litellm(\[[^]]*\])?[[:space:]]*==[[:space:]]*([^[:space:];#]+).*/\2/p' \
+    "$LITELLM_REQ" | head -n1
+}
+
+litellm_installed_version() {
+  local py="${LITELLM_DIR}/venv/bin/python"
+  [[ -x "$py" ]] || return 0
+  "$py" -c 'import importlib.metadata as m
+try: print(m.version("litellm"))
+except Exception: pass' 2>/dev/null
+}
+
+# True when the venv has the pinned litellm AND the proxy extra's imports work.
+# The import is the real test: a plain `litellm` install passes a version check
+# but `litellm --config` then dies with "Missing dependency ... backoff".
+litellm_venv_ok() {
+  local want have
+  want="$(litellm_pinned_version)"
+  have="$(litellm_installed_version)"
+  [[ -n "$have" ]] || return 1
+  [[ -z "$want" || "$want" == "$have" ]] || return 1
+  "${LITELLM_DIR}/venv/bin/python" -c 'import litellm.proxy.proxy_server' >/dev/null 2>&1
+}
+
+# Build (or bring up to date) LiteLLM's own venv, hash-checked when the repo
+# carries requirements.lock.
+litellm_install() {
+  local pip="${LITELLM_DIR}/venv/bin/pip"
+  if [[ ! -x "$pip" ]]; then
+    mkdir -p "$LITELLM_DIR"
+    python3 -m venv "${LITELLM_DIR}/venv" || { note "  could not create ${LITELLM_DIR}/venv"; return 1; }
+  fi
+  if [[ -f "$LITELLM_LOCK" ]]; then
+    "$pip" install --no-cache-dir --require-hashes -r "$LITELLM_LOCK"
+  else
+    note "  WARNING: no $(basename "$LITELLM_LOCK"); installing without hash checking."
+    "$pip" install --no-cache-dir -r "$LITELLM_REQ"
+  fi
+}
+
+# --- safe apply ---------------------------------------------------------------
+# Validate every file apply-config.sh is about to install. Prints one line per
+# problem; returns 1 if there was any. Nothing on the running system changes.
+validate_config() {
+  local py=python3
+  # The YAML check needs PyYAML. Debian's python3 may lack it; LiteLLM's venv
+  # always has it. (Without either, only a basic structural check runs.)
+  if ! python3 -c 'import yaml' 2>/dev/null && [[ -x "${LITELLM_DIR}/venv/bin/python" ]]; then
+    py="${LITELLM_DIR}/venv/bin/python"
+  fi
+  "$py" - "$REPO_DIR" <<'PYEOF'
+import configparser, json, re, sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+errors = []
+deployments = {}   # model_name -> {(model, api_base)}
+
+def err(path, message):
+    errors.append("%s: %s" % (path, message))
+
+# env files: KEY=value lines only (systemd EnvironmentFile syntax).
+for rel in ("env/router.env", "env/openwebui.env"):
+    path = repo / rel
+    if not path.is_file():
+        err(rel, "missing")
+        continue
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if line.strip() and not line.lstrip().startswith("#") \
+                and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", line):
+            err(rel, "line %d is not KEY=value: %r" % (number, line[:60]))
+
+# Python services must at least compile.
+for rel in ("services/ollama-router/router.py", "services/ollama-monitor/monitor.py"):
+    try:
+        compile((repo / rel).read_text(), rel, "exec")
+    except (OSError, SyntaxError) as exc:
+        err(rel, "does not compile: %s" % exc)
+
+# router.ini
+rel = "services/ollama-router/router.ini"
+cp = configparser.ConfigParser()
+try:
+    cp.read(repo / rel)
+    for option in ("code", "large", "xlarge"):
+        if cp.has_option("keywords", option):
+            value = json.loads(cp.get("keywords", option))
+            if not isinstance(value, list):
+                err(rel, "[keywords] %s must be a JSON array" % option)
+                continue
+            for entry in value:
+                if str(entry).startswith("re:"):
+                    try:
+                        re.compile(str(entry)[3:])
+                    except re.error as exc:
+                        err(rel, "[keywords] %s: bad regex %r (%s)" % (option, entry, exc))
+    for option in ("xlarge", "large", "medium"):
+        if cp.has_option("thresholds", option):
+            int(cp.get("thresholds", option))
+    for option in ("fast_params", "medium_params", "large_params", "xlarge_params"):
+        if cp.has_option("discovery", option):
+            low, high = cp.get("discovery", option).split(":", 1)
+            if float(low) > float(high):
+                err(rel, "[discovery] %s has low > high" % option)
+except (configparser.Error, ValueError) as exc:
+    err(rel, str(exc))
+
+# monitor.ini
+rel = "services/ollama-monitor/monitor.ini"
+cp = configparser.ConfigParser()
+try:
+    cp.read(repo / rel)
+    for section, option in (("polling", "interval_seconds"), ("alerting", "fail_threshold"),
+                            ("alerting", "recover_threshold")):
+        if cp.has_option(section, option):
+            int(cp.get(section, option))
+except (configparser.Error, ValueError) as exc:
+    err(rel, str(exc))
+
+# litellm_config.yaml
+rel = "services/litellm-proxy/litellm_config.yaml"
+try:
+    import yaml
+except ImportError:
+    yaml = None
+text = (repo / rel).read_text() if (repo / rel).is_file() else None
+if text is None:
+    err(rel, "missing")
+elif yaml is None:
+    if not re.search(r"^model_list:", text, re.M):
+        err(rel, "no model_list (PyYAML unavailable; only a basic check was possible)")
+else:
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        err(rel, "is not valid YAML: %s" % str(exc).splitlines()[0])
+        doc = None
+    if doc is not None:
+        names = set()
+        models = doc.get("model_list") if isinstance(doc, dict) else None
+        if not isinstance(models, list) or not models:
+            err(rel, "model_list must be a non-empty list")
+            models = []
+        for index, item in enumerate(models):
+            params = (item or {}).get("litellm_params") or {}
+            if not (item or {}).get("model_name") or not params.get("model") \
+                    or not params.get("api_base"):
+                err(rel, "model_list[%d] needs model_name, litellm_params.model and api_base" % index)
+            else:
+                names.add(item["model_name"])
+                deployments.setdefault(item["model_name"], set()).add(
+                    (params["model"], params["api_base"]))
+        settings = (doc.get("router_settings") or {}) if isinstance(doc, dict) else {}
+        for entry in settings.get("fallbacks") or []:
+            if not isinstance(entry, dict) or len(entry) != 1:
+                err(rel, "each fallbacks entry must be {tier: [tiers]}")
+                continue
+            (source, targets), = entry.items()
+            for name in [source] + list(targets or []):
+                if name not in names:
+                    err(rel, "fallback names %r, which has no deployment" % name)
+
+if not errors:
+    seen = {}
+    for name, deps in sorted(deployments.items()):
+        key = frozenset(deps)
+        if key in seen:
+            print("  note: tiers %r and %r serve the same model on the same host(s); "
+                  "one of them adds nothing (not an error)" % (seen[key], name))
+        else:
+            seen[key] = name
+
+for line in errors:
+    print("  " + line)
+sys.exit(1 if errors else 0)
+PYEOF
+}
+
+# runtime path -> repo source, and the services that read it.
+apply_map() {
+  cat <<EOF
+services/ollama-router/router.py|${ROUTER_DIR}/router.py|ollama-router
+services/ollama-router/router.ini|${ROUTER_DIR}/router.ini|ollama-router
+services/ollama-monitor/monitor.py|${ROUTER_DIR}/monitor.py|ollama-monitor
+services/ollama-monitor/monitor.ini|${ROUTER_DIR}/monitor.ini|ollama-monitor
+services/litellm-proxy/litellm_config.yaml|${ROUTER_DIR}/litellm_config.yaml|litellm-proxy
+env/router.env|${ROUTER_DIR}/.env|litellm-proxy ollama-router ollama-monitor
+env/openwebui.env|${OPENWEBUI_DIR}/.env|open-webui
+services/litellm-proxy/litellm-proxy.service|${UNIT_DIR}/litellm-proxy.service|litellm-proxy
+services/ollama-router/ollama-router.service|${UNIT_DIR}/ollama-router.service|ollama-router
+services/ollama-monitor/ollama-monitor.service|${UNIT_DIR}/ollama-monitor.service|ollama-monitor
+services/open-webui/open-webui.service|${UNIT_DIR}/open-webui.service|open-webui
+EOF
+}
+
+# Fingerprint of the secrets file, recorded after each successful apply, so a
+# set-token / set-webhook / set-api-key since then restarts the services that
+# load it.
+secrets_fingerprint() {
+  if [[ -f "$SECRETS_FILE" ]]; then sha256sum < "$SECRETS_FILE" | cut -d' ' -f1; else echo none; fi
+}
+
+# Services that must restart for the pending apply, in SERVICES order: any
+# whose files differ from what is installed, any that is not running, and the
+# secret-loading ones when secrets.env changed. Run BEFORE apply-config.sh.
+affected_services() {
+  local src dest svcs svc
+  local -A want=()
+  if $APPLY_ALL; then printf '%s\n' "${SERVICES[@]}"; return 0; fi
+  while IFS='|' read -r src dest svcs; do
+    [[ -f "${REPO_DIR}/${src}" ]] || continue
+    if ! cmp -s "${REPO_DIR}/${src}" "$dest"; then
+      for svc in $svcs; do want[$svc]=1; done
+    fi
+  done < <(apply_map)
+  if [[ "$(secrets_fingerprint)" != "$(cat "${ROUTER_DIR}/.secrets.applied" 2>/dev/null)" ]]; then
+    want[ollama-router]=1; want[ollama-monitor]=1; want[open-webui]=1
+  fi
+  for svc in "${SERVICES[@]}"; do
+    systemctl is-active --quiet "${svc}.service" 2>/dev/null || want[$svc]=1
+  done
+  for svc in "${SERVICES[@]}"; do
+    [[ -n "${want[$svc]:-}" ]] && printf '%s\n' "$svc"
+  done
+  return 0
+}
+
+# Copy every runtime file apply-config.sh may overwrite into a new timestamped
+# snapshot directory; print its path. Old snapshots beyond APPLY_BACKUP_KEEP
+# are pruned.
+snapshot_runtime() {
+  local dir src dest svcs
+  dir="${APPLY_BACKUP_DIR}/$(date +%Y%m%dT%H%M%S)-$$"
+  mkdir -p "$dir" && chmod 0700 "$APPLY_BACKUP_DIR" "$dir"
+  : > "${dir}/MANIFEST"
+  while IFS='|' read -r src dest svcs; do
+    [[ -f "$dest" ]] || continue
+    mkdir -p "${dir}/files$(dirname "$dest")"
+    cp -p "$dest" "${dir}/files${dest}"
+    printf '%s\n' "$dest" >> "${dir}/MANIFEST"
+  done < <(apply_map)
+  # shellcheck disable=SC2012  # names are our own timestamps
+  ls -1d "${APPLY_BACKUP_DIR}"/*/ 2>/dev/null | sort | head -n "-${APPLY_BACKUP_KEEP}" |
+    while IFS= read -r old; do rm -rf -- "$old"; done
+  printf '%s\n' "$dir"
+}
+
+# Put back every file recorded in a snapshot.
+restore_runtime() {
+  local dir="$1" dest
+  [[ -f "${dir}/MANIFEST" ]] || { note "  snapshot ${dir} has no MANIFEST"; return 1; }
+  while IFS= read -r dest; do
+    [[ -n "$dest" ]] && cp -p "${dir}/files${dest}" "$dest"
+  done < "${dir}/MANIFEST"
+}
+
+# The URL a service answers health checks on (empty: use systemd state only).
+health_url() {
+  local port
+  case "$1" in
+    litellm-proxy) printf '%s\n' "$LITELLM_HEALTH_URL" ;;
+    ollama-router) printf '%s/healthz\n' "$ROUTER_URL" ;;
+    open-webui)
+      port="$(kv_get "${REPO_DIR}/env/openwebui.env" PORT)"
+      printf 'http://127.0.0.1:%s/health\n' "${port:-8080}" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+# Wait until a restarted service is active AND answers its health URL. A unit
+# that systemd reports as failed is given up on at once. Returns 1 on timeout.
+wait_healthy() {
+  local svc="$1" limit="${2:-$HEALTH_TIMEOUT}" url waited=0 state
+  url="$(health_url "$svc")"
+  while (( waited < limit )); do
+    state="$(systemctl is-active "${svc}.service" 2>/dev/null || true)"
+    if [[ "$state" == failed ]]; then
+      return 1
+    fi
+    if [[ "$state" == active ]]; then
+      if [[ -z "$url" ]]; then
+        # No HTTP health endpoint: require it to stay up for a few seconds.
+        sleep 3
+        systemctl is-active --quiet "${svc}.service" 2>/dev/null && return 0
+        return 1
+      fi
+      curl -fsS -o /dev/null --max-time 5 "$url" 2>/dev/null && return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
+}
+
+# Restart the given services in order and health-check each. Prints the name
+# of the first that fails and returns 1.
+restart_and_check() {
+  local svc limit
+  for svc in "$@"; do
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
+    if ! systemctl restart "${svc}.service" >/dev/null 2>&1; then
+      printf '%s\n' "$svc"; return 1
+    fi
+    limit="$HEALTH_TIMEOUT"
+    [[ "$svc" == open-webui ]] && limit="$OPENWEBUI_HEALTH_TIMEOUT"
+    if wait_healthy "$svc" "$limit"; then
+      echo "  restarted ${svc}: healthy" >&2
+    else
+      printf '%s\n' "$svc"; return 1
+    fi
+  done
+}
+
+# Open WebUI's data directory (its SQLite database lives there).
+openwebui_data_dir() {
+  local dir
+  dir="$(kv_get "${REPO_DIR}/env/openwebui.env" DATA_DIR)"
+  printf '%s\n' "${dir:-${OPENWEBUI_DIR}/data}"
+}
+
+# An Open WebUI upgrade migrates webui.db in place and cannot be undone by
+# reinstalling the old version alone, so the database is copied into the apply
+# snapshot first. (Uploads and the vector store are not copied: they are large
+# and not rewritten by schema migrations.)
+openwebui_backup_db() {
+  local snap="$1" data f
+  data="$(openwebui_data_dir)"
+  mkdir -p "${snap}/openwebui-data"
+  for f in "${data}"/webui.db "${data}"/webui.db-wal "${data}"/webui.db-shm; do
+    [[ -f "$f" ]] && cp -p "$f" "${snap}/openwebui-data/"
+  done
+  return 0
+}
+
+openwebui_restore_db() {
+  local snap="$1" data f
+  data="$(openwebui_data_dir)"
+  [[ -d "${snap}/openwebui-data" ]] || return 0
+  rm -f "${data}/webui.db-wal" "${data}/webui.db-shm"
+  for f in "${snap}"/openwebui-data/*; do
+    [[ -f "$f" ]] && cp -p "$f" "${data}/"
+  done
+  return 0
+}
+
 cmd_apply() {
-  local svc
+  local svc snapshot failed webui_from=""
+  local -a affected=()
   if $DRY_RUN; then echo "  [dry-run] would apply config and restart services"; return 0; fi
-  # Checked with -f, not -x: tar/push/history round trips can lose the
-  # executable bit, and we invoke it via `bash` anyway.
+  # Checked with -f, not -x: seeding through the Gitea contents API does not
+  # preserve the executable bit, and we invoke it via `bash` anyway.
   [[ -f "$APPLY_SCRIPT" ]] || die "apply script not found: ${APPLY_SCRIPT}"
-  echo "Applying configuration..."
+  migrate_secrets
+
+  echo "Validating configuration..."
+  if ! validate_config; then
+    note "Configuration is invalid; nothing was applied or restarted."
+    return 1
+  fi
+
+  mapfile -t affected < <(affected_services)
+  snapshot="$(snapshot_runtime)"
+  echo "Applying configuration (previous files saved in ${snapshot})..."
   bash "$APPLY_SCRIPT" "$REPO_DIR"
+
+  # Older deployments ran LiteLLM from the router's venv without the [proxy]
+  # extra, which crash-loops. Build its own venv before the unit is restarted.
+  if ! litellm_venv_ok; then
+    echo "LiteLLM venv missing or out of date; installing into ${LITELLM_DIR}/venv..."
+    if litellm_install && litellm_venv_ok; then
+      echo "  installed litellm $(litellm_installed_version)"
+      affected+=(litellm-proxy)
+    else
+      note "  WARNING: LiteLLM install failed; litellm-proxy will not start."
+    fi
+  fi
 
   # If the pinned Open WebUI version no longer matches what is installed,
   # bring the venv in line before restarting the unit.
@@ -5701,12 +5361,19 @@ cmd_apply() {
   have_v="$(openwebui_installed_version)"
   if [[ -n "$want_v" && "$want_v" != "$have_v" ]]; then
     echo "Open WebUI ${have_v:-<none>} -> ${want_v}; installing (this takes a while)..."
+    openwebui_backup_db "$snapshot"
     if openwebui_install; then
-      echo "  installed open-webui ${want_v}"
+      echo "  installed open-webui ${want_v} (database backed up in ${snapshot})"
+      webui_from="$have_v"
+      affected+=(open-webui)
     else
       note "  WARNING: install failed; the service keeps running ${have_v:-its current version}."
     fi
   fi
+  # De-duplicate, keeping SERVICES order.
+  mapfile -t affected < <(for svc in "${SERVICES[@]}"; do
+    printf '%s\n' "${affected[@]}" | grep -qx -- "$svc" && echo "$svc"; done)
+
   # Files are already in place at this point. If systemd isn't running (a
   # chroot, a container without PID 1, a rescue shell), say so plainly rather
   # than dying with "Failed to connect to bus" after a partial job.
@@ -5716,25 +5383,45 @@ cmd_apply() {
     note "           systemctl restart ${SERVICES[*]}"
     return 0
   fi
-  echo "Restarting services..."
-  for svc in "${SERVICES[@]}"; do
-    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
-      if systemctl restart "${svc}.service" 2>/dev/null; then
-        echo "  restarted ${svc}"
-      else
-        note "  WARNING: failed to restart ${svc} (check: systemctl status ${svc})"
-      fi
-    fi
-  done
+  if (( ${#affected[@]} == 0 )); then
+    echo "No service is affected by this change; nothing restarted."
+    secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    return 0
+  fi
+  echo "Restarting: ${affected[*]}"
+  if failed="$(restart_and_check "${affected[@]}")"; then
+    secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    echo "Applied; all restarted services are healthy."
+    return 0
+  fi
+
+  note "ERROR: ${failed} did not become healthy. Rolling back to the previous files..."
+  note "  (see: journalctl -u ${failed} -n 50)"
+  restore_runtime "$snapshot"
+  if [[ -n "$webui_from" ]]; then
+    note "  Reinstalling open-webui ${webui_from} and restoring its database..."
+    systemctl stop open-webui.service 2>/dev/null || true
+    "${OPENWEBUI_DIR}/venv/bin/pip" install --no-cache-dir "open-webui==${webui_from}" >/dev/null 2>&1 || \
+      note "  WARNING: reinstalling open-webui ${webui_from} failed."
+    openwebui_restore_db "$snapshot"
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  if restart_and_check "${affected[@]}" >/dev/null; then
+    note "Rolled back; the previous configuration is running again."
+  else
+    note "Rolled back the files, but a service is still unhealthy — check it by hand."
+  fi
+  note "  The LiteLLM venv is not rolled back. The repo still holds the new config;"
+  note "  fix it (or git revert) and run apply again."
+  return 1
 }
 
-# Push using the Gitea deploy token from router.env.
+# Push using the Gitea deploy token from the secrets file.
 #
 # Gitea does not accept an account password for git-over-HTTP (it wants a token
-# or an app password). The installer does not keep git credentials on disk after
-# pushing deployment history, so the management command writes a temporary
-# credential entry for each push. Without this, git falls back to prompting for a
-# username/password, which then fails against Gitea.
+# or an app password), and provisioning deliberately deletes the stored git
+# credentials once the clone is done. Without this, git falls back to prompting
+# for a username/password, which then fails against Gitea.
 git_push_authenticated() {
   local remote branch token user host cred sslverify out rc=0 hostpart scheme
   remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || remote=""
@@ -5755,7 +5442,7 @@ git_push_authenticated() {
 
   token="$(env_get GITEA_DEPLOY_TOKEN)"
   if [[ -z "$token" ]]; then
-    note "  No GITEA_DEPLOY_TOKEN in ${ENV_FILE}."
+    note "  No GITEA_DEPLOY_TOKEN in ${SECRETS_FILE}."
     note "  Gitea needs a token for git over HTTP — an account password will be"
     note "  rejected. Store one with:  $0 set-token"
     return 1
@@ -5825,7 +5512,7 @@ cmd_test_alert() {
   [[ -n "$message" ]] || message="Test alert from $(hostname) via ${0##*/} — if you can read this, monitor alerting works."
 
   if [[ -z "$url" ]]; then
-    echo "MATTERMOST_WEBHOOK_URL is not set in ${ENV_FILE}."
+    echo "MATTERMOST_WEBHOOK_URL is not set in ${SECRETS_FILE}."
     echo "The monitor logs alerts instead of posting them. Set one with:"
     echo "  $0 set-webhook <url>"
     return 1
@@ -5920,19 +5607,9 @@ cmd_set_webhook() {
   local url="" set_url=false
   while (( $# )); do
     case "$1" in
-      --channel)
-        (( $# >= 2 )) || die "set-webhook: --channel needs a value"
-        env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
-      --username)
-        # Two separate tests, deliberately. `(( $# >= 2 && -n "${2-}" ))` is not
-        # valid arithmetic: inside (( )) `-n` is minus-the-variable-n, and the
-        # string that follows is a syntax error -- so the guard failed for EVERY
-        # --username, valid value or not, and the flag could never be used.
-        (( $# >= 2 )) || die "set-webhook: --username needs a value"
-        [[ -n "${2}" ]] || die "set-webhook: --username needs a value"
-        env_set MATTERMOST_MONITOR_USER "$2"; CHANGED=true; shift 2 ;;
+      --channel)    env_set MATTERMOST_CHANNEL "${2-}"; CHANGED=true; shift 2 ;;
+      --username)   env_set MATTERMOST_MONITOR_USER "${2:?--username needs a value}"; CHANGED=true; shift 2 ;;
       --verify-tls)
-        (( $# >= 2 )) || die "set-webhook: --verify-tls needs a value"
         [[ "${2-}" == "true" || "${2-}" == "false" ]] \
           || die "set-webhook: --verify-tls takes 'true' or 'false'"
         env_set MATTERMOST_VERIFY_TLS "$2"; CHANGED=true; shift 2 ;;
@@ -5951,7 +5628,7 @@ cmd_set_webhook() {
     env_set MATTERMOST_WEBHOOK_URL "$url"
     CHANGED=true
     if [[ -n "$url" ]]; then
-      echo "Webhook stored in ${ENV_FILE}."
+      echo "Webhook stored in ${SECRETS_FILE}."
     else
       echo "Webhook cleared — the monitor will log alerts instead of posting."
     fi
@@ -5978,7 +5655,7 @@ cmd_set_token() {
   fi
   [[ -n "$token" ]] || die "set-token: empty token"
   env_set GITEA_DEPLOY_TOKEN "$token"
-  echo "Stored the deploy token in ${ENV_FILE}."
+  echo "Stored the deploy token in ${SECRETS_FILE}."
   note "  Verifying against $(env_get GITEA_SERVER_URL) ..."
   local base api code
   base="$(env_get GITEA_SERVER_URL)"; base="${base%/}"
@@ -5996,6 +5673,59 @@ cmd_set_token() {
   CHANGED=true
 }
 
+# Router API key. Stored twice in the secrets file: ROUTER_API_KEY for the
+# router, OPENAI_API_KEYS for Open WebUI, which authenticates to the router as
+# an OpenAI connection. Both units load secrets.env.
+cmd_set_api_key() {
+  local key="${1:-}"
+  case "$key" in
+    --off)
+      env_set ROUTER_API_KEY ""
+      env_set OPENAI_API_KEYS ""
+      echo "Router API key cleared: the API is open to anyone who can reach it."
+      CHANGED=true
+      return 0 ;;
+    --generate|"")
+      key="sk-router-$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')" ;;
+  esac
+  [[ "$key" =~ ^[A-Za-z0-9._~+/=-]{16,}$ ]] || \
+    die "set-api-key: use at least 16 characters from A-Z a-z 0-9 . _ ~ + / = -"
+  env_set ROUTER_API_KEY "$key"
+  env_set OPENAI_API_KEYS "$key"
+  echo "Stored the router API key in ${SECRETS_FILE}."
+  $DRY_RUN || echo "  key: ${key}"
+  note "  Clients must send:  Authorization: Bearer <key>"
+  note "  Open WebUI reads OPENAI_API_KEYS only on its FIRST start; on an existing"
+  note "  install also paste the key into Admin Settings > Connections > OpenAI."
+  note "  Run '$0 apply' to restart the services with the key."
+  CHANGED=true
+}
+
+# Token for LM Studio servers with "Require authentication" on. One token for
+# every LM Studio server; stored outside the repo like the other secrets.
+cmd_set_lmstudio_token() {
+  local token="${1:-}" confirm_token=""
+  if [[ "$token" == --off ]]; then
+    env_set LMSTUDIO_API_TOKEN ""
+    echo "LM Studio token cleared."
+    regenerate_litellm
+    CHANGED=true
+    return 0
+  fi
+  if [[ -z "$token" ]]; then
+    [[ "$ASSUME_YES" == "true" ]] && die "set-lmstudio-token: no token given"
+    read -r -s -p "LM Studio API token: " token; echo
+    read -r -s -p "Confirm token: " confirm_token; echo
+    [[ "$token" == "$confirm_token" ]] || die "tokens did not match"
+  fi
+  [[ -n "$token" ]] || die "set-lmstudio-token: empty token"
+  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "set-lmstudio-token: unexpected characters in token"
+  env_set LMSTUDIO_API_TOKEN "$token"
+  echo "Stored the LM Studio token in ${SECRETS_FILE}."
+  regenerate_litellm
+  CHANGED=true
+}
+
 cmd_commit() {
   local message="${1:-Update model server list}"
   if $DRY_RUN; then echo "  [dry-run] would commit: ${message}"; return 0; fi
@@ -6005,6 +5735,7 @@ cmd_commit() {
     note "Nothing to commit or push."
     return 0
   }
+  migrate_secrets
   git -C "$REPO_DIR" add -A
   if git -C "$REPO_DIR" diff --cached --quiet; then
     note "Nothing to commit."
@@ -6018,7 +5749,113 @@ cmd_commit() {
     echo "Pushed to Gitea."
   else
     note "  The commit is saved locally in ${REPO_DIR}; push it when resolved."
+    # Only a caller that asked for it (update-router.sh) treats this as failure.
+    if [[ "${REQUIRE_PUSH:-false}" == true ]]; then return 1; fi
   fi
+  return 0
+}
+
+# Commands that write config, secrets or runtime files take the config lock;
+# read-only ones (list, status, models, discover, test-alert) never wait on it.
+command_writes() {
+  case "$1" in
+    add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
+    set-token|set-api-key|set-lmstudio-token|set-webhook|set-webui-version) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_path() { readlink -f -- "$CONFIG_LOCK_FILE" 2>/dev/null || printf '%s\n' "$CONFIG_LOCK_FILE"; }
+
+# True when nobody holds the lock (probed through a separate open of the file,
+# so it also sees a lock held by this process's parent).
+lock_is_free() {
+  [[ -e "$CONFIG_LOCK_FILE" ]] || return 0
+  ( flock -n 9 ) 9>>"$CONFIG_LOCK_FILE" 2>/dev/null
+}
+
+# True when a parent (install/update-router.sh) holds the lock and handed this
+# process the descriptor: CONFIG_LOCK_INHERITED_FD must be an open descriptor on
+# the lock file AND the lock must really be taken.
+lock_inherited() {
+  local fd="${CONFIG_LOCK_INHERITED_FD:-}"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(readlink -f "/proc/self/fd/${fd}" 2>/dev/null)" == "$(lock_path)" ]] || return 1
+  ! lock_is_free
+}
+
+# PIDs of processes with the lock file open (holders and children that
+# inherited the descriptor), excluding this shell.
+lock_holders() {
+  local target link pid
+  target="$(lock_path)"
+  for link in /proc/[0-9]*/fd/*; do
+    [[ "$(readlink "$link" 2>/dev/null)" == "$target" ]] || continue
+    pid="${link#/proc/}"; pid="${pid%%/*}"
+    [[ "$pid" == "$$" || "$pid" == "${BASHPID:-}" ]] && continue
+    printf '%s\n' "$pid"
+  done | sort -un
+}
+
+acquire_config_lock() {
+  local -a wait=(-n)
+  command -v flock >/dev/null 2>&1 || die "flock is required to serialize config changes"
+  [[ "$CONFIG_LOCK_WAIT" =~ ^[0-9]+$ ]] || die "CONFIG_LOCK_WAIT must be a number of seconds"
+  (( CONFIG_LOCK_WAIT > 0 )) && wait=(-w "$CONFIG_LOCK_WAIT")
+  exec {CONFIG_LOCK_FD}>>"$CONFIG_LOCK_FILE" || die "cannot open config lock: ${CONFIG_LOCK_FILE}"
+  if ! flock "${wait[@]}" "$CONFIG_LOCK_FD"; then
+    # Close ours first, or this process and its subshells list themselves.
+    exec {CONFIG_LOCK_FD}>&-
+    note "Another config change is running (lock: ${CONFIG_LOCK_FILE}), held by PID(s): $(lock_holders | tr '\n' ' ')"
+    note "Wait for it (or set CONFIG_LOCK_WAIT=<seconds>). If it is hung: $0 clear-lock"
+    exit 1
+  fi
+}
+
+cmd_clear_lock() {
+  local pid waited
+  local -a pids=()
+  if [[ ! -e "$CONFIG_LOCK_FILE" ]]; then
+    echo "No lock file at ${CONFIG_LOCK_FILE}; nothing to clear."
+    return 0
+  fi
+  if lock_is_free; then
+    # The file is kept on purpose: deleting it while another process has it
+    # open would let two changes lock two different files at once.
+    echo "The config lock is not held; nothing to clear. ${CONFIG_LOCK_FILE} is only"
+    echo "a placeholder: the lock dies with the process that holds it, so a crash"
+    echo "or reboot never leaves it in force."
+    return 0
+  fi
+  mapfile -t pids < <(lock_holders)
+  note "The config lock (${CONFIG_LOCK_FILE}) is held by:"
+  for pid in "${pids[@]}"; do
+    note "  $(ps -o pid=,etime=,args= -p "$pid" 2>/dev/null || echo "$pid (exited)")"
+  done
+  (( ${#pids[@]} > 0 )) || die "no holding process is visible here (another container sharing the file?); not touching it."
+  if ! $FORCE; then
+    note "A change is in progress. If it is hung, stop it with: $0 clear-lock --force"
+    return 1
+  fi
+  note "Stopping a change midway can leave the config repo or services half-updated."
+  confirm "Stop these process(es)?" || die "cancelled; the lock is still held."
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  for (( waited = 0; waited < LOCK_KILL_WAIT * 5; waited++ )); do
+    lock_is_free && break
+    sleep 0.2
+  done
+  if ! lock_is_free; then
+    note "Still held after ${LOCK_KILL_WAIT}s; sending SIGKILL."
+    mapfile -t pids < <(lock_holders)
+    (( ${#pids[@]} == 0 )) || kill -KILL "${pids[@]}" 2>/dev/null || true
+    for (( waited = 0; waited < 25; waited++ )); do
+      lock_is_free && break
+      sleep 0.2
+    done
+  fi
+  lock_is_free || die "the lock is still held; check: ps -p $(lock_holders | tr '\n' ' ')"
+  echo "Lock cleared. Check the config repo (git -C ${REPO_DIR} status) and run"
+  echo "'$0 apply' so the running services match it."
 }
 
 # --- running from the Proxmox host -------------------------------------------
@@ -6145,6 +5982,9 @@ while (( $# > 0 )); do
     --no-probe)  NO_PROBE=true; shift ;;
     --dry-run)   DRY_RUN=true; shift ;;
     -y|--yes)    ASSUME_YES=true; shift ;;
+    --force)
+      [[ "$COMMAND" == "clear-lock" ]] || die "unknown option: $1"
+      FORCE=true; shift ;;
     -h|--help)   usage; exit 0 ;;
     # set-webhook's own flags. They are passed through rather than handled
     # here, because they take a value that may legitimately be EMPTY
@@ -6153,18 +5993,12 @@ while (( $# > 0 )); do
       [[ "$COMMAND" == "set-webhook" ]] || die "unknown option: $1"
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
-    # routing-stats' own flags, passed through for the same reason.
-    --days|--san)
-      [[ "$COMMAND" == "cert" ]] || die "unknown option: $1"
-      (( $# >= 2 )) || die "$1 needs a value"
-      ARGS+=("$1" "$2"); shift 2 ;;
-    --last|--class|--file)
-      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
-      (( $# >= 2 )) || die "$1 needs a value"
-      ARGS+=("$1" "$2"); shift 2 ;;
-    --json)
-      [[ "$COMMAND" == "routing-stats" ]] || die "unknown option: $1"
+    --generate|--off)
+      [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-lmstudio-token" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
+    --all)       APPLY_ALL=true; shift ;;
+    --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
+    --type=*)    SERVER_TYPE="${1#*=}"; shift ;;
     --*)         die "unknown option: $1" ;;
     *)           ARGS+=("$1"); shift ;;
   esac
@@ -6173,16 +6007,21 @@ done
 for tier in $(csv_to_lines "${TIER_ARG:-}"); do
   tier_env_key "$tier" >/dev/null
 done
+case "$SERVER_TYPE" in
+  auto|ollama|lmstudio) ;;
+  *) die "--type must be ollama, lmstudio or auto (got '${SERVER_TYPE}')" ;;
+esac
 
 ensure_config_or_forward
+if command_writes "$COMMAND" && ! $DRY_RUN && ! lock_inherited; then
+  acquire_config_lock
+fi
 $DRY_RUN && note "(dry run — no files will be written)"
 
 case "$COMMAND" in
   list)     cmd_list false ;;
   status)   cmd_list true ;;
   discover) cmd_discover ;;
-  cert) cmd_cert ${ARGS[@]+"${ARGS[@]}"} ;;
-  routing-stats) cmd_routing_stats ${ARGS[@]+"${ARGS[@]}"} ;;
   add)      cmd_add "${ARGS[@]:-}" ;;
   remove)   cmd_remove "${ARGS[@]:-}" ;;
   set-tier) cmd_set_tier "${ARGS[@]:-}" ;;
@@ -6193,9 +6032,12 @@ case "$COMMAND" in
   apply)    cmd_apply ;;
   commit)   cmd_commit "${ARGS[0]:-Update model server list}" ;;
   set-token) cmd_set_token "${ARGS[0]:-}" ;;
+  set-api-key) cmd_set_api_key "${ARGS[0]:-}" ;;
+  set-lmstudio-token) cmd_set_lmstudio_token "${ARGS[0]:-}" ;;
   test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
   set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
+  clear-lock) cmd_clear_lock ;;
   *)        die "unknown command '${COMMAND}' (try --help)" ;;
 esac
 
@@ -6213,6 +6055,9 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
+  set-api-key|set-lmstudio-token)
+    if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
+    ;;
 esac
 MANAGEEOF
 chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
@@ -6221,31 +6066,29 @@ chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
 cat > "${REPO_DIR}/README.md" <<'RDEOF'
 # ollama-smart-router — service configuration
 
-Local configuration for the Ollama Smart Router LXC. The installer generates
-this tree inside the container and runs `install/apply-config.sh` to copy each
-file into place. If Gitea is configured, this tree is pushed there as deployment
-history; it is not cloned or pulled from Gitea during provisioning.
+Version-controlled configuration for the Ollama Smart Router LXC. The installer
+clones this repo into the container during provisioning and runs
+`install/apply-config.sh` to copy each file into place.
 
     services/<service>/     unit file, code, .ini tunables, requirements.txt
     env/                    environment files consumed via systemd EnvironmentFile
     install/apply-config.sh copies everything into its runtime location
 
-Config is applied from this local tree. Gitea is only an outbound history target,
-so stale remote commits cannot change a clean install and a Gitea outage can
-never block a boot.
+Config is pulled **once, at provisioning time** — services do not contact Gitea
+to start, so a Gitea outage can never block a boot.
 
 ## Changing configuration on a running container
 
-    cd /app/config-repo
+    cd /app/config-repo && git pull
     ./install/apply-config.sh
     systemctl daemon-reload
     systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
-    manage-model-servers commit "Describe the change"
 
 ## Layout notes
 
-* `services/ollama-router`, `litellm-proxy` and `ollama-monitor` share one venv
-  (`/app/router/venv`); it is built from all three `requirements.txt` files.
+* `services/ollama-router` and `ollama-monitor` share one venv
+  (`/app/router/venv`). `litellm-proxy` has its own (`/app/litellm/venv`),
+  installed from `requirements.lock` with hash checking when present.
 * `services/open-webui` has its own venv on Python 3.12 — every open-webui
   release requires `>=3.11,<3.13`, and Debian 13 ships 3.13.
 * `router.ini` holds the complexity-routing thresholds and keyword lists, so
@@ -6256,12 +6099,14 @@ RDEOF
 cat > "${REPO_DIR}/services/ollama-router/ollama-router.service" <<'UNITEOF'
 [Unit]
 Description=Intelligent Ollama Prompt Complexity Router Middleware
+# LiteLLM is the *fallback* dispatch path, not a hard requirement: the router
+# serves traffic from its own live discovery inventory and only forwards to
+# LiteLLM when discovery is off or the inventory is empty. Wants= keeps the
+# start ordering (After= still holds LiteLLM first) without the binding, so a
+# crash-looping litellm-proxy degrades routing to discovery-only. With
+# Requires=, every LiteLLM restart propagated a stop up through this unit to
+# open-webui, and the UI never stayed up long enough to bind :8080.
 After=network-online.target litellm-proxy.service
-# Wants=, deliberately NOT Requires=. LiteLLM is only the FALLBACK dispatch
-# path -- the router serves every request from its own discovery inventory and
-# does not need it to start. Requires= additionally propagates stop/restart:
-# each litellm crash-restart cycle would tear this unit down too, and through
-# open-webui's own dependency, the UI with it. See the comment on open-webui.
 Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
@@ -6269,17 +6114,25 @@ User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
+# ROUTER_API_KEY (optional bearer token for the API) lives outside the repo.
+EnvironmentFile=-/app/router/secrets.env
 ExecStart=/app/router/venv/bin/python router.py
 Restart=always
 RestartSec=3
-# Creates /var/log/ollama-router owned by this service and exports
-# $LOGS_DIRECTORY. The per-request decision records live there.
-LogsDirectory=ollama-router
-LogsDirectoryMode=0750
+# --- sandboxing (same model as the llama.cpp target units) ---
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
 ProtectHome=true
+# Writes nothing; bytecode caching is turned off instead of granting a path.
+Environment=PYTHONDONTWRITEBYTECODE=1
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
 [Install]
 WantedBy=multi-user.target
 UNITEOF
@@ -6290,18 +6143,33 @@ Description=LiteLLM Load Balancing Proxy
 After=network-online.target
 Wants=network-online.target
 [Service]
+# LiteLLM has its own venv: litellm[proxy] pins fastapi/uvicorn versions that
+# conflict with the router's, so the two cannot share /app/router/venv.
 Type=simple
 User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
-ExecStart=/app/router/venv/bin/litellm --config litellm_config.yaml --port 4000 --host 127.0.0.1
+# LMSTUDIO_API_TOKEN (for LM Studio servers with authentication) lives outside
+# the repo; litellm_config.yaml refers to it as os.environ/LMSTUDIO_API_TOKEN.
+EnvironmentFile=-/app/router/secrets.env
+ExecStart=/app/litellm/venv/bin/litellm --config litellm_config.yaml --port 4000 --host 127.0.0.1
 Restart=always
 RestartSec=5
+# --- sandboxing (same model as the llama.cpp target units) ---
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
 ProtectHome=true
+# Needs no writable path: verified serving with a read-only install tree and
+# an unwritable HOME (litellm[proxy] 1.75.5.post1, no database configured).
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
 [Install]
 WantedBy=multi-user.target
 UNITEOF
@@ -6309,10 +6177,10 @@ UNITEOF
 cat > "${REPO_DIR}/services/ollama-monitor/ollama-monitor.service" <<'UNITEOF'
 [Unit]
 Description=Ollama Cluster Resilience Health Monitor
+# The monitor polls the Ollama hosts directly and posts to Mattermost; it never
+# talks to LiteLLM, so a hard dependency only made it collateral damage of a
+# LiteLLM failure. Start ordering is kept, the binding is not.
 After=network-online.target litellm-proxy.service
-# Wants=, not Requires=: the monitor probes the Ollama hosts directly and only
-# reads LiteLLM's health endpoint. A flapping litellm must not restart the
-# monitor -- a restart re-reads state and re-arms alerting for no reason.
 Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
@@ -6320,18 +6188,28 @@ User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
+# Secrets (MATTERMOST_WEBHOOK_URL) live outside the config repo. The leading
+# '-' keeps the unit starting when the file does not exist yet.
+EnvironmentFile=-/app/router/secrets.env
 ExecStart=/app/router/venv/bin/python monitor.py
 Restart=always
 RestartSec=10
-# Creates /var/lib/ollama-monitor owned by this service and exports
-# $STATE_DIRECTORY. Health state lives there so a restart during an outage does
-# not re-announce it.
-StateDirectory=ollama-monitor
-StateDirectoryMode=0750
+# --- sandboxing (same model as the llama.cpp target units) ---
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
 ProtectHome=true
+# /var/lib/ollama-monitor holds the startup-notice timestamp.
+StateDirectory=ollama-monitor
+Environment=MONITOR_STATE_DIR=/var/lib/ollama-monitor
+Environment=PYTHONDONTWRITEBYTECODE=1
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
 [Install]
 WantedBy=multi-user.target
 UNITEOF
@@ -6339,97 +6217,96 @@ UNITEOF
 cat > "${REPO_DIR}/services/open-webui/open-webui.service" <<'UNITEOF'
 [Unit]
 Description=Open WebUI (chat frontend for the smart router)
+# This Requires= is deliberate and stays: the router is the UI's only backend,
+# so Open WebUI has nothing to serve without it. Contrast the router and monitor
+# units, which only Want= litellm-proxy.
 After=network-online.target ollama-router.service
-# Wants=, not Requires=. This one matters more than the others: Open WebUI runs
-# alembic migrations against data/webui.db on its FIRST start, and that start
-# takes minutes. Requires= propagates a stop, so a crash-looping litellm-proxy
-# would stop ollama-router, which would stop THIS unit mid-migration. The
-# schema is then left with the new column applied but the alembic revision not
-# stamped, and every later start dies with
-#   sqlite3.OperationalError: duplicate column name: info_json
-# from which it never recovers. The UI needs the router only when a request
-# arrives, never to boot, so an ordering-only dependency is the correct one.
-Wants=network-online.target ollama-router.service
+Wants=network-online.target
+Requires=ollama-router.service
 [Service]
 Type=simple
 User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/openwebui
 EnvironmentFile=/app/openwebui/.env
-# --host/--port are passed EXPLICITLY, and that is not belt and braces.
-# open-webui's serve() is declared as:
-#     def serve(host: str = "0.0.0.0", port: int = 8080):
-# with LITERAL defaults -- it never reads HOST or PORT from the environment.
-# Setting them in the env file alone left it binding 0.0.0.0:8080, the port
-# nginx already owns, so it died with "address already in use" and the proxy
-# returned 502 for a port nothing was listening on. Typer exposes plain keyword
-# parameters as CLI options automatically, so the flags below do work, and a
-# flag cannot be quietly ignored by a future release the way an env var was.
-# systemd expands ${HOST} and ${PORT} from the EnvironmentFile above, so the
-# env file stays the single source of truth for where this binds.
-ExecStart=/app/openwebui/venv/bin/open-webui serve --host ${HOST} --port ${PORT}
+# OPENAI_API_KEYS (the router API key) lives outside the repo and overrides
+# the placeholder in .env. Open WebUI reads it on first start only; see
+# `manage-model-servers set-api-key`.
+EnvironmentFile=-/app/router/secrets.env
+ExecStart=/app/openwebui/venv/bin/open-webui serve
 Restart=always
 RestartSec=5
 # First start downloads a local embedding model; give it room before timeout.
 TimeoutStartSec=600
+# --- sandboxing (same model as the llama.cpp target units) ---
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
 ProtectHome=true
+# DATA_DIR (the SQLite database, uploads) and the model cache.
+ReadWritePaths=/app/openwebui
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
 [Install]
 WantedBy=multi-user.target
 UNITEOF
 
-# The four units above all ask for a private mount namespace. Find out whether
-# this container will actually give them one BEFORE shipping them in — a unit
-# that asks and is refused does not start at all. See apply_sandbox_policy.
-apply_sandbox_policy "$REPO_DIR"
+if [[ "$CONFIG_SOURCE" == "repo" ]]; then
+  echo "Seeding the Gitea config repository (missing files; installer-owned code is updated)."
+  seed_gitea_repo "$REPO_DIR" "$GITEA_DEPLOY_TOKEN_KEEP" || \
+    echo "Seeding reported problems; the clone below may be incomplete." >&2
 
-echo "Installing the generated configuration directly."
-push_local_config_tree "$REPO_DIR"
-
-if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
   echo "Installing git in the container."
   apt_get install -y git
 
-  echo "Initializing Gitea deployment history from the generated configuration."
-  if ! init_config_repo_history "$GITEA_DEPLOY_TOKEN_KEEP"; then
-    echo "WARNING: could not push deployment history to Gitea; continuing with" >&2
-    echo "         the local generated configuration." >&2
-    CONFIG_SOURCE="local"
-  fi
-fi
-
-# The certificate has to exist BEFORE apply-config installs the nginx site,
-# because that site names it and `nginx -t` refuses to load a file that is not
-# there. Doing this the other way round made every fresh install print
-# "nginx rejected the configuration ... cannot load certificate" and then work
-# anyway on the retry -- which is exactly how an operator learns to ignore that
-# warning.
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  echo "Configuring TLS."
-  generate_tls_cert "$ROUTER_IP" "$CT_NAME" || TLS_OK=false
+  echo "Cloning the config repository into the container."
+  clone_config_repo "$GITEA_DEPLOY_TOKEN_KEEP"
+else
+  echo "Installing the generated configuration directly (no Gitea repo)."
+  push_local_config_tree "$REPO_DIR"
 fi
 
 echo "Applying configuration."
 run_ct bash "${CONFIG_REPO_DIR}/install/apply-config.sh" "$CONFIG_REPO_DIR"
 
+echo "Installing secrets outside the config repo."
+pct push "$CT_ID" "$SECRETS_STAGE" /app/router/secrets.env --perms 0640
+run_ct chown root:ollama-router /app/router/secrets.env
+
 rm -rf "$STAGE_DIR"; STAGE_DIR=""
 unset GITEA_DEPLOY_TOKEN_KEEP
 
 echo "Installing Python dependencies (from the repo's requirements files)."
-# The generated config tree above is built with umask 077 because it contains
-# secret-bearing env files. Runtime venvs need ordinary executable/traversable
-# bits; otherwise systemd reports status=203/EXEC and nginx can only return 502.
-umask 022
-# router, litellm-proxy and monitor share one venv; it is built from all three
-# per-service requirements files so each service's pins stay independently
-# version controlled.
+# The router and monitor share /app/router/venv. LiteLLM gets its own venv:
+# `litellm --config` needs the litellm[proxy] extra, and that extra pins
+# fastapi/uvicorn versions that conflict with the router's pins.
 run_ct python3 -m venv /app/router/venv
 run_ct /app/router/venv/bin/pip install --no-cache-dir \
   -r "${CONFIG_REPO_DIR}/services/ollama-router/requirements.txt" \
-  -r "${CONFIG_REPO_DIR}/services/litellm-proxy/requirements.txt" \
   -r "${CONFIG_REPO_DIR}/services/ollama-monitor/requirements.txt"
+
+echo "Installing LiteLLM proxy (own venv)."
+run_ct install -d -m 0755 /app/litellm
+run_ct python3 -m venv /app/litellm/venv
+# Prefer the hash-locked resolution when the repo carries one; a supply-chain
+# swap of any dependency then fails the install instead of shipping.
+run_ct bash -c "
+  set -e
+  lock='${CONFIG_REPO_DIR}/services/litellm-proxy/requirements.lock'
+  req='${CONFIG_REPO_DIR}/services/litellm-proxy/requirements.txt'
+  if [ -f \"\$lock\" ]; then
+    /app/litellm/venv/bin/pip install --no-cache-dir --require-hashes -r \"\$lock\"
+  else
+    echo 'WARNING: no requirements.lock; installing LiteLLM without hash checking.' >&2
+    /app/litellm/venv/bin/pip install --no-cache-dir -r \"\$req\"
+  fi
+  /app/litellm/venv/bin/python -c 'import litellm.proxy.proxy_server' >/dev/null
+"
 
 echo "Installing Open WebUI (separate venv to avoid dependency conflicts)."
 # open-webui pins its own fastapi/uvicorn/etc., so it must not share the
@@ -6469,43 +6346,21 @@ run_ct chown root:ollama-router /app/router/.env
 run_ct chmod 0640 /app/router/.env
 run_ct chown root:ollama-router /app/openwebui/.env
 run_ct chmod 0640 /app/openwebui/.env
-verify_service_executables
 
 
 
 
 # ------------------------------------------------------------------------------
 # Optional: if the CT firewall is on, the default input policy can drop inbound
-# traffic. Allow the Router API (8000) and Open WebUI (OPENWEBUI_PORT) from the
-# trusted subnet. LiteLLM (4000) stays localhost-only and needs no rule.
-fw_add_rule() {
-  # Appending blindly duplicates every rule when this runs twice against a
-  # container id whose .fw file survived. Match first.
-  grep -qxF "$1" "$fw_conf" || echo "$1" >> "$fw_conf"
-}
-if [[ "$FIREWALL" == "1" ]]; then
+# traffic. Allow SSH (22), the Router API (8000) and Open WebUI (OPENWEBUI_PORT)
+# from the trusted subnet. LiteLLM (4000) stays localhost-only and needs no rule.
+if [[ "$FIREWALL" == "1" && -n "$API_ALLOW_CIDR" ]]; then
+  echo "Adding firewall rules to allow tcp/22, tcp/8000 and tcp/${OPENWEBUI_PORT} from ${API_ALLOW_CIDR}."
   mkdir -p "/etc/pve/firewall"
-  fw_conf="/etc/pve/firewall/${CT_ID}.fw"
-  if [[ ! -f "$fw_conf" ]]; then
-    printf '[OPTIONS]\nenable: 1\n\n[RULES]\n' > "$fw_conf"
-  fi
-  if [[ -n "$API_ALLOW_CIDR" ]]; then
-    echo "Adding firewall rules to allow tcp/8000 and tcp/${OPENWEBUI_PORT} from ${API_ALLOW_CIDR}."
-    fw_add_rule "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport 8000 -log nolog"
-    fw_add_rule "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport ${OPENWEBUI_PORT} -log nolog"
-  fi
-  # ZeroTier's control/data port. NOT restricted by source: peers and the root
-  # servers come from arbitrary internet addresses, so a CIDR-scoped rule would
-  # silently force every session onto ZeroTier's relays -- it still "works",
-  # just slowly and via a third party, which is the worst kind of failure to
-  # diagnose. Without the rule, Proxmox's default DROP input policy blocks the
-  # direct path entirely.
-  echo "Allowing udp/9993 inbound for ZeroTier peer traffic."
-  fw_add_rule "IN ACCEPT -p udp -dport 9993 -log nolog"
-fi
-if [[ "$FIREWALL" == "1" && -z "$API_ALLOW_CIDR" ]]; then
+  write_firewall_rules "/etc/pve/firewall/${CT_ID}.fw" "$API_ALLOW_CIDR" "$OPENWEBUI_PORT"
+elif [[ "$FIREWALL" == "1" ]]; then
   echo "WARNING: FIREWALL=1 but API_ALLOW_CIDR is unset. If the datacenter" >&2
-  echo "         firewall is active, inbound tcp/8000 and tcp/${OPENWEBUI_PORT}" >&2
+  echo "         firewall is active, inbound tcp/22, tcp/8000 and tcp/${OPENWEBUI_PORT}" >&2
   echo "         may be dropped. Set API_ALLOW_CIDR (e.g. 192.168.11.0/24) or" >&2
   echo "         disable FIREWALL." >&2
 fi
@@ -6523,8 +6378,9 @@ cat > "$motd_tmp" <<EOF
 
   SERVICES
   ---------------------------------------------------------------------------
-   Open WebUI (chat UI)       ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}        [open-webui.service]
-   Smart Router (OpenAI API)  ${URL_SCHEME}://${ROUTER_IP}:8000/v1     [ollama-router.service]
+   Open WebUI (chat UI)       http://${ROUTER_IP}:${OPENWEBUI_PORT}        [open-webui.service]
+   Smart Router (OpenAI API)  http://${ROUTER_IP}:8000/v1     [ollama-router.service]
+     (Bearer key: ROUTER_API_KEY in /app/router/secrets.env)
    LiteLLM proxy              http://127.0.0.1:4000  (local)  [litellm-proxy.service]
    Health monitor             Mattermost alerts               [ollama-monitor.service]
 
@@ -6541,18 +6397,13 @@ cat > "$motd_tmp" <<EOF
    Router config : /app/router/.env  /app/router/litellm_config.yaml
    Tunables      : /app/router/router.ini  /app/router/monitor.ini
    WebUI config  : /app/openwebui/.env
-   Config dir    : ${CONFIG_REPO_DIR}  (edit locally, apply-config.sh, then commit)
-                   on PATH for login shells — every *.sh in the repo is
-                   executable and runnable by name
+   Config repo   : ${CONFIG_REPO_DIR}  (git pull && ./install/apply-config.sh)
    Model servers : manage-model-servers list | status | models
                    manage-model-servers add <ip> --tier large --apply
                    manage-model-servers set-model large <tag> --apply
                    manage-model-servers set-server-model <tier> <ip> <tag>
                    manage-model-servers set-webui-version latest --apply
                    manage-model-servers set-keepalive 2h --apply
-   Alerting      : manage-model-servers test-alert
-                   manage-model-servers set-webhook <url> [--channel <c>]
-   ZeroTier      : zerotier-cli status | zerotier-cli join [network-id]
    Status        : systemctl status open-webui ollama-router litellm-proxy ollama-monitor
    Logs          : journalctl -u ollama-router -f
 ==============================================================================
@@ -6560,157 +6411,26 @@ EOF
 pct push "$CT_ID" "$motd_tmp" /etc/motd --perms 0644
 rm -f "$motd_tmp"
 
-if [[ "$TLS_ENABLED" == "true" ]] && $TLS_OK; then
-  # Debian's stock site listens on :80 and would answer for anything the config
-  # repo does not claim. Nothing here serves plain HTTP, so remove it.
-  run_ct rm -f /etc/nginx/sites-enabled/default
-  if run_ct nginx -t >/dev/null 2>&1; then
-    run_ct systemctl enable --now nginx >/dev/null 2>&1 || true
-    run_ct systemctl reload nginx >/dev/null 2>&1 || run_ct systemctl restart nginx >/dev/null 2>&1 || true
-    echo "nginx is terminating TLS on ${OPENWEBUI_PORT} (UI) and 8000 (API)."
-  else
-    echo "WARNING: nginx rejected the generated configuration:" >&2
-    run_ct nginx -t 2>&1 | sed 's/^/         /' >&2
-    TLS_OK=false
-  fi
-fi
-
 echo "Starting services."
 run_ct systemctl daemon-reload
-# Enable all four, but start Open WebUI SEPARATELY below. Its first start runs
-# database migrations and downloads an embedding model on a 2-vCPU container;
-# starting it alongside three other services makes that slow start slower and
-# gives the installer nothing to check.
-run_ct systemctl enable \
+run_ct systemctl enable --now \
   litellm-proxy.service ollama-router.service ollama-monitor.service open-webui.service
-run_ct systemctl start \
-  litellm-proxy.service ollama-router.service ollama-monitor.service
-
-start_openwebui_verified || OPENWEBUI_OK=false
-
-# Non-fatal, and that is the whole point of the guard. This runs BEFORE the
-# ERR trap is disarmed, with CT_CREATED still set, so a bare call would let a
-# transient network failure fetching the ZeroTier installer destroy a fully
-# provisioned container -- Open WebUI migrations, certificates and all.
-install_zerotier || ZEROTIER_OK=false
 
 # Provisioning succeeded — disarm the failure trap so we keep the container.
 CT_CREATED=""
 trap - ERR
 
 echo "=============================================================================="
-# Report what is actually running, not what was asked to run. The previous
-# version printed "Provisioning complete" over a dead UI, because
-# `systemctl enable --now` on a Type=simple unit succeeds the moment the
-# process is forked -- long before it has failed.
-report_services() {
-  local unit state ok=true units=(litellm-proxy ollama-router ollama-monitor open-webui)
-  [[ "$TLS_ENABLED" == "true" ]] && units+=(nginx)
-  echo "Service status:"
-  for unit in "${units[@]}"; do
-    state="$(ct_out systemctl is-active "${unit}.service" || true)"
-    printf '  %-16s %s\n' "$unit" "${state:-unknown}"
-    [[ "$state" == "active" ]] || ok=false
-  done
-  for pair in "8000:router API" "${OPENWEBUI_PORT}:Open WebUI"; do
-    if ! ct_port_listening "${pair%%:*}"; then
-      printf '  %-16s NOT listening on %s\n' "${pair#*:}" "${pair%%:*}"
-      ok=false
-    elif [[ "$TLS_ENABLED" != "true" ]]; then
-      printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
-    elif ct_tls_ok "${pair%%:*}"; then
-      printf '  %-16s TLS ok on %s\n' "${pair#*:}" "${pair%%:*}"
-    else
-      # Listening but not completing a handshake is a different fault from not
-      # listening at all, and needs saying differently.
-      printf '  %-16s listening on %s but the TLS handshake FAILED\n' \
-        "${pair#*:}" "${pair%%:*}"
-      ok=false
-    fi
-  done
-  if [[ "$TLS_ENABLED" == "true" ]]; then
-    for pair in "${ROUTER_BIND_PORT}:router upstream" "${OPENWEBUI_BIND_PORT}:Open WebUI upstream"; do
-      if ct_port_listening "${pair%%:*}"; then
-        printf '  %-16s listening on %s\n' "${pair#*:}" "${pair%%:*}"
-      else
-        printf '  %-16s NOT listening on %s (nginx will return 502)\n' \
-          "${pair#*:}" "${pair%%:*}"
-        ok=false
-      fi
-    done
-  fi
-  $ok
-}
-
-echo "=============================================================================="
-report_services || true
-echo "=============================================================================="
 echo "Provisioning complete."
 echo "Container ID: ${CT_ID}"
 echo "Service IP: ${ROUTER_IP}"
-echo "OpenAI-compatible API base URL: ${URL_SCHEME}://${ROUTER_IP}:8000/v1"
-echo "Open WebUI (chat UI):          ${URL_SCHEME}://${ROUTER_IP}:${OPENWEBUI_PORT}"
+echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
+echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to the router."
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
-if ! $ZEROTIER_OK; then
-  echo "ZeroTier: NOT installed — see the warnings above. Nothing else is affected."
-elif [[ -z "$ZEROTIER_NETWORK_ID" ]]; then
-  echo "ZeroTier: installed, node ${ZEROTIER_NODE_ID:-unknown} (join with: pct exec ${CT_ID} -- zerotier-cli join <network-id>)"
-elif [[ "$ZEROTIER_NET_STATUS" == "OK" ]]; then
-  echo "ZeroTier: node ${ZEROTIER_NODE_ID:-unknown} on network ${ZEROTIER_NETWORK_ID} (OK)"
+if [[ "$CONFIG_SOURCE" == "repo" ]]; then
+  echo "Config source: git clone of ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
 else
-  # "Requested" is the honest word. The member carries no traffic until someone
-  # authorises it, and a summary that says "joined" sends the operator looking
-  # for a routing fault instead of clicking a checkbox.
-  echo "ZeroTier: join REQUESTED for ${ZEROTIER_NETWORK_ID}${ZEROTIER_NET_STATUS:+ (${ZEROTIER_NET_STATUS})}"
-  echo "  -> authorise node ${ZEROTIER_NODE_ID:-<see zerotier-cli info>} in ZeroTier Central."
-fi
-if ! $TUN_OK; then
-  echo
-  echo "WARNING: /dev/net/tun could not be added to the container config, so" >&2
-  echo "         ZeroTier has no overlay interface. Fix the LXC config and" >&2
-  echo "         reboot the container — the mount entry is read at start." >&2
-fi
-if [[ "$CONFIG_SOURCE" == "gitea" ]]; then
-  echo "Config source: LOCAL generated config; mirrored to ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"
-else
-  echo "Config source: LOCAL generated config (not mirrored — no usable Gitea token)"
-fi
-if $OPENWEBUI_RESET; then
-  echo
-  echo "NOTE: Open WebUI's first-run migration failed and its empty database was"
-  echo "      reset once, automatically. The broken copy is kept beside it as"
-  echo "      /app/openwebui/data/webui.db.broken-<timestamp>; delete it when you"
-  echo "      are satisfied the UI works."
-fi
-if [[ "$TLS_ENABLED" == "true" ]]; then
-  echo
-  echo "TLS: self-signed certificate at ${TLS_DIR}/server.crt, valid ${TLS_CERT_DAYS} days."
-  echo "     Browsers will warn until you trust it. To fetch a copy:"
-  echo "       pct pull ${CT_ID} ${TLS_DIR}/server.crt ollama-router.crt"
-  echo "     For API clients:  export SSL_CERT_FILE=/path/to/ollama-router.crt"
-  echo "     Inspect or replace it with:  manage-model-servers cert"
-fi
-if $SANDBOX_DEGRADED; then
-  echo
-  echo "NOTE: this container refuses systemd mount namespacing, so PrivateTmp=,"
-  echo "      ProtectSystem= and ProtectHome= were removed from the four service"
-  echo "      units — with them present the services cannot start at all"
-  echo "      (status=226/NAMESPACE) and nginx answers 502. The services still"
-  echo "      run as a non-login system account with NoNewPrivileges and"
-  echo "      loopback-only internal binds."
-  echo "      To restore the full hardening:"
-  echo "        pct set ${CT_ID} -features nesting=1 && pct reboot ${CT_ID}"
-  echo "      then re-run the installer, or fix-service-namespacing.sh ${CT_ID}."
-fi
-if ! $TLS_OK; then
-  echo
-  echo "WARNING: TLS setup did not complete. See the messages above." >&2
-fi
-if ! $OPENWEBUI_OK; then
-  echo
-  echo "WARNING: Open WebUI is NOT serving. Everything else is provisioned; the" >&2
-  echo "         OpenAI API on :8000 does not depend on it. Investigate with:" >&2
-  echo "           pct exec ${CT_ID} -- journalctl -u open-webui -n 100 --no-pager" >&2
+  echo "Config source: LOCAL (not version controlled — no usable Gitea token)"
 fi
 echo "=============================================================================="

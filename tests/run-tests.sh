@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run every shell unit-test suite and report per-function coverage.
+# Run every test suite (shell, repo consistency, llama.cpp target, bridge
+# pytest) and report per-function coverage for the two main scripts.
 #
 #   ./run-tests.sh                 # run everything
 #   ./run-tests.sh installer       # run one suite
@@ -18,16 +19,39 @@ EXTRACT="${HERE}/lib/extract-functions.py"
 # suite-name : script-under-test : test-file
 SUITES=(
   "installer:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-installer.sh"
-  "manage:${ROOT}/manage-model-servers.sh:${HERE}/test-manage.sh"
+  "manage:${ROOT}/install/manage-model-servers.sh:${HERE}/test-manage.sh"
 )
-
-# Python suites. These test code the installer GENERATES rather than the
-# installer itself, so the shell coverage gate does not apply to them — there
-# are no bash functions to enumerate. Same argument convention: the suite is
-# handed the script it should extract from.
-PY_SUITES=(
-  "monitor:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-monitor.py"
-  "router:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-router.py"
+# Suites without per-function coverage: repo consistency, the inference-target
+# scripts (llama.cpp, AirLLM), and their Python tests.
+EXTRA_NAMES=(repo nvidia update)
+EXTRA_KINDS=(shell shell shell)
+EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh")
+EXTRA_PYTHONS=("" "" "")
+EXTRA_TESTS=("" "" "")
+for _t in "${ROOT}"/targets/*/test-*.sh; do
+  [[ -f "$_t" ]] || continue
+  _target=$(basename "$(dirname "$_t")")
+  EXTRA_NAMES+=("${_target}-$(basename "$_t" .sh | sed 's/^test-//')")
+  EXTRA_KINDS+=(shell)
+  EXTRA_PATHS+=("$_t")
+  EXTRA_PYTHONS+=("")
+  EXTRA_TESTS+=("")
+done
+# The router and the llama.cpp bridge pin different fastapi versions, so each
+# pytest suite can run under its own interpreter (CI builds one venv per
+# service from its requirements.txt). Both default to python3. The AirLLM
+# server tests stub airllm/torch and only need the bridge's fastapi stack.
+ROUTER_PYTHON="${ROUTER_PYTHON:-python3}"
+BRIDGE_PYTHON="${BRIDGE_PYTHON:-python3}"
+EXTRA_NAMES+=(bridge airllm router monitor)
+EXTRA_KINDS+=(pytest pytest pytest pytest)
+EXTRA_PATHS+=("" "" "" "")
+EXTRA_PYTHONS+=("${BRIDGE_PYTHON}" "${BRIDGE_PYTHON}" "${ROUTER_PYTHON}" "${ROUTER_PYTHON}")
+EXTRA_TESTS+=(
+  "${ROOT}/targets/llamacpp/test_bridge.py"
+  "${ROOT}/targets/airllm/test_server.py"
+  "${HERE}/test_router.py"
+  "${HERE}/test_monitor.py"
 )
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'
@@ -45,7 +69,8 @@ for arg in "$@"; do
 done
 
 if $list_only; then
-  for entry in "${SUITES[@]}" "${PY_SUITES[@]}"; do echo "${entry%%:*}"; done
+  for entry in "${SUITES[@]}"; do echo "${entry%%:*}"; done
+  printf '%s\n' "${EXTRA_NAMES[@]}"
   exit 0
 fi
 
@@ -102,16 +127,27 @@ for entry in "${SUITES[@]}"; do
   bash "$test" "$script" || failed_suites+=("$name")
 done
 
-for entry in "${PY_SUITES[@]}"; do
-  IFS=: read -r name script test <<< "$entry"
+for i in "${!EXTRA_NAMES[@]}"; do
+  name="${EXTRA_NAMES[$i]}"
   [[ -n "$want" && "$want" != "$name" ]] && continue
   ran_any=true
-  if [[ ! -f "$test" || ! -f "$script" ]]; then
-    printf '%sMISSING%s python suite: %s\n' "$c_red" "$c_off" "$test"
-    failed_suites+=("$name"); continue
-  fi
   printf '\n%s══ %s ══════════════════════════════════════════%s\n' "$c_bld" "$name" "$c_off"
-  python3 "$test" "$script" || failed_suites+=("$name")
+  case "${EXTRA_KINDS[$i]}" in
+    shell)
+      bash "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
+      ;;
+    pytest)
+      if ! "${EXTRA_PYTHONS[$i]}" -c 'import pytest, fastapi, httpx' 2>/dev/null; then
+        printf '  %sskip%s %s (needs: pip install pytest fastapi httpx)\n' "$c_yel" "$c_off" "$name"
+        continue
+      fi
+      "${EXTRA_PYTHONS[$i]}" -m pytest -q "${EXTRA_TESTS[$i]}" || failed_suites+=("$name")
+      ;;
+    *)
+      printf 'ERROR: unknown suite type for %s\n' "$name" >&2
+      failed_suites+=("$name")
+      ;;
+  esac
 done
 
 if ! $ran_any; then

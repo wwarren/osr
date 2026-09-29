@@ -754,13 +754,14 @@ def band_distance(entry: dict, need: dict) -> float:
     """How far outside the requested band a model sits, in billions (0 = in).
 
     Used to order candidates when nothing is in band at all -- see
-    rank_candidates. A model of unknown size returns 0.0 because it cannot be
-    placed on the axis, not because it fits; that matches the benefit of the
-    doubt score_entry already gives it via unknown_params.
+    rank_candidates. A model of unknown size sorts after known out-of-band
+    models, but remains eligible when no known-size model exists.
     """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
-    if params <= 0 or _in_band(params, low, high):
+    if params <= 0:
+        return float("inf")
+    if _in_band(params, low, high):
         return 0.0
     return (low - params) if params < low else (params - high)
 
@@ -768,9 +769,10 @@ def band_distance(entry: dict, need: dict) -> float:
 def in_requested_band(entry: dict, need: dict) -> bool:
     """Does this model's size genuinely fall inside the requested band?
 
-    Distinct from `band_distance(...) == 0.0`, which is also true for a model
-    of unknown size. Keeping them separate matters: one unknown-size model in
-    the pool must not switch off distance ranking for every other candidate.
+    Distinct from `band_distance(...) == 0.0`, which means a known model is
+    inside the requested band. Keeping them separate matters: one unknown-size
+    model in the pool must not switch off distance ranking for every other
+    candidate.
     """
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     return entry["params_b"] > 0 and _in_band(entry["params_b"], low, high)
@@ -883,17 +885,40 @@ def find_named_model(model_name: str) -> list:
         return []
     matches = [e for e in INVENTORY.get("models", [])
                if e["name"].lower() == wanted
+               and not e["is_embedding"]
                and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
     if not matches:
         # Allow the bare name without its tag, e.g. "qwen3" -> "qwen3:14b".
         matches = [e for e in INVENTORY.get("models", [])
                    if e["name"].lower().split(":", 1)[0] == wanted
+                   and not e["is_embedding"]
                    and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
     if len(matches) > 1:
         index = _rotation.get(wanted, 0) % len(matches)
         _rotation[wanted] = index + 1
         matches = matches[index:] + matches[:index]
     return matches
+
+
+def embedding_only_match(model_name: str):
+    """The inventory name when an explicitly requested model exists ONLY as an
+    embedding model (exact name first, then the bare name without its tag);
+    None when it is unknown or any host serves it for chat.
+
+    Such a request cannot be answered by the chat endpoint. Rerouting it to
+    some other chat model would silently answer with a model the client did
+    not ask for, so the caller rejects it instead.
+    """
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return None
+    models = INVENTORY.get("models", [])
+    matches = [e for e in models if e["name"].lower() == wanted]
+    if not matches:
+        matches = [e for e in models if e["name"].lower().split(":", 1)[0] == wanted]
+    if matches and all(e["is_embedding"] for e in matches):
+        return matches[0]["name"]
+    return None
 
 
 # --- proxying -----------------------------------------------------------------
@@ -1075,6 +1100,15 @@ async def route_chat_completion(request: Request):
                 and requested not in TIER_NAMES:
             candidates = find_named_model(requested)
             explicit = bool(candidates)
+            embedding = None if candidates else embedding_only_match(requested)
+            if embedding:
+                log.warning("route: %s is embedding-only; rejecting the chat request", embedding)
+                return _error(
+                    400,
+                    f"Model '{embedding}' is an embedding-only model and cannot answer chat "
+                    "completions. Send embedding requests to /v1/embeddings, or choose a chat "
+                    "model (see /v1/models) or 'auto'.",
+                    "embedding_model_not_chat")
         if not candidates:
             if requested in TIER_NAMES:
                 need = dict(need, **{"class": TIER_NAMES[requested]})

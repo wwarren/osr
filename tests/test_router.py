@@ -371,6 +371,63 @@ def test_embedding_capability_keeps_a_model_out_of_chat(served):
         router.classify_request([user("hi")])))
 
 
+def test_explicit_embedding_model_is_rejected_with_a_clear_error(served):
+    router, upstream, client = served
+    upstream.inventory[HOST_B] = tags(("granite-small:2b", "2B", "granite"))
+    upstream.capabilities["granite-small:2b"] = ["embedding"]
+    client.post("/routing/refresh")
+    before = list(served_hosts(upstream))
+
+    for name in ("granite-small:2b", "granite-small"):   # exact and bare name
+        response = chat(client, model=name)
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["code"] == "embedding_model_not_chat"
+        assert "granite-small:2b" in error["message"] and "/v1/embeddings" in error["message"]
+    # Nothing was sent to any backend, and no other model answered instead.
+    assert list(served_hosts(upstream)) == before
+
+
+def test_an_unknown_explicit_model_still_falls_back_to_routing(served):
+    router, upstream, client = served
+    response = chat(client, model="no-such-model:1b")
+    assert response.status_code == 200
+
+
+def test_embedding_only_match(router):
+    router.INVENTORY["models"] = [
+        router.build_entry("http://a", {"name": "embed:1b"}, ["embedding"]),
+        router.build_entry("http://a", {"name": "both:7b"}, ["embedding"]),
+        router.build_entry("http://b", {"name": "both:7b"}, ["completion"]),
+    ]
+    assert router.embedding_only_match("embed:1b") == "embed:1b"
+    assert router.embedding_only_match("EMBED") == "embed:1b"
+    assert router.embedding_only_match("both:7b") is None
+    assert router.embedding_only_match("missing") is None
+    assert router.embedding_only_match("") is None
+
+
+def test_unknown_size_follows_known_out_of_band_model(router):
+    unknown = router.build_entry("http://unknown", {"name": "mystery"})
+    known = router.build_entry(
+        "http://known",
+        {"name": "model:27b", "details": {"parameter_size": "27B"}},
+    )
+    inventory = {
+        "models": [unknown, known],
+        "servers": {
+            "http://unknown": {"up": True},
+            "http://known": {"up": True},
+        },
+    }
+
+    ranked = router.rank_candidates(
+        {"class": "xlarge", "code": False, "vision": False}, inventory
+    )
+
+    assert [entry["name"] for entry in ranked] == ["model:27b", "mystery"]
+
+
 def test_capabilities_override_a_misleading_name(router):
     entry = router.build_entry(HOST_A, {"name": "my-vision-finetune:7b"}, ["completion"])
     assert entry["is_vision"] is False

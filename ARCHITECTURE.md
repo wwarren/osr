@@ -1,7 +1,7 @@
 # Ollama Smart Router — Service Architecture
 
 **System:** `ollama-smart-router`
-**Platform:** Proxmox VE, privileged Debian 13 LXC
+**Platform:** Proxmox VE, unprivileged Debian 13 LXC
 **Status:** as provisioned by `ollama-smart-router-install.sh`
 
 ---
@@ -31,7 +31,7 @@ configuration lifecycle. It explicitly does **not** cover running Ollama itself
 | **Correctness of routing** | Live inventory rather than static assumptions; embedding models structurally excluded from chat |
 | **Operability** | Every routing decision is inspectable via headers and endpoints; config is version controlled |
 | **Reproducibility** | Whole system rebuilt from one script plus a git repo |
-| **Least privilege** | One unprivileged service account; localhost-bound internals; hardened units. Note the *container* is privileged — see §9 |
+| **Least privilege** | One unprivileged service account; localhost-bound internals; hardened units |
 
 ---
 
@@ -45,9 +45,8 @@ flowchart LR
     end
 
     subgraph ct["ollama-smart-router LXC"]
-        nginx["nginx TLS<br/>:8080 :8000"]
-        router["Smart Router<br/>127.0.0.1:8010"]
-        webui["Open WebUI<br/>127.0.0.1:8088"]
+        router["Smart Router<br/>:8000"]
+        webui["Open WebUI<br/>:8080"]
         litellm["LiteLLM<br/>127.0.0.1:4000"]
         monitor["Health Monitor"]
     end
@@ -58,20 +57,18 @@ flowchart LR
         oN["ollama :11434"]
     end
 
-    gitea["Gitea<br/>deployment history"]
+    gitea["Gitea<br/>config repository"]
     mm["Mattermost<br/>alert channel"]
 
-    api -->|"HTTPS<br/>OpenAI API"| nginx
-    browser -->|HTTPS| nginx
-    nginx --> webui
-    nginx --> router
-    webui -->|"OpenAI API (loopback)"| router
+    api -->|"HTTPS/HTTP<br/>OpenAI API"| router
+    browser --> webui
+    webui -->|OpenAI API| router
     router -->|"direct dispatch<br/>(discovery mode)"| pool
     router -.->|"fallback"| litellm
     litellm --> pool
     monitor -->|"GET /api/tags"| pool
     monitor -->|"webhook"| mm
-    ct -.->|"push history"| gitea
+    gitea -.->|"clone at provisioning"| ct
 ```
 
 ### External dependencies
@@ -81,7 +78,6 @@ flowchart LR
 | Ollama hosts | HTTP `:11434` | **Critical** | Router fails forward to other hosts; total loss → 502 |
 | Gitea | HTTPS | **Provisioning only** | Install falls back to local config; running system unaffected |
 | Mattermost | HTTPS webhook | Optional | Monitor logs alerts instead of posting |
-| nginx | local | **Critical when TLS is on** | No UI and no API reachable; the applications are on loopback |
 | Proxmox host | — | Provisioning only | — |
 
 > **Key design property:** after provisioning, the only runtime dependency is
@@ -92,143 +88,67 @@ flowchart LR
 
 ## 3. Deployment view
 
-The four application services run in a single **privileged** LXC container as
-the same non-login system account (`ollama-router`); nginx runs as the
-distribution packages it, reading the certificate as root before dropping
-privileges. Privileged is deliberate — see §9 for what it costs and why.
+All four services run in a single unprivileged LXC container as the same
+non-login system account (`ollama-router`).
 
 ```mermaid
 flowchart TB
     subgraph host["Proxmox host"]
-        subgraph ctr["LXC (privileged) — 2 vCPU / 4 GB / 32 GB"]
+        subgraph ctr["LXC (unprivileged) — 2 vCPU / 4 GB / 32 GB"]
             direction TB
             subgraph units["systemd units"]
-                N["nginx.service<br/>0.0.0.0:8080 + :8000 TLS"]
-                A["open-webui.service<br/>127.0.0.1:8088"]
-                B["ollama-router.service<br/>127.0.0.1:8010"]
+                A["open-webui.service<br/>0.0.0.0:8080"]
+                B["ollama-router.service<br/>0.0.0.0:8000"]
                 C["litellm-proxy.service<br/>127.0.0.1:4000"]
                 D["ollama-monitor.service<br/>no listener"]
             end
             subgraph fs["Filesystem"]
                 E["/app/router<br/>code, .ini, .env, venv (py3.13)"]
                 F["/app/openwebui<br/>.env, venv (py3.12), data"]
-                G["/app/config-repo<br/>local config + git history"]
-                T["/app/tls<br/>self-signed cert + key"]
+                G["/app/config-repo<br/>git clone, root-only 0700"]
                 H["/opt/python<br/>standalone CPython 3.12"]
             end
         end
     end
 
-    N -->|proxies| A
-    N -->|proxies| B
-    A -->|"After + Wants"| B
-    B -->|"After + Wants"| C
-    D -->|"After + Wants"| C
+    A -->|Requires| B
+    B -->|Requires| C
+    D -->|Requires| C
 ```
 
 ### Unit dependency rationale
 
-* Every cross-service dependency is `After=` + `Wants=`, never `Requires=`.
-  Ordering is real — the UI should come up behind the router, the router behind
-  LiteLLM — but no service needs its upstream *present* in order to start. The
-  router serves from its own discovery inventory; the monitor probes the Ollama
-  hosts directly; the UI needs the router only when a request arrives.
-* This is not a style preference. `Requires=` propagates stop and restart, so a
-  crash-looping `litellm-proxy` stopped `ollama-router`, which stopped
-  `open-webui` — a failure whose only visible symptom was on the unit that had
-  done nothing wrong. Ordering-only dependencies remove that whole class of
-  confusion.
-* It is **not**, however, what breaks Open WebUI's first start. That has a
-  separate, upstream cause — see §4.3.
+* `open-webui` **Requires** `ollama-router`, because the UI's only backend is
+  the router.
+* `ollama-router` and `ollama-monitor` only **Want** `litellm-proxy`. LiteLLM
+  is the router's *fallback* path, and a hard `Requires=` let every LiteLLM
+  restart cascade into the router and the UI.
 * All units are `Restart=always`. `open-webui` carries `TimeoutStartSec=600`
   because its first start downloads a local embedding model.
 
 ### Hardening applied to every unit
 
 ```
-User=ollama-router      Group=ollama-router
-NoNewPrivileges=true    PrivateTmp=true
-ProtectSystem=full      ProtectHome=true
+User=ollama-router            Group=ollama-router
+NoNewPrivileges=true          PrivateTmp=true        PrivateDevices=true
+ProtectSystem=strict          ProtectHome=true       UMask=0027
+RestrictSUIDSGID=true         LockPersonality=true   SystemCallArchitectures=native
+CapabilityBoundingSet=        RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-`ProtectSystem=full` makes `/usr`, `/boot` and `/efi` read-only. Everything the
-services write lives under `/app`, so no `ReadWritePaths=` exemption is needed.
-Adding one would be required if logs or venvs ever move to `/var` or `/opt`.
+`ProtectSystem=strict` makes the whole filesystem read-only except for
+explicit exemptions:
 
-#### The three namespace directives are conditional, and that is deliberate
+| Unit | Writable |
+|---|---|
+| `ollama-router` | nothing (`PYTHONDONTWRITEBYTECODE=1`) |
+| `litellm-proxy` | nothing. Verified serving with a read-only install tree and no writable `HOME`. |
+| `ollama-monitor` | `StateDirectory=ollama-monitor`, which holds the startup-notice timestamp |
+| `open-webui` | `ReadWritePaths=/app/openwebui` (data directory and model cache) |
 
-`PrivateTmp=`, `ProtectSystem=` and `ProtectHome=` are not flags on a process.
-systemd implements them by building a private **mount namespace** before it
-execs the binary. Whether an LXC container is allowed to build one is decided by
-the AppArmor profile the Proxmox host applies, which depends on the container's
-`features` (nesting) and its privilege level, and on the host kernel.
-
-When it is refused, the failure is total rather than graceful:
-
-```
-open-webui.service: Failed to set up mount namespacing: Permission denied
-open-webui.service: Failed at step NAMESPACE spawning ...: Permission denied
-open-webui.service: Main process exited, code=exited, status=226/NAMESPACE
-```
-
-systemd never runs the binary at all. `Restart=always` loops forever, nothing
-binds the upstream port, and the only symptom an operator sees is **nginx
-returning 502 Bad Gateway** — a message about a proxy, describing a mount.
-
-An earlier revision of this document claimed that `-features nesting=1` made the
-hardening "genuinely in force rather than silently degraded." A real install
-disproved it. So the installer no longer asserts; it **measures**:
-
-1. After the container is created, it checks `pct config` to confirm `nesting=1`
-   actually landed rather than trusting that `pct create` honoured it.
-2. Before the generated units are shipped in, `apply_sandbox_policy` runs two
-   transient probe units inside the finished container via `systemd-run` — one
-   plain, one carrying exactly these three directives. Two probes, because "the
-   sandbox was refused" and "the probe itself would not run" call for opposite
-   decisions:
-
-   | plain | sandboxed | verdict | action |
-   |---|---|---|---|
-   | fails | — | `unknown` | keep the hardening; we learned nothing |
-   | ok | fails | `denied` | strip the three directives, say so loudly |
-   | ok | ok | `ok` | keep them; they are real |
-
-3. On `denied`, the three lines are removed from all four unit files — the
-   staged copies, so both `/etc/systemd/system` and `/app/config-repo` end up
-   consistent and `manage-model-servers apply` does not put them back — and a
-   comment is left in each unit explaining why. `NoNewPrivileges=` stays: it is
-   a `prctl` flag, not a mount, and it works in every container. The final
-   summary reports the degradation instead of hiding it.
-
-The probe re-runs on every install, so a container later given `nesting=1` gets
-its hardening back automatically.
-
-#### Reading values back out of `pct exec`
-
-Every value the host captures from inside the container goes through `ct_out`,
-which strips carriage returns and takes the first non-empty line. That is not
-tidying. `pct exec` runs `lxc-attach`, which allocates a pty whenever the host's
-stdout is a terminal — every interactive install — and the pty's ONLCR turns
-each `\n` into `\r\n`. Command substitution strips the trailing newline but not
-the `\r`, so
-
-```bash
-state="$(run_ct systemctl is-active open-webui.service)"   # "active\r"
-[[ "$state" == "active" ]]                                  # false
-```
-
-prints `active` and compares equal to nothing. The visible symptom is a script
-that lists a unit as active and declares it failed in the same breath. In
-`ct_wait_for_port` the consequence was worse: `activating\r` matched none of the
-keep-waiting cases, so the installer abandoned a service that was only slow.
-
-An existing container stuck in this loop is repaired by
-`fix-service-namespacing.sh <CTID>` on the Proxmox host. It runs the same probe,
-offers to enable `nesting=1` and reboot first — the fix that *keeps* the
-hardening — and only strips the directives if namespacing is still refused
-afterwards.
-
-Nesting also permits Docker/Podman inside the container.
+A unit that fails to start under these settings is caught by
+`manage-model-servers apply`. It health-checks every restarted service and
+rolls back the unit files with the rest of the configuration.
 
 ---
 
@@ -236,12 +156,8 @@ Nesting also permits Docker/Podman inside the container.
 
 ### 4.1 Smart Router (`ollama-router.service`) — the core
 
-FastAPI/uvicorn service, the only component that makes routing decisions. It
-binds `ROUTER_BIND_HOST:ROUTER_BIND_PORT` from `router.env` — `127.0.0.1:8010`
-behind the TLS front end, `0.0.0.0:8000` when `TLS_ENABLED=false`. Clients see
-`:8000` either way; whether that port is the router itself or nginx in front of
-it is decided entirely by `TLS_ENABLED`, which is why anything *inside* the
-container must read the bind port rather than assume 8000 (see §8).
+FastAPI/uvicorn service on `:8000`. The only component that makes routing
+decisions.
 
 | Endpoint | Purpose |
 |---|---|
@@ -263,45 +179,6 @@ Internally it has three collaborating parts:
   image.
 * **Selector + dispatcher** — scores every `(host, model)` pair, ranks them, and
   dispatches to the best, failing forward on error.
-* **Decision recorder** — writes one JSON object per request to
-  `/var/log/ollama-router/decisions.jsonl`.
-
-#### Why the decision log exists
-
-A routing decision is only evaluable against the decisions it *rejected*. The
-model that answered tells you nothing about whether it should have; the
-alternatives and their scores do. So the record keeps the whole comparison:
-
-```
-request    class, why that class, which keywords matched, length, prompt preview
-ranking    candidate count, tie-group size, whether distance ranking was used
-candidates every scored (host, model) pair: score, in_band, band_distance, and
-           the score split into its band / code / vision / size terms
-chosen     model, host, rank, score
-attempts   each fall-forward hop with its outcome and latency
-outcome    status, ttfb_ms, total_ms
-```
-
-`score_entry()` is a one-line wrapper around `score_breakdown()` so there is a
-single implementation of the arithmetic and the logged terms can never drift
-from the score that actually decided the routing. The terms are unrounded
-inside the breakdown — `sum(terms) == score` exactly — and rounded once, at the
-point the record is built.
-
-The record is written from the response's `BackgroundTask`, after the last byte
-has streamed, because that is the only point at which `total_ms` is knowable.
-The one-line journal summary is emitted at dispatch instead, so `journalctl -f`
-shows decisions live.
-
-`POST /routing/explain` returns the identical shape without executing the
-request, so a hypothesis formed from the log can be tested against a prompt
-directly.
-
-Cost is bounded by construction: `log_candidates` caps how many candidates are
-stored, `prompt_chars` caps the text, and a `RotatingFileHandler` caps the file.
-A log that cannot be opened disables itself with a warning — a router that
-refuses to route because it cannot write a log would be a worse failure than
-routing blind.
 
 ### 4.2 LiteLLM proxy (`litellm-proxy.service`)
 
@@ -311,89 +188,6 @@ backs the passthrough routes for non-chat OpenAI endpoints. Its
 `litellm_config.yaml` is generated at install time with one deployment per
 `(tier, host)` pair and `latency-based-routing` plus cross-tier fallbacks.
 
-### 4.2b nginx TLS front end (`nginx.service`)
-
-Owns the two public ports (8080 for the UI, 8000 for the API) and proxies to
-`127.0.0.1:8088` and `127.0.0.1:8010`. The applications bind loopback only, so
-there is no second unencrypted listener serving the same content.
-
-**Where it binds is set on the command line, not by environment.** Open WebUI's
-`serve()` carries literal defaults — `host="0.0.0.0", port=8080` — and reads
-neither `HOST` nor `PORT` from the environment. Configuring the env file alone
-left it binding the port nginx owns, so it died with *address already in use*
-and the proxy returned **502** for a loopback port nothing was listening on.
-The unit passes `--host`/`--port` explicitly (typer exposes plain keyword
-parameters as options automatically), with systemd expanding them from the
-`EnvironmentFile` so the env file stays the single source of truth. A flag also
-cannot be silently ignored by a future release the way the variables were.
-
-**Why a proxy at all.** Open WebUI cannot terminate TLS. Its `serve` command
-passes only host and port to `uvicorn.run()` and exposes no `--ssl-*` options,
-which is why upstream's own documentation points at a reverse proxy. Patching
-the unit to call uvicorn directly would work but would bypass the CLI's own
-startup (secret-key handling, `UVICORN_WORKERS`) and need re-checking on every
-Open WebUI upgrade.
-
-**Ports deliberately unchanged.** TLS was added *on top of* 8080 and 8000
-rather than moving to 443, so existing firewall rules, bookmarks and API base
-URLs keep working — only the scheme changes.
-
-Three directives in the generated site are load-bearing rather than decorative:
-
-| Directive | What breaks without it |
-|---|---|
-| `Upgrade` / `Connection` proxy headers | Open WebUI's socket.io degrades to long-polling — the UI works but feels broken, which is harder to diagnose than an outright failure |
-| `proxy_buffering off` | nginx holds the SSE token stream until a buffer fills; replies arrive in bursts instead of streaming |
-| `proxy_read_timeout 1h` | a long generation is severed mid-sentence at nginx's 60-second default |
-
-Two things are deliberately *absent*. There is no `http2 on`, because WebSocket
-upgrade is an HTTP/1.1 mechanism and the directive only exists from nginx
-1.25.1 — on anything older the entire file is rejected and the front end never
-reloads. There are no `listen [::]` lines, because in a container whose network
-has no IPv6 nginx fails with *Address family not supported* and refuses to
-start at all; no UI is a worse outcome than no IPv6, and the installer only
-ever configures an IPv4 address.
-
-Ordering matters during provisioning: the certificate is generated **before**
-`apply-config.sh` installs the site that names it. The other way round,
-`nginx -t` cannot load a file that does not exist yet, so every fresh install
-printed a rejection warning and then worked on the retry — which is how an
-operator learns to ignore the one warning that matters.
-
-`apply-config.sh` installs the site from the config repo and reloads nginx, but
-only after checking the certificate exists and `nginx -t` passes, and never
-fatally — a broken proxy config must
-not abort an apply that has already put the application config in place, and it
-must not take down the running front end, which is the only way in to the UI.
-
-### 4.2c The certificate
-
-Self-signed, generated **inside the container** so the private key is never
-written to the Proxmox host or passed on a command line. Key `0600`,
-certificate `0644`, both under `/app/tls`. The key is not in the config repo —
-a private key does not belong in git — which is the one piece of this system's
-state that is not reproducible from the repo alone.
-
-`subjectAltName` is the part that matters: it carries the container IP as an
-`IP:` entry, the hostname and localhost as `DNS:` entries, plus anything in
-`TLS_EXTRA_SAN`. A certificate with only a CN has not been accepted as an
-identity by any current browser since Chrome 58, and an address written as
-`DNS:` instead of `IP:` fails silently until a client refuses to connect —
-which is why `tls_san_list` classifies operator-supplied names by shape rather
-than asking.
-
-`manage-model-servers cert renew` carries the existing SANs forward unless
-`--san` is given, so a renewal cannot silently narrow the certificate. It
-generates into a temporary pair and swaps only on success, so a failed renewal
-cannot leave nginx holding a key that no longer matches its certificate.
-
-`TLS_ENABLED=false` reverts the whole arrangement: no nginx or openssl package,
-no site generated, applications bound to `0.0.0.0` on the public ports, plain
-HTTP. Because the config repo is the source of truth, `apply-config.sh` also
-*removes* an installed site that is no longer in the repo — otherwise nginx
-would keep holding 8080 and 8000, which are the very ports the applications
-bind directly in that mode.
-
 ### 4.3 Open WebUI (`open-webui.service`)
 
 Chat UI on `:8080`. Points at the **router**, not at LiteLLM, so UI traffic is
@@ -401,87 +195,12 @@ smart-routed. Runs from its own virtualenv on **Python 3.12** — every
 `open-webui` release requires `>=3.11,<3.13` while Debian 13 ships 3.13, so the
 installer provisions a dedicated interpreter for it (see §7.3).
 
-#### The first-start migration, and why provisioning verifies it
-
-On a brand-new database Open WebUI creates its SQLite schema and then runs
-alembic over it. On this platform the two disagree, and the very first start
-dies:
-
-```
-sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
-    duplicate column name: info_json
-[SQL: ALTER TABLE user ADD COLUMN info_json JSON]
-```
-
-The column is present, the revision that adds it is not stamped, and every
-later start repeats the same `ALTER`. It cannot recover on its own. This is
-upstream behaviour, not a configuration error — but the database at that point
-holds no account and no data, so discarding it and starting once more produces
-a clean schema.
-
-Provisioning therefore does three things rather than one:
-
-1. **Starts Open WebUI separately, after the other three.** Its first start
-   runs migrations and downloads an embedding model on a 2-vCPU container;
-   there is nothing to gain from doing that while three other services are
-   also starting.
-2. **Waits for the port**, with `ct_wait_for_port` polling the container's own
-   `ss` and giving up early if the unit stops trying. `Type=simple` means
-   `systemctl start` returns the instant the process is forked, so "the unit
-   started" says nothing about whether the service works — which is exactly
-   how an earlier version printed *Provisioning complete* over a dead UI.
-3. **Self-heals once, and only once.** If the port never opens *and* the
-   journal carries the migration signature, `openwebui_reset_db` moves the
-   database aside — after confirming the `user` table holds zero accounts, so
-   a re-run against a live deployment can never destroy data — and the start
-   is retried. Anything else is reported with the journal excerpt and left
-   alone.
-
-The end of provisioning prints each unit's real state and whether each port
-answers. A failed Open WebUI is a warning, not a fatal error: the OpenAI API on
-`:8000` does not depend on it.
-
 ### 4.4 Health monitor (`ollama-monitor.service`)
 
-No listener. Polls each distinct host once per cycle and posts state
-*transitions* only — down and recovery. A healthy, unchanged cluster is silent.
-
-**Health is a property of the host, not of the tier.** State is keyed by URL and
-the message names every tier the host serves. Keying it per `(tier, host)` meant
-one unreachable box produced one alert per tier it backed — and since a
-single-server deployment points all four tiers at the same URL, one outage
-posted four identical messages and four more on recovery.
-
-Three mechanisms keep the channel quiet, all configurable under `[alerting]` in
-`monitor.ini`:
-
-| Mechanism | Default | Problem it solves |
-|---|---|---|
-| `failure_threshold` / `recovery_threshold` | 3 / 2 consecutive probes | A backend answering slowly — one probe timing out, the next succeeding — otherwise alternates down/up **every cycle, forever**. Thresholds of 1 reproduce that flood. |
-| `state_file` (systemd `StateDirectory=`) | `/var/lib/ollama-monitor/state.json` | Held only in memory, health defaulted to "everything is up", so each restart rediscovered an ongoing outage and re-announced it. With `Restart=always` that is one message per `RestartSec` for the length of the outage. |
-| `startup_notice` | `auto` | The webhook self-test is useful on a first start and after a reconfiguration, and pure noise on the 400th restart. `auto` posts only when there is no prior state or the watched set changed. |
-
-On top of those, the send path itself is guarded. The state file carries
-`last_check` (the raw probe result for the most recent cycle), `last_check_at`,
-and `last_posted_digest` — a fingerprint of the believed health of every watched
-host at the moment of the last message. `announce()` recomputes that fingerprint
-and **drops the message if it is unchanged**, so an unchanged cluster cannot
-produce a post even if the debouncing above were bypassed entirely. The
-fingerprint is written back after a successful post, which is why the loop saves
-state twice on a transition cycle and not at all in steady state.
-
-`repeat_seconds` (default `0`, off) is the single deliberate exception: it
-re-reports an outage that is still ongoing, and is excluded from the digest
-guard by design. Transitions occurring in the same cycle are batched into one
-message.
-
-State is written **before** the message is posted: if the post hangs and the
-unit is killed, a lost alert beats a duplicated one. An unwritable or corrupt
-state file degrades to memory-only with a warning rather than failing the
-daemon, and settings are read through a section-safe accessor — `ConfigParser`'s
-`fallback=` covers a missing *option* but still raises `NoSectionError` for a
-missing *section*, which would otherwise crash-loop the daemon against a
-hand-trimmed `monitor.ini`.
+No listener. Polls each distinct host once per cycle and maps the result onto
+every `(tier, host)` pair that uses it, so a host shared by two tiers is probed
+once but alerted per tier. Posts state *transitions* only — down and recovery —
+plus a startup notice that doubles as a webhook permission check.
 
 It also runs the **keep-alive maintainer**. Ollama's OpenAI-compatible endpoint
 does not accept a `keep_alive` field, so a model driven through the router would
@@ -491,14 +210,6 @@ works around this by periodically calling each healthy host's *native*
 loads the model and resets its unload timer without generating anything. It runs
 only when `OLLAMA_KEEP_ALIVE` is set; blank leaves each server's own setting in
 charge. Down hosts are skipped so a dead host never stalls the cycle.
-
-**Webhook delivery.** An incoming webhook is bound to one channel, and many
-Mattermost servers refuse a payload that names a different one — which surfaces
-as a 4xx that reads like a permissions failure. On any 4xx the monitor retries
-once **without** the `channel` field and logs a warning, so the alert lands in
-the webhook's own channel rather than being dropped. `MATTERMOST_VERIFY_TLS`
-covers the other common failure, an internal CA. `manage-model-servers
-test-alert` reproduces the exact payload and reports which of the two applies.
 
 ---
 
@@ -541,7 +252,7 @@ Each `(host, model)` pair is scored; highest wins.
 | **Vision** | `+vision_match` when an image request meets a vision model; `−vision_match` when it doesn't; small off-task penalty for a vision model on plain text |
 | **Extremes within class** | Large requests bias larger, fast requests bias smaller |
 | **Unknown size** | Scores `unknown_params` (0.3) — usable but never preferred |
-| **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt |
+| **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt. Explicitly requesting an embedding-only model on the chat endpoint is a 400 (`embedding_model_not_chat`), never a silent substitute |
 | **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load across hosts serving the same model |
 
 Parameter counts come from `details.parameter_size`, falling back to parsing the
@@ -587,9 +298,8 @@ replayed against a different host.
 
 ## 6. Configuration architecture
 
-Configuration is **generated locally and injected at provisioning time**. When
-Gitea is configured, that generated tree is committed and pushed as deployment
-history, but it is never cloned or pulled to seed a deployment.
+Configuration is **version controlled in Gitea and injected at provisioning
+time** — a deliberate middle ground between baked-in config and full GitOps.
 
 ```
 services/ollama-router/     router.py  router.ini  requirements.txt  *.service
@@ -606,9 +316,9 @@ dependency pins version independently.
 
 ### 6.1 Changing the server list — `manage-model-servers`
 
-`install/manage-model-servers.sh` is generated into the local config tree and
-symlinked to `/usr/local/bin/manage-model-servers`, so it versions alongside the
-config it edits and local edits update the command immediately.
+`install/manage-model-servers.sh` is seeded into the repo and symlinked to
+`/usr/local/bin/manage-model-servers`, so it versions alongside the config it
+edits and a `git pull` updates the command.
 
 ```
 manage-model-servers list | status | discover | models
@@ -639,16 +349,6 @@ then optionally applies and restarts. Design points:
 * Both verify the tag is **actually present** on the affected server(s) before
   writing it (`models` lists what is available; `--no-probe` overrides for a
   not-yet-pulled model).
-* **The repo is on PATH inside the container.** `apply-config.sh` makes every
-  `*.sh` in the repo executable (skipping `.git/`) and writes a `profile.d`
-  snippet appending the repo root and `install/` to `PATH`. Appended rather
-  than prepended, so a committed file cannot shadow a system binary. Because
-  `profile.d` is read only by login shells, the `/usr/local/bin` symlink is
-  kept for `pct exec` — and it is created as the script's *first* action, so a
-  failure further down cannot leave a half-applied system without its
-  management command. The repo stays `0700 root:root` throughout: `router.env`
-  holds live secrets, so this is operator convenience, not a grant to the
-  service account.
 * **No automatic config migration.** The tiers were renamed twice
   (`BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
   `model_name: qwen-heavy` → `heavy` → `large`), but the management script does
@@ -659,7 +359,7 @@ then optionally applies and restarts. Design points:
   instead of coming up healthy with none. Anything `router.ini` omits falls back
   to the built-in defaults in `router.py`, so a config predating the `xlarge`
   tier still loads.
-* `commit` authenticates with the deploy token from `router.env`. Gitea rejects
+* `commit` authenticates with the deploy token from `/app/router/secrets.env`. Gitea rejects
   account passwords for git-over-HTTP, and the stored git credentials are
   deleted after provisioning, so the token is written to a temporary 0600
   credential file for the duration of the push — never onto the command line.
@@ -677,23 +377,41 @@ change it.
 The router picks up an added host on its next discovery poll; `--apply` mainly
 matters for LiteLLM's static path.
 
-### Why local config, not pull-on-start
+### Why provisioning-time pull, not pull-on-start
 
 A `git pull` in `ExecStartPre` would make **Gitea a boot dependency of every
 service**. A Gitea outage during a container restart would then take down
 routing entirely, and a bad commit would break startup rather than being caught
-at install. Provisioning also avoids pulling from Gitea: the installer-generated
-tree is the source of truth, and Gitea receives an outbound history push only.
+at install. Pulling once at provisioning keeps the blast radius of the config
+system confined to install time.
 
 Changing config on a running container is an explicit, reversible act:
 
 ```bash
-cd /app/config-repo
-./install/apply-config.sh
-systemctl daemon-reload
-systemctl restart litellm-proxy ollama-router ollama-monitor open-webui
-manage-model-servers commit "Describe the change"
+cd /app/config-repo && git pull
+manage-model-servers apply      # validate, snapshot, restart what changed, roll back on failure
 ```
+
+Updating the components themselves (new router, monitor, units, requirements
+or management tools) from a local copy of the repository is
+`install/update-router.sh`, run inside the container. It takes only the
+installer-owned code (`INSTALLER_OWNED_CODE`) plus itself, never `env/*.env`,
+`litellm_config.yaml` or secrets, and the `router.ini` / `monitor.ini`
+tunables only with `--with-tunables`. It checks the source (LF endings,
+bash/Python syntax), commits the changes into the config repo, refreshes the
+router venv when the router/monitor requirements changed, runs
+`manage-model-servers apply` (with `--all` after a venv change), and pushes to
+Gitea. A failed apply resets the commit and restores the venv's previous
+package set, so repo, venv and running files stay consistent.
+
+Config changes are serialized by an `flock` on
+`/run/lock/ollama-smart-router-config.lock`, taken by `update-router.sh` and by
+the `manage-model-servers` commands that write. `update-router.sh` hands its
+held descriptor to the `manage-model-servers apply`/`commit` it runs
+(`CONFIG_LOCK_INHERITED_FD`); the child accepts it only when that descriptor
+is open on the lock file and the lock is really taken. An flock ends with its
+process, so nothing is left locked after a crash; `manage-model-servers
+clear-lock [--force]` reports, and on request stops, a hung holder.
 
 ---
 
@@ -712,11 +430,11 @@ sequenceDiagram
     G-->>I: identity (token owner)
     I->>G: resolve or create config repository
     I->>I: build config tree from answers
+    I->>G: seed missing files only
     I->>CT: pct create + start
     I->>CT: wait for systemd + DNS, install base packages
     I->>CT: create service account and directories
-    I->>CT: push generated config tree
-    I->>CT: initialize git history and push branch to Gitea
+    CT->>G: git clone config repo
     I->>CT: run install/apply-config.sh
     I->>CT: build venvs from requirements.txt
     I->>CT: provision Python 3.12 for Open WebUI
@@ -730,42 +448,6 @@ prompts, input validation, Gitea authentication and repo resolution, and
 storage capacity. A typo, a bad token, or a disk without room costs a re-prompt
 rather than a wasted build. An `ERR` trap destroys a half-provisioned container
 so a failed run never leaves debris.
-
-#### The corollary: what runs after `pct create` must not fail loudly
-
-That trap is armed from the moment `CT_CREATED=1` until it is disarmed at the
-very end. Every step in between is therefore either **essential** — allowed to
-abort, because a container without it is worthless — or **optional**, in which
-case it must be called as
-
-```bash
-optional_step || FEATURE_OK=false
-```
-
-and reported in the summary. `generate_tls_cert`, `configure_lxc_tun_device` and
-`install_zerotier` all take this form. The hazard is not theoretical: ZeroTier is
-installed *after* Open WebUI's multi-minute first-run migration, so a bare call
-meant a transient failure fetching `install.zerotier.com` would run
-`pct destroy` on a fully provisioned, working system.
-
-The reverse mistake matters too — a genuinely essential step that swallows its
-own failure produces a container that provisions "successfully" and does not
-work. `verify_service_executables` is the reference for that direction: it names
-each check before it can fail, precisely so the trap does not destroy the
-evidence.
-
-#### ZeroTier and the TUN device
-
-`configure_lxc_tun_device` appends `lxc.cgroup2.devices.allow: c 10:200 rwm` and
-a bind mount of `/dev/net/tun` to the container config. Both are read **once, at
-container start**, which is why `-start 1` was removed from `create_args` and
-the container is started explicitly afterwards. Written to a running container,
-they do nothing until it is rebooted.
-
-`install_zerotier` runs last. A `join` is a *request*: the member stays in
-`REQUESTING_CONFIGURATION` or `ACCESS_DENIED` until it is authorised in ZeroTier
-Central, so the installer prints the node address and the real network status
-rather than claiming a join succeeded.
 
 **Storage selection** resolves candidates in three steps, because
 `pvesm status -content <type>` returns an empty table on some setups:
@@ -792,19 +474,23 @@ perfectly healthy host. Sizes are KiB (pvesm divides bytes by 1024) and are floo
 a capacity report is never optimistic. Inactive storages are excluded. The same
 check guards the template storage against `TEMPLATE_MIN_GIB`.
 
-### 7.2 History policy
+### 7.2 Seeding policy
 
-The installer always applies the freshly generated local tree. If a usable Gitea
-token exists, that local tree is initialized as a git repository and pushed as a
-deployment-history branch. Gitea is never cloned, pulled or fetched during
-provisioning, so remote state cannot override a clean install. If no usable
-token exists, the end state is identical minus the history push.
+The installer pushes files the repository **does not already have**, so
+committed edits to *configuration* always win over generated defaults.
+Installer-owned *code* (the services, their units and requirements, and the
+management tool; see `INSTALLER_OWNED_CODE`) is **updated** in place when it
+differs (`CONFIG_UPDATE_CODE=true`), so a re-install never leaves stale code
+running. The repo files are the source of truth, and
+`tools/sync-embedded.py` keeps the installer's embedded copies identical. If no usable token exists,
+the tree is shipped into the container directly and applied through the same
+`apply-config.sh` path — identical end state, minus version control.
 
 ### 7.3 Dual Python runtimes
 
 | Runtime | Used by | Source |
 |---|---|---|
-| System Python 3.13 | router, LiteLLM, monitor (shared venv) | Debian 13 |
+| System Python 3.13 | router + monitor (`/app/router/venv`); LiteLLM (`/app/litellm/venv`, `litellm[proxy]`, hash-locked) | Debian 13 |
 | Python 3.12 | Open WebUI (own venv) | Existing binary → distro package → `uv` standalone build in `/opt/python` |
 
 Open WebUI requires `>=3.11,<3.13`; Debian 13 ships 3.13, so **every**
@@ -817,37 +503,16 @@ fails at service start.
 
 ## 8. Network and ports
 
-Ports below are the `TLS_ENABLED=true` default. With TLS off there is no
-nginx, and the two applications bind the public ports directly over plain HTTP.
-
 | Port | Service | Binding | Exposure |
 |---|---|---|---|
-| 8000 | nginx → Smart Router | `0.0.0.0` | LAN — the OpenAI-compatible API, **HTTPS** |
-| 8080 | nginx → Open WebUI | `0.0.0.0` | LAN — browser UI, **HTTPS** |
-| 8010 | Smart Router | `127.0.0.1` | **Container-local**; `ROUTER_BIND_PORT` |
-| 8088 | Open WebUI | `127.0.0.1` | **Container-local**; `OPENWEBUI_BIND_PORT` |
+| 8000 | Smart Router | `0.0.0.0` | LAN — the OpenAI-compatible API |
+| 8080 | Open WebUI | `0.0.0.0` | LAN — browser UI |
 | 4000 | LiteLLM | `127.0.0.1` | **Container-local only** |
 | 11434 | Ollama hosts | outbound | Router and monitor → model pool |
-| 9993/udp | ZeroTier | `0.0.0.0` | Internet — peers and root servers |
 
 When the container firewall is enabled, the installer writes explicit accept
 rules for 8000 and 8080 from a trusted CIDR. LiteLLM needs no rule because it
 never leaves the loopback interface.
-
-> **In-container callers must use the bind port, not 8000.** A plain-HTTP
-> request to the TLS port gets nginx's `400 The plain HTTP request was sent to
-> HTTPS port`. `curl -f` collapses that into **exit 22**, which reads exactly
-> like the service being down — `manage-model-servers discover` reported
-> precisely that against a router that was running normally. `resolve_router_url`
-> now reads `ROUTER_BIND_HOST`/`ROUTER_BIND_PORT` out of `router.env` rather
-> than assuming the public port, and the failure path prints the status and the
-> response body instead of one guess about the cause.
-
-The ZeroTier rule is the exception to the CIDR pattern and is written whenever
-the firewall is on, **unscoped by source** — peers and root servers arrive from
-arbitrary internet addresses. Scoping it to `API_ALLOW_CIDR` would not break
-ZeroTier outright; it would silently force every session onto ZeroTier's relay
-servers, which presents as unexplained latency rather than as a firewall fault.
 
 ---
 
@@ -855,23 +520,7 @@ servers, which presents as unexplained latency rather than as a firewall fault.
 
 ### Identity and privilege
 
-* **Privileged LXC.** `CT_UNPRIVILEGED=0` at creation, so there is no UID shift:
-  root inside the container is UID 0 on the host. This is what makes device
-  passthrough, host bind mounts and NFS shares work without remapping, and it is
-  the reason the setting exists — but it means **the container boundary is not a
-  security boundary**. A root process inside it is materially closer to root on
-  the Proxmox host than it would be under an unprivileged container, where a
-  container escape lands on an unprivileged host UID with no capabilities over
-  anything else.
-
-  The mitigations that remain are the ones inside the container, and they are
-  unchanged: services run as the non-login `ollama-router` account, never root;
-  systemd hardening (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`,
-  `PrivateTmp`) applies to every unit; LiteLLM and both applications bind
-  loopback only. What is gone is the outer layer, so the container should be
-  treated as trusted infrastructure on a trusted network — do not run untrusted
-  code or expose it to an untrusted one. `CT_UNPRIVILEGED=1` restores the
-  unprivileged container if the passthrough needs go away.
+* Unprivileged LXC; services run as the non-login `ollama-router` account.
 * systemd hardening as listed in §3.
 * The root password is set over stdin via `chpasswd`, never passed as a
   command-line argument where it would appear in the Proxmox host's process list.
@@ -880,8 +529,9 @@ servers, which presents as unexplained latency rather than as a firewall fault.
 
 | Secret | At rest | Notes |
 |---|---|---|
-| Gitea deploy token | `env/router.env`, `0640 root:ollama-router` | Also committed to the history repo |
-| Mattermost webhook | same | Also committed to the history repo |
+| Gitea deploy token, Mattermost webhook | `/app/router/secrets.env`, `0640 root:ollama-router` | Never committed; migrated out of `env/router.env` by `commit`/`apply` |
+| Router API key (`ROUTER_API_KEY` = Open WebUI's `OPENAI_API_KEYS`) | `/app/router/secrets.env` | Generated on new installs; `manage-model-servers set-api-key` |
+| Mattermost webhook | same | Also committed |
 | Container root password | `/etc/shadow` | Never written to a file by the installer |
 
 Configuration files are **built on the Proxmox host and pushed in**, never
@@ -889,42 +539,9 @@ assembled by an inner shell. This closes an injection and mangling class:
 a token containing `'`, `$` or a backtick would otherwise break quoting or be
 silently expanded.
 
-#### The same rule for anything the host runs *inside* the container
-
-Four places build a script for `bash -c` in the container. All four follow one
-rule: the body is **single-quoted**, so the host expands nothing into it, and
-every value travels as a **positional argument**.
-
-```bash
-run_ct bash -c '
-  set -e
-  repo="$1"
-  rm -rf "$repo"
-' push_local_config_tree "$CONFIG_REPO_DIR"
-```
-
-They previously interpolated `'${CONFIG_REPO_DIR}'` into a double-quoted body.
-That looks quoted and is not: the single quotes become part of the script *text*,
-so a value containing an apostrophe closes them and the remainder executes — as
-root, in the container, two lines above an `rm -rf`. Measured:
-
-```
---- OLD form (interpolated into script text) ---
-  would-rm-rf /app/x
-  PWNED-AS-ROOT-IN-CONTAINER
---- NEW form (single-quoted body, value as argv) ---
-  would-rm-rf [/app/x'; echo PWNED-AS-ROOT-IN-CONTAINER; :']
-```
-
-The git history push was the sharper case: `remote` and `branch` are built from
-prompt input (Gitea URL, owner, repo name), and the `http.sslVerify` line was a
-bare unquoted expansion. `push_local_config_tree`, `init_config_repo_history`,
-`ensure_openwebui_python` and `install_zerotier` are all argument-passing now,
-and `describe injected_shell_bodies` fails the build if one regresses.
-
-The local config tree is `chown root:root` + `chmod -R go-rwx`, because it holds
-the env files that are also copied into runtime locations as `0640
-root:ollama-router`.
+The cloned repository is `chown root:root` + `chmod -R go-rwx`, because `git
+clone` writes mode 0644 by default — without this the clone would be *more*
+permissive than the 0640 runtime copy it feeds.
 
 ### Accepted risks
 
@@ -934,8 +551,6 @@ root:ollama-router`.
 | **`GITEA_VERIFY_TLS=false`** | TurnKey appliance ships a self-signed certificate | Install the appliance CA and flip the flag in `prompt_gitea_credentials` |
 | **No auth on the router API** | Trusted LAN deployment | Firewall CIDR; add a reverse proxy with auth if exposed |
 | **Deploy token grants access to the Gitea storing it** | Same-system credential | Scope the token to the single repository |
-| **ZeroTier bypasses the container firewall** | The Proxmox CT firewall filters the veth on `vmbr0`; overlay traffic arrives on `zt*` inside the container, so `API_ALLOW_CIDR` does not constrain it | Network membership in ZeroTier Central *is* the access control — authorise deliberately, and add auth in front of the API if that is not enough |
-| **`curl \| bash` from a third-party host** | ZeroTier's supported install path | The fetch is `curl -fsSL --proto "=https" --tlsv1.2`, so an HTTP error page or a plaintext redirect cannot reach the shell; pin a distro package instead if that trade is unacceptable |
 
 ---
 
@@ -943,11 +558,8 @@ root:ollama-router`.
 
 | Failure | Detection | System behaviour | Operator signal |
 |---|---|---|---|
-| One Ollama host down | Connect error mid-request; `failure_threshold` consecutive failed probes | Fail-forward to next candidate; dropped from inventory | One Mattermost alert naming every tier it served; `/routing/inventory` |
-| All Ollama hosts down | Empty inventory | Falls back to LiteLLM path, which also fails → 502 | One batched alert listing every host |
-| A host flapping (intermittent timeouts) | Streak counters never reach a threshold | Treated as up; no churn | Nothing posted — check `/routing/inventory` and the probe latency |
-| Monitor restarted during an outage | Health reloaded from `state_file` | Outage is remembered, not re-announced | `Resuming with N backend(s) already known down` in the journal |
-| Monitor `state_file` unwritable | Write failure | Degrades to memory-only; alerting still works | One warning; restarts will re-announce |
+| One Ollama host down | Connect error mid-request; next poll | Fail-forward to next candidate; dropped from inventory | Mattermost alert; `/routing/inventory` |
+| All Ollama hosts down | Empty inventory | Falls back to LiteLLM path, which also fails → 502 | Alerts per host |
 | A model removed from a host | Next discovery poll | Stops being a candidate within `refresh_seconds` | Inventory diff |
 | Gitea unreachable at install | Auth probe | Local config mode; provisioning completes | Explicit console warning |
 | Gitea unreachable at runtime | — | **No effect** — nothing reads it | — |
@@ -987,11 +599,7 @@ root:ollama-router`.
 | `GET /routing/inventory` | What does each host currently serve; who is down and why |
 | `POST /routing/explain` | What *would* happen to this prompt, with scores |
 | `journalctl -u <unit>` | Service logs; monitor logs suppressed alerts too |
-| `/var/log/ollama-router/decisions.jsonl` | Every routing decision with all candidate scores |
-| `manage-model-servers routing-stats` | Whether the scoring is discriminating, and where it drifted |
-| `X-Router-Request-Id` | Ties a response back to its record in the decision log |
-| Mattermost `#ollama-monitor` | Host up/down transitions, and a startup confirmation on first start or reconfiguration |
-| `/var/lib/ollama-monitor/state.json` | What the monitor believes about each host, and when it last said so |
+| Mattermost `#ollama-monitor` | Host up/down transitions and startup confirmation |
 | `/etc/motd` | Ports, tier map, config paths at login |
 
 ---
@@ -1003,10 +611,10 @@ root:ollama-router`.
 | Routing logic in the router, not LiteLLM | Extend LiteLLM config | LiteLLM's model map is static YAML; dynamic discovery would mean regenerating and reloading config per change |
 | Direct dispatch when discovery succeeds | Always route via LiteLLM | Router-side ranking is inventory-aware; fail-forward replaces LiteLLM's fallbacks with something better informed |
 | Keep LiteLLM as fallback | Remove it | Preserves a tested static path when discovery is unavailable, and serves non-chat OpenAI routes |
-| Apply generated local config at provisioning | Clone/pull Gitea config | Prevents stale remote commits from changing a clean install; Gitea is history only |
+| Pull config at provisioning | `ExecStartPre` git pull | Avoids making Gitea a boot dependency of every service |
 | Separate venv + Python for Open WebUI | Shared venv | Hard version constraint (`<3.13`) and conflicting pins with LiteLLM |
 | Keyword lists as JSON arrays in `.ini` | Comma-separated | Preserves exact spacing — `"def "` must not match `default` |
-| Push deployment-history branch | Push to `main` during provisioning | Avoids non-fast-forward conflicts and keeps each deployment snapshot distinct |
+| Seed only missing files | Always overwrite | Operator commits win over generated defaults |
 | Embeddings structurally excluded | Score them low | A low score is still selectable; an embedding model cannot serve chat at all |
 
 ---
@@ -1019,39 +627,173 @@ root:ollama-router`.
 2. **Classification is lexical.** Prompt length and keyword matching approximate
    complexity; they will misclassify adversarial or unusual phrasing. Thresholds
    are tunable, but there is no semantic understanding of difficulty.
-3. **No request-level authentication** on the router or UI beyond Open WebUI's
-   own accounts.
+3. **Router authentication is a single shared bearer key** (`ROUTER_API_KEY`),
+   not per-user; Open WebUI provides the user accounts.
 4. **No queue or concurrency control.** A saturated host is not detected as
    "busy" — only as up or down. Latency-aware selection is limited to LiteLLM's
    static path.
 5. **Single container.** The router itself is not redundant; the container is a
    single point of failure for the API surface.
-6. **Secrets in git**, by explicit choice — see §9.
+6. **Secrets are outside git** since 2026-09 (`/app/router/secrets.env`), but
+   earlier commits still contain the old token. Rotate it; see §9.
 
 ### Natural next steps
 
 * Feed observed latency back into candidate scoring (turn health into a gradient
   rather than a boolean).
-* Optional API-key auth at the router.
 * Add hosts dynamically via a config endpoint, rather than via the CLI tool.
 * Track in-flight requests per host to avoid piling onto a saturated one.
+
+---
+
+## 14b. LM Studio servers
+
+`MODEL_SERVERS` and `BACKEND_*` may mix Ollama hosts (`http://host:11434`)
+and LM Studio servers (`lmstudio+http://host:1234`). The prefix is the only
+place the kind is recorded, and each component branches on it:
+
+* **The router** discovers LM Studio models through LM Studio's native API.
+  It tries `/api/v1/models` (0.4+: `key`, `params_string`,
+  `capabilities.vision`, `loaded_instances`), then `/api/v0/models` (0.3.x:
+  `type` llm/vlm/embeddings, `state`), then the name-only `/v1/models`. It
+  dispatches to `<base>/v1/chat/completions`, adding `LMSTUDIO_API_TOKEN`
+  itself; the client's key is never forwarded. Entries carry `loaded`:
+  resident models get `loaded_bonus`, and `lmstudio_loaded_only` excludes
+  cold ones so a request never waits on, or causes, a just-in-time load.
+* **The monitor** probes `/v1/models`. An auth failure counts as down. The
+  keep-alive pinner skips LM Studio, which manages residency with its own
+  idle TTL.
+* **manage-model-servers** detects the kind when adding (Ollama `/api/tags`,
+  else LM Studio `/api/v1|v0/models`, a 401 included). It writes LiteLLM
+  deployments as `lm_studio/<model>` against `<base>/v1`, and resolves
+  `host:port` to the stored prefixed entry for remove, set-tier and
+  set-server-model.
+
+---
+
+## 15. llama.cpp inference targets (`targets/llamacpp/`)
+
+An alternative to an Ollama host. It is a dedicated Debian 12 LXC that runs
+one resident GGUF model under `llama-server`, plus a small FastAPI **bridge**
+that answers on the Ollama port (11434) with enough of the Ollama and OpenAI
+APIs for the router, LiteLLM and the monitor. To the router it is just another
+entry in `MODEL_SERVERS`.
+
+```
+router / LiteLLM / monitor
+          | :11434  (Ollama + OpenAI subset)
+          v
+llama-ollama-bridge.service   bridge.py (FastAPI, uvicorn)
+          | 127.0.0.1:8081    (OpenAI API)
+          v
+llama-server.service          llama.cpp, one GGUF, GPU via passed-through /dev/nvidia*
+```
+
+* **Provisioning.** On the Proxmox host, `provision-lxc.sh` creates the
+  unprivileged CT (GPU device nodes mapped to gid 993). It copies the
+  deployment files and optionally runs the NVIDIA user-space installer and
+  `install-target.sh` inside the CT. `install-target.sh` builds llama.cpp from
+  a pinned release, creates the service account, venv and units, and never
+  overwrites an existing install.
+* **Upgrades.** `install-target.sh --upgrade` rebuilds only when the llama.cpp
+  ref resolves to a new commit. It always refreshes the bridge, venv and
+  units, health-checks `/healthz`, and restores everything it replaced
+  (`*.prev`) on failure.
+* **What the bridge reports.** `/api/tags` and `/api/show` return the model
+  with its parameter size. The size comes from llama-server's `n_params` when
+  not configured, so the router can size-band the target. `capabilities` come
+  from `MODEL_CAPABILITIES`, and the router's capability probe uses them.
+  `/api/ps` lists the resident model.
+* **Compatibility boundary.** Per-request sampling options are forwarded.
+  Load-time options such as `num_ctx` or `num_gpu` are ignored and reported in
+  `X-Bridge-Ignored-Options`. Model lifecycle calls (pull, delete,
+  `keep_alive: 0`) return 501, because the model is managed by systemd on the
+  target.
+* **Tuning.** `CONTEXT_SIZE`, `PARALLEL_SLOTS`, `THREADS` and `GPU_LAYERS` live
+  in `/etc/llama-target/llama-server.env`. `LLAMA_EXTRA_ARGS` passes any other
+  llama-server flag.
+* **Hardening.** Both units run as `llama-target` with
+  `ProtectSystem=strict`. llama-server may write only `/var/lib/llama-target`,
+  and the bridge nothing at all.
+
+See `targets/llamacpp/README.md` for the step-by-step procedure and the NVIDIA
+baseline.
+
+## 16. AirLLM inference targets (`targets/airllm/`)
+
+An AirLLM target serves one Hugging Face model that is far larger than the
+target's RAM or VRAM by streaming it from disk a layer at a time. It follows
+the llama.cpp target's conventions, so the router treats it as one more Ollama
+server:
+
+* **Deployment.** `provision-lxc.sh` on the PVE host creates an unprivileged
+  CT (Debian 12/13 or Ubuntu 24.04/26.04) whose root disk is sized for the
+  model's weights twice (download + shards) and, with `GPU_DEVICES`, passes the
+  GPU through and runs the NVIDIA 580.173.02 user-space helper.
+  `install-target.sh` inside the CT installs `server.py` into
+  `/opt/airllm-target` with a hash-locked venv, settings in
+  `/etc/airllm-target/airllm.env` (0640, holds `HF_TOKEN`), and data in
+  `/var/lib/airllm-target`. `--upgrade` refreshes code, venv and unit and rolls
+  back when the target is not healthy again; it will not interrupt a download
+  unless told to.
+* **Readiness.** `/api/tags` and `/healthz` answer 503 until the model is
+  loaded, so discovery and the monitor ignore a downloading or broken target.
+  A failed load exits the process; systemd retries three times and then leaves
+  the unit failed.
+* **API.** `/api/chat` and `/api/generate` (streamed or not), one generation
+  at a time. Prompt plus reply fit `AIRLLM_MAX_SEQ_LEN`; long prompts lose
+  their oldest tokens. No tools, images or embeddings.
+* **Speed.** Seconds to minutes per token. Put it in its own tier, never in a
+  fallback chain, and remember LiteLLM's 600 s request timeout.
+* **Hardening.** `airllm-ollama-api.service` runs as `airllm-target` with
+  `ProtectSystem=strict`; only `/var/lib/airllm-target` is writable.
+
+See `targets/airllm/README.md` for the procedure and the migration from the
+earlier `/opt/airllm-ollama-api` layout.
+
+## 17. Ollama inference targets (`targets/ollama/`)
+
+A plain Ollama server in its own CT. Unlike the other targets, the CT and the
+first Ollama install are not built here: `provision-lxc.sh` runs the Proxmox
+VE community script `ct/ollama.sh` with this repository's settings preset as
+its `var_*` variables (larger RAM and disk defaults, GPU passthrough when the
+host has an NVIDIA device), then copies the target files in.
+
+* **Adoption.** `install-target.sh` inside the CT leaves the community unit
+  untouched and adds a drop-in, `ollama.service.d/10-ollama-target.conf`: the
+  service runs as the unprivileged `ollama` user with `ProtectSystem=strict`
+  and no capabilities, reads `/etc/ollama-target/ollama.env` (which overrides
+  the unit's `Environment=` lines), and keeps models in
+  `/var/lib/ollama-target/models` (moved from `/root/.ollama`, not
+  re-downloaded). Re-running it is safe.
+* **Upgrades.** `--upgrade` installs a pinned release into the community
+  layout (`/usr/local/lib/ollama`) after checking it against the release's
+  `sha256sum.txt` (and optionally `OLLAMA_SHA256`), and restores the previous
+  release if the server does not report the new version. The community
+  script's `update` still works, since the drop-in survives it.
+* **Trust.** The community script is fetched from its `main` branch at run
+  time; the wrapper prints its SHA-256 and `COMMUNITY_SCRIPT_SHA256` pins it.
+
+See `targets/ollama/README.md` for the procedure.
 
 ---
 
 ## Appendix A — Runtime file layout
 
 ```
-/app/router/.env                  shared runtime config (secrets, 0640)
+/app/router/.env                  shared runtime config (0640, no secrets)
+/app/router/secrets.env           deploy token + webhook URL (0640, not in git)
 /app/router/router.py             complexity router + discovery + proxy
 /app/router/router.ini            routing thresholds, keywords, weights, bands
 /app/router/monitor.py            backend health monitor
 /app/router/monitor.ini           polling tunables
 /app/router/litellm_config.yaml   tier -> backend mapping, fallbacks
-/app/router/venv/                 router + litellm + monitor deps (py3.13)
+/app/router/venv/                 router + monitor deps (py3.13)
+/app/litellm/venv/                litellm[proxy] (py3.13, own venv)
 /app/openwebui/.env               Open WebUI config (0640)
 /app/openwebui/venv/              Open WebUI deps (py3.12)
 /app/openwebui/data/              Open WebUI state (DATA_DIR)
-/app/config-repo/                 local config tree, optional git history
+/app/config-repo/                 cloned config repo (root-only, 0700)
 /opt/python/                      standalone CPython 3.12 (if uv-provisioned)
 /etc/systemd/system/*.service     the four units
 /etc/motd                         login summary
@@ -1063,7 +805,7 @@ root:ollama-router`.
 |---|---|
 | `router.ini` | Size thresholds, keyword lists, tier names, discovery bands and weights |
 | `monitor.ini` | Poll interval, timeout, health path, keep-alive maintenance |
-| `env/router.env` | Backend URLs per tier, full host list, per-tier model tags, keep-alive, credentials, LiteLLM URLs |
+| `env/router.env` | Backend URLs per tier, full host list, per-tier model tags, keep-alive, LiteLLM URLs (no credentials) |
 | `env/openwebui.env` | UI port, data dir, upstream API base, auth toggle |
 | `litellm_config.yaml` | Static tier → host deployments, routing strategy, fallbacks |
 | `requirements.txt` (×4) | Dependency pins, per service |

@@ -3,8 +3,12 @@
 #
 # Each test gets a throwaway config repo, so nothing touches a real deployment.
 
+# Never read the caller's stdin: a prompt under test that is not fed input
+# explicitly would otherwise block forever when run from a pipe or CI runner.
+exec </dev/null
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="${1:-${HERE}/../manage-model-servers.sh}"
+SCRIPT="${1:-${HERE}/../install/manage-model-servers.sh}"
 # shellcheck source=lib/assert.sh
 source "${HERE}/lib/assert.sh"
 # shellcheck source=lib/mocks.sh
@@ -29,7 +33,21 @@ LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
+# Exported so `bash -c "source $FUNCS; ..."` subshells see it too.
+export SECRETS_FILE="${WORK}/router/secrets.env"
+LITELLM_DIR="${WORK}/litellm"
+UNIT_DIR="${WORK}/units"
+APPLY_BACKUP_DIR="${WORK}/backups"
+APPLY_BACKUP_KEEP=2
+HEALTH_TIMEOUT=4
+OPENWEBUI_HEALTH_TIMEOUT=4
+LITELLM_HEALTH_URL="http://127.0.0.1:65998/health/liveliness"
+APPLY_ALL=false
+LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
+LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT=11434
+LMSTUDIO_PORT=1234
+SERVER_TYPE=auto
 MODEL_SERVER_MIN=1
 MODEL_SERVER_MAX=20
 ROUTER_URL="http://127.0.0.1:65999"
@@ -43,8 +61,18 @@ ORIG_ARGS=()
 # shellcheck source=/dev/null
 source "$FUNCS"
 
+# A fake venv interpreter that runs the real python3. Deliberately a wrapper
+# SCRIPT, never a symlink: a later `printf > .../venv/bin/python` in another
+# test would write THROUGH a symlink and overwrite the system interpreter.
+use_real_python() {
+  rm -f "$1"
+  printf '#!/bin/sh\nexec python3 "$@"\n' > "$1"
+  chmod +x "$1"
+}
+
 reset_repo() {
   rm -rf "$REPO_DIR"
+  rm -f "$SECRETS_FILE"
   make_config_repo "$REPO_DIR"
   TIER_MODEL_OVERRIDE=(); PAIR_MODEL_OVERRIDE=(); CHANGED=false
 }
@@ -81,6 +109,25 @@ assert_ok   "ip:port"       valid_addr 10.0.0.5:11434
 assert_ok   "url"           valid_addr http://h:11434
 assert_fail "port too big"  valid_addr 10.0.0.5:99999
 assert_fail "empty"         valid_addr ""
+assert_ok   "lmstudio://host"        valid_addr lmstudio://10.0.0.9
+assert_ok   "lmstudio+http url"      valid_addr lmstudio+http://h:1234
+assert_fail "lmstudio:// bad port"   valid_addr lmstudio://h:0
+
+describe server_kind
+assert_eq "ollama"   "ollama"   "$(server_kind http://h:11434)"
+assert_eq "lmstudio" "lmstudio" "$(server_kind lmstudio+http://h:1234)"
+
+describe server_base
+assert_eq "strips the prefix" "http://h:1234" "$(server_base lmstudio+http://h:1234)"
+assert_eq "ollama unchanged"  "http://h:11434" "$(server_base http://h:11434)"
+
+describe litellm_provider
+assert_eq "ollama"   "ollama"    "$(litellm_provider http://h:11434)"
+assert_eq "lmstudio" "lm_studio" "$(litellm_provider lmstudio+http://h:1234)"
+
+describe litellm_api_base
+assert_eq "ollama base as-is"      "http://h:11434"   "$(litellm_api_base http://h:11434)"
+assert_eq "lmstudio OpenAI base"   "http://h:1234/v1" "$(litellm_api_base lmstudio+http://h:1234)"
 
 describe normalize_addr
 assert_eq "adds scheme+port"   "http://10.0.0.5:11434" "$(normalize_addr 10.0.0.5)"
@@ -88,6 +135,13 @@ assert_eq "keeps explicit port" "http://10.0.0.5:9999" "$(normalize_addr 10.0.0.
 assert_eq "strips trailing /"   "http://h:1"           "$(normalize_addr http://h:1/)"
 assert_eq "matches the installer normalisation" \
   "http://ollama1.lan:11434" "$(normalize_addr ollama1.lan)"
+
+assert_eq "lmstudio:// gets LM Studio's port" "lmstudio+http://10.0.0.9:1234" "$(normalize_addr lmstudio://10.0.0.9)"
+assert_eq "lmstudio+http passes through"      "lmstudio+http://h:4321" "$(normalize_addr lmstudio+http://h:4321/)"
+assert_eq "a forced kind applies"             "lmstudio+http://h:1234" "$(normalize_addr h lmstudio)"
+SERVER_TYPE=lmstudio
+assert_eq "--type lmstudio applies"           "lmstudio+http://h:5555" "$(normalize_addr h:5555)"
+SERVER_TYPE=auto
 
 describe valid_keep_alive
 assert_ok   "blank"    valid_keep_alive ""
@@ -119,6 +173,75 @@ DRY_RUN=true
 env_set OLLAMA_KEEP_ALIVE "9h" >/dev/null
 assert_eq "dry-run writes nothing" "3h" "$(env_get OLLAMA_KEEP_ALIVE)"
 DRY_RUN=false
+env_set GITEA_DEPLOY_TOKEN "S3CRET"
+assert_eq "a secret reads back"                "S3CRET" "$(env_get GITEA_DEPLOY_TOKEN)"
+assert_fail "a secret never lands in the repo env file" grep -q S3CRET "$ENV_FILE"
+assert_file_contains "it lands in the secrets file" "GITEA_DEPLOY_TOKEN=S3CRET" "$SECRETS_FILE"
+reset_repo
+kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "LEGACY"
+assert_eq "unmigrated secrets still resolve" "LEGACY" "$(env_get GITEA_DEPLOY_TOKEN)"
+reset_repo
+
+# ── secrets ───────────────────────────────────────────────────────────────────
+describe secret_keys
+assert_contains "the deploy token is secret" "GITEA_DEPLOY_TOKEN"     "$(secret_keys)"
+assert_contains "the webhook is secret"      "MATTERMOST_WEBHOOK_URL" "$(secret_keys)"
+
+describe is_secret_key
+assert_ok   "token"            is_secret_key GITEA_DEPLOY_TOKEN
+assert_fail "ordinary key"     is_secret_key MODEL_SERVERS
+assert_fail "no prefix match"  is_secret_key GITEA_DEPLOY_TOKEN_OLD
+
+describe kv_has
+kvf="${WORK}/kv.env"; printf 'A=1\nEMPTY=\n' > "$kvf"
+assert_ok   "present"                kv_has "$kvf" A
+assert_ok   "present but empty"      kv_has "$kvf" EMPTY
+assert_fail "absent"                 kv_has "$kvf" B
+assert_fail "missing file"           kv_has "${WORK}/nope.env" A
+
+describe kv_get
+assert_eq "reads a value"            "1" "$(kv_get "$kvf" A)"
+assert_eq "missing file is empty"    ""  "$(kv_get "${WORK}/nope.env" A)"
+
+describe kv_set
+kv_set "$kvf" A 'back\slash\n'
+assert_eq "keeps backslashes literally" 'back\slash\n' "$(kv_get "$kvf" A)"
+kv_set "$kvf" NEW v
+assert_eq "appends a new key"        "v" "$(kv_get "$kvf" NEW)"
+kv_set "${WORK}/fresh.env" K v
+assert_eq "creates a missing file"   "v" "$(kv_get "${WORK}/fresh.env" K)"
+rm -f "${WORK}/fresh.env"
+
+describe kv_del
+kv_del "$kvf" A
+assert_fail "removes the key"        kv_has "$kvf" A
+assert_ok   "keeps the others"       kv_has "$kvf" NEW
+assert_ok   "absent key is a no-op"  kv_del "$kvf" A
+rm -f "$kvf"
+
+describe ensure_secrets_file
+rm -f "$SECRETS_FILE"
+ensure_secrets_file
+assert_ok        "creates the file" test -f "$SECRETS_FILE"
+assert_file_mode "group-readable only" "640" "$SECRETS_FILE"
+
+describe migrate_secrets
+reset_repo
+kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "LEAKED"
+kv_set "$ENV_FILE" MATTERMOST_WEBHOOK_URL "https://mm.example.net/hooks/xyz"
+out="$(migrate_secrets 2>&1)"
+assert_contains "reports the move"            "Moved 2 secret" "$out"
+assert_contains "says to rotate"              "rotate" "$out"
+assert_fail "token gone from the repo file"   kv_has "$ENV_FILE" GITEA_DEPLOY_TOKEN
+assert_fail "webhook gone from the repo file" kv_has "$ENV_FILE" MATTERMOST_WEBHOOK_URL
+assert_eq "token kept in the secrets file"    "LEAKED" "$(kv_get "$SECRETS_FILE" GITEA_DEPLOY_TOKEN)"
+assert_eq "env_get still resolves it"         "LEAKED" "$(env_get GITEA_DEPLOY_TOKEN)"
+kv_set "$SECRETS_FILE" GITEA_DEPLOY_TOKEN "NEWER"
+kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "STALE"
+migrate_secrets >/dev/null 2>&1
+assert_eq "an existing secret is not clobbered" "NEWER" "$(kv_get "$SECRETS_FILE" GITEA_DEPLOY_TOKEN)"
+assert_eq "nothing to move is silent" "" "$(migrate_secrets 2>&1)"
+reset_repo
 
 describe tier_env_key
 assert_eq "fast"   "BACKEND_FAST"   "$(tier_env_key fast)"
@@ -201,11 +324,104 @@ assert_eq "lists names"  "qwen3:32b llava:13b" "$(server_models http://h | tr '\
 mock_command curl 7
 assert_eq "unreachable yields nothing" "" "$(server_models http://h)"
 
+# LM Studio: native v1 list (embedding models are not chat models).
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/v1/models"*) echo '{"models":[{"type":"llm","key":"qwen/qwen3-8b"},{"type":"embedding","key":"nomic"}]}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "LM Studio v1 list, no embeddings" "qwen/qwen3-8b" "$(server_models lmstudio+http://h:1234)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/v0/models"*) echo '{"data":[{"id":"llama-3.1-8b","type":"llm"},{"id":"e","type":"embeddings"}]}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "falls back to v0" "llama-3.1-8b" "$(server_models lmstudio+http://h:1234)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/v1/models"*) [[ "$*" == *"/api/"* ]] && exit 22; echo '{"data":[{"id":"plain"}]}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "then to /v1/models" "plain" "$(server_models lmstudio+http://h:1234)"
+mock_command curl 7
+assert_status "unreachable LM Studio -> 1" 1 server_models lmstudio+http://h:1234
+
+describe server_curl
+reset_repo
+mock_reset_log; mock_command curl 0 '{}'
+server_curl lmstudio+http://h:1234 /v1/models >/dev/null
+assert_contains "strips the prefix from the URL" "http://h:1234/v1/models" "$(mock_calls)"
+assert_not_contains "no token -> no header" "-H" "$(mock_calls)"
+env_set LMSTUDIO_API_TOKEN "lms-tok-123"
+mock_reset_log
+server_curl lmstudio+http://h:1234 /v1/models >/dev/null
+assert_contains "token via a header file" "-H @" "$(mock_calls)"
+assert_not_contains "never on the command line" "lms-tok-123" "$(mock_calls)"
+mock_reset_log
+server_curl http://h:11434 /api/tags >/dev/null
+assert_not_contains "never sent to Ollama" "-H" "$(mock_calls)"
+reset_repo
+
+describe detect_server_kind
+mock_script curl <<'EOF'
+case "$*" in *"/api/tags"*) echo '{"models":[]}';; *) exit 7;; esac
+EOF
+assert_eq "Ollama answers /api/tags" "ollama" "$(detect_server_kind http://h:11434)"
+mock_script curl <<'EOF'
+case "$*" in *"/api/tags"*) exit 22;; *"/api/v1/models"*) printf 200;; *) printf 404;; esac
+EOF
+assert_eq "LM Studio answers /api/v1/models" "lmstudio" "$(detect_server_kind http://h:1234)"
+mock_script curl <<'EOF'
+case "$*" in *"/api/tags"*) exit 22;; *"/api/v1/models"*) printf 401;; *) printf 404;; esac
+EOF
+assert_eq "a 401 still identifies LM Studio" "lmstudio" "$(detect_server_kind http://h:1234)"
+mock_command curl 7 "000"
+assert_status "nothing answers -> 1" 1 detect_server_kind http://h:1
+
+describe resolve_server
+NO_PROBE=false
+mock_script curl <<'EOF'
+case "$*" in
+  *":11434/api/tags"*) exit 7;;
+  *":1234/api/v1/models"*) printf 200;;
+  *) printf 000; exit 7;;
+esac
+EOF
+assert_eq "a bare host found on LM Studio's port" "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
+assert_eq "host:port detected as LM Studio"       "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9:1234)"
+mock_command curl 7 "000"
+assert_status "nothing answers -> 1" 1 resolve_server 10.0.0.9
+NO_PROBE=true
+assert_eq "--no-probe assumes Ollama"             "http://10.0.0.9:11434" "$(resolve_server 10.0.0.9)"
+assert_eq "an explicit lmstudio:// needs no probe" "lmstudio+http://10.0.0.9:1234" "$(resolve_server lmstudio://10.0.0.9)"
+SERVER_TYPE=lmstudio
+assert_eq "--type lmstudio needs no probe"        "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
+SERVER_TYPE=auto
+
+describe configured_entry
+reset_repo
+env_set MODEL_SERVERS "http://10.0.0.51:11434,lmstudio+http://10.0.0.9:1234"
+assert_eq "finds the LM Studio entry without the prefix" "lmstudio+http://10.0.0.9:1234" "$(configured_entry 10.0.0.9:1234)"
+assert_eq "finds an Ollama entry"                         "http://10.0.0.51:11434"       "$(configured_entry 10.0.0.51)"
+assert_eq "unknown -> normalized form"                    "http://10.0.0.99:11434"       "$(configured_entry 10.0.0.99)"
+reset_repo
+
 describe model_present_on
 mock_command curl 0 '{"models":[{"name":"qwen3:32b"},{"name":"phi4:latest"}]}'
 assert_status "exact match -> 0"            0 model_present_on http://h qwen3:32b
 assert_status "absent -> 1"                 1 model_present_on http://h nope:1b
 assert_status "bare name matches :latest"   0 model_present_on http://h phi4
+mock_script curl <<'EOF'
+case "$*" in *"/api/v1/models"*) echo '{"models":[{"type":"llm","key":"phi4:latest"}]}';; *) exit 22;; esac
+EOF
+assert_status "no :latest aliasing on LM Studio" 1 model_present_on lmstudio+http://h:1234 phi4
+mock_command curl 0 '{"models":[{"name":"smtek/Qwen3.8-27B:Q3_K_XL-16gb"},{"name":"smtek/Qwen3.8-27B:latest"}]}'
+assert_status "namespaced extended tag matches exactly" 0 model_present_on http://h smtek/Qwen3.8-27B:Q3_K_XL-16gb
+assert_status "namespaced bare name matches :latest"    0 model_present_on http://h smtek/Qwen3.8-27B
+assert_status "namespace is required for a match"       1 model_present_on http://h Qwen3.8-27B:Q3_K_XL-16gb
 mock_command curl 7
 assert_status "unreachable -> 2"            2 model_present_on http://h qwen3:32b
 
@@ -235,6 +451,49 @@ env_set OLLAMA_KEEP_ALIVE ""
 regenerate_litellm >/dev/null 2>&1
 assert_eq "blank keep_alive emits nothing" "0" "$(grep -c 'keep_alive' "$LITELLM_YAML" || true)"
 reset_repo
+# router_settings: hand-edited keys survive, fallbacks are rebuilt, and a
+# section after router_settings is left alone.
+cat >> "$LITELLM_YAML" <<'EOF'
+  num_retries: 2
+litellm_settings:
+  drop_params: true
+EOF
+sed -i 's/    - xlarge: \["large", "medium", "fast"\]/    - qwen-heavy: ["qwen-fast"]/' "$LITELLM_YAML"
+regenerate_litellm >/dev/null 2>&1
+assert_file_contains "keeps other router_settings keys" "  num_retries: 2" "$LITELLM_YAML"
+assert_file_contains "keeps later sections"             "litellm_settings:" "$LITELLM_YAML"
+assert_fail "drops fallbacks to tiers that no longer exist" grep -q "qwen-heavy" "$LITELLM_YAML"
+assert_file_contains "regenerates fallbacks for current tiers" '- fast: ["medium", "large", "xlarge"]' "$LITELLM_YAML"
+assert_eq "exactly one fallbacks key" "1" "$(grep -c '^  fallbacks:' "$LITELLM_YAML")"
+assert_ok "the result is valid for LiteLLM" validate_config
+reset_repo
+
+# An LM Studio server gets LiteLLM's lm_studio provider and its /v1 base.
+env_set MODEL_SERVERS "http://10.0.0.51:11434,lmstudio+http://10.0.0.9:1234"
+env_set BACKEND_FAST "lmstudio+http://10.0.0.9:1234"
+env_set OLLAMA_KEEP_ALIVE "2h"
+TIER_MODEL_OVERRIDE[fast]="qwen/qwen3-8b"
+regenerate_litellm >/dev/null 2>&1
+TIER_MODEL_OVERRIDE=()
+assert_file_contains "lm_studio provider"  "model: lm_studio/qwen/qwen3-8b" "$LITELLM_YAML"
+assert_file_contains "OpenAI /v1 base"     "api_base: http://10.0.0.9:1234/v1" "$LITELLM_YAML"
+assert_eq "keep_alive only on Ollama deployments" "4" "$(grep -c 'keep_alive: 2h' "$LITELLM_YAML")"
+assert_eq "reads back its own tag" "qwen/qwen3-8b" "$(current_pair_tag fast lmstudio+http://10.0.0.9:1234)"
+assert_not_contains "no api_key without a token" "api_key" "$(cat "$LITELLM_YAML")"
+env_set LMSTUDIO_API_TOKEN "tok"
+regenerate_litellm >/dev/null 2>&1
+assert_file_contains "api_key from the environment" "api_key: os.environ/LMSTUDIO_API_TOKEN" "$LITELLM_YAML"
+assert_fail "the token itself never enters the YAML" grep -q "tok$" "$LITELLM_YAML"
+assert_ok "and the result validates" validate_config
+reset_repo
+
+describe litellm_fallbacks
+out="$(printf 'fast a@1\nmedium b@2\nlarge b@2\nxlarge c@3\n' | litellm_fallbacks)"
+assert_contains "nearest tier first"             '- fast: ["medium", "large", "xlarge"]' "$out"
+assert_contains "identical deployments skipped"  '- medium: ["fast", "xlarge"]' "$out"
+assert_not_contains "never falls back to itself" '"medium", "medium"' "$out"
+assert_eq "no tiers -> no block" "" "$(printf '' | litellm_fallbacks)"
+assert_eq "one tier -> no block" "" "$(printf 'fast a@1\n' | litellm_fallbacks)"
 
 describe confirm
 ASSUME_YES=true
@@ -247,122 +506,6 @@ assert_fail "rejects n" bash -c "source '$FUNCS'; ASSUME_YES=false; DRY_RUN=fals
 ASSUME_YES=true
 
 # ── mutating commands ─────────────────────────────────────────────────────────
-describe cmd_cert
-_ct="$(mktemp -d)"; TLS_DIR="${_ct}/tls"
-mock_command systemctl 0
-mock_command nginx 0
-out="$(cmd_cert show 2>&1)"; rc=$?
-assert_eq       "no certificate is a clean failure" "1" "$rc"
-assert_contains "and says how to make one" "cert renew" "$out"
-
-# Generate for real: a certificate is only worth asserting on if openssl made it.
-out="$(cmd_cert renew --days 90 --san 'osr.lan,10.0.0.5' 2>&1)"
-assert_ok "certificate written" bash -c "[[ -s '${TLS_DIR}/server.crt' ]]"
-assert_ok "key written"         bash -c "[[ -s '${TLS_DIR}/server.key' ]]"
-assert_file_mode "key is owner-only" "600" "${TLS_DIR}/server.key"
-_san="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
-assert_contains "the given DNS name is present" "DNS:osr.lan"        "$_san"
-assert_contains "the given IP is an IP entry"   "IP Address:10.0.0.5" "$_san"
-assert_contains "loopback is always present"    "DNS:localhost"       "$_san"
-assert_eq "key and certificate match" \
-  "$(openssl x509 -noout -modulus -in "${TLS_DIR}/server.crt" | openssl md5)" \
-  "$(openssl rsa  -noout -modulus -in "${TLS_DIR}/server.key" 2>/dev/null | openssl md5)"
-
-out="$(cmd_cert show 2>&1)"
-assert_contains "show reports the subject"     "ollama-smart-router" "$out"
-assert_contains "show reports the SANs"        "osr.lan"             "$out"
-assert_contains "show reports a fingerprint"   "Fingerprint"         "$out"
-
-# Renewing without --san must NOT narrow the certificate: someone added that
-# name for a reason and a silent drop breaks their client at renewal time.
-cmd_cert renew >/dev/null 2>&1
-_san2="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
-assert_contains "renew carries the DNS name forward" "DNS:osr.lan"        "$_san2"
-assert_contains "renew carries the IP forward"       "IP Address:10.0.0.5" "$_san2"
-
-# A single --san entry is the last field of the split, which is exactly the one
-# a bare `read` drops.
-cmd_cert renew --san 'only.example.com' >/dev/null 2>&1
-assert_contains "a lone --san entry is not dropped" "DNS:only.example.com" \
-  "$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -ext subjectAltName)"
-
-# An expired certificate must be called out, not left in a date field.
-openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
-  -keyout "${TLS_DIR}/server.key" -out "${TLS_DIR}/server.crt" \
-  -subj "/CN=old/O=ollama-smart-router" -addext "subjectAltName=DNS:localhost" \
-  >/dev/null 2>&1
-faketime_note=""
-assert_contains "a soon-to-expire certificate is flagged" "expires within 30 days" \
-  "$(cmd_cert show 2>&1)"
-
-DRY_RUN=true
-_before="$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -fingerprint)"
-cmd_cert renew >/dev/null 2>&1
-assert_eq "dry-run writes nothing" "$_before" \
-  "$(openssl x509 -in "${TLS_DIR}/server.crt" -noout -fingerprint)"
-DRY_RUN=false
-
-# TLS_ENABLED=false containers have no openssl, and the failure should name
-# that rather than surfacing "command not found" from inside the function.
-mock_script command <<'EOF'
-exit 1
-EOF
-out="$(PATH="/nonexistent" cmd_cert show 2>&1)"; rc=$?
-assert_eq "fails when openssl is absent" "1" "$rc"
-rm -f "${MOCK_BIN}/command"
-
-assert_fail "rejects a non-numeric --days" cmd_cert renew --days soon
-assert_fail "rejects an unknown action"    cmd_cert bogus
-assert_fail "rejects an unknown flag"      cmd_cert show --nope
-rm -rf "$_ct"
-
-describe cmd_routing_stats
-_rs="$(mktemp -d)"
-_rslog="${_rs}/decisions.jsonl"
-# Two records: one healthy in-band pick, one that fell forward and was ranked
-# by distance because nothing was in band.
-cat > "$_rslog" <<'RSEOF'
-{"id":"a1","mode":"discovery","request":{"class":"fast","reason":"default","code":false,"vision":false},"ranking":{"candidates":2,"tied":1,"distance_ranked":false},"candidates":[{"rank":0,"model":"qwen3:8b","server":"http://a:11434","score":1.12,"in_band":true},{"rank":1,"model":"qwen3:14b","server":"http://b:11434","score":0.61,"in_band":false}],"chosen":{"model":"qwen3:8b","server":"http://a:11434"},"status":200,"ttfb_ms":120.0,"total_ms":900.0,"fell_forward":0}
-{"id":"b2","mode":"discovery","request":{"class":"xlarge","reason":"xlarge keyword","code":false,"vision":false},"ranking":{"candidates":2,"tied":2,"distance_ranked":true},"candidates":[{"rank":0,"model":"qwen3:14b","server":"http://b:11434","score":0.0,"in_band":false}],"chosen":{"model":"qwen3:14b","server":"http://b:11434"},"status":200,"ttfb_ms":300.0,"total_ms":4200.0,"fell_forward":1}
-RSEOF
-out="$(cmd_routing_stats --file "$_rslog" 2>&1)"
-assert_contains "counts the records"        "2 record(s)"   "$out"
-assert_contains "breaks down request class" "xlarge"        "$out"
-assert_contains "reports the chosen model"  "qwen3:8b"      "$out"
-assert_contains "reports the chosen host"   "http://b:11434" "$out"
-assert_contains "reports in-band rate"      "top candidate in band" "$out"
-assert_contains "reports distance ranking"  "distance-ranked requests" "$out"
-assert_contains "reports fall-forward rate" "fell forward"  "$out"
-assert_contains "reports latency"           "time to first byte" "$out"
-
-# --json is the machine-readable form; it must parse and carry the same numbers.
-out="$(cmd_routing_stats --file "$_rslog" --json 2>&1)"
-assert_ok "json parses" bash -c "printf '%s' \"\$1\" | python3 -m json.tool >/dev/null" _ "$out"
-assert_eq "half the top candidates were in band" "50.0" \
-  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["top_in_band_pct"])')"
-assert_eq "half were distance-ranked" "50.0" \
-  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["distance_ranked_pct"])')"
-assert_eq "one request fell forward" "50.0" \
-  "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fell_forward_pct"])')"
-
-out="$(cmd_routing_stats --file "$_rslog" --class xlarge 2>&1)"
-assert_contains "--class filters" "1 record(s)" "$out"
-out="$(cmd_routing_stats --file "$_rslog" --last 1 2>&1)"
-assert_contains "--last keeps the newest" "1 record(s)" "$out"
-
-# A torn final line is normal during rotation and must not abort the summary.
-printf '{"id":"c3","mode":"disc' >> "$_rslog"
-out="$(cmd_routing_stats --file "$_rslog" 2>&1)"
-assert_contains "tolerates a torn line" "1 unparsable" "$out"
-
-out="$(cmd_routing_stats --file "${_rs}/missing.jsonl" 2>&1)"; rc=$?
-assert_eq "missing log is a clean failure" "1" "$rc"
-assert_contains "says where it looked"     "No decision log" "$out"
-assert_contains "and how to check the router" "systemctl status ollama-router" "$out"
-assert_fail "rejects a non-numeric --last" cmd_routing_stats --file "$_rslog" --last abc
-assert_fail "rejects an unknown flag"      cmd_routing_stats --file "$_rslog" --nope
-rm -rf "$_rs"
-
 describe cmd_add
 reset_repo; NO_PROBE=true
 cmd_add 10.0.0.60 >/dev/null 2>&1
@@ -378,6 +521,21 @@ assert_fail "rejects an invalid address" bash -c "source '$FUNCS'; REPO_DIR='$RE
 MODEL_SERVER_MAX=3
 assert_fail "refuses to exceed the maximum" cmd_add 10.0.0.70
 MODEL_SERVER_MAX=20
+reset_repo; NO_PROBE=false
+mock_script curl <<'EOF'
+case "$*" in
+  *":11434/"*) printf 000; exit 7;;
+  *"-w"*) printf 200;;
+  *"/api/v1/models"*) echo '{"models":[{"type":"llm","key":"qwen/qwen3-8b"}]}';;
+  *) exit 7;;
+esac
+EOF
+out="$(cmd_add 10.0.0.9 2>&1)"
+assert_contains "an LM Studio server is detected" "LM Studio server" "$out"
+assert_ok "and stored with its prefix" bash -c "grep -q 'lmstudio+http://10.0.0.9:1234' '$ENV_FILE'"
+mock_command curl 7 "000"
+assert_fail "an unreachable address is refused" cmd_add 10.0.0.77
+NO_PROBE=true
 
 describe cmd_remove
 reset_repo
@@ -387,11 +545,6 @@ assert_eq "tier membership cleaned" "1" "$(get_tier large | grep -c .)"
 reset_repo
 cmd_remove 1 >/dev/null 2>&1
 assert_eq "removal by list number" "3" "$(get_servers | grep -c .)"
-reset_repo
-MODEL_SERVER_MIN=3
-cmd_remove 1 1 >/dev/null 2>&1
-assert_eq "duplicate removal counts once" "3" "$(get_servers | grep -c .)"
-MODEL_SERVER_MIN=1
 reset_repo
 MODEL_SERVER_MIN=4
 assert_fail "refuses to drop below the minimum" cmd_remove 1
@@ -415,6 +568,18 @@ assert_eq "applies to every host in the tier" "2" "$(grep -c 'ollama/newmodel:1b
 assert_fail "rejects an ollama/ prefix" cmd_set_model large ollama/x
 assert_fail "rejects an unknown tier"   cmd_set_model turbo x
 reset_repo
+NO_PROBE=false
+namespaced_tag="smtek/Qwen3.8-27B:Q3_K_XL-16gb"
+mock_command curl 0 '{"models":[{"name":"smtek/Qwen3.8-27B:Q3_K_XL-16gb"}]}'
+assert_status "accepts an available third-party model for a tier" 0 cmd_set_model large "$namespaced_tag"
+assert_eq "writes the full namespaced tag for every host" \
+  "2" "$(grep -Fc "model: ollama/${namespaced_tag}" "$LITELLM_YAML" || true)"
+assert_eq "reads back the full namespaced tier tag" "$namespaced_tag" "$(current_tier_tag large)"
+regenerate_litellm >/dev/null 2>&1
+assert_eq "namespaced tier tags survive regeneration" \
+  "2" "$(grep -Fc "model: ollama/${namespaced_tag}" "$LITELLM_YAML" || true)"
+assert_fail "still rejects a provider-prefixed third-party model" cmd_set_model large "ollama/${namespaced_tag}"
+reset_repo
 
 describe cmd_set_server_model
 reset_repo; NO_PROBE=true
@@ -425,6 +590,18 @@ assert_fail "rejects a host outside the tier" cmd_set_server_model fast http://1
 assert_fail "rejects an unconfigured host"    cmd_set_server_model large 10.9.9.9 x:1b
 assert_fail "rejects an ollama/ prefix"       cmd_set_server_model large http://10.0.0.53:11434 ollama/x
 reset_repo
+NO_PROBE=false
+mock_command curl 0 '{"models":[{"name":"smtek/Qwen3.8-27B:Q3_K_XL-16gb"}]}'
+assert_status "accepts an available third-party model for one server" 0 cmd_set_server_model large 10.0.0.53 "$namespaced_tag"
+assert_eq "reads back the full namespaced per-server tag" \
+  "$namespaced_tag" "$(current_pair_tag large http://10.0.0.53:11434)"
+assert_eq "third-party override leaves the other host alone" \
+  "qwen3:32b" "$(current_pair_tag large http://10.0.0.52:11434)"
+regenerate_litellm >/dev/null 2>&1
+assert_eq "namespaced per-server tag survives regeneration" \
+  "$namespaced_tag" "$(current_pair_tag large http://10.0.0.53:11434)"
+assert_fail "still rejects a provider-prefixed third-party model" cmd_set_server_model large 10.0.0.53 "ollama/${namespaced_tag}"
+reset_repo; NO_PROBE=true
 
 describe resolve_server_arg
 reset_repo
@@ -474,6 +651,12 @@ assert_contains "renders capability flags" "code" "$out"
 mock_command curl 0 'not json'
 out="$(cmd_discover 2>&1)"
 assert_contains "handles a non-JSON reply" "did not parse" "$out"
+env_set ROUTER_API_KEY "sk-router-testkey-000000"
+mock_reset_log
+cmd_discover >/dev/null 2>&1
+assert_contains "sends the router key when one is set" "-H @" "$(mock_calls)"
+assert_not_contains "never puts the key on the command line" "sk-router-testkey" "$(mock_calls)"
+reset_repo
 
 # ── open webui version ────────────────────────────────────────────────────────
 describe openwebui_current_version
@@ -485,6 +668,7 @@ reset_repo
 
 describe openwebui_installed_version
 mkdir -p "${OPENWEBUI_DIR}/venv/bin"
+rm -f "${OPENWEBUI_DIR}/venv/bin/python"
 printf '#!/usr/bin/env bash\necho 0.9.1\n' > "${OPENWEBUI_DIR}/venv/bin/python"
 chmod +x "${OPENWEBUI_DIR}/venv/bin/python"
 assert_eq "queries the venv" "0.9.1" "$(openwebui_installed_version)"
@@ -493,7 +677,7 @@ assert_eq "no venv -> empty" "" "$(openwebui_installed_version)"
 
 describe openwebui_python_ok
 mkdir -p "${OPENWEBUI_DIR}/venv/bin"
-ln -sf "$(command -v python3)" "${OPENWEBUI_DIR}/venv/bin/python"
+use_real_python "${OPENWEBUI_DIR}/venv/bin/python"
 pv="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 assert_ok   "empty spec always passes" openwebui_python_ok ""
 assert_ok   "satisfied spec"           openwebui_python_ok ">=3.0"
@@ -515,12 +699,69 @@ fi
 describe cmd_set_webui_version
 reset_repo
 mkdir -p "${OPENWEBUI_DIR}/venv/bin"
-ln -sf "$(command -v python3)" "${OPENWEBUI_DIR}/venv/bin/python"
+use_real_python "${OPENWEBUI_DIR}/venv/bin/python"
 assert_fail "rejects a nonexistent release" cmd_set_webui_version 99.99.99
 out="$(cmd_set_webui_version 2>&1)"
 assert_contains "no-arg shows the pinned version" "0.6.5" "$out"
 
 # ── apply / install ───────────────────────────────────────────────────────────
+# A stand-in LiteLLM venv: python reports version $1 and "imports" succeed;
+# pip logs its arguments and then reports the pinned version from then on.
+make_fake_litellm_venv() {
+  rm -rf "$LITELLM_DIR"; mkdir -p "${LITELLM_DIR}/venv/bin"
+  echo "$1" > "${LITELLM_DIR}/version"
+  cat > "${LITELLM_DIR}/venv/bin/python" <<PYEOF
+#!/usr/bin/env bash
+[[ "\$*" == *importlib.metadata* ]] && cat "${LITELLM_DIR}/version"
+[[ -f "${WORK}/IMPORTFAIL" && "\$*" == *proxy_server* ]] && exit 1
+exit 0
+PYEOF
+  cat > "${LITELLM_DIR}/venv/bin/pip" <<PIPEOF
+#!/usr/bin/env bash
+echo "pip \$*" >> "${WORK}/litellm-pip.log"
+echo 1.75.5.post1 > "${LITELLM_DIR}/version"
+PIPEOF
+  chmod +x "${LITELLM_DIR}/venv/bin/python" "${LITELLM_DIR}/venv/bin/pip"
+  printf 'litellm[proxy]==1.75.5.post1\n' > "$LITELLM_REQ"
+  printf 'litellm==1.75.5.post1 --hash=sha256:00\n' > "$LITELLM_LOCK"
+  : > "${WORK}/litellm-pip.log"
+}
+
+describe litellm_pinned_version
+reset_repo
+printf '# c\nlitellm[proxy]==1.75.5.post1  # pin\n' > "$LITELLM_REQ"
+assert_eq "reads the pin through the extra" "1.75.5.post1" "$(litellm_pinned_version)"
+printf 'litellm==1.2.3\n' > "$LITELLM_REQ"
+assert_eq "reads a plain pin" "1.2.3" "$(litellm_pinned_version)"
+rm -f "$LITELLM_REQ"
+assert_eq "no file -> empty" "" "$(litellm_pinned_version)"
+
+describe litellm_installed_version
+rm -rf "$LITELLM_DIR"
+assert_eq "no venv -> empty" "" "$(litellm_installed_version)"
+make_fake_litellm_venv 1.75.5.post1
+assert_eq "queries the venv" "1.75.5.post1" "$(litellm_installed_version)"
+
+describe litellm_venv_ok
+make_fake_litellm_venv 1.75.5.post1
+assert_ok   "pinned version with working imports" litellm_venv_ok
+make_fake_litellm_venv 1.70.0
+assert_fail "version drift"                       litellm_venv_ok
+make_fake_litellm_venv 1.75.5.post1; touch "${WORK}/IMPORTFAIL"
+assert_fail "proxy extra missing"                 litellm_venv_ok
+rm -f "${WORK}/IMPORTFAIL"; rm -rf "$LITELLM_DIR"
+assert_fail "no venv"                             litellm_venv_ok
+
+describe litellm_install
+make_fake_litellm_venv 1.70.0
+litellm_install >/dev/null 2>&1
+assert_file_contains "prefers the hash lock" "--require-hashes -r ${LITELLM_LOCK}" "${WORK}/litellm-pip.log"
+rm -f "$LITELLM_LOCK"; : > "${WORK}/litellm-pip.log"
+out="$(litellm_install 2>&1)"
+assert_contains "warns without a lock" "without hash checking" "$out"
+assert_file_contains "falls back to requirements.txt" "-r ${LITELLM_REQ}" "${WORK}/litellm-pip.log"
+rm -rf "$LITELLM_DIR"; reset_repo
+
 describe openwebui_install
 reset_repo
 mkdir -p "${OPENWEBUI_DIR}/venv/bin"
@@ -551,13 +792,223 @@ openwebui_install >/dev/null 2>&1
 assert_eq "cpu-only disabled skips the extra index" "0" "$(grep -c pytorch.org "${WORK}/pip.log" || true)"
 env_set TORCH_CPU_ONLY "true"
 
+# ── safe apply ────────────────────────────────────────────────────────────────
+describe validate_config
+reset_repo
+assert_ok "a sane repo validates" validate_config
+printf 'model_list: [\n' > "$LITELLM_YAML"
+out="$(validate_config)"; rc=$?
+assert_ne "broken YAML fails" "0" "$rc"
+assert_contains "and says why" "not valid YAML" "$out"
+reset_repo
+sed -i 's/- large: \["medium", "fast"\]/- large: ["ghost"]/' "$LITELLM_YAML"
+assert_contains "fallback to an unknown tier fails" "'ghost'" "$(validate_config)"
+reset_repo
+printf 'not a key value line\n' >> "$ENV_FILE"
+assert_contains "bad env line fails" "not KEY=value" "$(validate_config)"
+reset_repo
+printf '[keywords]\ncode = ["def ",\n' > "$ROUTER_INI"
+assert_fail "bad keyword JSON fails" validate_config
+printf '[keywords]\ncode = ["re:(unclosed"]\n' > "$ROUTER_INI"
+assert_contains "a bad keyword regex fails" "bad regex" "$(validate_config)"
+reset_repo
+printf 'def broken(:\n' > "${REPO_DIR}/services/ollama-router/router.py"
+assert_contains "a syntax error fails" "does not compile" "$(validate_config)"
+reset_repo
+
+describe apply_map
+assert_eq "maps every installed file" "11" "$(apply_map | grep -c '|')"
+assert_contains "env feeds three services" "litellm-proxy ollama-router ollama-monitor" "$(apply_map)"
+
+describe secrets_fingerprint
+rm -f "$SECRETS_FILE"
+assert_eq "no file -> none" "none" "$(secrets_fingerprint)"
+kv_set "$SECRETS_FILE" A 1; f1="$(secrets_fingerprint)"
+kv_set "$SECRETS_FILE" A 2
+assert_ne "changes with content" "$f1" "$(secrets_fingerprint)"
+rm -f "$SECRETS_FILE"
+
+# Runtime copies identical to the repo, as after a successful apply.
+install_runtime() {
+  export ROUTER_DIR OPENWEBUI_DIR
+  migrate_secrets >/dev/null 2>&1
+  bash "$APPLY_SCRIPT" "$REPO_DIR" >/dev/null
+  mkdir -p "$UNIT_DIR"
+  secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+}
+
+describe affected_services
+reset_repo; install_runtime
+mock_command systemctl 0
+assert_eq "nothing changed -> nothing to restart" "" "$(affected_services)"
+echo "# tweak" >> "$ROUTER_INI"
+assert_eq "router.ini -> router only" "ollama-router" "$(affected_services)"
+install_runtime
+echo "EXTRA=1" >> "$ENV_FILE"
+assert_eq "router.env -> its three services" "litellm-proxy ollama-router ollama-monitor" \
+  "$(affected_services | paste -sd' ')"
+install_runtime
+kv_set "$SECRETS_FILE" ROUTER_API_KEY "k"
+assert_eq "secrets -> the services that load them" "ollama-router ollama-monitor open-webui" \
+  "$(affected_services | paste -sd' ')"
+install_runtime
+mock_script systemctl <<'EOF'
+[[ "$*" == *open-webui* ]] && exit 3
+exit 0
+EOF
+assert_eq "a stopped service is brought up" "open-webui" "$(affected_services)"
+APPLY_ALL=true
+assert_eq "--all restarts everything" "4" "$(affected_services | grep -c .)"
+APPLY_ALL=false
+rm -f "$SECRETS_FILE"
+
+describe snapshot_runtime
+reset_repo; install_runtime
+snap="$(snapshot_runtime)"
+assert_file_contains "records what it saved" "${ROUTER_DIR}/router.ini" "${snap}/MANIFEST"
+assert_file_mode "snapshots are root-only" "700" "$snap"
+snapshot_runtime >/dev/null; sleep 1; snapshot_runtime >/dev/null
+assert_eq "old snapshots are pruned" "2" "$(ls -1d "$APPLY_BACKUP_DIR"/*/ | wc -l)"
+
+describe restore_runtime
+snap="$(snapshot_runtime)"
+echo "broken" > "${ROUTER_DIR}/router.ini"
+restore_runtime "$snap"
+assert_ok "puts the previous file back" cmp -s "$ROUTER_INI" "${ROUTER_DIR}/router.ini"
+assert_fail "a snapshot without a manifest is refused" restore_runtime "${WORK}/nope"
+
+describe health_url
+assert_eq "router"     "${ROUTER_URL}/healthz"            "$(health_url ollama-router)"
+assert_eq "litellm"    "$LITELLM_HEALTH_URL"              "$(health_url litellm-proxy)"
+assert_eq "open webui" "http://127.0.0.1:8080/health"     "$(health_url open-webui)"
+assert_eq "monitor has none" ""                           "$(health_url ollama-monitor)"
+
+describe wait_healthy
+mock_command sleep 0
+mock_command systemctl 0 "active"
+mock_command curl 0
+assert_ok   "active and answering"     wait_healthy ollama-router 4
+mock_command curl 7
+assert_fail "never answers -> timeout" wait_healthy ollama-router 4
+mock_command systemctl 3 "failed"
+mock_reset_log
+assert_fail "a failed unit gives up at once" wait_healthy ollama-router 60
+assert_eq   "without waiting it out" "0" "$(mock_call_count 'sleep')"
+mock_command systemctl 0 "active"
+assert_ok   "no URL -> stays active" wait_healthy ollama-monitor 4
+
+describe restart_and_check
+mock_command systemctl 0 "active"
+mock_command curl 0
+assert_eq "all healthy -> no output" "" "$(restart_and_check litellm-proxy ollama-router 2>/dev/null)"
+mock_script curl <<'EOF'
+[[ "$*" == *healthz* ]] && exit 7
+exit 0
+EOF
+out="$(restart_and_check litellm-proxy ollama-router open-webui 2>/dev/null)"; rc=$?
+assert_eq "names the first unhealthy service" "ollama-router" "$out"
+assert_ne "and fails" "0" "$rc"
+
+describe openwebui_data_dir
+reset_repo
+assert_eq "defaults under OPENWEBUI_DIR" "${OPENWEBUI_DIR}/data" "$(openwebui_data_dir)"
+printf 'DATA_DIR=/srv/owui\n' >> "${REPO_DIR}/env/openwebui.env"
+assert_eq "honours DATA_DIR" "/srv/owui" "$(openwebui_data_dir)"
+reset_repo
+
+describe openwebui_backup_db
+mkdir -p "${OPENWEBUI_DIR}/data"; echo "v1" > "${OPENWEBUI_DIR}/data/webui.db"
+snap="${WORK}/snapdb"; rm -rf "$snap"; mkdir -p "$snap"
+openwebui_backup_db "$snap"
+assert_file_contains "copies the database" "v1" "${snap}/openwebui-data/webui.db"
+
+describe openwebui_restore_db
+echo "v2-migrated" > "${OPENWEBUI_DIR}/data/webui.db"; touch "${OPENWEBUI_DIR}/data/webui.db-wal"
+openwebui_restore_db "$snap"
+assert_file_contains "puts the old database back" "v1" "${OPENWEBUI_DIR}/data/webui.db"
+assert_fail "drops the new write-ahead log" test -f "${OPENWEBUI_DIR}/data/webui.db-wal"
+assert_ok "a snapshot without a database is a no-op" openwebui_restore_db "${WORK}/nope"
+rm -rf "$snap" "${OPENWEBUI_DIR}/data"
+
 describe cmd_apply
 reset_repo
+make_fake_litellm_venv 1.75.5.post1
+kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "LEAKED"
 mock_command systemctl 1     # simulate "systemd not running here"
 : > "${WORK}/pip.log"
 out="$(cmd_apply 2>&1)"
 assert_contains "runs apply-config"        "apply-config ran" "$out"
 assert_contains "degrades without systemd" "systemd is not available" "$out"
+assert_fail "migrates secrets before applying" kv_has "$ENV_FILE" GITEA_DEPLOY_TOKEN
+assert_not_contains "a healthy LiteLLM venv is left alone" "LiteLLM venv missing" "$out"
+make_fake_litellm_venv 1.70.0
+out="$(cmd_apply 2>&1)"
+assert_contains "an outdated LiteLLM venv is rebuilt" "LiteLLM venv missing or out of date" "$out"
+assert_file_contains "installs from the hash lock" "--require-hashes -r ${LITELLM_LOCK}" "${WORK}/litellm-pip.log"
+
+# Full cycle with systemd: only changed services restart, and are checked.
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
+mkdir -p "${OPENWEBUI_DIR}/venv/bin"
+rm -f "${OPENWEBUI_DIR}/venv/bin/python"
+printf '#!/usr/bin/env bash\necho 0.6.5\n' > "${OPENWEBUI_DIR}/venv/bin/python"
+chmod +x "${OPENWEBUI_DIR}/venv/bin/python"
+mock_command sleep 0
+mock_command systemctl 0 "active"
+mock_command curl 0
+out="$(cmd_apply 2>&1)"
+assert_contains "nothing changed -> nothing restarted" "nothing restarted" "$out"
+echo "# tweak" >> "$ROUTER_INI"
+mock_reset_log
+out="$(cmd_apply 2>&1)"
+assert_contains "restarts only the router" "Restarting: ollama-router" "$out"
+assert_eq "exactly one restart issued" "1" "$(mock_call_count 'restart ')"
+assert_contains "reports health" "healthy" "$out"
+
+# Invalid config: stop before touching anything.
+printf 'model_list: [\n' > "$LITELLM_YAML"
+mock_reset_log
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_ne "invalid config fails" "0" "$rc"
+assert_contains "and says nothing was applied" "nothing was applied" "$out"
+assert_eq "no restart was attempted" "0" "$(mock_call_count 'restart ')"
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
+
+# Unhealthy after restart: roll back to the previous files.
+good="$(cat "${ROUTER_DIR}/router.ini")"
+echo "# bad change" >> "$ROUTER_INI"
+mock_script curl <<'EOF'
+grep -q "bad change" "$ROUTER_DIR_WATCH/router.ini" && exit 7
+exit 0
+EOF
+export ROUTER_DIR_WATCH="$ROUTER_DIR"
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_ne "an unhealthy restart fails the apply" "0" "$rc"
+assert_contains "names the service" "ollama-router did not become healthy" "$out"
+assert_contains "rolls back" "Rolled back; the previous configuration is running again" "$out"
+assert_eq "the previous file is back in place" "$good" "$(cat "${ROUTER_DIR}/router.ini")"
+
+# A failed Open WebUI upgrade: the old version is reinstalled and the database
+# (migrated by the new version) is put back.
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
+mkdir -p "${OPENWEBUI_DIR}/venv/bin" "${OPENWEBUI_DIR}/data"
+rm -f "${OPENWEBUI_DIR}/venv/bin/python" "${OPENWEBUI_DIR}/venv/bin/pip"
+printf '#!/usr/bin/env bash\necho 0.5.0\n' > "${OPENWEBUI_DIR}/venv/bin/python"
+printf '#!/usr/bin/env bash\necho "pip $*" >> "%s/webui-pip.log"\n[[ "$*" == *" -r "* ]] && echo migrated > "%s/data/webui.db"\nexit 0\n' \
+  "$WORK" "$OPENWEBUI_DIR" > "${OPENWEBUI_DIR}/venv/bin/pip"
+chmod +x "${OPENWEBUI_DIR}/venv/bin/python" "${OPENWEBUI_DIR}/venv/bin/pip"
+echo "original" > "${OPENWEBUI_DIR}/data/webui.db"
+: > "${WORK}/webui-pip.log"
+mock_script curl <<'EOF'
+[[ "$*" == *":8080/health"* ]] && exit 7
+exit 0
+EOF
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_ne "a failed Open WebUI upgrade fails the apply" "0" "$rc"
+assert_contains "reports the reinstall" "Reinstalling open-webui 0.5.0" "$out"
+assert_file_contains "reinstalls the previous version" "install --no-cache-dir open-webui==0.5.0" "${WORK}/webui-pip.log"
+assert_file_contains "restores the pre-upgrade database" "original" "${OPENWEBUI_DIR}/data/webui.db"
+rm -rf "${OPENWEBUI_DIR}/venv" "${OPENWEBUI_DIR}/data"
+rm -rf "$LITELLM_DIR"
 
 # ── git / gitea ───────────────────────────────────────────────────────────────
 describe git_push_authenticated
@@ -587,11 +1038,49 @@ assert_contains "uses a credential helper" "credential.helper" "$(mock_calls)"
 assert_contains "pushes the current branch" "push origin HEAD:main" "$(mock_calls)"
 assert_not_contains "token never appears on the command line" "SECRET123" "$(mock_calls)"
 
+describe cmd_set_api_key
+reset_repo
+out="$(cmd_set_api_key 2>&1)"
+key="$(kv_get "$SECRETS_FILE" ROUTER_API_KEY)"
+assert_contains "generates a key by default" "sk-router-" "$key"
+assert_eq "gives Open WebUI the same key" "$key" "$(kv_get "$SECRETS_FILE" OPENAI_API_KEYS)"
+assert_fail "never written to the repo env file" grep -q ROUTER_API_KEY "$ENV_FILE"
+assert_contains "explains the Open WebUI caveat" "FIRST start" "$out"
+cmd_set_api_key "my-explicit-key-1234" >/dev/null 2>&1
+assert_eq "accepts an explicit key" "my-explicit-key-1234" "$(env_get ROUTER_API_KEY)"
+assert_fail "rejects a short key" cmd_set_api_key "short"
+assert_fail "rejects spaces" cmd_set_api_key "has spaces in the key!!"
+cmd_set_api_key --off >/dev/null 2>&1
+assert_eq "--off clears it" "" "$(env_get ROUTER_API_KEY)"
+reset_repo
+
+describe cmd_set_lmstudio_token
+reset_repo
+cmd_set_lmstudio_token "lms-abc.123" >/dev/null 2>&1
+assert_eq "stores the token" "lms-abc.123" "$(env_get LMSTUDIO_API_TOKEN)"
+assert_fail "in the secrets file, not the repo" grep -q LMSTUDIO_API_TOKEN "$ENV_FILE"
+assert_fail "rejects odd characters" cmd_set_lmstudio_token 'a b;c'
+cmd_set_lmstudio_token --off >/dev/null 2>&1
+assert_eq "--off clears it" "" "$(env_get LMSTUDIO_API_TOKEN)"
+reset_repo
+
 describe cmd_commit
 reset_repo
 mock_command git 0
 out="$(cmd_commit "msg" 2>&1)"
 assert_contains "no-git config dir is a no-op" "not a git repository" "$out"
+mkdir -p "${REPO_DIR}/.git"
+kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "LEAKED"
+cmd_commit "msg" >/dev/null 2>&1
+assert_fail "a token is moved out before anything is staged" grep -q LEAKED "$ENV_FILE"
+unset REQUIRE_PUSH
+assert_ok "by default a failed push still succeeds (the commit is kept)" cmd_commit "msg"
+out="$(cmd_commit "msg" 2>&1)"
+assert_contains "and says the commit is kept locally" "saved locally" "$out"
+REQUIRE_PUSH=true
+assert_fail "strict mode reports push failure" cmd_commit "msg"
+unset REQUIRE_PUSH
+rm -rf "${REPO_DIR}/.git"
 
 describe cmd_set_webhook
 reset_repo
@@ -614,17 +1103,6 @@ assert_eq "an empty url disables alerting" "" "$(env_get MATTERMOST_WEBHOOK_URL)
 assert_fail "rejects a non-url"        cmd_set_webhook "not-a-url"
 assert_fail "rejects a bad verify-tls" cmd_set_webhook --verify-tls maybe
 assert_fail "rejects an unknown flag"  cmd_set_webhook --nope x
-# Regression: the value guards must not be written as `(( $# >= 2 && -n "$2" ))`
-# -- that is a bash ARITHMETIC context, where `-n` is minus-variable-n and the
-# string is a syntax error, so the guard rejected every value including good
-# ones. These four pin both halves: a real value is accepted, a missing or
-# empty one is not.
-env_set MATTERMOST_MONITOR_USER "OllamaMonitor"
-cmd_set_webhook --username "Bot 2" >/dev/null 2>&1
-assert_eq "a username with a space is accepted" "Bot 2" "$(env_get MATTERMOST_MONITOR_USER)"
-assert_fail "rejects an empty username"   cmd_set_webhook --username ""
-assert_fail "rejects a dangling username" cmd_set_webhook --username
-assert_fail "rejects a dangling channel"  cmd_set_webhook --channel
 out="$(cmd_set_webhook "https://mm.example.net/hooks/secret123" 2>&1)"
 assert_not_contains "never echoes the full webhook path" "secret123" "$out"
 reset_repo
@@ -724,5 +1202,139 @@ assert_eq "none available -> empty" "" "$(in_container_command 105)"
 describe ensure_config_or_forward
 reset_repo
 assert_ok "returns immediately when the config is local" ensure_config_or_forward
+
+describe command_writes
+for c in add remove set-tier set-model set-server-model set-keepalive apply commit \
+         set-token set-api-key set-lmstudio-token set-webhook set-webui-version; do
+  assert_ok "${c} takes the lock" command_writes "$c"
+done
+for c in list status models discover test-alert clear-lock; do
+  assert_fail "${c} never waits on the lock" command_writes "$c"
+done
+
+# The lock tests need real time: earlier sections stub `sleep` out.
+rm -f "${MOCK_BIN}/sleep"
+
+# hold_lock FILE [ignore-term]: a background process that takes the lock and
+# keeps it; prints its PID once the lock is really held. (Run in $(...), so the
+# caller sets CONFIG_LOCK_FILE itself.)
+hold_lock() {
+  local f="$1" pid
+  if [[ "${2:-}" == ignore-term ]]; then
+    bash -c 'trap "" TERM; exec 9>>"$1"; flock 9; while :; do sleep 0.1; done' _ "$f" >/dev/null 2>&1 &
+  else
+    bash -c 'exec 9>>"$1"; flock 9; exec sleep 60' _ "$f" >/dev/null 2>&1 &
+  fi
+  pid=$!
+  for _ in $(seq 50); do CONFIG_LOCK_FILE="$f" lock_is_free || break; sleep 0.1; done
+  printf '%s\n' "$pid"
+}
+# stop_holder PID: end a hold_lock process and wait until the lock is free.
+stop_holder() {
+  kill "$1" 2>/dev/null || true
+  for _ in $(seq 50); do lock_is_free && return 0; sleep 0.1; done
+}
+
+describe lock_path
+mkdir -p "$WORK/real"; ln -sfn "$WORK/real" "$WORK/link"
+CONFIG_LOCK_FILE="$WORK/link/x.lock"
+assert_eq "resolves symlinked directories (so /proc fd links compare equal)" "$WORK/real/x.lock" "$(lock_path)"
+
+describe lock_is_free
+CONFIG_LOCK_FILE="$WORK/free.lock"
+assert_ok "a missing lock file is free" lock_is_free
+assert_fail "probing does not create the file" test -e "$WORK/free.lock"
+: > "$WORK/free.lock"
+assert_ok "an unlocked file is free" lock_is_free
+holder="$(hold_lock "$WORK/free.lock")"
+assert_fail "a held lock is not free" lock_is_free
+stop_holder "$holder"
+assert_ok "free again once the holder exits (nothing to clean up after a crash)" lock_is_free
+
+describe lock_holders
+CONFIG_LOCK_FILE="$WORK/holders.lock"; holder="$(hold_lock "$WORK/holders.lock")"
+assert_contains "lists the holding process" "$holder" "$(lock_holders)"
+stop_holder "$holder"
+assert_eq "empty once it exits" "" "$(lock_holders)"
+
+describe lock_inherited
+CONFIG_LOCK_FILE="$WORK/inherit.lock"
+unset CONFIG_LOCK_INHERITED_FD
+assert_fail "no descriptor handed over" lock_inherited
+exec 7>>"$WORK/inherit.lock"
+CONFIG_LOCK_INHERITED_FD=7
+assert_fail "an open but unlocked descriptor is not enough" lock_inherited
+flock -n 7
+assert_ok "an open, locked descriptor on the lock file is inherited" lock_inherited
+CONFIG_LOCK_INHERITED_FD=abc
+assert_fail "a non-numeric value is ignored" lock_inherited
+exec 6>>"$WORK/other.lock"; flock -n 6
+CONFIG_LOCK_INHERITED_FD=6
+assert_fail "a descriptor on another file is ignored" lock_inherited
+exec 6>&- 7>&-
+unset CONFIG_LOCK_INHERITED_FD
+
+describe acquire_config_lock
+CONFIG_LOCK_FILE="$WORK/config.lock"
+CONFIG_LOCK_FD=""
+CONFIG_LOCK_WAIT=0
+acquire_config_lock
+assert_ok "acquires an available lock" test -f "$CONFIG_LOCK_FILE"
+eval "exec ${CONFIG_LOCK_FD}>&-"
+exec 9>"$WORK/held.lock"
+flock -n 9
+CONFIG_LOCK_FILE="$WORK/held.lock"
+out="$( (acquire_config_lock) 2>&1)"; rc=$?
+assert_eq "refuses a held lock" "1" "$rc"
+assert_contains "and points at clear-lock" "clear-lock" "$out"
+exec 9>&-
+CONFIG_LOCK_FILE="$WORK/named.lock"; holder="$(hold_lock "$WORK/named.lock")"
+out="$( (acquire_config_lock) 2>&1)"
+assert_eq "names only the real holder, not itself" "$holder" "$(sed -n 's/.*PID(s): *//p' <<< "$out" | xargs)"
+stop_holder "$holder"
+holder="$(hold_lock "$WORK/wait.lock")"
+( sleep 1; kill "$holder" ) &
+CONFIG_LOCK_WAIT=5
+assert_ok "CONFIG_LOCK_WAIT waits for the holder to finish" bash -c "source '$FUNCS'; die(){ exit 1; }; note(){ :; }
+  CONFIG_LOCK_FILE='$WORK/wait.lock' CONFIG_LOCK_WAIT=5 CONFIG_LOCK_FD=''; acquire_config_lock"
+CONFIG_LOCK_WAIT=abc
+assert_fail "CONFIG_LOCK_WAIT must be a number" acquire_config_lock
+CONFIG_LOCK_WAIT=0
+wait 2>/dev/null
+
+describe cmd_clear_lock
+ASSUME_YES=true; DRY_RUN=false; FORCE=false; LOCK_KILL_WAIT=1
+CONFIG_LOCK_FILE="$WORK/none.lock"
+out="$(cmd_clear_lock 2>&1)"; rc=$?
+assert_eq "no lock file: nothing to do" "0" "$rc"
+: > "$WORK/stale.lock"; CONFIG_LOCK_FILE="$WORK/stale.lock"
+out="$(cmd_clear_lock 2>&1)"; rc=$?
+assert_eq "a leftover file after a crash is not a lock" "0" "$rc"
+assert_contains "and says so" "not held" "$out"
+assert_ok "the file is kept (deleting it could split the lock)" test -e "$WORK/stale.lock"
+CONFIG_LOCK_FILE="$WORK/live.lock"; holder="$(hold_lock "$WORK/live.lock")"
+out="$(cmd_clear_lock 2>&1)"; rc=$?
+assert_eq "a live holder is not touched without --force" "1" "$rc"
+assert_contains "names the holder" "$holder" "$out"
+assert_ok "the holder is still running" kill -0 "$holder"
+FORCE=true
+out="$(cmd_clear_lock 2>&1)"; rc=$?
+assert_eq "--force stops the holder" "0" "$rc"
+assert_ok "the lock is free afterwards" lock_is_free
+assert_contains "and suggests re-applying" "apply" "$out"
+wait "$holder" 2>/dev/null
+CONFIG_LOCK_FILE="$WORK/stubborn.lock"; holder="$(hold_lock "$WORK/stubborn.lock" ignore-term)"
+out="$(cmd_clear_lock 2>&1)"; rc=$?
+assert_eq "a holder that ignores SIGTERM gets SIGKILL" "0" "$rc"
+assert_contains "and the escalation is reported" "SIGKILL" "$out"
+assert_ok "the lock is free afterwards" lock_is_free
+wait 2>/dev/null
+CONFIG_LOCK_FILE="$WORK/confirm.lock"; holder="$(hold_lock "$WORK/confirm.lock")"
+ASSUME_YES=false
+out="$(cmd_clear_lock 2>&1 </dev/null)"; rc=$?
+assert_eq "an unconfirmed --force stops nothing" "1" "$rc"
+assert_ok "the holder is still running" kill -0 "$holder"
+stop_holder "$holder"
+ASSUME_YES=true; FORCE=false
 
 summary

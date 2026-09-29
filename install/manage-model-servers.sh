@@ -47,12 +47,21 @@ UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # Snapshots of the runtime files taken before each apply (root-only).
 APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/ollama-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
+# One config change at a time (this tool and install/update-router.sh share it).
+# The lock is an flock on this file: it lasts only as long as the process that
+# holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
+# seconds to wait for it (0 = fail at once); `clear-lock` deals with a hung holder.
+CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/ollama-smart-router-config.lock}"
+CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
+# Seconds clear-lock --force gives a holder to exit after SIGTERM before SIGKILL.
+LOCK_KILL_WAIT="${LOCK_KILL_WAIT:-10}"
 # Seconds a restarted service gets to pass its health check. Open WebUI's
 # first start downloads an embedding model, hence its longer allowance.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
 OPENWEBUI_HEALTH_TIMEOUT="${OPENWEBUI_HEALTH_TIMEOUT:-300}"
 LITELLM_HEALTH_URL="${LITELLM_HEALTH_URL:-http://127.0.0.1:4000/health/liveliness}"
 APPLY_ALL=false
+CONFIG_LOCK_FD=""
 
 declare -A TIER_MODEL_OVERRIDE=()   # tier            -> model tag
 declare -A PAIR_MODEL_OVERRIDE=()   # "tier|server"   -> model tag
@@ -63,6 +72,7 @@ NO_PROBE=false
 AUTO_APPLY=false
 AUTO_COMMIT=false
 ASSUME_YES=false
+FORCE=false
 
 usage() {
   cat <<'USAGE'
@@ -106,6 +116,10 @@ Commands:
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
+  clear-lock [--force]       Show who holds the config lock. A crash or reboot
+                             never leaves it in force (it dies with its
+                             process); a live but hung holder is only stopped
+                             with --force (SIGTERM, then SIGKILL)
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
@@ -117,6 +131,7 @@ Options:
                              model-availability check when setting a model
   --dry-run                  Show what would change; write nothing
   --yes, -y                  Do not prompt for confirmation
+  --force                    With 'clear-lock': stop the process holding the lock
   -h, --help                 This help
 
 Examples:
@@ -1985,7 +2000,113 @@ cmd_commit() {
     echo "Pushed to Gitea."
   else
     note "  The commit is saved locally in ${REPO_DIR}; push it when resolved."
+    # Only a caller that asked for it (update-router.sh) treats this as failure.
+    if [[ "${REQUIRE_PUSH:-false}" == true ]]; then return 1; fi
   fi
+  return 0
+}
+
+# Commands that write config, secrets or runtime files take the config lock;
+# read-only ones (list, status, models, discover, test-alert) never wait on it.
+command_writes() {
+  case "$1" in
+    add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
+    set-token|set-api-key|set-lmstudio-token|set-webhook|set-webui-version) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_path() { readlink -f -- "$CONFIG_LOCK_FILE" 2>/dev/null || printf '%s\n' "$CONFIG_LOCK_FILE"; }
+
+# True when nobody holds the lock (probed through a separate open of the file,
+# so it also sees a lock held by this process's parent).
+lock_is_free() {
+  [[ -e "$CONFIG_LOCK_FILE" ]] || return 0
+  ( flock -n 9 ) 9>>"$CONFIG_LOCK_FILE" 2>/dev/null
+}
+
+# True when a parent (install/update-router.sh) holds the lock and handed this
+# process the descriptor: CONFIG_LOCK_INHERITED_FD must be an open descriptor on
+# the lock file AND the lock must really be taken.
+lock_inherited() {
+  local fd="${CONFIG_LOCK_INHERITED_FD:-}"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(readlink -f "/proc/self/fd/${fd}" 2>/dev/null)" == "$(lock_path)" ]] || return 1
+  ! lock_is_free
+}
+
+# PIDs of processes with the lock file open (holders and children that
+# inherited the descriptor), excluding this shell.
+lock_holders() {
+  local target link pid
+  target="$(lock_path)"
+  for link in /proc/[0-9]*/fd/*; do
+    [[ "$(readlink "$link" 2>/dev/null)" == "$target" ]] || continue
+    pid="${link#/proc/}"; pid="${pid%%/*}"
+    [[ "$pid" == "$$" || "$pid" == "${BASHPID:-}" ]] && continue
+    printf '%s\n' "$pid"
+  done | sort -un
+}
+
+acquire_config_lock() {
+  local -a wait=(-n)
+  command -v flock >/dev/null 2>&1 || die "flock is required to serialize config changes"
+  [[ "$CONFIG_LOCK_WAIT" =~ ^[0-9]+$ ]] || die "CONFIG_LOCK_WAIT must be a number of seconds"
+  (( CONFIG_LOCK_WAIT > 0 )) && wait=(-w "$CONFIG_LOCK_WAIT")
+  exec {CONFIG_LOCK_FD}>>"$CONFIG_LOCK_FILE" || die "cannot open config lock: ${CONFIG_LOCK_FILE}"
+  if ! flock "${wait[@]}" "$CONFIG_LOCK_FD"; then
+    # Close ours first, or this process and its subshells list themselves.
+    exec {CONFIG_LOCK_FD}>&-
+    note "Another config change is running (lock: ${CONFIG_LOCK_FILE}), held by PID(s): $(lock_holders | tr '\n' ' ')"
+    note "Wait for it (or set CONFIG_LOCK_WAIT=<seconds>). If it is hung: $0 clear-lock"
+    exit 1
+  fi
+}
+
+cmd_clear_lock() {
+  local pid waited
+  local -a pids=()
+  if [[ ! -e "$CONFIG_LOCK_FILE" ]]; then
+    echo "No lock file at ${CONFIG_LOCK_FILE}; nothing to clear."
+    return 0
+  fi
+  if lock_is_free; then
+    # The file is kept on purpose: deleting it while another process has it
+    # open would let two changes lock two different files at once.
+    echo "The config lock is not held; nothing to clear. ${CONFIG_LOCK_FILE} is only"
+    echo "a placeholder: the lock dies with the process that holds it, so a crash"
+    echo "or reboot never leaves it in force."
+    return 0
+  fi
+  mapfile -t pids < <(lock_holders)
+  note "The config lock (${CONFIG_LOCK_FILE}) is held by:"
+  for pid in "${pids[@]}"; do
+    note "  $(ps -o pid=,etime=,args= -p "$pid" 2>/dev/null || echo "$pid (exited)")"
+  done
+  (( ${#pids[@]} > 0 )) || die "no holding process is visible here (another container sharing the file?); not touching it."
+  if ! $FORCE; then
+    note "A change is in progress. If it is hung, stop it with: $0 clear-lock --force"
+    return 1
+  fi
+  note "Stopping a change midway can leave the config repo or services half-updated."
+  confirm "Stop these process(es)?" || die "cancelled; the lock is still held."
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  for (( waited = 0; waited < LOCK_KILL_WAIT * 5; waited++ )); do
+    lock_is_free && break
+    sleep 0.2
+  done
+  if ! lock_is_free; then
+    note "Still held after ${LOCK_KILL_WAIT}s; sending SIGKILL."
+    mapfile -t pids < <(lock_holders)
+    (( ${#pids[@]} == 0 )) || kill -KILL "${pids[@]}" 2>/dev/null || true
+    for (( waited = 0; waited < 25; waited++ )); do
+      lock_is_free && break
+      sleep 0.2
+    done
+  fi
+  lock_is_free || die "the lock is still held; check: ps -p $(lock_holders | tr '\n' ' ')"
+  echo "Lock cleared. Check the config repo (git -C ${REPO_DIR} status) and run"
+  echo "'$0 apply' so the running services match it."
 }
 
 # --- running from the Proxmox host -------------------------------------------
@@ -2112,6 +2233,9 @@ while (( $# > 0 )); do
     --no-probe)  NO_PROBE=true; shift ;;
     --dry-run)   DRY_RUN=true; shift ;;
     -y|--yes)    ASSUME_YES=true; shift ;;
+    --force)
+      [[ "$COMMAND" == "clear-lock" ]] || die "unknown option: $1"
+      FORCE=true; shift ;;
     -h|--help)   usage; exit 0 ;;
     # set-webhook's own flags. They are passed through rather than handled
     # here, because they take a value that may legitimately be EMPTY
@@ -2140,6 +2264,9 @@ case "$SERVER_TYPE" in
 esac
 
 ensure_config_or_forward
+if command_writes "$COMMAND" && ! $DRY_RUN && ! lock_inherited; then
+  acquire_config_lock
+fi
 $DRY_RUN && note "(dry run — no files will be written)"
 
 case "$COMMAND" in
@@ -2161,6 +2288,7 @@ case "$COMMAND" in
   test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
   set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
+  clear-lock) cmd_clear_lock ;;
   *)        die "unknown command '${COMMAND}' (try --help)" ;;
 esac
 

@@ -285,7 +285,7 @@ export BACKEND=cuda
 unset CUDA_COMPILER  # Let the installer discover the installed nvcc.
 export CUDA_ARCHITECTURES=89  # use the table above for this target
 export CONTEXT_SIZE=8192 PARALLEL_SLOTS=1 THREADS=8 BUILD_JOBS=4
-export GPU_LAYERS=999
+export GPU_LAYERS=auto  # preserve llama.cpp VRAM auto-fitting
 bash install-target.sh
 ```
 
@@ -318,8 +318,11 @@ with `pct set "$CT_ID" --onboot 1`; creation leaves it off until the setup is re
 
 Readiness fails until llama.cpp finishes loading. The server log must show CUDA
 devices and GPU layer offload; a running Python adapter alone is not success.
-If VRAM is insufficient, reduce context/parallelism, use a smaller quantized
-model, or lower `GPU_LAYERS` for CPU offload. Configuration lives in
+Leave `GPU_LAYERS=auto` so llama.cpp can reduce GPU offload when the model,
+context, recurrent-state cache, and compute buffers exceed free VRAM. Setting
+`GPU_LAYERS=999`, `all`, or an exact number disables that adjustment. If VRAM
+is still insufficient, reduce context/parallelism or use a smaller quantized
+model. Configuration lives in
 `/etc/llama-target/llama-server.env` and `/etc/llama-target/bridge.env`.
 Keep their aliases and model paths synchronized, then restart both services.
 
@@ -416,7 +419,7 @@ bash test-gpu-selector.sh
 bash test-upgrade.sh
 ```
 
-Local validation passed: **33 API tests, 37 provisioning dry-run cases,
+Local validation passed: **33 API tests, 40 provisioning dry-run cases,
 23 model-configuration cases, 11 upgrade cases, 10 model-storage/download URL cases, 8 GGUF
 downloader cases, 6 CUDA compiler/toolkit cases, 50 container-configuration
 cases, 15 GPU-selector cases, and Bash syntax checks for the provisioning,
