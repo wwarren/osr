@@ -1,0 +1,42 @@
+[Unit]
+Description=Strata inference API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=strata
+Group=strata
+WorkingDirectory=/opt/strata
+# Written by install-target.sh after setup.sh generates run-<model>.sh.
+EnvironmentFile=/etc/strata-target/strata.env
+ExecStart=/bin/sh ${STRATA_RUN_SCRIPT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+# Strata pins model memory; the CT's lxc.prlimit.memlock must allow it too.
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/strata
+Environment=PYTHONUNBUFFERED=1
+Environment=STRATA_EXECV=1
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Strata keeps its venv, engine and model configs in its checkout, and models
+# in the data directory.
+ReadWritePaths=/opt/strata /var/lib/strata
+PrivateTmp=true
+# Keep passed-through GPU devices visible. Access is restricted by CT devN
+# entries and by the device group the strata account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

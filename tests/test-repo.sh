@@ -34,11 +34,73 @@ extra="$(comm -13 <(printf '%s\n' "$embedded") <(printf '%s\n' "$owned" | grep -
 assert_eq "no owned entry the installer does not ship" "" "$extra"
 assert_fail "tunables stay seed-if-missing" grep -qx 'services/ollama-router/router.ini' <<< "$owned"
 
+# scan_tracked_text MODE (crlf | mojibake | encoding): print offending files.
+# Lists the tracked files with git; outside a git checkout (a tarball, the
+# update stage) it walks the tree instead. Any failure to list or read exits
+# non-zero, and the callers assert that status, so a broken scan can never
+# report "ok".
+scan_tracked_text() {
+  python3 - "$ROOT" "$1" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
+
+
+def listed():
+    if (root / ".git").exists():
+        try:
+            out = subprocess.check_output(["git", "ls-files", "--cached", "-z"], cwd=root)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            sys.exit(f"scan_tracked_text: git ls-files failed: {exc}")
+        return [p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p]
+    names = []
+    for here, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".venv")]
+        names += [os.path.relpath(os.path.join(here, f), root) for f in files]
+    return names
+
+
+for name in sorted(listed()):
+    path = root / name
+    if not path.is_file():
+        continue
+    data = path.read_bytes()
+    if b"\0" in data:
+        continue
+    if mode == "crlf" and b"\r" in data:
+        print(name)
+        continue
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        if mode == "encoding":
+            print(name)
+        continue
+    if mode == "mojibake" and ("\u00e2\u20ac" in decoded or "\u00c3" in decoded):
+        print(name)
+PY
+}
+
 describe line_endings
-crlf="$(cd "$ROOT" && grep -rlI $'\r' --exclude-dir=.git --exclude-dir='.venv*' \
-         --exclude-dir=__pycache__ --exclude-dir=.pytest_cache . || true)"
+crlf="$(scan_tracked_text crlf)"; rc=$?
+assert_eq "the CRLF scan ran" "0" "$rc"
 assert_eq "no CRLF text files" "" "$crlf"
 assert_file_contains "root .gitattributes forces LF" "eol=lf" "${ROOT}/.gitattributes"
+
+describe text_encoding
+# A UTF-8 file re-saved through Windows-1252 can acquire double-encoded text.
+# Scan tracked text, including this test file, without embedding those bytes.
+mojibake="$(scan_tracked_text mojibake)"; rc=$?
+assert_eq "the double-encoding scan ran" "0" "$rc"
+assert_eq "no Windows-1252 double-encoded text" "" "$mojibake"
+not_utf8="$(scan_tracked_text encoding)"; rc=$?
+assert_eq "the UTF-8 scan ran" "0" "$rc"
+assert_eq "text files are valid UTF-8" "" "$not_utf8"
 
 describe secrets
 for f in "${ROOT}"/env/*.env; do
@@ -73,6 +135,17 @@ assert_ok "the AirLLM target installs from a hash lock" grep -q -- '--require-ha
 assert_fail "the AirLLM requirements are exact pins" grep -Eq '^[A-Za-z].*(>=|~=|<)' "${airllm}/requirements.txt"
 pin="$(sed -nE 's/^airllm==([^[:space:]#]+).*/\1/p' "${airllm}/requirements.txt")"
 assert_ok "the AirLLM lock matches its pin" grep -q "^airllm==${pin} " "${airllm}/requirements.lock"
+
+describe venv_permissions
+# Venvs are built after the secret-bearing tree (umask 077); the service account
+# must still be able to run them (litellm-proxy failed with 203/EXEC otherwise).
+tree_umask="$(grep -n '^umask 077$' "$INSTALLER" | head -n1 | cut -d: -f1)"
+reset_umask="$(grep -n '^umask 022$' "$INSTALLER" | head -n1 | cut -d: -f1)"
+first_venv="$(grep -n 'run_ct python3 -m venv' "$INSTALLER" | head -n1 | cut -d: -f1)"
+assert_ok "umask is reset to 022 before the first venv is built" \
+  test "${tree_umask:-0}" -lt "${reset_umask:-0}" -a "${reset_umask:-0}" -lt "${first_venv:-0}"
+assert_ok "the LiteLLM venv is made readable after install" \
+  grep -q 'chmod -R u+rwX,go+rX,go-w /app/litellm' "$INSTALLER"
 
 describe single_management_tool
 assert_ok "the root script only wraps install/" grep -q 'exec bash "\$target"' "${ROOT}/manage-model-servers.sh"

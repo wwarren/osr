@@ -146,6 +146,9 @@ assert_fail "rejects empty"              valid_ollama_addr ""
 assert_ok   "accepts lmstudio://host"    valid_ollama_addr lmstudio://10.0.0.9
 assert_ok   "accepts lmstudio+http url"  valid_ollama_addr lmstudio+http://h:1234
 assert_fail "rejects lmstudio:// junk"   valid_ollama_addr "lmstudio://a b"
+assert_ok   "accepts strata://host"      valid_ollama_addr strata://10.0.0.8
+assert_ok   "accepts Strata on port 11434" valid_ollama_addr strata://10.0.0.8:11434
+assert_ok   "accepts strata+http url"    valid_ollama_addr strata+http://h:8080
 
 describe normalize_ollama_url
 assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
@@ -157,6 +160,12 @@ assert_eq "https preserved"              "https://h:8443"        "$(normalize_ol
 assert_eq "lmstudio:// gets LM Studio's port" "lmstudio+http://h:1234" "$(normalize_ollama_url lmstudio://h)"
 assert_eq "lmstudio:// keeps an explicit port" "lmstudio+http://h:4321" "$(normalize_ollama_url lmstudio://h:4321)"
 assert_eq "lmstudio+http passes through"     "lmstudio+http://h:1234" "$(normalize_ollama_url lmstudio+http://h:1234/)"
+assert_eq "strata:// default port"          "strata+http://h:8080"   "$(normalize_ollama_url strata://h)"
+assert_eq "strata:// keeps port 11434"      "strata+http://h:11434" "$(normalize_ollama_url strata://h:11434)"
+STRATA_PORT=11434
+assert_eq "Strata default port can be 11434" "strata+http://h:11434" "$(normalize_ollama_url strata://h)"
+unset STRATA_PORT
+assert_eq "strata+http passes through"      "strata+http://h:8081"   "$(normalize_ollama_url strata+http://h:8081/)"
 
 describe valid_tier_selection
 MODEL_SERVER_COUNT=3
@@ -621,6 +630,10 @@ MODEL_SERVERS=(); MODEL_SERVER_COUNT=3
 prompt_model_servers > "$_pms_out" 2>&1 <<< $'3\n10.0.0.1\n10.0.0.1\n10.0.0.3\n\n\n\n\n\n\n\n' || true
 out="$(cat "$_pms_out")"; rm -f "$_pms_out"
 assert_contains "warns about duplicate addresses" "same address" "$out"
+MODEL_SERVERS=(); MODEL_SERVER_COUNT=1; MODEL_SERVER_1=strata://10.0.0.8:11434
+prompt_model_servers > /dev/null 2>&1 <<< $'\n\n\n\n\n\n\n\n\n\n\n' || true
+assert_eq "installer keeps Strata on port 11434" "strata+http://10.0.0.8:11434" "${MODEL_SERVERS[0]}"
+MODEL_SERVER_COUNT=3; MODEL_SERVER_1=10.0.0.51
 
 # ── python provisioning ───────────────────────────────────────────────────────
 describe ensure_openwebui_python
@@ -727,6 +740,20 @@ assert_ok "returns 0 so provisioning continues" \
   bash -c "source '$FUNCS'; NONINTERACTIVE=true; GITEA_DEPLOY_TOKEN=''; GITEA_SERVER_URL=https://g.example; \
            GITEA_ADMIN_USER=t; GITEA_REPO_NAME=r; GITEA_VERIFY_TLS=false; GITEA_CURL_OPTS=(); \
            prompt_gitea_credentials"
+# No URL: there is no placeholder host to fall back on.
+assert_ok "the URL has no built-in default" \
+  bash -c "unset GITEA_SERVER_URL; source '$FUNCS'; [[ -z \$GITEA_SERVER_URL ]]"
+GITEA_SERVER_URL=""; GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n' || true
+assert_eq "blank URL installs a local config" "local" "$CONFIG_SOURCE"
+assert_contains "and says so" "No Gitea server URL" "$(cat "$_pg_out")"
+assert_fail "a token without a URL stops the install" \
+  bash -c "source '$FUNCS'; NONINTERACTIVE=true; GITEA_DEPLOY_TOKEN=tok; GITEA_SERVER_URL=''; \
+           prompt_gitea_credentials"
+GITEA_SERVER_URL=""; CONFIG_SOURCE="gitea"
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'https://git.example.org\n\n\n\n' || true
+assert_eq "a typed URL is used" "https://git.example.org" "$GITEA_SERVER_URL"
+GITEA_SERVER_URL="https://git.example.net"
 rm -f "$_pg_out"
 GITEA_ADMIN_USER="tester"; GITEA_OWNER="tester"; GITEA_DEPLOY_TOKEN=""
 

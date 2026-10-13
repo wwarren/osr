@@ -1,0 +1,38 @@
+[Unit]
+Description=Open Terminal dedicated workspace
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=open-terminal
+Group=open-terminal
+WorkingDirectory=/srv/open-terminal/workspace
+# Root-only (0600), written by install-target.sh: OPEN_TERMINAL_API_KEY and
+# OPEN_TERMINAL_PORT. The key is given as the variable itself, never as
+# OPEN_TERMINAL_API_KEY_FILE: open-terminal's CLI exports the variable after
+# reading a _FILE, and v0.14.0 then refuses to start with both set.
+EnvironmentFile=/etc/open-terminal/service.env
+# An empty value is treated as unset and falls back to "*". Open WebUI proxies
+# every request server-side, so no browser origin needs access.
+Environment=OPEN_TERMINAL_CORS_ALLOWED_ORIGINS=http://127.0.0.1
+ExecStart=/opt/open-terminal/venv/bin/open-terminal run --host 0.0.0.0 --port ${OPEN_TERMINAL_PORT} --cwd /srv/open-terminal/workspace
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The shell this service provides can write only here (and its private /tmp).
+ReadWritePaths=/srv/open-terminal
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

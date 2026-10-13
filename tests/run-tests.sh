@@ -23,11 +23,11 @@ SUITES=(
 )
 # Suites without per-function coverage: repo consistency, the inference-target
 # scripts (llama.cpp, AirLLM), and their Python tests.
-EXTRA_NAMES=(repo nvidia update)
-EXTRA_KINDS=(shell shell shell)
-EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh")
-EXTRA_PYTHONS=("" "" "")
-EXTRA_TESTS=("" "" "")
+EXTRA_NAMES=(repo nvidia update remote-update)
+EXTRA_KINDS=(shell shell shell shell)
+EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh" "${HERE}/test-remote-update.sh")
+EXTRA_PYTHONS=("" "" "" "")
+EXTRA_TESTS=("" "" "" "")
 for _t in "${ROOT}"/targets/*/test-*.sh; do
   [[ -f "$_t" ]] || continue
   _target=$(basename "$(dirname "$_t")")
@@ -53,6 +53,12 @@ EXTRA_TESTS+=(
   "${HERE}/test_router.py"
   "${HERE}/test_monitor.py"
 )
+# Standard-library unittest scripts: no venv needed.
+EXTRA_NAMES+=(open-terminal-integration open-terminal-webui-probe)
+EXTRA_KINDS+=(python python)
+EXTRA_PATHS+=("${ROOT}/targets/open-terminal/test-integration.py" "${ROOT}/targets/open-terminal/test-webui-probe.py")
+EXTRA_PYTHONS+=(python3 python3)
+EXTRA_TESTS+=("" "")
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'
 [[ -t 1 ]] || { c_red=""; c_grn=""; c_yel=""; c_bld=""; c_off=""; }
@@ -142,6 +148,9 @@ for i in "${!EXTRA_NAMES[@]}"; do
         continue
       fi
       "${EXTRA_PYTHONS[$i]}" -m pytest -q "${EXTRA_TESTS[$i]}" || failed_suites+=("$name")
+      ;;
+    python)
+      "${EXTRA_PYTHONS[$i]}" "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
       ;;
     *)
       printf 'ERROR: unknown suite type for %s\n' "$name" >&2

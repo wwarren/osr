@@ -37,7 +37,8 @@ OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # LM Studio's server port. LM Studio servers are stored with a scheme prefix,
 # lmstudio+http://host:1234, so every consumer knows which API to speak.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
-SERVER_TYPE="auto"   # --type ollama|lmstudio|auto for add / set-tier
+STRATA_PORT="${STRATA_PORT:-8080}"
+SERVER_TYPE="auto"   # --type ollama|lmstudio|strata|auto for add / set-tier
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8000}"
@@ -83,8 +84,11 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             An LM Studio server is detected automatically, or
-                             write it lmstudio://host[:port] / use --type lmstudio
+                             LM Studio and Strata are detected automatically, or
+                             use lmstudio://host / strata://host or --type.
+                             Detection never sends the Strata key. Use
+                             strata://host if an older keyed server cannot
+                             identify itself through public /health.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
@@ -110,6 +114,9 @@ Commands:
   set-lmstudio-token [token|--off]
                              Bearer token for LM Studio servers that require
                              authentication (stored in secrets.env)
+  set-strata-token [token|--off]
+                             Bearer token for Strata servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on the router
                              API (Open WebUI is given the same key)
@@ -123,7 +130,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio>   With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -155,13 +162,23 @@ note() { echo "$*" >&2; }
 valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 
 # --- server kinds -------------------------------------------------------------
-server_kind() { [[ "$1" == lmstudio+* ]] && echo lmstudio || echo ollama; }
-server_base() { printf '%s\n' "${1#lmstudio+}"; }
+server_kind() {
+  if [[ "$1" == lmstudio+* ]]; then echo lmstudio
+  elif [[ "$1" == strata+* ]]; then echo strata
+  else echo ollama; fi
+}
+server_base() { local base="${1#lmstudio+}"; printf '%s\n' "${base#strata+}"; }
 # LiteLLM provider prefix and api_base for a server entry. LM Studio is
 # OpenAI-compatible under /v1 and uses LiteLLM's lm_studio/ provider.
-litellm_provider() { [[ "$(server_kind "$1")" == lmstudio ]] && echo lm_studio || echo ollama; }
+litellm_provider() {
+  case "$(server_kind "$1")" in
+    lmstudio) echo lm_studio ;;
+    strata) echo openai ;;
+    *) echo ollama ;;
+  esac
+}
 litellm_api_base() {
-  if [[ "$(server_kind "$1")" == lmstudio ]]; then
+  if [[ "$(server_kind "$1")" != ollama ]]; then
     printf '%s/v1\n' "$(server_base "$1")"
   else
     printf '%s\n' "$1"
@@ -172,9 +189,10 @@ litellm_api_base() {
 # The header goes through a file descriptor so the token never shows in `ps`.
 server_curl() {
   local url="$1" path="$2" token=""
-  if [[ "$(server_kind "$url")" == lmstudio ]]; then
-    token="$(env_get LMSTUDIO_API_TOKEN 2>/dev/null)"
-  fi
+  case "$(server_kind "$url")" in
+    lmstudio) token="$(env_get LMSTUDIO_API_TOKEN 2>/dev/null)" ;;
+    strata) token="$(env_get STRATA_API_KEY 2>/dev/null)" ;;
+  esac
   if [[ -n "$token" ]]; then
     curl -fsS --max-time "$PROBE_TIMEOUT" -H @<(printf 'Authorization: Bearer %s\n' "$token") \
       "$(server_base "$url")${path}"
@@ -189,6 +207,8 @@ valid_addr() {
   # lmstudio://host[:port] and lmstudio+http(s)://... are LM Studio servers.
   raw="${raw#lmstudio+}"
   [[ "$raw" == lmstudio://* ]] && raw="${raw#lmstudio://}"
+  raw="${raw#strata+}"
+  [[ "$raw" == strata://* ]] && raw="${raw#strata://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     [[ "$raw" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/.*)?$ ]]
     return $?
@@ -212,8 +232,16 @@ normalize_addr() {
     kind=lmstudio; raw="${raw#lmstudio+}"
   elif [[ "$raw" == lmstudio://* ]]; then
     kind=lmstudio; raw="${raw#lmstudio://}"
+  elif [[ "$raw" == strata+* ]]; then
+    kind=strata; raw="${raw#strata+}"
+  elif [[ "$raw" == strata://* ]]; then
+    kind=strata; raw="${raw#strata://}"
   fi
-  [[ "$kind" == lmstudio ]] && port="$LMSTUDIO_PORT" || port="$OLLAMA_PORT"
+  case "$kind" in
+    lmstudio) port="$LMSTUDIO_PORT" ;;
+    strata) port="${STRATA_PORT:-8080}" ;;
+    *) port="$OLLAMA_PORT" ;;
+  esac
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     base="$raw"
   elif [[ "$raw" == *:* ]]; then
@@ -221,22 +249,50 @@ normalize_addr() {
   else
     base="http://${raw}:${port}"
   fi
-  if [[ "$kind" == lmstudio ]]; then printf 'lmstudio+%s\n' "$base"; else printf '%s\n' "$base"; fi
+  if [[ "$kind" == lmstudio || "$kind" == strata ]]; then
+    printf '%s+%s\n' "$kind" "$base"
+  else printf '%s\n' "$base"; fi
 }
 
-# Which API answers at a plain http base URL: ollama, lmstudio, or nothing.
+# Which API answers at a plain http base URL: ollama, lmstudio, strata, or nothing.
 detect_server_kind() {
   local base="$1" body
   if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/api/tags" 2>/dev/null)" &&
      [[ "$body" == *'"models"'* ]]; then
     echo ollama; return 0
   fi
+  # Probe Strata WITHOUT credentials. Its /health endpoint identifies itself
+  # even when the model API requires a key. Older releases may need one of the
+  # other fingerprints below, or an explicit strata:// entry.
+  if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/health" 2>/dev/null)" &&
+     [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"strata\" ]]; then
+    echo strata; return 0
+  fi
+  local code path status_code=''
+  body="$(curl -sS --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' "${base}/v1/status" 2>/dev/null || true)"
+  status_code="${body##*$'\n'}"; body="${body%$'\n'*}"
+  if [[ "$status_code" == 200 && "$body" == *'"auto_load"'* && "$body" == *'"loaded"'* ]]; then
+    echo strata; return 0
+  fi
+  if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/v1/models" 2>/dev/null)" &&
+     [[ "$body" =~ \"(id|owned_by)\"[[:space:]]*:[[:space:]]*\"strata\" ]]; then
+    echo strata; return 0
+  fi
   # LM Studio: its native model API (0.4+ /api/v1, 0.3 /api/v0). A 401 still
-  # identifies it: authentication is on and needs set-lmstudio-token.
-  local code path
+  # identifies it: authentication is on and needs set-lmstudio-token. An
+  # older keyed Strata without a service marker on /health can also answer
+  # 401 here; then only LM Studio's own port settles it.
   for path in /api/v1/models /api/v0/models; do
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT" "${base}${path}" 2>/dev/null || true)"
-    if [[ "$code" == 200 || "$code" == 401 ]]; then echo lmstudio; return 0; fi
+    [[ "$code" == 200 ]] && { echo lmstudio; return 0; }
+    if [[ "$code" == 401 ]]; then
+      if [[ "$status_code" != 401 || "${base##*:}" == "$LMSTUDIO_PORT" ]]; then
+        echo lmstudio; return 0
+      fi
+      note "  ${base} requires authentication, so its API cannot be identified without sending a key."
+      note "  Add it as strata://${base#*://} or lmstudio://${base#*://} (or use --type)."
+      return 1
+    fi
   done
   return 1
 }
@@ -252,6 +308,8 @@ configured_entry() {
   get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
   alt="$(normalize_addr "$1" ollama)"
   get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
+  alt="$(normalize_addr "$1" strata)"
+  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
   printf '%s\n' "$url"
 }
 
@@ -262,7 +320,7 @@ configured_entry() {
 resolve_server() {
   local addr="$1" url base kind alt
   url="$(normalize_addr "$addr")"
-  [[ "$SERVER_TYPE" != auto || "$(server_kind "$url")" == lmstudio ]] && { printf '%s\n' "$url"; return 0; }
+  [[ "$SERVER_TYPE" != auto || "$(server_kind "$url")" != ollama ]] && { printf '%s\n' "$url"; return 0; }
   $NO_PROBE && { printf '%s\n' "$url"; return 0; }
   base="$(server_base "$url")"
   if kind="$(detect_server_kind "$base")"; then
@@ -274,6 +332,10 @@ resolve_server() {
     if kind="$(detect_server_kind "$alt")" && [[ "$kind" == lmstudio ]]; then
       normalize_addr "$alt" lmstudio; return 0
     fi
+    alt="$(server_base "$(normalize_addr "$addr" strata)")"
+    if kind="$(detect_server_kind "$alt")" && [[ "$kind" == strata ]]; then
+      normalize_addr "$alt" strata; return 0
+    fi
   fi
   return 1
 }
@@ -282,7 +344,7 @@ resolve_server() {
 # Keys that must never be written to the version-controlled env file.
 secret_keys() {
   printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS \
-    LMSTUDIO_API_TOKEN
+    LMSTUDIO_API_TOKEN STRATA_API_KEY
 }
 is_secret_key() { secret_keys | grep -qx -- "$1"; }
 
@@ -442,6 +504,8 @@ server_models() {
   local url="$1" body path
   if [[ "$(server_kind "$url")" == ollama ]]; then
     body="$(server_curl "$url" /api/tags 2>/dev/null)" || return 1
+  elif [[ "$(server_kind "$url")" == strata ]]; then
+    body="$(server_curl "$url" /v1/models 2>/dev/null)" || return 1
   else
     for path in /api/v1/models /api/v0/models /v1/models; do
       body="$(server_curl "$url" "$path" 2>/dev/null)" && break
@@ -488,8 +552,8 @@ current_pair_tag() {
       n = $0; sub(/.*model_name:[[:space:]]*/, "", n); sub(/[[:space:]]*$/, "", n)
       tag = ""; next
     }
-    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio)\// {
-      tag = $0; sub(/.*model:[[:space:]]*(ollama|lm_studio)\//, "", tag); sub(/[[:space:]]*(#.*)?$/, "", tag); next
+    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio|openai)\// {
+      tag = $0; sub(/.*model:[[:space:]]*(ollama|lm_studio|openai)\//, "", tag); sub(/[[:space:]]*(#.*)?$/, "", tag); next
     }
     /^[[:space:]]*api_base:[[:space:]]*/ {
       b = $0; sub(/.*api_base:[[:space:]]*/, "", b); sub(/[[:space:]]*$/, "", b)
@@ -505,8 +569,8 @@ current_tier_tag() {
     /^[[:space:]]*-[[:space:]]*model_name:/ {
       n=$0; sub(/.*model_name:[[:space:]]*/,"",n); sub(/[[:space:]]*$/,"",n); next
     }
-    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio)\// && n==want {
-      t=$0; sub(/.*model:[[:space:]]*(ollama|lm_studio)\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t); print t; exit
+    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio|openai)\// && n==want {
+      t=$0; sub(/.*model:[[:space:]]*(ollama|lm_studio|openai)\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t); print t; exit
     }' "$LITELLM_YAML"
 }
 
@@ -652,9 +716,10 @@ if rows:
 regenerate_litellm() {
   local tmp tier name tag tier_tag url tail_block keep_alive fallbacks sig
   local -a sig_lines=()
-  local lms_token
+  local lms_token strata_token
   keep_alive="$(env_get OLLAMA_KEEP_ALIVE)"
   lms_token="$(env_get LMSTUDIO_API_TOKEN)"
+  strata_token="$(env_get STRATA_API_KEY)"
   $DRY_RUN && { echo "  [dry-run] would regenerate ${LITELLM_YAML}"; return 0; }
   [[ -f "$LITELLM_YAML" ]] || die "missing ${LITELLM_YAML}"
   tmp="$(mktemp)"
@@ -688,6 +753,12 @@ regenerate_litellm() {
           # LM Studio: token only when set (secrets.env, loaded by the unit);
           # keep_alive is an Ollama setting and is not sent.
           [[ -n "$lms_token" ]] && printf '      api_key: os.environ/LMSTUDIO_API_TOKEN\n'
+        elif [[ "$(server_kind "$url")" == strata ]]; then
+          if [[ -n "$strata_token" ]]; then
+            printf '      api_key: os.environ/STRATA_API_KEY\n'
+          else
+            printf '      api_key: none\n'
+          fi
         else
           [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
         fi
@@ -735,9 +806,10 @@ cmd_add() {
   for addr in "${wanted[@]}"; do
     valid_addr "$addr" || die "not a valid address: '${addr}'"
     if ! url="$(resolve_server "$addr")"; then
-      die "${addr} is not reachable as Ollama (/api/tags) or LM Studio (port ${LMSTUDIO_PORT}). Use --type and/or --no-probe to add anyway."
+      die "${addr} is not reachable as Ollama, LM Studio or Strata. Use --type and/or --no-probe to add anyway."
     fi
     [[ "$(server_kind "$url")" == lmstudio ]] && note "  ${addr}: LM Studio server -> ${url}"
+    [[ "$(server_kind "$url")" == strata ]] && note "  ${addr}: Strata server -> ${url}"
     if get_servers | contains_line "$url"; then
       note "  already configured, skipping: ${url}"
       continue
@@ -750,6 +822,8 @@ cmd_add() {
       if [[ "$(probe_server "$url")" == "-" ]]; then
         if [[ "$(server_kind "$url")" == lmstudio ]]; then
           die "${url} did not list its models. Is the LM Studio server running? If it requires authentication, run set-lmstudio-token first. Use --no-probe to add anyway."
+        elif [[ "$(server_kind "$url")" == strata ]]; then
+          die "${url} did not list its models. Is Strata running? If it requires authentication, run set-strata-token first. Use --no-probe to add anyway."
         fi
         die "${url} is not reachable (no /api/tags). Use --no-probe to add anyway."
       fi
@@ -788,7 +862,7 @@ cmd_add() {
     # server. Say so now rather than at the first failed request.
     local tag
     for url in "${to_add[@]}"; do
-      [[ "$(server_kind "$url")" == lmstudio ]] || continue
+      [[ "$(server_kind "$url")" != ollama ]] || continue
       for tier in $(csv_to_lines "$TIER_ARG"); do
         tag="$(current_tier_tag "$(tier_model_name "$tier")")"
         [[ -n "$tag" ]] || continue
@@ -1255,17 +1329,58 @@ litellm_venv_ok() {
 # Build (or bring up to date) LiteLLM's own venv, hash-checked when the repo
 # carries requirements.lock.
 litellm_install() {
-  local pip="${LITELLM_DIR}/venv/bin/pip"
-  if [[ ! -x "$pip" ]]; then
-    mkdir -p "$LITELLM_DIR"
-    python3 -m venv "${LITELLM_DIR}/venv" || { note "  could not create ${LITELLM_DIR}/venv"; return 1; }
-  fi
-  if [[ -f "$LITELLM_LOCK" ]]; then
-    "$pip" install --no-cache-dir --require-hashes -r "$LITELLM_LOCK"
-  else
-    note "  WARNING: no $(basename "$LITELLM_LOCK"); installing without hash checking."
-    "$pip" install --no-cache-dir -r "$LITELLM_REQ"
-  fi
+  local pip="${LITELLM_DIR}/venv/bin/pip" rc=0
+  # The service runs as ollama-router from this root-owned tree: build it world-
+  # readable whatever the calling shell's umask (a 077/027 umask here produced
+  # "Failed to execute .../litellm: Permission denied", status=203/EXEC).
+  (
+    umask 022
+    if [[ ! -x "$pip" ]]; then
+      mkdir -p "$LITELLM_DIR"
+      python3 -m venv "${LITELLM_DIR}/venv" || { note "  could not create ${LITELLM_DIR}/venv"; exit 1; }
+    fi
+    if [[ -f "$LITELLM_LOCK" ]]; then
+      "$pip" install --no-cache-dir --require-hashes -r "$LITELLM_LOCK"
+    else
+      note "  WARNING: no $(basename "$LITELLM_LOCK"); installing without hash checking."
+      "$pip" install --no-cache-dir -r "$LITELLM_REQ"
+    fi
+  ) || rc=$?
+  venv_make_readable "${LITELLM_DIR}/venv"
+  return "$rc"
+}
+
+# Give everyone read (and traverse/execute where set) access to a venv, and let
+# them traverse its parent. Venvs hold no secrets; the service accounts need this.
+venv_make_readable() {
+  local venv="$1"
+  [[ -d "$venv" ]] || return 0
+  chmod -R u+rwX,go+rX,go-w -- "$venv"
+  chmod go+x -- "$(dirname -- "$venv")"
+}
+
+# The service account every unit runs as.
+SERVICE_USER="${SERVICE_USER:-ollama-router}"
+
+# Before restarting anything, make sure the service account can actually run
+# each venv's interpreter; repair the permissions when a restrictive umask
+# (on an earlier install, pip run or update) left them unreadable. Prints the
+# venvs it fixed; returns 1 when one is still unusable.
+repair_venv_access() {
+  local venv bad=0
+  getent passwd "$SERVICE_USER" >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for venv in "${LITELLM_DIR}/venv" "${ROUTER_DIR}/venv" "${OPENWEBUI_DIR}/venv"; do
+    [[ -x "${venv}/bin/python" ]] || continue
+    runuser -u "$SERVICE_USER" -- "${venv}/bin/python" -c 'import sys' >/dev/null 2>&1 && continue
+    echo "  ${venv} is not usable by ${SERVICE_USER}; making it readable"
+    venv_make_readable "$venv"
+    if ! runuser -u "$SERVICE_USER" -- "${venv}/bin/python" -c 'import sys' >/dev/null 2>&1; then
+      note "  WARNING: ${SERVICE_USER} still cannot run ${venv}/bin/python; check the permissions of its parent directories."
+      bad=1
+    fi
+  done
+  return "$bad"
 }
 
 # --- safe apply ---------------------------------------------------------------
@@ -1613,7 +1728,8 @@ cmd_apply() {
   if [[ -n "$want_v" && "$want_v" != "$have_v" ]]; then
     echo "Open WebUI ${have_v:-<none>} -> ${want_v}; installing (this takes a while)..."
     openwebui_backup_db "$snapshot"
-    if openwebui_install; then
+    # umask 022: the UI runs as the service account from this root-owned venv.
+    if ( umask 022; openwebui_install ); then
       echo "  installed open-webui ${want_v} (database backed up in ${snapshot})"
       webui_from="$have_v"
       affected+=(open-webui)
@@ -1621,6 +1737,8 @@ cmd_apply() {
       note "  WARNING: install failed; the service keeps running ${have_v:-its current version}."
     fi
   fi
+  # A venv the service account cannot read fails at exec (status=203/EXEC).
+  repair_venv_access || true
   # De-duplicate, keeping SERVICES order.
   mapfile -t affected < <(for svc in "${SERVICES[@]}"; do
     printf '%s\n' "${affected[@]}" | grep -qx -- "$svc" && echo "$svc"; done)
@@ -1652,7 +1770,7 @@ cmd_apply() {
   if [[ -n "$webui_from" ]]; then
     note "  Reinstalling open-webui ${webui_from} and restoring its database..."
     systemctl stop open-webui.service 2>/dev/null || true
-    "${OPENWEBUI_DIR}/venv/bin/pip" install --no-cache-dir "open-webui==${webui_from}" >/dev/null 2>&1 || \
+    ( umask 022; "${OPENWEBUI_DIR}/venv/bin/pip" install --no-cache-dir "open-webui==${webui_from}" ) >/dev/null 2>&1 || \
       note "  WARNING: reinstalling open-webui ${webui_from} failed."
     openwebui_restore_db "$snapshot"
   fi
@@ -1977,6 +2095,29 @@ cmd_set_lmstudio_token() {
   CHANGED=true
 }
 
+cmd_set_strata_token() {
+  local token="${1:-}" confirm_token=""
+  if [[ "$token" == --off ]]; then
+    env_set STRATA_API_KEY ""
+    echo "Strata API key cleared."
+    regenerate_litellm
+    CHANGED=true
+    return 0
+  fi
+  if [[ -z "$token" ]]; then
+    [[ "$ASSUME_YES" == "true" ]] && die "set-strata-token: no key given"
+    read -r -s -p "Strata API key: " token; echo
+    read -r -s -p "Confirm key: " confirm_token; echo
+    [[ "$token" == "$confirm_token" ]] || die "keys did not match"
+  fi
+  [[ -n "$token" ]] || die "set-strata-token: empty key"
+  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "set-strata-token: unexpected characters in key"
+  env_set STRATA_API_KEY "$token"
+  echo "Stored the Strata API key in ${SECRETS_FILE}."
+  regenerate_litellm
+  CHANGED=true
+}
+
 cmd_commit() {
   local message="${1:-Update model server list}"
   if $DRY_RUN; then echo "  [dry-run] would commit: ${message}"; return 0; fi
@@ -2011,7 +2152,7 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-lmstudio-token|set-webhook|set-webui-version) return 0 ;;
+    set-token|set-api-key|set-lmstudio-token|set-strata-token|set-webhook|set-webui-version) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2245,7 +2386,7 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
-      [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-lmstudio-token" ]] || die "unknown option: $1"
+      [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-lmstudio-token" || "$COMMAND" == "set-strata-token" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -2259,8 +2400,8 @@ for tier in $(csv_to_lines "${TIER_ARG:-}"); do
   tier_env_key "$tier" >/dev/null
 done
 case "$SERVER_TYPE" in
-  auto|ollama|lmstudio) ;;
-  *) die "--type must be ollama, lmstudio or auto (got '${SERVER_TYPE}')" ;;
+  auto|ollama|lmstudio|strata) ;;
+  *) die "--type must be ollama, lmstudio, strata or auto (got '${SERVER_TYPE}')" ;;
 esac
 
 ensure_config_or_forward
@@ -2285,6 +2426,7 @@ case "$COMMAND" in
   set-token) cmd_set_token "${ARGS[0]:-}" ;;
   set-api-key) cmd_set_api_key "${ARGS[0]:-}" ;;
   set-lmstudio-token) cmd_set_lmstudio_token "${ARGS[0]:-}" ;;
+  set-strata-token) cmd_set_strata_token "${ARGS[0]:-}" ;;
   test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
   set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
@@ -2306,7 +2448,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-lmstudio-token)
+  set-api-key|set-lmstudio-token|set-strata-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac

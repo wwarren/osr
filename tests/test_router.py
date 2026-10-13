@@ -24,6 +24,7 @@ def load_router(monkeypatch, **env):
         "MODEL_SERVERS": f"{HOST_A},{HOST_B}",
         "ROUTER_API_KEY": "",
         "LMSTUDIO_API_TOKEN": "",
+        "STRATA_API_KEY": "",
         "LITELLM_BASE_URL": "http://litellm.test",
     }
     base.update(env)
@@ -646,3 +647,114 @@ def test_unreachable_lmstudio_is_down(monkeypatch):
     router._HTTP["transport"] = httpx.MockTransport(refuse)
     with TestClient(router.app):
         assert router.INVENTORY["servers"][LMS]["up"] is False
+
+
+# --- Strata servers ----------------------------------------------------------
+STRATA = "strata+http://10.0.0.8:8080"
+
+
+@pytest.mark.parametrize("strata", [STRATA, "strata+http://10.0.0.8:11434"])
+def test_strata_discovery_and_dispatch(monkeypatch, strata):
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, dict(request.headers)))
+        if request.headers.get("authorization") != "Bearer strata-secret":
+            return httpx.Response(401)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [
+                {"id": "strata", "status": {"value": "loaded"},
+                 "input_modalities": ["text", "image"]},
+                {"id": "strata-alias", "status": "unloaded",
+                 "input_modalities": ["text"]}]})
+        if request.url.path == "/v1/chat/completions":
+            return streamed(200, {"model": json.loads(request.content)["model"]})
+        return httpx.Response(404)
+
+    router = load_router(monkeypatch, MODEL_SERVERS=strata,
+                         STRATA_API_KEY="strata-secret", ROUTER_API_KEY="client-secret")
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app) as client:
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+        response = client.post("/v1/chat/completions",
+                               headers={"Authorization": "Bearer client-secret"},
+                               json={"model": "strata", "messages": [user("hi")]})
+    assert router.server_kind(strata) == "strata"
+    assert router.server_base(strata) == strata.removeprefix("strata+")
+    assert models["strata"]["kind"] == "strata"
+    assert models["strata"]["params_b"] == 125
+    assert models["strata"]["is_vision"] and models["strata"]["loaded"]
+    assert models["strata-alias"]["loaded"] is False
+    # Only Strata's default id gets the configured 125B; other unsized ids
+    # (the Coder variant, aliases) stay unknown-size.
+    assert models["strata-alias"]["params_b"] == 0
+    assert response.status_code == 200 and response.json()["model"] == "strata"
+    assert response.headers["x-router-server"] == strata
+    assert [p for p, _ in calls] == ["/v1/models", "/v1/chat/completions"]
+    assert all(h["authorization"] == "Bearer strata-secret" for _, h in calls)
+
+
+def test_unreachable_strata_is_down(monkeypatch):
+    def refuse(request):
+        raise httpx.ConnectError("refused", request=request)
+    router = load_router(monkeypatch, MODEL_SERVERS=STRATA)
+    router._HTTP["transport"] = httpx.MockTransport(refuse)
+    with TestClient(router.app):
+        assert router.INVENTORY["servers"][STRATA]["up"] is False
+
+
+def test_lmstudio_loaded_only_does_not_exclude_unloaded_strata(router, monkeypatch):
+    monkeypatch.setattr(router, "LMSTUDIO_LOADED_ONLY", True)
+    entry = router.build_entry(STRATA, {"name": "strata", "loaded": False})
+    need = {"class": "xlarge", "code": False, "vision": False}
+    inv = {"models": [entry], "servers": {STRATA: {"up": True}}}
+    assert router.rank_candidates(need, inv) == [entry]
+
+
+def test_strata_default_params_is_configurable(monkeypatch, tmp_path):
+    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    assert "strata_default_params = 125B" in ini
+    custom = tmp_path / "router.ini"
+    custom.write_text(ini.replace("strata_default_params = 125B", "strata_default_params ="))
+
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"id": "strata"}, {"id": "coder:62b"}]})
+
+    router = load_router(monkeypatch, MODEL_SERVERS=STRATA, ROUTER_INI=str(custom))
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app):
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+    assert models["strata"]["params_b"] == 0          # blank: no assumed size
+    assert models["coder:62b"]["params_b"] == 62      # a sized tag still parses
+
+
+# --- named models on unreachable hosts ----------------------------------------
+def test_named_model_on_a_down_host_is_routed_with_a_warning(served):
+    router, upstream, client = served
+    upstream.inventory[HOST_B] = tags(("qwen3:14b", "14.8B", "qwen3"),
+                                      ("special:7b", "7B", "llama"))
+    client.post("/routing/refresh")
+    router.mark_server_down(HOST_B, "test")
+
+    response = chat(client, model="special:7b")
+    assert response.status_code == 200
+    assert response.headers["x-router-warning"] == "model-unavailable"
+    assert served_hosts(upstream)[-1] == HOST_A
+
+    # A name the router has never seen is routed without that warning.
+    response = chat(client, model="never-seen:1b")
+    assert response.status_code == 200
+    assert "x-router-warning" not in response.headers
+
+
+def test_chat_copy_on_a_down_host_is_not_called_embedding_only(served):
+    router, upstream, client = served
+    router.INVENTORY = dict(router.INVENTORY, models=router.INVENTORY["models"] + [
+        router.build_entry(HOST_A, {"name": "dual:1b"}, ["embedding"]),
+        router.build_entry(HOST_B, {"name": "dual:1b"}, ["completion"]),
+    ])
+    router.mark_server_down(HOST_B, "test")
+
+    response = chat(client, model="dual:1b")
+    assert response.status_code == 200          # not the embedding-only 400
+    assert response.headers["x-router-warning"] == "model-unavailable"

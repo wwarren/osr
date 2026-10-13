@@ -84,6 +84,10 @@ _DEFAULTS = {
         # load models on demand. true: only route to models already loaded
         # there (no multi-second JIT load on the request path).
         "lmstudio_loaded_only": "false",
+        # Size assumed for a Strata server's default model id "strata", which
+        # reports no parameter count (Qwen3.8-Flash-Next, 125B total). Other
+        # unsized Strata ids (Coder, aliases) stay unknown. Blank: no default.
+        "strata_default_params": "125B",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -220,6 +224,8 @@ DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
 CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
 LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
+STRATA_DEFAULT_PARAMS = _cfg.get("discovery", "strata_default_params").strip()
+STRATA_DEFAULT_ID = "strata"
 BANDS = {
     "fast": _band(_cfg, "fast_params"),
     "medium": _band(_cfg, "medium_params"),
@@ -247,29 +253,36 @@ TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 
 # --- server kinds -----------------------------------------------------------------
-# A server entry is a base URL. An LM Studio server is written with a scheme
-# prefix -- lmstudio+http://host:1234 -- so the one MODEL_SERVERS / BACKEND_*
-# list can mix both kinds and every consumer (router, monitor, manage tool,
-# LiteLLM config) knows how to talk to each entry.
+# A server entry is a base URL. LM Studio and Strata entries carry lmstudio+
+# or strata+ prefixes, so MODEL_SERVERS / BACKEND_* can mix all three APIs.
 LMSTUDIO_PREFIX = "lmstudio+"
+STRATA_PREFIX = "strata+"
 # Optional bearer token for LM Studio servers with authentication enabled
 # (LM Studio 0.4+ "Require authentication"). Lives in secrets.env.
 LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
+STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
 
 
 def server_kind(server: str) -> str:
-    return "lmstudio" if server.startswith(LMSTUDIO_PREFIX) else "ollama"
+    if server.startswith(LMSTUDIO_PREFIX):
+        return "lmstudio"
+    if server.startswith(STRATA_PREFIX):
+        return "strata"
+    return "ollama"
 
 
 def server_base(server: str) -> str:
     """The plain http(s) base URL of a server entry."""
-    return server[len(LMSTUDIO_PREFIX):] if server.startswith(LMSTUDIO_PREFIX) else server
+    kind = server_kind(server)
+    return server.split("+", 1)[1] if kind != "ollama" else server
 
 
 def backend_headers(server: str) -> dict:
     """Credentials the ROUTER adds for a backend (never the client's own)."""
-    if server_kind(server) == "lmstudio" and LMSTUDIO_API_TOKEN:
-        return {"Authorization": f"Bearer {LMSTUDIO_API_TOKEN}"}
+    kind = server_kind(server)
+    token = LMSTUDIO_API_TOKEN if kind == "lmstudio" else STRATA_API_KEY if kind == "strata" else ""
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     return {}
 
 CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
@@ -317,7 +330,7 @@ def _tier_env(tier: str) -> str:
 
 
 def _discovery_servers() -> list:
-    """Ollama base URLs to poll, in order of preference:
+    """Model server entries to poll, in order of preference:
       1. an explicit list in router.ini
       2. MODEL_SERVERS - every configured host, including any not assigned to a
          tier (those are absent from BACKEND_*, so relying on those alone would
@@ -526,9 +539,46 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
     return server, None, last_error or "no LM Studio model API answered"
 
 
+async def fetch_strata_models(client: httpx.AsyncClient, server: str) -> tuple:
+    """Strata exposes OpenAI model IDs and input modalities at /v1/models."""
+    try:
+        response = await client.get(f"{server_base(server)}/v1/models",
+                                    headers=backend_headers(server),
+                                    timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        models = payload["data"]
+        if not isinstance(models, list):
+            raise ValueError("data is not a list")
+        entries = []
+        for model in models:
+            if not isinstance(model, dict) or not model.get("id"):
+                continue
+            modalities = model.get("input_modalities") or []
+            caps = ["completion"] + (["vision"] if "image" in modalities else [])
+            state = model.get("status", model.get("state"))
+            if isinstance(state, dict):
+                state = state.get("value")
+            size = model.get("parameter_size") or model.get("params_string")
+            # Only Strata's default id gets the configured size: the Coder
+            # variant drops half the experts, so a blanket default would
+            # misplace it. Any other unsized id stays unknown (see band_distance).
+            if not size and str(model["id"]).lower() == STRATA_DEFAULT_ID:
+                size = STRATA_DEFAULT_PARAMS or None
+            raw = {"name": model["id"], "capabilities": caps,
+                   "details": {"parameter_size": size},
+                   "loaded": state == "loaded" if state is not None else None}
+            entries.append(build_entry(server, raw, caps))
+        return server, entries, None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        return server, None, f"{type(exc).__name__}: {exc}"
+
+
 async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
     if server_kind(server) == "lmstudio":
         return await fetch_lmstudio_models(client, server)
+    if server_kind(server) == "strata":
+        return await fetch_strata_models(client, server)
     try:
         response = await client.get(f"{server}/api/tags", timeout=DISCOVERY_TIMEOUT)
         response.raise_for_status()
@@ -547,7 +597,7 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
 
 
 async def refresh_inventory() -> dict:
-    """Poll every Ollama target for the models it is currently serving."""
+    """Poll every target for the models it is currently serving."""
     global INVENTORY
     if not SERVERS:
         INVENTORY = {"models": [], "servers": {}, "updated_at": time.time(),
@@ -834,7 +884,7 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
             continue  # embedding models cannot serve chat completions
         if not inv.get("servers", {}).get(entry["server"], {}).get("up", True):
             continue
-        if LMSTUDIO_LOADED_ONLY and entry.get("loaded") is False:
+        if LMSTUDIO_LOADED_ONLY and entry["kind"] == "lmstudio" and entry.get("loaded") is False:
             continue  # would trigger a just-in-time load on LM Studio
         scored.append((score_entry(entry, need), entry))
     if not scored:
@@ -908,6 +958,11 @@ def embedding_only_match(model_name: str):
     Such a request cannot be answered by the chat endpoint. Rerouting it to
     some other chat model would silently answer with a model the client did
     not ask for, so the caller rejects it instead.
+
+    Host state is deliberately ignored: when the chat copy of a name is only on
+    a host that is down, the model is not embedding-only, and the request takes
+    the same path as any explicitly named model that is currently unavailable
+    (routed by its content, flagged with X-Router-Warning: model-unavailable).
     """
     wanted = (model_name or "").strip().lower()
     if not wanted:
@@ -919,6 +974,18 @@ def embedding_only_match(model_name: str):
     if matches and all(e["is_embedding"] for e in matches):
         return matches[0]["name"]
     return None
+
+
+def known_chat_model(model_name: str) -> bool:
+    """Is this name (exact, or without its tag) a chat model on ANY host, up or
+    down? Distinguishes "named model temporarily unavailable" from a name the
+    router has never seen."""
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return False
+    return any(not e["is_embedding"]
+               and wanted in (e["name"].lower(), e["name"].lower().split(":", 1)[0])
+               for e in INVENTORY.get("models", []))
 
 
 # --- proxying -----------------------------------------------------------------
@@ -1022,7 +1089,7 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             background=BackgroundTask(close_upstream, upstream_response),
         )
     raise HTTPException(status_code=502,
-                        detail=f"No usable Ollama target. Last error: {last_error}")
+                        detail=f"No usable model target. Last error: {last_error}")
 
 
 @app.get("/healthz")
@@ -1109,6 +1176,13 @@ async def route_chat_completion(request: Request):
                     "completions. Send embedding requests to /v1/embeddings, or choose a chat "
                     "model (see /v1/models) or 'auto'.",
                     "embedding_model_not_chat")
+        warnings = []
+        if requested and not candidates and requested.lower() != "auto" \
+                and requested not in TIER_NAMES and known_chat_model(requested):
+            # Named, known, but every host serving it is down: answer by
+            # content, and say so rather than silently using another model.
+            log.warning("route: %s is on no reachable host; routing by content", requested)
+            warnings.append("model-unavailable")
         if not candidates:
             if requested in TIER_NAMES:
                 need = dict(need, **{"class": TIER_NAMES[requested]})
@@ -1121,7 +1195,9 @@ async def route_chat_completion(request: Request):
             if VISION_STRICT:
                 return _error(400, message, "no_vision_model")
             log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
-            extra["X-Router-Warning"] = "no-vision-model"
+            warnings.append("no-vision-model")
+        if warnings:
+            extra["X-Router-Warning"] = ", ".join(warnings)
         if candidates:
             return await _dispatch_direct(
                 candidates, body, _forward_headers(request, drop_auth=True),

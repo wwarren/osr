@@ -252,7 +252,7 @@ Each `(host, model)` pair is scored; highest wins.
 | **Vision** | `+vision_match` when an image request meets a vision model; `−vision_match` when it doesn't; small off-task penalty for a vision model on plain text |
 | **Extremes within class** | Large requests bias larger, fast requests bias smaller |
 | **Unknown size** | Scores `unknown_params` (0.3) — usable but never preferred |
-| **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt. Explicitly requesting an embedding-only model on the chat endpoint is a 400 (`embedding_model_not_chat`), never a silent substitute |
+| **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt. Explicitly requesting an embedding-only model on the chat endpoint is a 400 (`embedding_model_not_chat`), never a silent substitute. A named chat model whose hosts are all down is routed by content with `X-Router-Warning: model-unavailable` |
 | **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load across hosts serving the same model |
 
 Parameter counts come from `details.parameter_size`, falling back to parsing the

@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Run inside the dedicated Open Terminal LXC after /etc/open-terminal/api-key
+# has been pushed (provision-lxc.sh does both).
+#
+#   bash install-target.sh            install, or upgrade in place to
+#                                     OPEN_TERMINAL_VERSION / OPEN_TERMINAL_COMMIT
+#   bash install-target.sh --dry-run  print the plan; change nothing
+#
+# The upstream tag is checked against a pinned commit (tags can be moved), the
+# Python dependencies come from the hash-locked requirements.lock, and the
+# package itself is built offline from the verified checkout. Each commit gets
+# its own venv; /opt/open-terminal/venv points at the active one, so a failed
+# upgrade switches straight back to the previous venv.
+set -Eeuo pipefail
+
+OPEN_TERMINAL_URL=https://github.com/open-webui/open-terminal.git
+DEFAULT_VERSION=v0.14.0
+DEFAULT_COMMIT=b58442aa8599755525878f917b621e0145b0e8f7
+# Paths are overridable for tests only; open-terminal.service uses the defaults.
+OT_ETC=${OT_ETC:-/etc/open-terminal}
+OT_OPT=${OT_OPT:-/opt/open-terminal}
+OT_SRV=${OT_SRV:-/srv/open-terminal}
+UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
+SERVICE_USER=${SERVICE_USER:-open-terminal}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-60}
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+run() {
+    printf '+'; printf ' %q' "$@"; printf '\n'
+    if (( ! dry_run )); then "$@"; fi
+}
+usage() {
+    cat <<'USAGE'
+Usage: bash install-target.sh [--dry-run]
+Installs (or upgrades) Open Terminal from github.com/open-webui/open-terminal
+as the unprivileged open-terminal account and starts open-terminal.service.
+
+Environment:
+  OPEN_TERMINAL_VERSION=v0.14.0   upstream tag
+  OPEN_TERMINAL_COMMIT=<sha>      the commit that tag must resolve to (required
+                                  for any tag other than the default)
+  OPEN_TERMINAL_PORT=8000
+The tag's Python dependencies must match requirements.in; a release that
+changes them needs a regenerated requirements.lock (see README.md).
+USAGE
+}
+
+# Install helpers (sourced by test-install.sh) -------------------------------
+
+# deps_mismatch PYPROJECT REQUIREMENTS_IN: print the dependency lines that
+# differ between the checkout's pyproject.toml and requirements.in (the lock's
+# inputs). Platform-specific Windows dependencies and hatchling are ignored.
+deps_mismatch() {
+    python3 - "$1" "$2" <<'PY'
+import re
+import sys
+import tomllib
+
+def norm(spec):
+    spec = spec.split(";")[0].strip()
+    return re.sub(r"\s+", "", spec).lower()
+
+with open(sys.argv[1], "rb") as f:
+    project = tomllib.load(f)["project"]
+wanted = {norm(d) for d in project.get("dependencies", [])
+          if "win32" not in d}
+locked = set()
+with open(sys.argv[2], encoding="utf-8") as f:
+    for line in f:
+        line = line.split("#")[0].strip()
+        if line and norm(line) != "hatchling":
+            locked.add(norm(line))
+for spec in sorted(wanted - locked):
+    print(f"needed by the checkout, not in requirements.in: {spec}")
+for spec in sorted(locked - wanted):
+    print(f"in requirements.in, not needed by the checkout: {spec}")
+PY
+}
+
+# service_env KEY PORT: the root-only EnvironmentFile the unit loads.
+service_env() {
+    printf '# Written by install-target.sh; root-only. Do not add OPEN_TERMINAL_API_KEY_FILE.\n'
+    printf 'OPEN_TERMINAL_API_KEY=%s\n' "$1"
+    printf 'OPEN_TERMINAL_PORT=%s\n' "$2"
+}
+
+# healthy PORT: /health answers {"status":"ok"}.
+healthy() {
+    curl --fail --silent --max-time 2 "http://127.0.0.1:$1/health" 2>/dev/null |
+        grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'
+}
+# End install helpers. ----------------------------------------------------------
+
+wait_healthy() {
+    local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+    while (( SECONDS < deadline )); do
+        healthy "$PORT" && return 0
+        sleep 2
+    done
+    return 1
+}
+
+dry_run=0
+while (( $# )); do
+    case $1 in
+        --dry-run) dry_run=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+VERSION=${OPEN_TERMINAL_VERSION:-$DEFAULT_VERSION}
+COMMIT=${OPEN_TERMINAL_COMMIT:-}
+PORT=${OPEN_TERMINAL_PORT:-8000}
+[[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid OPEN_TERMINAL_VERSION.'
+if [[ -z $COMMIT ]]; then
+    [[ $VERSION == "$DEFAULT_VERSION" ]] ||
+        die "Set OPEN_TERMINAL_COMMIT to the reviewed commit of ${VERSION} (tags can be moved upstream)."
+    COMMIT=$DEFAULT_COMMIT
+fi
+[[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || die 'OPEN_TERMINAL_COMMIT must be a full 40-digit lowercase SHA-1.'
+[[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || die 'Invalid OPEN_TERMINAL_PORT.'
+[[ $HEALTH_TIMEOUT =~ ^[1-9][0-9]{0,4}$ ]] || die 'Invalid HEALTH_TIMEOUT.'
+for path_var in OT_ETC OT_OPT OT_SRV UNIT_DIR; do
+    [[ ${!path_var} =~ ^/[A-Za-z0-9._/-]+$ && ${!path_var} != *..* ]] || die "Invalid $path_var."
+done
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+for file in open-terminal.service requirements.in requirements.lock; do
+    [[ -r $source_dir/$file ]] || die "Missing $source_dir/$file (push it with install-target.sh)."
+done
+src=$OT_OPT/source
+venv=$OT_OPT/venv-$COMMIT
+
+if (( dry_run )); then
+    run apt-get update
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-venv
+    printf '+ create the %s account; workspace %s/workspace\n' "$SERVICE_USER" "$OT_SRV"
+    printf '+ %s/api-key -> root-only %s/service.env (OPEN_TERMINAL_API_KEY, OPEN_TERMINAL_PORT=%s)\n' "$OT_ETC" "$OT_ETC" "$PORT"
+    printf '+ git fetch --depth 1 %s refs/tags/%s; require commit %s\n' "$OPEN_TERMINAL_URL" "$VERSION" "$COMMIT"
+    printf '+ check the checkout'\''s dependencies against requirements.in\n'
+    printf '+ python3 -m venv %s; pip install --require-hashes -r requirements.lock; pip install --no-deps --no-build-isolation %s\n' "$venv" "$src"
+    printf '+ point %s/venv at %s; install %s/open-terminal.service\n' "$OT_OPT" "$venv" "$UNIT_DIR"
+    run systemctl daemon-reload
+    run systemctl enable open-terminal.service
+    run systemctl restart open-terminal.service
+    printf '+ wait for http://127.0.0.1:%s/health to report "ok" (up to %ss); on failure switch back to the previous venv\n' "$PORT" "$HEALTH_TIMEOUT"
+    exit 0
+fi
+
+[[ $EUID -eq 0 ]] || die 'Run as root inside the terminal CT.'
+[[ -s $OT_ETC/api-key ]] || die "Missing $OT_ETC/api-key."
+key=$(< "$OT_ETC/api-key")
+key=${key//[$'\r\n\t ']/}
+[[ $key =~ ^[A-Za-z0-9._~+/=-]{16,}$ ]] || die "$OT_ETC/api-key does not hold a usable key."
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-venv
+python3 -c 'import sys; assert sys.version_info >= (3, 11), "Open Terminal needs Python 3.11+"'
+
+id "$SERVICE_USER" >/dev/null 2>&1 ||
+    useradd --system --home-dir "$OT_SRV" --create-home --shell /bin/bash "$SERVICE_USER"
+install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$OT_SRV" "$OT_SRV/workspace"
+install -d -m 0755 "$OT_OPT"
+# The service reads the key through systemd (EnvironmentFile, read as root), so
+# neither file needs to be readable by the account the shell runs as.
+chown root:root "$OT_ETC" "$OT_ETC/api-key"
+chmod 0700 "$OT_ETC"
+chmod 0600 "$OT_ETC/api-key"
+(umask 077 && service_env "$key" "$PORT" > "$OT_ETC/service.env.new")
+mv -f "$OT_ETC/service.env.new" "$OT_ETC/service.env"
+
+# Source: the tag, refetched (+ forces a moved tag to show up), then checked
+# against the pinned commit.
+if [[ ! -d $src/.git ]]; then
+    git init -q "$src"
+    git -C "$src" remote add origin "$OPEN_TERMINAL_URL"
+fi
+git -C "$src" fetch -q --depth 1 origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+git -C "$src" checkout -q --detach "refs/tags/${VERSION}"
+actual=$(git -C "$src" rev-parse HEAD)
+[[ $actual == "$COMMIT" ]] ||
+    die "Tag ${VERSION} is commit ${actual}, not the reviewed ${COMMIT}. Review the change and set OPEN_TERMINAL_COMMIT if it is intended."
+mismatch=$(deps_mismatch "$src/pyproject.toml" "$source_dir/requirements.in")
+[[ -z $mismatch ]] ||
+    die "Open Terminal ${VERSION} needs different Python dependencies than requirements.lock was built for:"$'\n'"$mismatch"$'\n'"Update requirements.in and regenerate requirements.lock (README.md, \"Updating the pin\")."
+
+# A fresh venv per commit; the venv/bin scripts carry its absolute path, so the
+# venv is never moved, only the venv symlink is switched.
+if [[ ! -x $venv/bin/open-terminal ]]; then
+    rm -rf -- "$venv"
+    (umask 022
+     python3 -m venv "$venv"
+     "$venv/bin/python" -m pip install --no-cache-dir --require-hashes -r "$source_dir/requirements.lock"
+     "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src")
+fi
+previous=''
+if [[ -L $OT_OPT/venv ]]; then
+    previous=$(readlink "$OT_OPT/venv")
+elif [[ -d $OT_OPT/venv ]]; then
+    # An install made before per-commit venvs: keep it as the rollback target.
+    mv "$OT_OPT/venv" "$OT_OPT/venv-legacy"
+    previous=$OT_OPT/venv-legacy
+fi
+ln -sfn "$venv" "$OT_OPT/venv"
+
+install -m 0644 "$source_dir/open-terminal.service" "$UNIT_DIR/open-terminal.service"
+systemctl daemon-reload
+systemctl enable open-terminal.service
+systemctl restart open-terminal.service
+if wait_healthy; then
+    # Keep the active venv and the one before it; remove older ones.
+    for old in "$OT_OPT"/venv-*; do
+        [[ -d $old && $old != "$venv" && $old != "$previous" ]] && rm -rf -- "$old"
+    done
+    printf 'Open Terminal %s (%s) is healthy on port %s.\n' "$VERSION" "$COMMIT" "$PORT"
+    exit 0
+fi
+
+systemctl status --no-pager open-terminal.service >&2 || true
+if [[ -n $previous && $previous != "$venv" && -x $previous/bin/open-terminal ]]; then
+    note "Open Terminal ${VERSION} did not become healthy; switching back to ${previous}."
+    ln -sfn "$previous" "$OT_OPT/venv"
+    systemctl restart open-terminal.service
+    wait_healthy && die "Upgrade failed; the previous Open Terminal is running again."
+    die "Upgrade failed and the previous Open Terminal did not come back either; see journalctl -u open-terminal."
+fi
+die "Open Terminal did not become healthy within ${HEALTH_TIMEOUT} seconds; see journalctl -u open-terminal."

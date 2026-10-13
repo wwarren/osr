@@ -58,7 +58,7 @@ def find_blocks(lines):
 
 
 def owned_files():
-    lines = INSTALLER.read_text().splitlines(keepends=True)
+    lines = INSTALLER.read_text(encoding="utf-8").splitlines(keepends=True)
     return [p for p, _, _ in find_blocks(lines) if p not in NOT_SYNCED]
 
 
@@ -75,7 +75,7 @@ def main():
         print("\n".join(owned_files()))
         return 0
 
-    text = INSTALLER.read_text()
+    text = INSTALLER.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
     drift, out, cursor = [], [], 0
     for path, start, end in find_blocks(lines):
@@ -85,7 +85,7 @@ def main():
         if not source.is_file():
             drift.append(f"{path}: embedded in the installer but missing from the repo")
             continue
-        body = source.read_text()
+        body = source.read_text(encoding="utf-8")
         if not body.endswith("\n"):
             body += "\n"
         tag = HEREDOC.match(lines[start - 1]).group("tag")
@@ -106,8 +106,11 @@ def main():
 
     if args.write:
         new = "".join(out)
-        if new != text:
-            INSTALLER.write_text(new)
+        # write_text() translates LF to CRLF on Windows; the installer is a
+        # Linux shell script and its embedded files must remain byte-for-byte
+        # identical to the LF sources.
+        if INSTALLER.read_bytes() != new.encode():
+            INSTALLER.write_bytes(new.encode())
         for line in drift:
             print("synced   " + line.split(":")[0])
         return 0

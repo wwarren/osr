@@ -112,22 +112,28 @@ assert_fail "empty"         valid_addr ""
 assert_ok   "lmstudio://host"        valid_addr lmstudio://10.0.0.9
 assert_ok   "lmstudio+http url"      valid_addr lmstudio+http://h:1234
 assert_fail "lmstudio:// bad port"   valid_addr lmstudio://h:0
+assert_ok   "strata://host"          valid_addr strata://10.0.0.8
+assert_ok   "strata+http url"        valid_addr strata+http://h:8080
 
 describe server_kind
 assert_eq "ollama"   "ollama"   "$(server_kind http://h:11434)"
 assert_eq "lmstudio" "lmstudio" "$(server_kind lmstudio+http://h:1234)"
+assert_eq "strata"   "strata"   "$(server_kind strata+http://h:8080)"
 
 describe server_base
 assert_eq "strips the prefix" "http://h:1234" "$(server_base lmstudio+http://h:1234)"
 assert_eq "ollama unchanged"  "http://h:11434" "$(server_base http://h:11434)"
+assert_eq "strata prefix"     "http://h:8080"  "$(server_base strata+http://h:8080)"
 
 describe litellm_provider
 assert_eq "ollama"   "ollama"    "$(litellm_provider http://h:11434)"
 assert_eq "lmstudio" "lm_studio" "$(litellm_provider lmstudio+http://h:1234)"
+assert_eq "strata uses OpenAI" "openai" "$(litellm_provider strata+http://h:8080)"
 
 describe litellm_api_base
 assert_eq "ollama base as-is"      "http://h:11434"   "$(litellm_api_base http://h:11434)"
 assert_eq "lmstudio OpenAI base"   "http://h:1234/v1" "$(litellm_api_base lmstudio+http://h:1234)"
+assert_eq "strata OpenAI base"     "http://h:8080/v1" "$(litellm_api_base strata+http://h:8080)"
 
 describe normalize_addr
 assert_eq "adds scheme+port"   "http://10.0.0.5:11434" "$(normalize_addr 10.0.0.5)"
@@ -139,6 +145,12 @@ assert_eq "matches the installer normalisation" \
 assert_eq "lmstudio:// gets LM Studio's port" "lmstudio+http://10.0.0.9:1234" "$(normalize_addr lmstudio://10.0.0.9)"
 assert_eq "lmstudio+http passes through"      "lmstudio+http://h:4321" "$(normalize_addr lmstudio+http://h:4321/)"
 assert_eq "a forced kind applies"             "lmstudio+http://h:1234" "$(normalize_addr h lmstudio)"
+assert_eq "strata:// default port"            "strata+http://h:8080" "$(normalize_addr strata://h)"
+assert_eq "strata:// keeps port 11434"       "strata+http://h:11434" "$(normalize_addr strata://h:11434)"
+assert_eq "strata+http passes through"        "strata+http://h:8888" "$(normalize_addr strata+http://h:8888/)"
+STRATA_PORT=11434
+assert_eq "Strata default port can be 11434" "strata+http://h:11434" "$(normalize_addr strata://h)"
+unset STRATA_PORT
 SERVER_TYPE=lmstudio
 assert_eq "--type lmstudio applies"           "lmstudio+http://h:5555" "$(normalize_addr h:5555)"
 SERVER_TYPE=auto
@@ -346,6 +358,7 @@ case "$*" in
 esac
 EOF
 assert_eq "then to /v1/models" "plain" "$(server_models lmstudio+http://h:1234)"
+assert_eq "Strata reads /v1/models" "plain" "$(server_models strata+http://h:8080)"
 mock_command curl 7
 assert_status "unreachable LM Studio -> 1" 1 server_models lmstudio+http://h:1234
 
@@ -360,6 +373,12 @@ mock_reset_log
 server_curl lmstudio+http://h:1234 /v1/models >/dev/null
 assert_contains "token via a header file" "-H @" "$(mock_calls)"
 assert_not_contains "never on the command line" "lms-tok-123" "$(mock_calls)"
+env_set STRATA_API_KEY "strata-tok-123"
+mock_reset_log
+server_curl strata+http://h:8080 /v1/models >/dev/null
+assert_contains "Strata uses its own key" "http://h:8080/v1/models" "$(mock_calls)"
+assert_contains "Strata key in header file" "-H @" "$(mock_calls)"
+assert_not_contains "Strata key absent from argv" "strata-tok-123" "$(mock_calls)"
 mock_reset_log
 server_curl http://h:11434 /api/tags >/dev/null
 assert_not_contains "never sent to Ollama" "-H" "$(mock_calls)"
@@ -378,6 +397,55 @@ mock_script curl <<'EOF'
 case "$*" in *"/api/tags"*) exit 22;; *"/api/v1/models"*) printf 401;; *) printf 404;; esac
 EOF
 assert_eq "a 401 still identifies LM Studio" "lmstudio" "$(detect_server_kind http://h:1234)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok","loaded":true,"service":"strata","api_key":true}';;
+  *"/v1/models"*) exit 22;;
+  *) printf 401;;
+esac
+EOF
+mock_reset_log
+assert_eq "a keyed Strata on 11434 identifies through public /health" "strata" "$(detect_server_kind http://h:11434)"
+assert_not_contains "health identification sends no key" "-H @" "$(mock_calls)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/v1/status"*) printf '{"loaded":true,"auto_load":true}\n200';;
+  *"/api/v1/models"*|*"/api/v0/models"*) printf 404;;
+  *) exit 22;;
+esac
+EOF
+assert_eq "Strata answers /v1/status" "strata" "$(detect_server_kind http://h:8080)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/v1/status"*) printf 'not found\n404';;
+  *"/v1/models"*) echo '{"object":"list","data":[{"id":"strata","object":"model"}]}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "Strata's model id identifies it" "strata" "$(detect_server_kind http://h:8080)"
+# A keyed older Strata without a distinguishing public /health response still
+# cannot be identified safely, so such a host has to be named.
+reset_repo
+env_set STRATA_API_KEY "strata-tok-123"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/v1/status"*) printf 'unauthorized\n401';;
+  *"/api/v1/models"*|*"/api/v0/models"*) printf 401;;
+  *) exit 22;;
+esac
+EOF
+mock_reset_log
+assert_status "keyed host off LM Studio's port is not guessed" 1 detect_server_kind http://h:11434
+assert_not_contains "detection never sends a key" "-H @" "$(mock_calls)"
+out="$(detect_server_kind http://h:11434 2>&1 >/dev/null || true)"
+assert_contains "says how to add it" "strata://h:11434" "$out"
+assert_status "a bare keyed address is not resolved" 1 resolve_server h:11434
+assert_eq "an explicit strata:// address needs no probe" "strata+http://h:11434" "$(resolve_server strata://h:11434)"
+assert_eq "a keyed host on LM Studio's port is LM Studio" "lmstudio" "$(detect_server_kind http://h:1234)"
+assert_not_contains "still no key sent" "-H @" "$(mock_calls)"
+reset_repo
 mock_command curl 7 "000"
 assert_status "nothing answers -> 1" 1 detect_server_kind http://h:1
 
@@ -392,19 +460,32 @@ esac
 EOF
 assert_eq "a bare host found on LM Studio's port" "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
 assert_eq "host:port detected as LM Studio"       "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9:1234)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/v1/status"*) printf '{"loaded":true,"auto_load":true}\n200';;
+  *"/api/v1/models"*|*"/api/v0/models"*) printf 404;;
+  *) exit 22;;
+esac
+EOF
+assert_eq "Strata at Ollama's port auto-detected" "strata+http://10.0.0.9:11434" "$(resolve_server 10.0.0.9:11434)"
+assert_eq "bare Strata host at Ollama's port detected" "strata+http://10.0.0.9:11434" "$(resolve_server 10.0.0.9)"
 mock_command curl 7 "000"
 assert_status "nothing answers -> 1" 1 resolve_server 10.0.0.9
 NO_PROBE=true
 assert_eq "--no-probe assumes Ollama"             "http://10.0.0.9:11434" "$(resolve_server 10.0.0.9)"
 assert_eq "an explicit lmstudio:// needs no probe" "lmstudio+http://10.0.0.9:1234" "$(resolve_server lmstudio://10.0.0.9)"
+assert_eq "explicit Strata on port 11434 needs no probe" "strata+http://10.0.0.9:11434" "$(resolve_server strata://10.0.0.9:11434)"
 SERVER_TYPE=lmstudio
 assert_eq "--type lmstudio needs no probe"        "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
+SERVER_TYPE=strata
+assert_eq "--type strata needs no probe"          "strata+http://10.0.0.9:8080" "$(resolve_server 10.0.0.9)"
 SERVER_TYPE=auto
 
 describe configured_entry
 reset_repo
-env_set MODEL_SERVERS "http://10.0.0.51:11434,lmstudio+http://10.0.0.9:1234"
+env_set MODEL_SERVERS "http://10.0.0.51:11434,lmstudio+http://10.0.0.9:1234,strata+http://10.0.0.8:8080"
 assert_eq "finds the LM Studio entry without the prefix" "lmstudio+http://10.0.0.9:1234" "$(configured_entry 10.0.0.9:1234)"
+assert_eq "finds the Strata entry without the prefix"    "strata+http://10.0.0.8:8080"  "$(configured_entry 10.0.0.8:8080)"
 assert_eq "finds an Ollama entry"                         "http://10.0.0.51:11434"       "$(configured_entry 10.0.0.51)"
 assert_eq "unknown -> normalized form"                    "http://10.0.0.99:11434"       "$(configured_entry 10.0.0.99)"
 reset_repo
@@ -487,6 +568,21 @@ assert_fail "the token itself never enters the YAML" grep -q "tok$" "$LITELLM_YA
 assert_ok "and the result validates" validate_config
 reset_repo
 
+env_set MODEL_SERVERS "strata+http://10.0.0.8:11434"
+env_set BACKEND_XLARGE "strata+http://10.0.0.8:11434"
+TIER_MODEL_OVERRIDE[xlarge]="strata"
+regenerate_litellm >/dev/null 2>&1
+TIER_MODEL_OVERRIDE=()
+assert_file_contains "Strata OpenAI provider" "model: openai/strata" "$LITELLM_YAML"
+assert_file_contains "Strata /v1 base on port 11434" "api_base: http://10.0.0.8:11434/v1" "$LITELLM_YAML"
+assert_file_contains "Strata no-key placeholder" "api_key: none" "$LITELLM_YAML"
+assert_eq "reads Strata pair tag" "strata" "$(current_pair_tag xlarge strata+http://10.0.0.8:11434)"
+env_set STRATA_API_KEY "strata-key"
+regenerate_litellm >/dev/null 2>&1
+assert_file_contains "Strata key reference" "api_key: os.environ/STRATA_API_KEY" "$LITELLM_YAML"
+assert_fail "Strata key never enters YAML" grep -q 'strata-key' "$LITELLM_YAML"
+reset_repo
+
 describe litellm_fallbacks
 out="$(printf 'fast a@1\nmedium b@2\nlarge b@2\nxlarge c@3\n' | litellm_fallbacks)"
 assert_contains "nearest tier first"             '- fast: ["medium", "large", "xlarge"]' "$out"
@@ -533,6 +629,18 @@ EOF
 out="$(cmd_add 10.0.0.9 2>&1)"
 assert_contains "an LM Studio server is detected" "LM Studio server" "$out"
 assert_ok "and stored with its prefix" bash -c "grep -q 'lmstudio+http://10.0.0.9:1234' '$ENV_FILE'"
+reset_repo
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/v1/status"*) echo '{"loaded":true,"auto_load":true}';;
+  *"/v1/models"*) echo '{"data":[{"id":"strata"}]}';;
+  *) exit 22;;
+esac
+EOF
+out="$(cmd_add 10.0.0.9:11434 2>&1)"
+assert_contains "Strata on port 11434 is detected" "Strata server" "$out"
+assert_ok "and stored with its prefix" bash -c "grep -q 'strata+http://10.0.0.9:11434' '$ENV_FILE'"
 mock_command curl 7 "000"
 assert_fail "an unreachable address is refused" cmd_add 10.0.0.77
 NO_PROBE=true
@@ -760,7 +868,56 @@ rm -f "$LITELLM_LOCK"; : > "${WORK}/litellm-pip.log"
 out="$(litellm_install 2>&1)"
 assert_contains "warns without a lock" "without hash checking" "$out"
 assert_file_contains "falls back to requirements.txt" "-r ${LITELLM_REQ}" "${WORK}/litellm-pip.log"
+# A restrictive umask in the operator's shell must not leave the venv unreadable
+# for the service account (it failed with status=203/EXEC, Permission denied).
+make_fake_litellm_venv 1.70.0
+chmod -R go-rwx "$LITELLM_DIR"
+( umask 077; litellm_install >/dev/null 2>&1 )
+assert_eq "venv readable by the service account after install" "755" "$(stat -c %a "${LITELLM_DIR}/venv/bin")"
+assert_eq "entry point executable by others" "755" "$(stat -c %a "${LITELLM_DIR}/venv/bin/python")"
+assert_eq "its parent is traversable" "1" "$(( $(stat -c %a "$LITELLM_DIR" | cut -c3) & 1 ))"
 rm -rf "$LITELLM_DIR"; reset_repo
+
+describe venv_make_readable
+mkdir -p "${WORK}/v/venv/bin" "${WORK}/v/secret"
+printf 'x\n' > "${WORK}/v/venv/bin/tool"; chmod 0700 "${WORK}/v/venv/bin/tool"
+printf 'x\n' > "${WORK}/v/venv/data"; chmod 0600 "${WORK}/v/venv/data"
+chmod 0700 "${WORK}/v" "${WORK}/v/venv" "${WORK}/v/venv/bin" "${WORK}/v/secret"
+venv_make_readable "${WORK}/v/venv"
+assert_eq "executables become 755" "755" "$(stat -c %a "${WORK}/v/venv/bin/tool")"
+assert_eq "plain files become 644" "644" "$(stat -c %a "${WORK}/v/venv/data")"
+assert_eq "directories become 755" "755" "$(stat -c %a "${WORK}/v/venv/bin")"
+assert_eq "the parent is only made traversable" "711" "$(stat -c %a "${WORK}/v")"
+assert_eq "siblings are not touched" "700" "$(stat -c %a "${WORK}/v/secret")"
+chmod 0666 "${WORK}/v/venv/data"; venv_make_readable "${WORK}/v/venv"
+assert_eq "group/other write is removed" "644" "$(stat -c %a "${WORK}/v/venv/data")"
+assert_ok "a missing venv is a no-op" venv_make_readable "${WORK}/nope"
+rm -rf "${WORK}/v"
+
+describe repair_venv_access
+# runuser stub: the service account can run the interpreter only when it and
+# its directory are world-executable (what the real kernel check comes down to).
+mock_script runuser <<'RUNEOF'
+py="$4"
+[[ $(( $(stat -c %a "$py") % 10 & 1 )) == 1 && $(( $(stat -c %a "$(dirname "$py")") % 10 & 1 )) == 1 ]]
+RUNEOF
+SERVICE_USER=root
+make_fake_litellm_venv 1.75.5.post1
+chmod -R go-rwx "${LITELLM_DIR}/venv"
+out="$(repair_venv_access 2>&1)"; rc=$?
+assert_eq "repairs an unreadable venv" "0" "$rc"
+assert_contains "and says which" "${LITELLM_DIR}/venv is not usable" "$out"
+assert_eq "the interpreter is executable again" "755" "$(stat -c %a "${LITELLM_DIR}/venv/bin/python")"
+out="$(repair_venv_access 2>&1)"
+assert_eq "a healthy venv is left alone" "" "$out"
+mock_command runuser 1
+out="$(repair_venv_access 2>&1)"; rc=$?
+assert_eq "reports a venv it cannot repair" "1" "$rc"
+assert_contains "with a hint" "parent directories" "$out"
+SERVICE_USER=no-such-user-xyz
+assert_ok "no service account (not a router container): nothing to do" repair_venv_access
+SERVICE_USER=ollama-router
+rm -f "${MOCK_BIN}/runuser"; rm -rf "$LITELLM_DIR"; reset_repo
 
 describe openwebui_install
 reset_repo
@@ -1064,6 +1221,16 @@ cmd_set_lmstudio_token --off >/dev/null 2>&1
 assert_eq "--off clears it" "" "$(env_get LMSTUDIO_API_TOKEN)"
 reset_repo
 
+describe cmd_set_strata_token
+reset_repo
+cmd_set_strata_token "strata-abc.123" >/dev/null 2>&1
+assert_eq "stores the key" "strata-abc.123" "$(env_get STRATA_API_KEY)"
+assert_fail "keeps it out of the repo" grep -q STRATA_API_KEY "$ENV_FILE"
+assert_fail "rejects odd characters" cmd_set_strata_token 'a b;c'
+cmd_set_strata_token --off >/dev/null 2>&1
+assert_eq "--off clears it" "" "$(env_get STRATA_API_KEY)"
+reset_repo
+
 describe cmd_commit
 reset_repo
 mock_command git 0
@@ -1205,7 +1372,7 @@ assert_ok "returns immediately when the config is local" ensure_config_or_forwar
 
 describe command_writes
 for c in add remove set-tier set-model set-server-model set-keepalive apply commit \
-         set-token set-api-key set-lmstudio-token set-webhook set-webui-version; do
+         set-token set-api-key set-lmstudio-token set-strata-token set-webhook set-webui-version; do
   assert_ok "${c} takes the lock" command_writes "$c"
 done
 for c in list status models discover test-alert clear-lock; do

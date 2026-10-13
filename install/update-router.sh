@@ -307,9 +307,10 @@ PY
     "${ROUTER_VENV}/bin/pip" freeze > "$freeze"
     "${ROUTER_VENV}/bin/pip" list --format=json > "$venv_packages"
     echo "Router/monitor requirements changed; updating ${ROUTER_VENV}..."
-    if ! "${ROUTER_VENV}/bin/pip" install -q --no-cache-dir \
+    # umask 022: the router runs as ollama-router from this root-owned venv.
+    if ! ( umask 022; "${ROUTER_VENV}/bin/pip" install -q --no-cache-dir \
          -r "$REPO_DIR/services/ollama-router/requirements.txt" \
-         -r "$REPO_DIR/services/ollama-monitor/requirements.txt"; then
+         -r "$REPO_DIR/services/ollama-monitor/requirements.txt" ); then
       undo
       die 'installing the new router requirements failed; nothing was applied.'
     fi

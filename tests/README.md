@@ -20,23 +20,26 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **736 assertions in the two main suites, 156/156 functions covered.**
+Current state: **753 assertions in the two main suites, 158/158 functions covered.**
 
 | Suite | Script under test | Functions | Assertions |
 |---|---|---|---|
 | `installer` | `ollama-smart-router-install.sh` | 63 | 296 |
-| `manage` | `install/manage-model-servers.sh` | 93 | 440 |
+| `manage` | `install/manage-model-servers.sh` | 95 | 457 |
 
 `run-tests.sh` also runs these suites, which have no per-function coverage:
 
 | Suite | What it checks |
 |---|---|
-| `repo` | installer heredocs match the repo files (`tools/sync-embedded.py --check`), the installer-owned code list, no CRLF files, no secrets in `env/*.env`, every unit hardened, every `targets/*` has the standard scripts and no nested `.git`, the Ollama drop-in is hardened, the AirLLM hash lock, a single management tool, LiteLLM's own venv, `[proxy]` extra and hash lock |
+| `repo` | installer heredocs match the repo files (`tools/sync-embedded.py --check`), the installer-owned code list, no CRLF, Windows-1252 double-encoded or invalid UTF-8 text (tracked files via `git ls-files`, or a tree walk outside a checkout; a scan that cannot run fails), no secrets in `env/*.env`, every unit hardened, every `targets/*` has the standard scripts and no nested `.git`, the Ollama drop-in is hardened, the AirLLM hash lock, a single management tool, LiteLLM's own venv, `[proxy]` extra and hash lock |
 | `update` | `tests/test-update.sh`: `install/update-router.sh` against a temporary config repo — owned-file list parsed as text, CRLF/syntax refusals, dry run, tunables and env kept, venv refresh, undo on a failed apply or pip install (end-to-end cases need root) |
+| `remote-update` | `tests/test-remote-update.sh`: update wrapper with mocked `pct` and container commands — location and CT prompts, arbitrary working directory, installed unit and runtime scan, host staging, container direct update, option forwarding, failure propagation, cleanup, root check, CRLF refusal before any CT is touched, root-owned archive, and container mode skipping its own clone (or refusing to run from the deployed config repo) |
 | `nvidia` | `tests/test-nvidia.sh`: driver version parsing, host/LXC match check, headers package, verified `.part` download, idempotent re-runs |
 | `llamacpp-*` | each `targets/llamacpp/test-*.sh`, including `test-upgrade.sh` (end-to-end `--upgrade` with rollback, needs root) |
 | `bridge` | `targets/llamacpp/test_bridge.py` with pytest (skipped when pytest/fastapi/httpx are missing) |
 | `ollama-*` | `targets/ollama/test-install.sh` (adopting a community-script CT, re-runs, `--upgrade` with checksum checks and rollback; end-to-end cases need root) and `test-provision.sh` (dry-run plans for the community script and presets) |
+| `strata-*` | `targets/strata/test-install.sh` (`setup.sh --help` parsing against the documented and a minimal option set, launcher selection and its fallback, fresh install as the `strata` account, unchanged/changed/stopped reruns, a failed fetch that leaves the service running, pinned `--upgrade`, rollback without network, refusals; end-to-end cases need root) and `test-provision.sh` (dry-run plans, family defaults, device group, validation, unit hardening). `targets/strata/test-pinned-run-script.py` needs network and runs as the separate `strata-upstream` CI job |
+| `open-terminal-*` | `targets/open-terminal/test-install.sh` (dependency-drift and env-file helpers, the unit's key/CORS settings, fresh install with a hash-locked venv and root-only key files, moved tag, dependency drift, unpinned version, upgrade, rollback to the previous venv, migration from the earlier layout; end-to-end cases need root), `test-provision.sh` (router CT ID vs. SSH address parsing, route-source parsing, SSH command quoting round trip, `pct` and `ssh` dry-run plans, `--integrate-only`, validation) and `test-integration.py` (stdlib unittest: mock Open WebUI and terminal; other connections and grants preserved, failed verify, wrong terminal key, malformed responses) |
 | `airllm-*` | `targets/airllm/test-install.sh` (helpers, fresh install, legacy migration, `--upgrade` with rollback; end-to-end cases need root) and `test-provision.sh` (dry-run plans) |
 | `airllm` | `targets/airllm/test_server.py` with pytest: packet shapes, readiness gating, context-window fitting, cancellation, load-failure exit (airllm/torch are stubbed; runs under `BRIDGE_PYTHON`) |
 | `router` | `tests/test_router.py`: keyword matching, classification scope, failover, header hygiene, vision handling and capability probing, API key, LM Studio discovery (v1/v0/OpenAI) and dispatch (pytest) |

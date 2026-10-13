@@ -6,6 +6,8 @@ routing, load balancing, a chat UI, and health alerting. Provisioned by
 
 ## What gets deployed
 
+For a separate terminal workspace in Proxmox, see [Open Terminal LXC](targets/open-terminal/README.md). Its installer adds an admin-only Open Terminal connection to this router's Open WebUI, at install time or any time later. The router can be a CT on the same Proxmox node, or any LXC or VM that root can reach over SSH.
+
 An unprivileged Debian 13 container running four systemd services, all as the
 hardened `ollama-router` user:
 
@@ -53,6 +55,10 @@ request is then scored against that live inventory rather than a static map:
   prompt is worded. Explicitly naming an embedding-only model on
   `/v1/chat/completions` returns **400** with code `embedding_model_not_chat`
   instead of silently answering with a different model.
+- **Named models on down hosts** — when a client names a known model and
+  every host serving it is down, the request is routed by its content and
+  flagged with `X-Router-Warning: model-unavailable`, so the substitution is
+  visible.
 - **Load spreading** — candidates within `tie_epsilon` of the best are rotated,
   so the same model on several hosts shares traffic.
 - **Fail-forward** — the ranked candidate list is retried in order on connection
@@ -115,7 +121,7 @@ The installer is driven by environment variables (all have defaults). Key ones:
 - `TIER_FAST_SERVERS` / `TIER_MEDIUM_SERVERS` / `TIER_LARGE_SERVERS` / `TIER_XLARGE_SERVERS` (e.g. `1,3`)
 - `MODEL_FAST` / `MODEL_MEDIUM` / `MODEL_LARGE` / `MODEL_XLARGE` — model tag per tier
 - `NONINTERACTIVE` (false) — take every default and skip all prompts
-- `GITEA_SERVER_URL` (`https://git.example.net`), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
+- `GITEA_SERVER_URL` (no default: prompted; unset in an unattended run means a local, non-version-controlled config), `GITEA_ADMIN_USER`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false)
 - `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`)
 - `FIREWALL`, `API_ALLOW_CIDR` — if the CT firewall is on, set the allow-CIDR or ports 8000/8080 may be dropped
 - `OPENWEBUI_PORT` (8080)
@@ -603,9 +609,9 @@ later sections are kept.
 
 ## Inference targets
 
-Besides existing Ollama and LM Studio hosts, the router can use three kinds of
-inference targets built from this repository, each in its own CT and each
-speaking the Ollama API on TCP 11434:
+Besides existing Ollama and LM Studio hosts, the router can use inference
+targets built from this repository. Each runs in its own CT. The following
+targets speak the Ollama API on TCP 11434:
 
 - `targets/ollama/`: a plain Ollama server. The CT and Ollama come from the
   Proxmox community script (`ct/ollama.sh`); `install-target.sh` then runs it
@@ -614,9 +620,12 @@ speaking the Ollama API on TCP 11434:
 - `targets/airllm/`: AirLLM, which streams a model far larger than RAM or VRAM
   from disk one layer at a time. Slow (seconds to minutes per token); give it
   its own tier.
+- `targets/strata/`: [Strata](targets/strata/README.md), installed from its
+  official GitHub repository. It speaks the OpenAI API on TCP 8080 by default,
+  with a configurable port including 11434. Register it as a Strata target.
 
-Each has `provision-lxc.sh` for the PVE host, `install-target.sh` (with
-`--upgrade`) for inside the CT, and a README with the details.
+Each has `provision-lxc.sh` for the PVE host, `install-target.sh` for inside
+the CT, and a README with the details.
 
 ## Continuous integration
 
@@ -630,19 +639,36 @@ repository and register an `act_runner` to use it.
 ## Updating the router components
 
 To update a running router container to newer code (router, monitor, units,
-requirements, management tools) without re-running the installer, copy the
-updated repository into the container and run `install/update-router.sh`
-there. From the PVE host:
+requirements, management tools) without re-running the installer, run the
+wrapper as root from a clone on the Proxmox host or inside the router container.
+It finds the clone from its own path, so your working directory does not matter.
+It prompts you to choose the location. On the host, it lists running CTs and
+prompts for the router CT ID; set `CT_ID` to skip that prompt:
 
 ```bash
-tar -C ~/osr --exclude=.git -czf - . |
-  pct exec <CT> -- sh -c 'rm -rf /root/osr-src && mkdir /root/osr-src && tar -C /root/osr-src -xzf -'
-pct exec <CT> -- bash /root/osr-src/install/update-router.sh --dry-run --diff   # review
-pct exec <CT> -- bash /root/osr-src/install/update-router.sh
+bash /path/to/clone/tools/update-router-services.sh --dry-run --diff
+bash /path/to/clone/tools/update-router-services.sh
 ```
 
-It commits the changed component files into `/app/config-repo`, reinstalls the
-router venv if its requirements changed, applies with
+When running inside the container, use a separate clone from the deployed
+config repository (normally `/app/config-repo`):
+
+```bash
+bash /path/to/separate-clone/tools/update-router-services.sh --container --dry-run --diff
+bash /path/to/separate-clone/tools/update-router-services.sh --container
+```
+
+Use `--host` to skip the location prompt on the Proxmox host. The wrapper
+inspects the installed systemd units, scans the runtime files, and locates the
+config repository. It refuses a missing or nonstandard service installation.
+Host mode stages only the installer-owned component files in the CT and removes
+the staging directory afterward. Container mode uses the separate clone
+directly. Both modes run `install/update-router.sh` inside the container; it
+copies changed files to their installed locations and restarts affected services.
+It accepts `--with-tunables`, `--no-apply`, and `--no-push` as well as the review
+options shown above. The in-container updater commits the changed component
+files into `/app/config-repo`, reinstalls the router venv if its requirements
+changed, applies with
 `manage-model-servers apply` (health checks and rollback), then pushes to
 Gitea. Your servers, tiers, `env/*.env`, `litellm_config.yaml` and secrets are
 never touched; `router.ini` / `monitor.ini` are replaced only with
@@ -726,3 +752,54 @@ manage-model-servers set-lmstudio-token               # only if LM Studio requir
 Model names differ between the two (`qwen3:14b` vs `qwen/qwen3-14b`). When
 an LM Studio server joins a tier whose model it lacks, `add` says so; pick
 one of its models with `set-server-model`.
+
+## Strata servers
+
+[Strata](https://github.com/Niko1221/Strata) exposes an OpenAI-compatible API
+on port 8080 by default. It can also run on port 11434 or another configured
+port. Store it as `strata+http://host:port` in `MODEL_SERVERS` and `BACKEND_*`;
+the `strata+` prefix selects Strata's API regardless of the port. For the
+initial installer, enter `strata://10.0.0.8:11434` as a model server (or set
+`MODEL_SERVER_1` to that value). Its server must listen on an address
+reachable from the router container; Strata's default `127.0.0.1` binding
+only accepts requests from its own machine.
+
+```bash
+manage-model-servers add strata://10.0.0.8 --tier xlarge --no-probe
+manage-model-servers set-strata-token --apply  # if Strata has an API key
+manage-model-servers set-server-model xlarge strata://10.0.0.8 strata --apply
+```
+
+For Strata listening on port 11434:
+
+Set Strata's port on its own host with `START-HERE.bat --port 11434` on
+Windows or `./setup.sh --port 11434` on Linux. For a remote router, configure
+Strata's host binding and API key during setup as described in
+[Strata's setup options](https://github.com/Niko1221/Strata/blob/main/docs/INSTALL.md#options-without-questions).
+
+```bash
+manage-model-servers add strata://10.0.0.8:11434 --tier xlarge
+manage-model-servers set-server-model xlarge strata://10.0.0.8:11434 strata --apply
+```
+
+Without authentication, omit `--no-probe` to check `/v1/models` when adding.
+A bare address is identified as Strata from the service marker on its public
+`/health` endpoint, or from older `/v1/status` or `/v1/models` responses, at
+port 8080 or 11434. Auto-detection never sends the Strata key. If an older
+keyed Strata cannot be identified without authentication, set the key first
+and add an explicit `strata://` address; the probe of a named Strata uses the
+key. You can also use `--no-probe` and apply after setting the key. The key is
+kept in `/app/router/secrets.env` and used
+for discovery, direct dispatch, monitoring, and LiteLLM fallback. It is
+separate from `ROUTER_API_KEY`, which protects the router's public API.
+
+The router reads model IDs and image capability from Strata's `/v1/models`,
+dispatches chat to `/v1/chat/completions`, and the monitor checks `/v1/models`.
+Strata's default model ID `strata` reports no size, so discovery assigns it
+`[discovery] strata_default_params` (125B, Qwen3.8-Flash-Next) in
+`router.ini`, which places it in the xlarge band. Leave the setting blank for no
+assumed size. Other unsized Strata IDs, such as the Coder variant with half the
+experts, stay unknown-size rather than inheriting 125B. A size encoded in the
+model ID or reported as `parameter_size` always takes precedence. Strata loads models on demand, so the
+Ollama `keep_alive` setting is never sent to it; use Strata's own idle unload
+setting instead. LiteLLM uses `openai/<model>` with the server's `/v1` base.

@@ -1,6 +1,6 @@
 """Health monitor for the smart-router stack.
 
-Watches every Ollama host the router can route to (MODEL_SERVERS plus the
+Watches every model host the router can route to (MODEL_SERVERS plus the
 per-tier BACKEND_* lists) and the three local services (LiteLLM, the router,
 Open WebUI), and posts state changes to Mattermost.
 
@@ -132,21 +132,25 @@ BACKENDS = {tier: _url_list(_tier_env(tier)) for tier in ("fast", "medium", "lar
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 
 
-# An LM Studio server is written lmstudio+http://host:1234 in MODEL_SERVERS and
-# BACKEND_* (see router.py). It has no Ollama /api/tags, so it is probed on
-# its OpenAI-compatible /v1/models, with LMSTUDIO_API_TOKEN when LM Studio
-# requires authentication.
+# LM Studio and Strata entries use lmstudio+ and strata+ prefixes in the shared
+# server lists. Both are probed through /v1/models with their own API keys.
 LMSTUDIO_PREFIX = "lmstudio+"
+STRATA_PREFIX = "strata+"
 LMSTUDIO_HEALTH_PATH = os.getenv("MONITOR_LMSTUDIO_HEALTH_PATH", "/v1/models")
 LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
+STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
 
 
 def server_kind(server: str) -> str:
-    return "lmstudio" if server.startswith(LMSTUDIO_PREFIX) else "ollama"
+    if server.startswith(LMSTUDIO_PREFIX):
+        return "lmstudio"
+    if server.startswith(STRATA_PREFIX):
+        return "strata"
+    return "ollama"
 
 
 def server_base(server: str) -> str:
-    return server[len(LMSTUDIO_PREFIX):] if server.startswith(LMSTUDIO_PREFIX) else server
+    return server.split("+", 1)[1] if server_kind(server) != "ollama" else server
 
 
 def ollama_hosts() -> dict:
@@ -222,6 +226,13 @@ def build_checks() -> list:
                        if LMSTUDIO_API_TOKEN else {})
             checks.append(Check(url, f"{server_base(url)}{LMSTUDIO_HEALTH_PATH}",
                                 f"LM Studio host `{server_base(url)}` (serving: {served})",
+                                headers))
+        elif server_kind(url) == "strata":
+            headers = ({"Authorization": f"Bearer {STRATA_API_KEY}"}
+                       if STRATA_API_KEY else {})
+            # /v1/models stays available while Strata's engine is unloaded.
+            checks.append(Check(url, f"{server_base(url)}/v1/models",
+                                f"Strata host `{server_base(url)}` (serving: {served})",
                                 headers))
         else:
             checks.append(Check(url, f"{url}{HEALTH_PATH}",
@@ -401,7 +412,7 @@ def refresh_keep_alive(is_up) -> int:
         if not model:
             continue
         for url in urls:
-            if server_kind(url) == "lmstudio":
+            if server_kind(url) != "ollama":
                 # LM Studio has no keep_alive: it loads on demand and unloads
                 # on its own idle TTL (configure that in LM Studio itself).
                 continue

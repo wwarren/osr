@@ -1,6 +1,8 @@
 # Runs every test suite, shellcheck and ruff on each push and pull request.
-# Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image;
-# nothing here talks to Proxmox, Gitea, Ollama or the network beyond PyPI.
+# Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image.
+# The "test" job talks to nothing beyond PyPI. The "strata-upstream" job also
+# fetches one pinned commit from github.com/Niko1221/Strata; it is a separate
+# job so a GitHub outage cannot hide the results of the main suites.
 name: tests
 
 on:
@@ -52,7 +54,34 @@ jobs:
             targets/airllm/install-target.sh targets/airllm/provision-lxc.sh \
             targets/airllm/test-install.sh targets/airllm/test-provision.sh \
             targets/ollama/install-target.sh targets/ollama/provision-lxc.sh \
-            targets/ollama/test-install.sh targets/ollama/test-provision.sh
+            targets/ollama/test-install.sh targets/ollama/test-provision.sh \
+            targets/strata/install-target.sh targets/strata/provision-lxc.sh \
+            targets/strata/test-provision.sh targets/strata/test-install.sh \
+            targets/open-terminal/install-target.sh targets/open-terminal/provision-lxc.sh \
+            targets/open-terminal/test-install.sh targets/open-terminal/test-provision.sh \
+            tools/update-router-services.sh tests/test-remote-update.sh
 
       - name: ruff
         run: ruff check --select E,F,W,B --ignore E501 services targets tools tests
+
+  # Runs Strata's real run-script generator at the commit the Strata target is
+  # tested against (PIN in targets/strata/test-pinned-run-script.py), so an
+  # upstream change to the launcher format is caught before the pin moves.
+  strata-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Strata commit
+        run: |
+          pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' targets/strata/test-pinned-run-script.py)
+          test -n "$pin" || { echo "no PIN in test-pinned-run-script.py" >&2; exit 1; }
+          git init -q "$RUNNER_TEMP/strata"
+          git -C "$RUNNER_TEMP/strata" fetch -q --depth 1 https://github.com/Niko1221/Strata.git "$pin"
+
+      - name: Pinned launcher check
+        run: python targets/strata/test-pinned-run-script.py "$RUNNER_TEMP/strata"
