@@ -24,7 +24,7 @@ def load_monitor(monkeypatch, **env):
         "OLLAMA_KEEP_ALIVE": "",
     }
     base.update(env)
-    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
+    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "BASALT_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
                 "MODEL_LARGE", "MONITOR_FAIL_THRESHOLD", "MONITOR_RECOVER_THRESHOLD"):
         monkeypatch.delenv(key, raising=False)
     for key, value in base.items():
@@ -249,6 +249,22 @@ def test_strata_health_key_and_keep_alive(monkeypatch, port):
     assert check.url == f"http://10.0.0.8:{port}/v1/models"
     assert check.headers == {"Authorization": "Bearer strata-secret"}
     assert "Strata host" in check.label
+    pinned = []
+    monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append(url) or True)
+    module.refresh_keep_alive(lambda url: True)
+    assert pinned == [A]
+
+
+@pytest.mark.parametrize("port", [8080, 11434])
+def test_basalt_health_key_and_keep_alive(monkeypatch, port):
+    basalt = f"basalt+http://10.0.0.7:{port}"
+    module = load_monitor(monkeypatch, MODEL_SERVERS=f"{A},{basalt}",
+                          BACKEND_FAST=f"{A},{basalt}", MODEL_FAST="qwen3.8-flash-next",
+                          BASALT_API_KEY="basalt-secret", OLLAMA_KEEP_ALIVE="2h")
+    check = [c for c in module.build_checks() if c.key == basalt][0]
+    assert check.url == f"http://10.0.0.7:{port}/v1/models"
+    assert check.headers == {"Authorization": "Bearer basalt-secret"}
+    assert "Basalt host" in check.label
     pinned = []
     monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append(url) or True)
     module.refresh_keep_alive(lambda url: True)

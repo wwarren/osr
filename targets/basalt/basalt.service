@@ -1,0 +1,45 @@
+[Unit]
+Description=Basalt inference API (OpenAI/Anthropic/Responses over a single Blackwell GPU)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=basalt
+Group=basalt
+# serve.server is a module of the source tree (serve/ is a package next to it),
+# so the working directory must be the checkout for `python -m serve.server`
+# to resolve it. The run script also cds here, so this is belt and suspenders.
+WorkingDirectory=/opt/basalt
+# Written by install-target.sh after the engine is built and the model is present.
+EnvironmentFile=/etc/basalt-target/basalt.env
+ExecStart=/bin/sh ${BASALT_RUN_SCRIPT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+# basalt pins a large expert arena (tens of GiB of pinned host RAM); the CT's
+# lxc.prlimit.memlock must allow it too (provision-lxc.sh sets it).
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/basalt
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The venv, the CUDA build tree and bin/basalt all live under /opt/basalt; the
+# model under /var/lib/basalt. The CUDA toolkit under /usr/local/cuda is read-only.
+ReadWritePaths=/opt/basalt /var/lib/basalt /dev/shm
+PrivateTmp=true
+# Keep the passed-through GPU device nodes visible. Access is restricted by the
+# CT devN entries and by the device group the basalt account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

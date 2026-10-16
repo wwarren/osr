@@ -609,9 +609,9 @@ later sections are kept.
 
 ## Inference targets
 
-Besides existing Ollama and LM Studio hosts, the router can use inference
-targets built from this repository. Each runs in its own CT. The following
-targets speak the Ollama API on TCP 11434:
+Besides existing Ollama and LM Studio hosts, this repository provides
+inference targets that run in their own CTs. The first three targets below
+speak the Ollama API on TCP 11434:
 
 - `targets/ollama/`: a plain Ollama server. The CT and Ollama come from the
   Proxmox community script (`ct/ollama.sh`); `install-target.sh` then runs it
@@ -623,6 +623,9 @@ targets speak the Ollama API on TCP 11434:
 - `targets/strata/`: [Strata](targets/strata/README.md), installed from its
   official GitHub repository. It speaks the OpenAI API on TCP 8080 by default,
   with a configurable port including 11434. Register it as a Strata target.
+- `targets/basalt/`: [Basalt](targets/basalt/README.md), built from its upstream
+  repository for a Blackwell GPU. It serves an OpenAI API on TCP 8080 by
+  default. Register it as a Basalt target.
 
 Each has `provision-lxc.sh` for the PVE host, `install-target.sh` for inside
 the CT, and a README with the details.
@@ -803,3 +806,27 @@ experts, stay unknown-size rather than inheriting 125B. A size encoded in the
 model ID or reported as `parameter_size` always takes precedence. Strata loads models on demand, so the
 Ollama `keep_alive` setting is never sent to it; use Strata's own idle unload
 setting instead. LiteLLM uses `openai/<model>` with the server's `/v1` base.
+
+## Basalt servers
+
+[Basalt](https://github.com/jesdga95/basalt) exposes an OpenAI-compatible API
+on port 8080 by default. Register its host as `basalt://host` (or use
+`--type basalt` with a plain address). The public `/health` service marker
+also lets the manager detect a bare host. Its API key is stored separately
+from the Strata key and the router's client key.
+
+```bash
+manage-model-servers set-basalt-token --apply
+manage-model-servers add basalt://10.0.0.7 --tier xlarge --apply
+manage-model-servers set-server-model xlarge basalt://10.0.0.7 qwen3.8-flash-next --apply
+```
+
+For a different model alias or port, use the alias returned by Basalt's
+`/v1/models` and include the port in the address. The router discovers image
+support from `architecture.input_modalities` and assigns 125B to Basalt's
+default `qwen3.8-flash-next` alias through
+`[discovery] basalt_default_params`. Set `basalt_default_id` to a custom
+`BASALT_ALIAS` to keep that size assumption. Other unsized aliases remain
+unknown; the size setting can be blank to disable the assumption. The monitor checks
+`/v1/models` using `BASALT_API_KEY`. LiteLLM uses `openai/<model>` with a
+`/v1` base and reads the same key from `secrets.env`.

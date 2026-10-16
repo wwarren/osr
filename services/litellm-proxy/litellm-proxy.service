@@ -10,8 +10,8 @@ User=ollama-router
 Group=ollama-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
-# LMSTUDIO_API_TOKEN (for LM Studio servers with authentication) lives outside
-# the repo; litellm_config.yaml refers to it as os.environ/LMSTUDIO_API_TOKEN.
+# Model server API keys live outside the repo; litellm_config.yaml refers to
+# their environment variables when authentication is configured.
 EnvironmentFile=-/app/router/secrets.env
 ExecStart=/app/litellm/venv/bin/litellm --config litellm_config.yaml --port 4000 --host 127.0.0.1
 Restart=always

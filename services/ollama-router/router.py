@@ -88,6 +88,9 @@ _DEFAULTS = {
         # reports no parameter count (Qwen3.8-Flash-Next, 125B total). Other
         # unsized Strata ids (Coder, aliases) stay unknown. Blank: no default.
         "strata_default_params": "125B",
+        # Basalt's default Qwen3.8-Flash-Next alias also omits parameter size.
+        "basalt_default_id": "qwen3.8-flash-next",
+        "basalt_default_params": "125B",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -226,6 +229,8 @@ CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
 LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
 STRATA_DEFAULT_PARAMS = _cfg.get("discovery", "strata_default_params").strip()
 STRATA_DEFAULT_ID = "strata"
+BASALT_DEFAULT_PARAMS = _cfg.get("discovery", "basalt_default_params").strip()
+BASALT_DEFAULT_ID = _cfg.get("discovery", "basalt_default_id").strip().lower()
 BANDS = {
     "fast": _band(_cfg, "fast_params"),
     "medium": _band(_cfg, "medium_params"),
@@ -253,14 +258,16 @@ TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 
 # --- server kinds -----------------------------------------------------------------
-# A server entry is a base URL. LM Studio and Strata entries carry lmstudio+
-# or strata+ prefixes, so MODEL_SERVERS / BACKEND_* can mix all three APIs.
+# A server entry is a base URL. OpenAI-compatible servers carry lmstudio+,
+# strata+ or basalt+ prefixes, so MODEL_SERVERS / BACKEND_* can mix the APIs.
 LMSTUDIO_PREFIX = "lmstudio+"
 STRATA_PREFIX = "strata+"
+BASALT_PREFIX = "basalt+"
 # Optional bearer token for LM Studio servers with authentication enabled
 # (LM Studio 0.4+ "Require authentication"). Lives in secrets.env.
 LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
 STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
+BASALT_API_KEY = (os.getenv("BASALT_API_KEY") or "").strip()
 
 
 def server_kind(server: str) -> str:
@@ -268,6 +275,8 @@ def server_kind(server: str) -> str:
         return "lmstudio"
     if server.startswith(STRATA_PREFIX):
         return "strata"
+    if server.startswith(BASALT_PREFIX):
+        return "basalt"
     return "ollama"
 
 
@@ -280,7 +289,8 @@ def server_base(server: str) -> str:
 def backend_headers(server: str) -> dict:
     """Credentials the ROUTER adds for a backend (never the client's own)."""
     kind = server_kind(server)
-    token = LMSTUDIO_API_TOKEN if kind == "lmstudio" else STRATA_API_KEY if kind == "strata" else ""
+    token = {"lmstudio": LMSTUDIO_API_TOKEN, "strata": STRATA_API_KEY,
+             "basalt": BASALT_API_KEY}.get(kind, "")
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
@@ -539,8 +549,8 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
     return server, None, last_error or "no LM Studio model API answered"
 
 
-async def fetch_strata_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Strata exposes OpenAI model IDs and input modalities at /v1/models."""
+async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
+    """Read Strata or Basalt model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -551,20 +561,25 @@ async def fetch_strata_models(client: httpx.AsyncClient, server: str) -> tuple:
         if not isinstance(models, list):
             raise ValueError("data is not a list")
         entries = []
+        defaults = {"strata": (STRATA_DEFAULT_ID, STRATA_DEFAULT_PARAMS),
+                    "basalt": (BASALT_DEFAULT_ID, BASALT_DEFAULT_PARAMS)}
+        default_id, default_size = defaults[server_kind(server)]
         for model in models:
             if not isinstance(model, dict) or not model.get("id"):
                 continue
+            architecture = model.get("architecture") or {}
             modalities = model.get("input_modalities") or []
+            if not modalities and isinstance(architecture, dict):
+                modalities = architecture.get("input_modalities") or []
             caps = ["completion"] + (["vision"] if "image" in modalities else [])
             state = model.get("status", model.get("state"))
             if isinstance(state, dict):
                 state = state.get("value")
             size = model.get("parameter_size") or model.get("params_string")
-            # Only Strata's default id gets the configured size: the Coder
-            # variant drops half the experts, so a blanket default would
-            # misplace it. Any other unsized id stays unknown (see band_distance).
-            if not size and str(model["id"]).lower() == STRATA_DEFAULT_ID:
-                size = STRATA_DEFAULT_PARAMS or None
+            # Only the known default IDs inherit sizes. Other aliases and
+            # variants stay unknown unless the API or model ID provides a size.
+            if not size and str(model["id"]).lower() == default_id:
+                size = default_size or None
             raw = {"name": model["id"], "capabilities": caps,
                    "details": {"parameter_size": size},
                    "loaded": state == "loaded" if state is not None else None}
@@ -574,11 +589,14 @@ async def fetch_strata_models(client: httpx.AsyncClient, server: str) -> tuple:
         return server, None, f"{type(exc).__name__}: {exc}"
 
 
+fetch_strata_models = fetch_openai_models  # preserve the existing callable
+
+
 async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
     if server_kind(server) == "lmstudio":
         return await fetch_lmstudio_models(client, server)
-    if server_kind(server) == "strata":
-        return await fetch_strata_models(client, server)
+    if server_kind(server) in ("strata", "basalt"):
+        return await fetch_openai_models(client, server)
     try:
         response = await client.get(f"{server}/api/tags", timeout=DISCOVERY_TIMEOUT)
         response.raise_for_status()
@@ -1242,7 +1260,8 @@ async def list_models(request: Request):
             if entry["is_embedding"] or entry["name"] in seen:
                 continue
             seen.add(entry["name"])
-            data.append({"id": entry["name"], "object": "model", "owned_by": "ollama"})
+            data.append({"id": entry["name"], "object": "model",
+                         "owned_by": entry["kind"]})
         return JSONResponse({"object": "list", "data": data})
 
     # Discovery unavailable: supplement the aliases with LiteLLM's own list so

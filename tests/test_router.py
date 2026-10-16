@@ -25,6 +25,7 @@ def load_router(monkeypatch, **env):
         "ROUTER_API_KEY": "",
         "LMSTUDIO_API_TOKEN": "",
         "STRATA_API_KEY": "",
+        "BASALT_API_KEY": "",
         "LITELLM_BASE_URL": "http://litellm.test",
     }
     base.update(env)
@@ -726,6 +727,79 @@ def test_strata_default_params_is_configurable(monkeypatch, tmp_path):
         models = {e["name"]: e for e in router.INVENTORY["models"]}
     assert models["strata"]["params_b"] == 0          # blank: no assumed size
     assert models["coder:62b"]["params_b"] == 62      # a sized tag still parses
+
+
+@pytest.mark.parametrize("port", [8080, 11434])
+def test_basalt_discovery_and_dispatch(monkeypatch, port):
+    basalt = f"basalt+http://10.0.0.7:{port}"
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, dict(request.headers)))
+        if request.headers.get("authorization") != "Bearer basalt-secret":
+            return httpx.Response(401)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [
+                {"id": "qwen3.8-flash-next", "status": {"value": "loaded"},
+                 "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "other-alias", "status": {"value": "unloaded"},
+                 "architecture": {"input_modalities": ["text"]}}]})
+        if request.url.path == "/v1/chat/completions":
+            return streamed(200, {"model": json.loads(request.content)["model"]})
+        return httpx.Response(404)
+
+    router = load_router(monkeypatch, MODEL_SERVERS=basalt,
+                         BASALT_API_KEY="basalt-secret", ROUTER_API_KEY="client-secret")
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app) as client:
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+        response = client.post("/v1/chat/completions",
+                               headers={"Authorization": "Bearer client-secret"},
+                               json={"model": "qwen3.8-flash-next", "messages": [user("hi")]})
+        listed = client.get("/v1/models", headers={"Authorization": "Bearer client-secret"})
+    assert router.server_kind(basalt) == "basalt"
+    assert router.server_base(basalt) == f"http://10.0.0.7:{port}"
+    assert models["qwen3.8-flash-next"]["kind"] == "basalt"
+    assert models["qwen3.8-flash-next"]["params_b"] == 125
+    assert models["qwen3.8-flash-next"]["is_vision"] and models["qwen3.8-flash-next"]["loaded"]
+    assert models["other-alias"]["params_b"] == 0
+    assert models["other-alias"]["loaded"] is False
+    assert response.status_code == 200 and response.json()["model"] == "qwen3.8-flash-next"
+    assert response.headers["x-router-server"] == basalt
+    assert {e["id"]: e["owned_by"] for e in listed.json()["data"]}["qwen3.8-flash-next"] == "basalt"
+    assert [p for p, _ in calls] == ["/v1/models", "/v1/chat/completions"]
+    assert all(h["authorization"] == "Bearer basalt-secret" for _, h in calls)
+
+
+def test_basalt_default_params_is_configurable(monkeypatch, tmp_path):
+    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    custom = tmp_path / "router.ini"
+    custom.write_text(ini.replace("basalt_default_params = 125B", "basalt_default_params ="))
+
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"id": "qwen3.8-flash-next"}]})
+
+    router = load_router(monkeypatch, MODEL_SERVERS="basalt+http://10.0.0.7:8080",
+                         ROUTER_INI=str(custom))
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app):
+        assert router.INVENTORY["models"][0]["params_b"] == 0
+
+
+def test_basalt_default_id_is_configurable(monkeypatch, tmp_path):
+    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    custom = tmp_path / "router.ini"
+    custom.write_text(ini.replace("basalt_default_id = qwen3.8-flash-next",
+                                  "basalt_default_id = my-basalt"))
+
+    def handler(request):
+        return httpx.Response(200, json={"data": [{"id": "my-basalt"}]})
+
+    router = load_router(monkeypatch, MODEL_SERVERS="basalt+http://10.0.0.7:8080",
+                         ROUTER_INI=str(custom))
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app):
+        assert router.INVENTORY["models"][0]["params_b"] == 125
 
 
 # --- named models on unreachable hosts ----------------------------------------

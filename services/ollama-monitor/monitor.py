@@ -132,13 +132,14 @@ BACKENDS = {tier: _url_list(_tier_env(tier)) for tier in ("fast", "medium", "lar
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 
 
-# LM Studio and Strata entries use lmstudio+ and strata+ prefixes in the shared
-# server lists. Both are probed through /v1/models with their own API keys.
+# OpenAI-compatible entries use kind prefixes in the shared server lists.
 LMSTUDIO_PREFIX = "lmstudio+"
 STRATA_PREFIX = "strata+"
+BASALT_PREFIX = "basalt+"
 LMSTUDIO_HEALTH_PATH = os.getenv("MONITOR_LMSTUDIO_HEALTH_PATH", "/v1/models")
 LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
 STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
+BASALT_API_KEY = (os.getenv("BASALT_API_KEY") or "").strip()
 
 
 def server_kind(server: str) -> str:
@@ -146,6 +147,8 @@ def server_kind(server: str) -> str:
         return "lmstudio"
     if server.startswith(STRATA_PREFIX):
         return "strata"
+    if server.startswith(BASALT_PREFIX):
+        return "basalt"
     return "ollama"
 
 
@@ -233,6 +236,12 @@ def build_checks() -> list:
             # /v1/models stays available while Strata's engine is unloaded.
             checks.append(Check(url, f"{server_base(url)}/v1/models",
                                 f"Strata host `{server_base(url)}` (serving: {served})",
+                                headers))
+        elif server_kind(url) == "basalt":
+            headers = ({"Authorization": f"Bearer {BASALT_API_KEY}"}
+                       if BASALT_API_KEY else {})
+            checks.append(Check(url, f"{server_base(url)}/v1/models",
+                                f"Basalt host `{server_base(url)}` (serving: {served})",
                                 headers))
         else:
             checks.append(Check(url, f"{url}{HEALTH_PATH}",
