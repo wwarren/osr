@@ -646,10 +646,11 @@ sees the result as one more host of the matching kind.
    are removed before the next write. A real run takes an exclusive `flock`
    on `/etc/<target>-target.lock` before reading settings and holds it until
    exit; overlapping runs fail before reading or changing installation state.
-   Commands run as the service account get the lock's descriptor closed, and
-   `git fetch` runs its housekeeping in the foreground, so nothing left running
-   in the background holds the lock after the installer exits. Dry runs create
-   no lock file. Both installed records are staged before
+   Commands run as the service account get the lock's descriptor closed, so
+   their descendants cannot retain the lock after the installer exits.
+   `git fetch` also runs its housekeeping in the foreground. Root-side helpers
+   can still inherit the descriptor and retain the lock if they outlive the
+   installer. Dry runs create no lock file. Both installed records are staged before
    either is published, and
    `installed-env` is published before the `installed-settings` fingerprint,
    so an interruption between the two re-applies the new settings once rather
