@@ -17,6 +17,8 @@ STRATA_URL=https://github.com/Niko1221/Strata.git
 STRATA_DIR=${STRATA_DIR:-/opt/strata}
 STRATA_DATA_DIR=${STRATA_DATA_DIR:-/var/lib/strata}
 STRATA_ETC_DIR=${STRATA_ETC_DIR:-/etc/strata-target}
+# Root-only scratch for the pre-upgrade runtime snapshot (removed after use).
+STRATA_STATE_DIR=${STRATA_STATE_DIR:-/var/lib/strata-target}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 SERVICE_USER=${SERVICE_USER:-strata}
 # GPU device nodes whose group the service user joins (glob-expanded).
@@ -42,6 +44,10 @@ otherwise it upgrades with rollback to the previous commit on failure.
 STRATA_REF), re-runs setup for the configured model (nothing is downloaded
 twice), restarts and health-checks the service, and returns to the previous
 commit if any step fails.
+
+Reruns, with or without --upgrade, keep the settings of the existing installation
+(installed-env, or installed-settings for older installs); explicit, non-empty
+environment values override them. A fresh install uses the defaults below.
 
 Environment: STRATA_REF=main, STRATA_COMMIT=<optional full SHA-1 pin>,
 STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (any family the
@@ -153,10 +159,54 @@ select_run_script() {
 # finds the same commit, these settings and the same unit does nothing.
 settings_fingerprint() {
     local key_hash
-    key_hash=$(printf '%s' "${api_key:-}" | sha256sum | cut -d' ' -f1)
+    key_hash=$(printf '%s' "${api_key:-}" | sha256sum | cut -d' ' -f1) || return 1
     printf 'family=%s\nmodel=%s\ncontext=%s\nvision=%s\nport=%s\ndata_dir=%s\nallow_no_key=%s\nkey_sha256=%s\n' \
         "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_VISION" "$STRATA_PORT" \
         "$STRATA_DATA_DIR" "$STRATA_ALLOW_NO_KEY" "$key_hash"
+}
+
+# The settings that decide how setup runs. save_settings records them after
+# every successful install or upgrade, so a failed upgrade can roll back to
+# what last worked rather than re-running setup with the settings that failed.
+SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_VISION STRATA_PORT STRATA_ALLOW_NO_KEY)
+
+# validate_settings: die unless every setting has a value this script accepts.
+# (Family, model and vision are also checked against setup.sh --help later.)
+validate_settings() {
+    [[ $STRATA_FAMILY =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die 'Invalid STRATA_FAMILY.'
+    [[ $STRATA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STRATA_MODEL.'
+    [[ $STRATA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid STRATA_CONTEXT.'
+    [[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'Invalid STRATA_VISION.'
+    [[ $STRATA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( STRATA_PORT <= 65535 )) || die 'Invalid STRATA_PORT.'
+    [[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
+}
+
+# settings_env: the settings as KEY=value lines (no secrets).
+settings_env() {
+    local key
+    for key in "${SETTING_KEYS[@]}"; do printf '%s=%s\n' "$key" "${!key}" || return 1; done
+}
+
+# load_settings FILE: set the recorded settings from FILE. The file is parsed,
+# never sourced: only the known keys are read, and nothing is changed unless
+# every key is present and valid. Returns 1 otherwise, for example for an
+# install made by an earlier version of this script (fingerprint only).
+load_settings() {
+    local file=$1 line key
+    local -A found=()
+    [[ -r $file ]] || return 1
+    while IFS= read -r line; do
+        [[ $line =~ ^(STRATA_[A-Z_]+)=(.*)$ ]] || continue
+        [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
+        found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+    done < "$file"
+    for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
+    # Validate in a subshell first: validate_settings dies on a bad value.
+    (
+        for key in "${SETTING_KEYS[@]}"; do printf -v "$key" '%s' "${found[$key]}"; done
+        validate_settings
+    ) >/dev/null 2>&1 || return 1
+    for key in "${SETTING_KEYS[@]}"; do printf -v "$key" '%s' "${found[$key]}"; done
 }
 
 # start_env: the EnvironmentFile path the unit expands into ExecStart.
@@ -164,9 +214,82 @@ start_env() {
     printf '# Written by install-target.sh for this Strata checkout; do not edit.\n'
     printf 'STRATA_RUN_SCRIPT=%s\n' "$run_script"
 }
+
+# fingerprint_env FILE: an installed-settings fingerprint (written by every
+# version of this script) as the KEY=value lines load_settings reads.
+fingerprint_env() {
+    sed -n -e 's/^family=/STRATA_FAMILY=/p' \
+        -e 's/^model=/STRATA_MODEL=/p' \
+        -e 's/^context=/STRATA_CONTEXT=/p' \
+        -e 's/^vision=/STRATA_VISION=/p' \
+        -e 's/^port=/STRATA_PORT=/p' \
+        -e 's/^allow_no_key=/STRATA_ALLOW_NO_KEY=/p' "$1"
+}
+
+# saved_settings: an existing installation keeps its settings on every rerun,
+# with or without --upgrade: the record of its last good install, or for an
+# install made before that record existed, its installed-settings fingerprint.
+# Explicit, non-empty environment values win. Only a fresh install with no
+# checkout, unit or settings record uses the defaults below.
+saved_settings() {
+    local key
+    local -A overrides=()
+    for key in "${SETTING_KEYS[@]}"; do
+        if [[ -n ${!key-} ]]; then overrides[$key]=${!key}; fi
+    done
+    if [[ -e $STRATA_ETC_DIR/installed-env ]]; then
+        load_settings "$STRATA_ETC_DIR/installed-env" ||
+            die "Invalid or incomplete $STRATA_ETC_DIR/installed-env. Fix it, or remove it to fall back to installed-settings; explicit settings in the environment still win."
+    elif [[ -e $STRATA_ETC_DIR/installed-settings || -L $STRATA_ETC_DIR/installed-settings ||
+            -e $STRATA_ETC_DIR/pending-env || -L $STRATA_ETC_DIR/pending-env ||
+            -e $STRATA_DIR/.git || -L $STRATA_DIR/.git ||
+            -e $UNIT_DIR/strata.service || -L $UNIT_DIR/strata.service ]]; then
+        # A checkout or unit still identifies an existing installation when
+        # its records have been lost. Never apply fresh defaults to it.
+        if [[ -f $STRATA_ETC_DIR/installed-settings && -r $STRATA_ETC_DIR/installed-settings ]] &&
+                load_settings <(fingerprint_env "$STRATA_ETC_DIR/installed-settings"); then
+            note "Using the settings recorded in $STRATA_ETC_DIR/installed-settings (an install from before installed-env)."
+        elif [[ ! -e $STRATA_ETC_DIR/installed-settings && ! -L $STRATA_ETC_DIR/installed-settings &&
+                -f $STRATA_ETC_DIR/pending-env && -r $STRATA_ETC_DIR/pending-env ]] &&
+                load_settings "$STRATA_ETC_DIR/pending-env"; then
+            # A first install that stopped part-way resumes with the settings it
+            # was started with, never with the defaults.
+            note "Resuming an interrupted install with the settings it was started with ($STRATA_ETC_DIR/pending-env)."
+        else
+            local missing
+            if [[ -e $STRATA_ETC_DIR/installed-settings || -L $STRATA_ETC_DIR/installed-settings ]]; then
+                missing="Cannot read this installation's settings from $STRATA_ETC_DIR/installed-settings"
+            else
+                missing="Found an existing Strata installation (checkout, unit or pending-env) but no readable settings record (installed-env, installed-settings or pending-env in $STRATA_ETC_DIR)"
+            fi
+            for key in "${SETTING_KEYS[@]}"; do
+                [[ -v overrides[$key] ]] ||
+                    die "$missing; set ${SETTING_KEYS[*]} explicitly, or restore a record."
+            done
+        fi
+    fi
+    # A different family needs its own default model unless one is given (the
+    # saved model may not exist for it, and setup would fail after the stop).
+    if [[ -v overrides[STRATA_FAMILY] && ! -v overrides[STRATA_MODEL] &&
+          ${overrides[STRATA_FAMILY]} != "${STRATA_FAMILY:-}" ]]; then
+        unset STRATA_MODEL
+    fi
+    for key in "${!overrides[@]}"; do printf -v "$key" '%s' "${overrides[$key]}"; done
+}
+
 # End install helpers. ----------------------------------------------------------
 
-as_service() { runuser -u "$SERVICE_USER" -- env HOME="$STRATA_DATA_DIR" "$@"; }
+# as_service CMD...: run CMD as the service account. The installer lock's
+# descriptor is closed for it, so nothing it leaves running in the background
+# (git's detached housekeeping, an upstream script's helper) holds the lock
+# after the installer has exited.
+as_service() {
+    if [[ -n ${install_lock_fd:-} ]]; then
+        runuser -u "$SERVICE_USER" -- env HOME="$STRATA_DATA_DIR" "$@" {install_lock_fd}>&-
+    else
+        runuser -u "$SERVICE_USER" -- env HOME="$STRATA_DATA_DIR" "$@"
+    fi
+}
 git_root() { git -c safe.directory="$STRATA_DIR" -C "$STRATA_DIR" "$@"; }
 verify_source_origin() {
     local origin
@@ -183,7 +306,7 @@ fetch_target() {
         as_service git init -q "$STRATA_DIR"
         as_service git -C "$STRATA_DIR" remote add origin "$STRATA_URL"
     fi
-    as_service git -C "$STRATA_DIR" fetch -q --depth 1 origin "${STRATA_COMMIT:-$STRATA_REF}" >&2 || return 1
+    as_service git -c gc.autoDetach=false -c maintenance.autoDetach=false -C "$STRATA_DIR" fetch -q --depth 1 origin "${STRATA_COMMIT:-$STRATA_REF}" >&2 || return 1
     fetched=$(git_root rev-parse FETCH_HEAD) || return 1
     if [[ -n $STRATA_COMMIT && ${fetched,,} != "${STRATA_COMMIT,,}" ]]; then
         note "Fetched $fetched; expected $STRATA_COMMIT."
@@ -235,8 +358,102 @@ run_setup() {
     rm -f "$setup_log" "$marker"
 }
 
+# Serialize real runs before reading saved settings. Keep the descriptor open
+# for the entire installer; never unlink the lock file while another run may
+# be waiting on its inode. Dry runs do not write or take the lock.
+acquire_install_lock() {
+    (( dry_run )) && return 0
+    [[ $EUID -eq 0 ]] || die 'Run as root inside the Strata LXC.'
+    [[ $STRATA_ETC_DIR =~ ^/[A-Za-z0-9._/-]+$ && $STRATA_ETC_DIR != *..* ]] || die 'Invalid STRATA_ETC_DIR.'
+    local previous_umask lock_directory
+    lock_directory=$(realpath -m -- "$STRATA_ETC_DIR") || return 1
+    previous_umask=$(umask)
+    umask 077
+    exec {install_lock_fd}>>"$lock_directory.lock"
+    umask "$previous_umask"
+    flock -n "$install_lock_fd" || die 'Another Strata installer is already running (or a process it started still holds the lock).'
+}
+
+# A rename is durable only after its containing directory has been flushed.
+# In save_settings this also orders settings publication before the fingerprint.
+publish_record() {
+    local temporary=$1 destination=$2
+    mv -fT -- "$temporary" "$destination" || return 1
+    sync -- "${destination%/*}"
+}
+
+# Stage a complete, private record beside its destination. Only rename it
+# after the writer succeeds, so a failed write cannot truncate a good record.
+stage_record() {
+    local destination=$1 temporary
+    shift
+    # A run killed while staging leaves its mktemp file behind (an api-key one
+    # holds the key); drop such leftovers before staging a new one.
+    rm -f -- "$destination".?????? || return 1
+    temporary=$(mktemp "$destination.XXXXXX") || return 1
+    # Flush the contents before the caller renames the file into place, so a
+    # power loss cannot leave the new name pointing at an empty file.
+    if ! "$@" > "$temporary" || ! sync -- "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    printf '%s\n' "$temporary"
+}
+
+# write_pending: record the settings a fresh (or resumed) install runs with
+# before it changes anything, so an interrupted first install resumes with
+# them instead of the defaults. save_settings removes it.
+write_pending() {
+    (( dry_run )) && return 0
+    install -d -m 0700 "$STRATA_ETC_DIR"
+    # Persist a newly created record directory before relying on its checkpoint.
+    sync -- "$STRATA_ETC_DIR/.." || return 1
+    local temporary
+    temporary=$(stage_record "$STRATA_ETC_DIR/pending-env" settings_env) || return 1
+    if ! publish_record "$temporary" "$STRATA_ETC_DIR/pending-env"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
 save_settings() {
-    (umask 077 && settings_fingerprint > "$STRATA_ETC_DIR/installed-settings")
+    local fingerprint_temporary env_temporary
+    fingerprint_temporary=$(stage_record "$STRATA_ETC_DIR/installed-settings" settings_fingerprint) || return 1
+    if ! env_temporary=$(stage_record "$STRATA_ETC_DIR/installed-env" settings_env); then
+        rm -f -- "$fingerprint_temporary"
+        return 1
+    fi
+    # Prepare both records before publishing either. Each rename publishes a
+    # complete record. installed-env (the settings every rerun starts from) goes
+    # first and the fingerprint (the "nothing to do" marker) last: interrupted
+    # between the two, the next run has the new settings and an old marker, so
+    # it re-applies them once instead of reverting to the previous settings.
+    if ! publish_record "$env_temporary" "$STRATA_ETC_DIR/installed-env" ||
+        ! publish_record "$fingerprint_temporary" "$STRATA_ETC_DIR/installed-settings"; then
+        rm -f -- "$fingerprint_temporary" "$env_temporary"
+        return 1
+    fi
+    # installed.service was written by an earlier revision and is not used.
+    rm -f -- "$STRATA_ETC_DIR/installed.service" "$STRATA_ETC_DIR/pending-env" || return 1
+    sync -- "$STRATA_ETC_DIR"
+}
+
+ensure_api_key() {
+    install -d -m 0700 "$STRATA_ETC_DIR"
+    # A key write killed mid-way leaves its staging file (holding a key) even
+    # when a key is in place by now; never keep such copies around.
+    rm -f -- "$STRATA_ETC_DIR/api-key".?????? || return 1
+    if [[ ! -s $STRATA_ETC_DIR/api-key ]]; then
+        local temporary
+        temporary=$(stage_record "$STRATA_ETC_DIR/api-key" openssl rand -hex 32) || return 1
+        if ! publish_record "$temporary" "$STRATA_ETC_DIR/api-key"; then
+            rm -f -- "$temporary"
+            return 1
+        fi
+    fi
+    chmod 0600 "$STRATA_ETC_DIR/api-key"
+    sync -- "$STRATA_ETC_DIR/api-key" "$STRATA_ETC_DIR" || return 1
+    api_key=$(< "$STRATA_ETC_DIR/api-key")
 }
 
 # Unchanged since the last successful install or upgrade, and serving?
@@ -302,6 +519,7 @@ do_install() {
         do_upgrade
         return
     fi
+    write_pending
     run apt-get update
     run env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git openssl python3 python3-venv python3-pip
     if (( dry_run )); then
@@ -316,6 +534,7 @@ do_install() {
         printf '+ wait for http://127.0.0.1:%s/health to report loaded=true (up to %ss)\n' "$STRATA_PORT" "$STRATA_READY_TIMEOUT"
         return 0
     fi
+    ensure_api_key
     ensure_service_user
     install -d -m 0700 "$STRATA_ETC_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STRATA_DATA_DIR"
@@ -351,18 +570,66 @@ apply_checkout() {
     wait_ready
 }
 
+# Keep a complete runnable checkout at its original absolute path on rollback.
+# Models in the separate data directory are not copied. Stop the service before
+# taking this snapshot so configs, venv and binaries form one consistent state.
+snapshot_runtime() {
+    # Snapshots of an earlier revision lived in $STRATA_ETC_DIR.
+    rm -f -- "$STRATA_ETC_DIR/rollback-runtime.tar" "$STRATA_ETC_DIR/rollback-runtime.tar.new" "$STRATA_ETC_DIR/rollback.service" "$STRATA_ETC_DIR/rollback.env"
+    install -d -m 0700 "$STRATA_STATE_DIR"
+    (umask 077
+     tar -C "$STRATA_DIR" --exclude='./.git' -cpf "$STRATA_STATE_DIR/rollback-runtime.tar.new" . &&
+     mv -f -- "$STRATA_STATE_DIR/rollback-runtime.tar.new" "$STRATA_STATE_DIR/rollback-runtime.tar") || {
+        rm -f -- "$STRATA_STATE_DIR/rollback-runtime.tar.new"
+        return 1
+    }
+    cp -p -- "$UNIT_DIR/strata.service" "$STRATA_STATE_DIR/rollback.service" || return 1
+    cp -p -- "$STRATA_ETC_DIR/strata.env" "$STRATA_STATE_DIR/rollback.env"
+}
+
+# clear_snapshot: drop the snapshot once it is no longer needed (after a
+# successful upgrade or rollback). A failed rollback keeps it for inspection.
+clear_snapshot() {
+    rm -f -- "$STRATA_STATE_DIR/rollback-runtime.tar" "$STRATA_STATE_DIR/rollback-runtime.tar.new" "$STRATA_STATE_DIR/rollback.service" "$STRATA_STATE_DIR/rollback.env"
+}
+
+# restore_probe_settings: the port from the fingerprint, for installs made
+# before installed-env existed.
+restore_probe_settings() {
+    local port
+    port=$(sed -n 's/^port=//p' "$STRATA_ETC_DIR/installed-settings" 2>/dev/null | tail -n1) || true
+    if [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )); then STRATA_PORT=$port; fi
+}
+
+# No setup, pip, compiler or model download is invoked on this path. The
+# caller has set the settings the previous runtime ran with (wait_ready uses
+# its port).
+restore_runtime() {
+    set -e
+    [[ $STRATA_DIR != / && -d $STRATA_DIR/.git && -s $STRATA_STATE_DIR/rollback-runtime.tar ]]
+    as_service git -C "$STRATA_DIR" reset -q --hard "$1"
+    find "$STRATA_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+    tar -C "$STRATA_DIR" -xpf "$STRATA_STATE_DIR/rollback-runtime.tar"
+    install -m 0644 "$STRATA_STATE_DIR/rollback.service" "$UNIT_DIR/strata.service"
+    cp -p -- "$STRATA_STATE_DIR/rollback.env" "$STRATA_ETC_DIR/strata.env"
+    systemctl daemon-reload
+    systemctl restart strata.service
+    wait_ready
+}
+
 do_upgrade() {
     if (( dry_run )); then
         printf '+ git fetch --depth 1 %s %s (before anything is stopped; a failed fetch changes nothing)\n' \
             "$STRATA_URL" "${STRATA_COMMIT:-$STRATA_REF}"
         printf '+ same commit, settings and unit, and /health healthy: nothing to do\n'
         printf '+ otherwise: record the current commit; systemctl stop strata.service; checkout; setup.sh --setup --no-start ...; restart; wait for /health loaded=true\n'
-        printf '+ on failure: check out the previous commit locally (no network), re-run setup, restart\n'
+        printf '+ on failure: check out the previous commit locally (no network) and restore its runnable checkout, launcher and unit without setup or downloads (%s/rollback-runtime.tar, removed afterwards)\n' "$STRATA_STATE_DIR"
         return 0
     fi
     [[ -d $STRATA_DIR/.git && -f $UNIT_DIR/strata.service ]] ||
         die "No Strata installation at $STRATA_DIR; run without --upgrade first."
     verify_source_origin
+    ensure_api_key
     ensure_service_user
     chown -R "$SERVICE_USER:$SERVICE_USER" "$STRATA_DIR" "$STRATA_DATA_DIR"
     local previous target rc
@@ -372,6 +639,10 @@ do_upgrade() {
     target=$(fetch_target) ||
         die "Could not fetch $STRATA_URL ${STRATA_COMMIT:-$STRATA_REF}; Strata was not stopped or changed."
     if [[ $target == "$previous" ]] && nothing_to_do; then
+        # A matching legacy fingerprint is sufficient to migrate its records.
+        if [[ ! -f $STRATA_ETC_DIR/installed-env ]]; then
+            save_settings
+        fi
         printf 'Strata is already at %s with these settings and is healthy; nothing to do.\n' "$previous"
         return 0
     fi
@@ -381,22 +652,40 @@ do_upgrade() {
         printf 'Upgrading Strata from %s to %s.\n' "$previous" "$target"
     fi
     systemctl stop strata.service
+    if ! snapshot_runtime; then
+        note 'Could not snapshot the previous runtime; no upgrade was applied.'
+        (load_settings "$STRATA_ETC_DIR/installed-env" || restore_probe_settings
+         systemctl restart strata.service; wait_ready) ||
+            die 'Snapshot failed and the previous service did not become ready.'
+        die 'Runtime snapshot failed; the previous service is running again.'
+    fi
     set +e
     ( apply_checkout "$target" )
     rc=$?
     set -e
     if (( rc == 0 )); then
         save_settings
+        clear_snapshot
         printf 'Strata is running %s.\n' "$(git_root rev-parse HEAD)"
         return 0
     fi
     note "Upgrade failed; returning to $previous."
     systemctl stop strata.service || true
+    # The settings the previous runtime ran with: the record of the last good
+    # install (the fingerprint's port for older installs). wait_ready checks
+    # the restored service on that port.
+    if load_settings "$STRATA_ETC_DIR/installed-env"; then
+        note "Restoring the settings it last ran with: $(settings_env | tr '\n' ' ')"
+    else
+        restore_probe_settings
+        note 'No record of the previous settings; restoring the complete runtime snapshot.'
+    fi
     set +e
-    ( apply_checkout "$previous" )
+    ( restore_runtime "$previous" )
     rc=$?
     set -e
-    (( rc == 0 )) || die "Rollback to $previous failed too; inspect journalctl -u strata and $STRATA_DIR."
+    (( rc == 0 )) || die "Rollback to $previous failed too; inspect journalctl -u strata and $STRATA_DIR; the snapshot is kept in $STRATA_STATE_DIR."
+    clear_snapshot
     die "Upgrade failed; Strata is running $previous again."
 }
 
@@ -411,6 +700,8 @@ while (( $# )); do
     esac
     shift
 done
+acquire_install_lock
+saved_settings
 STRATA_REF=${STRATA_REF:-main}
 STRATA_COMMIT=${STRATA_COMMIT:-}
 STRATA_FAMILY=${STRATA_FAMILY:-qwen}
@@ -428,15 +719,10 @@ STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}
 STRATA_ALLOW_NO_KEY=${STRATA_ALLOW_NO_KEY:-false}
 [[ $STRATA_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $STRATA_REF != HEAD && $STRATA_REF != *..* ]] || die 'Invalid STRATA_REF.'
 [[ -z $STRATA_COMMIT || $STRATA_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'Invalid STRATA_COMMIT.'
-[[ $STRATA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STRATA_MODEL.'
 # The families are checked against setup.sh --help choices once it is fetched.
-[[ $STRATA_FAMILY =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die 'Invalid STRATA_FAMILY.'
-[[ $STRATA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid STRATA_CONTEXT.'
-[[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'Invalid STRATA_VISION.'
-[[ $STRATA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( STRATA_PORT <= 65535 )) || die 'Invalid STRATA_PORT.'
+validate_settings
 [[ $STRATA_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'Invalid STRATA_READY_TIMEOUT.'
-[[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
-for path_var in STRATA_DIR STRATA_DATA_DIR STRATA_ETC_DIR UNIT_DIR; do
+for path_var in STRATA_DIR STRATA_DATA_DIR STRATA_ETC_DIR STRATA_STATE_DIR UNIT_DIR; do
     [[ ${!path_var} =~ ^/[A-Za-z0-9._/-]+$ && ${!path_var} != *..* ]] || die "Invalid $path_var."
 done
 [[ $SERVICE_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid SERVICE_USER.'
@@ -452,12 +738,6 @@ if (( ! dry_run )); then
     fi
     command -v nvidia-smi >/dev/null || die 'nvidia-smi is missing; install host-matched guest NVIDIA userspace first.'
     nvidia-smi -L || die 'NVIDIA GPU is not accessible inside the CT.'
-    install -d -m 0700 "$STRATA_ETC_DIR"
-    if [[ ! -s $STRATA_ETC_DIR/api-key ]]; then
-        (umask 077 && openssl rand -hex 32 > "$STRATA_ETC_DIR/api-key")
-    fi
-    chmod 0600 "$STRATA_ETC_DIR/api-key"
-    api_key=$(< "$STRATA_ETC_DIR/api-key")
 fi
 
 if [[ $mode == upgrade ]]; then

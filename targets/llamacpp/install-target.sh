@@ -444,11 +444,34 @@ backend=$BACKEND
 BUILDINFO
     )
 }
+# upgrade_unchanged COMMIT SOURCE_DIR: would --upgrade change nothing? The
+# same llama.cpp commit, requested ref and backend, the same bridge,
+# requirements and unit files, a venv, and every setting the upgrade adds
+# already present. FORCE_REBUILD=true always counts as a change.
+upgrade_unchanged() {
+    local commit=$1 src=$2 unit
+    [[ ${FORCE_REBUILD:-false} != true ]] || return 1
+    [[ $commit == "$(build_info resolved_commit)" && $LLAMA_CPP_REF == "$(build_info requested_ref)" &&
+       $BACKEND == "$(build_info backend)" ]] || return 1
+    cmp -s "$src/bridge.py" "$TARGET_ROOT/bridge.py" || return 1
+    cmp -s "$src/requirements.txt" "$TARGET_ROOT/requirements.txt" || return 1
+    [[ -x $TARGET_ROOT/venv/bin/python ]] || return 1
+    for unit in llama-server.service llama-ollama-bridge.service; do
+        cmp -s "$src/$unit" "$TARGET_UNITS/$unit" || return 1
+    done
+    grep -q '^LLAMA_EXTRA_ARGS=' "$TARGET_ETC/llama-server.env" || return 1
+}
 # Move $1 aside as $1.prev (replacing an older .prev); a no-op when absent.
 set_aside() {
     [[ -e $1 || -L $1 ]] || return 0
     rm -rf -- "$1.prev"
     mv -- "$1" "$1.prev"
+}
+# Like set_aside, but leaves $1 in place to be edited (settings files).
+copy_aside() {
+    [[ -e $1 ]] || return 0
+    rm -rf -- "$1.prev"
+    cp -a -- "$1" "$1.prev"
 }
 # Undo set_aside: put $1.prev back in place of whatever is at $1.
 restore_aside() {
@@ -459,6 +482,29 @@ restore_aside() {
 # Append KEY=value to an env file when the key is missing (never rewrites one).
 ensure_env_key() {
     grep -q "^$2=" "$1" 2>/dev/null || printf '%s=%s\n' "$2" "$3" >> "$1"
+}
+# Set KEY=value in an env file: replace the first KEY= line (dropping any
+# later duplicates) or append it. Rewritten in place, so mode and owner stay.
+# Only for validated values (no newlines).
+# env_key_value FILE KEY: the value systemd uses for KEY (the last assignment,
+# leading whitespace and spaces around = allowed, surrounding quotes dropped).
+env_key_value() {
+    awk -v k="$2" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+            v = substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
+            value = v; found = 1
+        }
+        END { if (found) print value }' "$1"
+}
+set_env_key() {
+    local updated
+    updated=$(awk -v k="$2" -v v="$3" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { if (!done) print k "=" v; done = 1; next }
+        { print }
+        END { if (!done) print k "=" v }' "$1")
+    printf '%s\n' "$updated" > "$1"
 }
 # Wait up to $1 seconds (default 300: a large model takes a while to load) for
 # the bridge to report the model ready.
@@ -510,6 +556,19 @@ if [[ $MODE == upgrade ]]; then
     CUDA_COMPILER=${CUDA_COMPILER:-}
     FORCE_REBUILD=${FORCE_REBUILD:-false}
     [[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
+    # A backend switch also switches GPU_LAYERS, which the upgrade otherwise
+    # never rewrites: a CUDA build left at 0 would silently run on the CPU, and
+    # a CPU build requires 0. GPU_LAYERS overrides the new backend's default.
+    gpu_layers_new=''
+    previous_backend=$(build_info backend)
+    if [[ -n $previous_backend && $BACKEND != "$previous_backend" ]]; then
+        if [[ $BACKEND == cuda ]]; then gpu_layers_new=${GPU_LAYERS:-auto}; else gpu_layers_new=${GPU_LAYERS:-0}; fi
+        [[ $gpu_layers_new == auto || $gpu_layers_new == all || $gpu_layers_new =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+            die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
+        [[ $BACKEND == cuda || $gpu_layers_new == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
+    elif [[ -n ${GPU_LAYERS:-} ]]; then
+        printf 'Note: GPU_LAYERS is applied by --upgrade only with a BACKEND change; edit %s/llama-server.env instead.\n' "$TARGET_ETC" >&2
+    fi
     [[ $BUILD_JOBS =~ ^[1-9][0-9]{0,8}$ ]] || die 'BUILD_JOBS must be a positive integer.'
     [[ $LLAMA_CPP_REF =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Use a release tag or full 40-character commit, without a refs/ prefix.'
     [[ $LLAMA_CPP_REF != HEAD && $LLAMA_CPP_REF != master && $LLAMA_CPP_REF != main ]] || die 'Choose a pinned release tag or commit, not a branch.'
@@ -525,15 +584,31 @@ if [[ $MODE == upgrade ]]; then
     printf 'Installed llama.cpp: %s (%s)\nRequested ref: %s\n' "${current_commit:-unknown}" "$(build_info requested_ref)" "$LLAMA_CPP_REF"
     new_repo=$TARGET_ROOT/src/llama.cpp.new
     new_commit=$(fetch_llama_source "$new_repo")
+    # Nothing to change: leave a healthy (or deliberately stopped) target alone.
+    if upgrade_unchanged "$new_commit" "$source_dir"; then
+        if [[ $(systemctl show llama-server.service -p ActiveState --value) == inactive ]]; then
+            rm -rf -- "$new_repo"
+            printf 'llama.cpp %s, the bridge, units and settings are unchanged; nothing to do (the services stay stopped).\n' "$new_commit"
+            exit 0
+        elif systemctl is-active --quiet llama-server.service && target_healthy 5; then
+            rm -rf -- "$new_repo"
+            printf 'llama.cpp %s, the bridge, units and settings are unchanged and the target is healthy; nothing to do.\n' "$new_commit"
+            exit 0
+        fi
+        printf 'Nothing changed, but the target is not healthy; re-applying.\n'
+    fi
     rebuild=false
-    [[ $new_commit != "$current_commit" || $FORCE_REBUILD == true ]] && rebuild=true
+    [[ $new_commit != "$current_commit" || $BACKEND != "$(build_info backend)" || $FORCE_REBUILD == true ]] && rebuild=true
 
     was_active=false
-    systemctl is-active --quiet llama-server.service && was_active=true
+    [[ $(systemctl show llama-server.service -p ActiveState --value) != inactive ]] && was_active=true
     # Only what THIS run set aside is restored: a *.prev left by an earlier
     # upgrade must never be mistaken for the version to go back to.
     aside=()
     stash() { set_aside "$1"; aside+=("$1"); }
+    stash_copy() { copy_aside "$1"; aside+=("$1"); }
+    # Put back everything this run replaced, code and settings alike, then
+    # check that the previous installation really serves again.
     rollback() {
         local path
         printf 'Upgrade failed; restoring the previous installation...\n' >&2
@@ -541,9 +616,18 @@ if [[ $MODE == upgrade ]]; then
         rm -f -- "$TARGET_ROOT/bin/llama-server.new"
         for path in "${aside[@]}"; do restore_aside "$path"; done
         systemctl daemon-reload
-        if $was_active; then systemctl start llama-server.service llama-ollama-bridge.service || true; fi
+        if ! $was_active; then
+            printf 'Upgrade failed; the previous files are back, and the services stay stopped as they were.\n' >&2
+        elif systemctl start llama-server.service llama-ollama-bridge.service &&
+                target_healthy "${UPGRADE_HEALTH_TIMEOUT:-300}"; then
+            printf 'Upgrade failed; the previous installation is running again.\n' >&2
+        else
+            printf 'Upgrade failed, and the previous installation did not become healthy either; see journalctl -u llama-server -u llama-ollama-bridge.\n' >&2
+        fi
     }
-    trap 'rollback; exit 1' ERR
+    # With set -E a failure inside a ( ... ) subshell fires this trap in the
+    # subshell and again in the parent; only the main shell rolls back.
+    trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
 
     if $rebuild; then
         printf 'Building llama.cpp %s (%s)...\n' "$LLAMA_CPP_REF" "$new_commit"
@@ -567,7 +651,15 @@ if [[ $MODE == upgrade ]]; then
         install -o root -g root -m 0644 "$source_dir/$unit" "$TARGET_UNITS/$unit"
     done
     # New settings get their defaults; existing values are never rewritten.
+    # The settings files are set aside too, so a rollback restores them.
+    stash_copy "$TARGET_ETC/llama-server.env"
+    stash_copy "$TARGET_ETC/bridge.env"
     ensure_env_key "$TARGET_ETC/llama-server.env" LLAMA_EXTRA_ARGS ''
+    if [[ -n $gpu_layers_new ]]; then
+        printf 'Backend %s -> %s: setting GPU_LAYERS=%s (was %s).\n' "$previous_backend" "$BACKEND" "$gpu_layers_new" \
+            "$(env_key_value "$TARGET_ETC/llama-server.env" GPU_LAYERS)"
+        set_env_key "$TARGET_ETC/llama-server.env" GPU_LAYERS "$gpu_layers_new"
+    fi
     systemctl daemon-reload
 
     if $was_active; then
@@ -623,7 +715,7 @@ if command -v ss >/dev/null; then
     [[ -z $(ss -H -ltn '( sport = :8081 or sport = :11434 )') ]] || die 'Port 8081 or 11434 is already in use. Do not install over a live Ollama target.'
 fi
 
-trap 'printf "Installation stopped at line %s. Services were not started. Inspect partial files before retrying; no existing installation is overwritten.\n" "$LINENO" >&2' ERR
+trap '[[ $BASHPID == "$$" ]] || exit 1; printf "Installation stopped at line %s. Services were not started. Inspect partial files before retrying; no existing installation is overwritten.\n" "$LINENO" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive
 if [[ $BACKEND == cuda ]]; then
     command -v nvidia-smi >/dev/null || die 'CUDA requested but nvidia-smi is missing; prepare matched userspace driver libraries first.'

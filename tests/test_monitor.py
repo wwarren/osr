@@ -24,7 +24,7 @@ def load_monitor(monkeypatch, **env):
         "OLLAMA_KEEP_ALIVE": "",
     }
     base.update(env)
-    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "BASALT_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
+    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "BASALT_API_KEY", "MAYA_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
                 "MODEL_LARGE", "MONITOR_FAIL_THRESHOLD", "MONITOR_RECOVER_THRESHOLD"):
         monkeypatch.delenv(key, raising=False)
     for key, value in base.items():
@@ -121,7 +121,7 @@ def test_alert_is_sent_once_per_host_and_retried_until_delivered(monitor):
 def test_probes_run_in_parallel(monitor):
     checks = [monitor.Check(str(i), f"http://h{i}", str(i)) for i in range(4)]
 
-    def slow(url, client, headers=None):
+    def slow(url, client, headers=None, require_models=False):
         time.sleep(0.3)
         return True, ""
 
@@ -269,3 +269,94 @@ def test_basalt_health_key_and_keep_alive(monkeypatch, port):
     monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append(url) or True)
     module.refresh_keep_alive(lambda url: True)
     assert pinned == [A]
+
+
+def test_maya_health_key_and_keep_alive(monkeypatch):
+    maya = "maya+http://10.0.0.9:8080"
+    module = load_monitor(monkeypatch, MODEL_SERVERS=f"{A},{maya}",
+                          BACKEND_FAST=f"{A},{maya}", MODEL_FAST="glm-5.3-flash",
+                          MAYA_API_KEY="maya-secret", OLLAMA_KEEP_ALIVE="2h")
+    check = [c for c in module.build_checks() if c.key == maya][0]
+    assert check.url == "http://10.0.0.9:8080/v1/models"
+    assert check.headers == {"Authorization": "Bearer maya-secret"}
+    assert "Maya host" in check.label
+    pinned = []
+    monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append(url) or True)
+    module.refresh_keep_alive(lambda url: True)
+    assert pinned == [A]
+
+
+@pytest.mark.parametrize("kind", ["strata", "basalt", "maya"])
+def test_openai_host_with_an_empty_model_list_is_down(monkeypatch, kind):
+    """Strata-style servers answer /v1/models with 200 and no models while
+    their engine is down; the router cannot use them, so neither is the host up."""
+    server = f"{kind}+http://10.0.0.9:8080"
+    module = load_monitor(monkeypatch, MODEL_SERVERS=server)
+    check = [c for c in module.build_checks() if c.key == server][0]
+    assert check.require_models
+    empty = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"object": "list", "data": []})))
+    ok, error = module.probe(check.url, empty, check.headers, check.require_models)
+    assert not ok and "empty" in error
+    loaded = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"data": [{"id": "glm-5.3-flash"}]})))
+    assert module.probe(check.url, loaded, check.headers, check.require_models) == (True, "")
+    not_json = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text="ok")))
+    assert not module.probe(check.url, not_json, check.headers, check.require_models)[0]
+
+
+def test_empty_model_list_alerts_through_run_cycle(monkeypatch):
+    maya = "maya+http://10.0.0.9:8080"
+    module = load_monitor(monkeypatch, MODEL_SERVERS=maya)
+    checks = [c for c in module.build_checks() if c.key == maya]
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"data": []})))
+    sent = []
+    with module.ThreadPoolExecutor(max_workers=2) as pool:
+        for _ in range(module.FAIL_THRESHOLD):
+            module.run_cycle(checks, client, pool, notify=lambda *a: sent.append(a) or True)
+    assert checks[0].status == "down"
+    assert sent and "Maya host" in str(sent[0])
+
+
+def test_lmstudio_with_no_models_listed_stays_up(monkeypatch):
+    module = load_monitor(monkeypatch, MODEL_SERVERS=LMS)
+    check = [c for c in module.build_checks() if c.key == LMS][0]
+    assert not check.require_models
+
+
+def _manager_kinds() -> dict:
+    """manage-model-servers.sh's kind table, read through its own functions."""
+    import subprocess
+    script = ROOT / "install/manage-model-servers.sh"
+    funcs = subprocess.run(
+        [sys.executable, str(ROOT / "tests/lib/extract-functions.py"), str(script),
+         "--only", "server_kinds,kind_field"],
+        check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["bash", "-c", funcs + '\nfor k in $(server_kinds); do '
+         'printf "%s|%s|%s|%s\\n" "$k" "$(kind_field "$k" key)" '
+         '"$(kind_field "$k" label)" "$(kind_field "$k" openai)"; done'],
+        check=True, capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}).stdout
+    kinds = {}
+    for line in out.splitlines():
+        kind, key, label, openai = line.split("|")
+        kinds[kind] = {"prefix": f"{kind}+", "key_env": key, "label": label,
+                       "openai": openai == "1"}
+    return kinds
+
+
+def test_router_monitor_and_manager_agree_on_server_kinds(monkeypatch):
+    """One kind table, three copies: a kind added to one must be added to all."""
+    monitor = load_monitor(monkeypatch)
+    for key in ("ROUTER_API_KEY", "MODEL_SERVERS"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setenv("ROUTER_INI", str(ROOT / "services/ollama-router/router.ini"))
+    spec = importlib.util.spec_from_file_location(
+        "router_kinds_under_test", ROOT / "services/ollama-router/router.py")
+    router = importlib.util.module_from_spec(spec)
+    sys.modules["router_kinds_under_test"] = router
+    spec.loader.exec_module(router)
+    assert router.SERVER_KINDS == monitor.SERVER_KINDS
+    assert _manager_kinds() == router.SERVER_KINDS
+    assert list(_manager_kinds()) == list(router.SERVER_KINDS)   # detection order too

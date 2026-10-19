@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Stub external commands so functions that shell out can be tested without a
 # Proxmox host, a Gitea server, or live Ollama backends.
 #

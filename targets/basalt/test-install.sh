@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Focused local checks; no model, GPU, network or system service is required.
+# Helpers are sourced from install-target.sh; the variables below are read by them.
+# shellcheck disable=SC1090,SC2034
 set -Eeuo pipefail
 exec </dev/null
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

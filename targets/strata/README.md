@@ -135,6 +135,19 @@ cluster's actual firewall rules as needed.
 
 ## Upgrade
 
+Every rerun of the installer, with or without `--upgrade`, keeps the
+installation's settings from `/etc/strata-target/installed-env`, including custom
+model, context and port values. An install from before that record existed uses
+its `installed-settings` fingerprint instead. Non-empty environment settings
+override the corresponding saved values, and a new `STRATA_FAMILY` without `STRATA_MODEL` takes that family's default model.
+Only a fresh install uses the defaults. A fresh install records the settings
+it runs with in `/etc/strata-target/pending-env` before its first change, so a
+first install that stops part-way resumes with them on the next run;
+the file is removed once the install succeeds. An existing checkout or service
+unit with no readable record (missing, unreadable or dangling) requires every
+setting explicitly before the installer can proceed. A malformed `installed-env`
+must be repaired or removed before retrying.
+
 Copy the current `install-target.sh` and `strata.service` into the CT, then
 re-run the installer. It fetches the latest `main` and upgrades the service:
 
@@ -153,9 +166,12 @@ fetched commit, the settings (family, model, context, vision, port, data
 directory and key) and the unit are all unchanged and `/health` reports a
 loaded model, the rerun does nothing. Otherwise it stops the service, checks
 out the commit, re-checks the `setup.sh` options, re-runs setup for the
-configured model, then restarts and health-checks Strata. If any step fails,
-it checks out the previous commit, which is kept locally so this needs no
-network, re-runs setup and restarts that version. Upstream's `update.sh` is
+configured model, then restarts and health-checks Strata. Before changing the
+checkout it stops the service and snapshots the runnable checkout, venv,
+launcher and unit. If any step fails, it restores the previous commit and
+runtime at their original paths without running setup or downloading packages,
+then health-checks that version. A healthy unchanged legacy rerun backfills
+missing `installed-env` records. Upstream's `update.sh` is
 not used: it runs `git pull`, which cannot move a pinned checkout or provide
 this rollback path.
 
@@ -184,3 +200,11 @@ regression fixture, then runs its real launcher generator in a temporary
 directory for both ports. It does not download a model, create a CT, or need
 a GPU. CI runs it as a separate job, so an upstream change to the launcher
 format is caught before you move the pin.
+
+The root-only `/var/lib/strata-target/` holds the runtime snapshot (including any
+configuration secrets) during an upgrade. It is deleted once the upgrade or the
+rollback succeeds, and kept for inspection only when the rollback fails too.
+Allow disk space for one copy of the checkout, in addition to the model and
+build. The default `/var/lib/strata` model store is outside the snapshot; weights
+placed inside `/opt/strata` are copied with that checkout.
+A snapshot failure aborts the upgrade and restarts the original service.

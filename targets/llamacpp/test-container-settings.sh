@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Exercise read-only provisioning prompts and validation without creating a CT.
 set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+# shellcheck disable=SC1090
 source <(awk '
     /^# Container configuration helpers / { capture=1; next }
     /^# End container configuration helpers\./ { capture=0 }
@@ -37,7 +40,7 @@ settings() {
     # Suppress inventory only; exercise the real read/default/validation loop.
     list_container_templates() { :; }
     list_container_storage() { :; }
-    for entry in "$@"; do export "$entry"; done
+    for entry in "$@"; do export "${entry?}"; done
     configure_container
     printf 'SETTINGS|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$CT_ID" "$TEMPLATE" "$CT_HOSTNAME" "$IP_CIDR" "$BRIDGE" "$GATEWAY" \

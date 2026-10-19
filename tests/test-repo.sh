@@ -136,6 +136,84 @@ assert_fail "the AirLLM requirements are exact pins" grep -Eq '^[A-Za-z].*(>=|~=
 pin="$(sed -nE 's/^airllm==([^[:space:]#]+).*/\1/p' "${airllm}/requirements.txt")"
 assert_ok "the AirLLM lock matches its pin" grep -q "^airllm==${pin} " "${airllm}/requirements.lock"
 
+describe upgrade_contract
+# Every target's upgrade follows one contract (ARCHITECTURE.md §16): the
+# rollback restores configuration as well as code, is health-checked, and
+# says when it failed too. The behaviour itself is exercised by each target's
+# own tests; this keeps a new or edited target from silently dropping a part.
+for name in strata basalt maya; do
+  t="${ROOT}/targets/${name}/install-target.sh"
+  assert_ok "${name}: stages the settings of a good install" grep -q 'stage_record "\$[A-Z_]*ETC_DIR/installed-env" settings_env' "$t"
+  assert_ok "${name}: publishes installed settings durably" grep -q 'publish_record "\$env_temporary" "\$[A-Z_]*ETC_DIR/installed-env"' "$t"
+  assert_eq "${name}: locks before loading settings" saved_settings "$(sed -n '/^acquire_install_lock$/{n;p;}' "$t")"
+  assert_fail "${name}: git fetch keeps its housekeeping in the foreground (no detached lock holder)" \
+    bash -c "grep -E 'as_service git .*fetch' '$t' | grep -qv 'gc.autoDetach=false -c maintenance.autoDetach=false'"
+  assert_ok "${name}: as_service closes the installer lock for its command" grep -q '{install_lock_fd}>&-' "$t"
+  assert_ok "${name}: snapshots the unit before changing it" grep -q 'STATE_DIR/rollback.service" || return 1' "$t"
+  assert_ok "${name}: the snapshot is removed after a success or a rollback" test "$(grep -c '^ *clear_snapshot$' "$t")" -ge 2
+  assert_ok "${name}: a failed rollback keeps the snapshot" grep -q 'the snapshot is kept in' "$t"
+  assert_fail "${name}: no snapshot is written under /etc" grep -q 'ETC_DIR/rollback-runtime.tar.new" \.' "$t"
+  assert_ok "${name}: rollback restores the recorded settings" grep -q 'if load_settings "\$[A-Z_]*ETC_DIR/installed-env"; then' "$t"
+  assert_ok "${name}: rollback restores its runnable snapshot" grep -q 'restore_runtime "\$previous"' "$t"
+  assert_ok "${name}: the settings record is parsed, never sourced" grep -q 'printf -v "\$key"' "$t"
+  assert_fail "${name}: the settings record is never sourced" grep -Eq '(source|\.) "?\$[A-Z_]*ETC_DIR/installed-env' "$t"
+  assert_ok "${name}: a failed rollback is reported" grep -q 'Rollback to \$previous failed too' "$t"
+  assert_ok "${name}: a fetch failure stops nothing" grep -q 'was not stopped or changed' "$t"
+done
+for name in llamacpp airllm; do
+  t="${ROOT}/targets/${name}/install-target.sh"
+  assert_ok "${name}: settings files are set aside before they are edited" grep -q 'stash_copy "\$TARGET_E' "$t"
+  assert_ok "${name}: rollback is health-checked" grep -q 'did not become healthy either' "$t"
+done
+assert_ok "ollama: rollback is health-checked" \
+  grep -q 'did not answer either' "${ROOT}/targets/ollama/install-target.sh"
+ot="${ROOT}/targets/open-terminal/install-target.sh"
+assert_ok "open-terminal: rollback restores service.env" grep -q 'mv -f -- "\$OT_ETC/service.env.prev"' "$ot"
+assert_ok "open-terminal: rollback restores the unit" grep -q 'install -m 0644 "\$OT_ETC/open-terminal.service.prev"' "$ot"
+# Configuration must not change before the new venv is ready (a refused tag or
+# dependency drift would otherwise leave a new port behind).
+env_line=$(grep -n 'service_env "\$key" "\$PORT" >' "$ot" | head -n1 | cut -d: -f1)
+venv_line=$(grep -n 'pip install --no-cache-dir --no-deps' "$ot" | head -n1 | cut -d: -f1)
+assert_ok "open-terminal: service.env is written after the venv is built" \
+  test "${env_line:-0}" -gt "${venv_line:-999999}"
+# With set -E an ERR trap also fires inside ( ... ) subshells; a rollback trap
+# must act only in the main shell, or a failure there rolls back twice.
+for t in "${ROOT}"/targets/*/install-target.sh; do
+  name=$(basename "$(dirname "$t")")
+  assert_fail "${name}: every ERR rollback trap is guarded against subshells" \
+    bash -c "grep -E \"trap '.*rollback.*' ERR\" '$t' | grep -qv 'BASHPID'"
+done
+for dir in "${ROOT}"/targets/*/; do
+  name=$(basename "$dir")
+  # Code lines of the target's tests (comments do not count as a test).
+  tests_code="cat '${dir}'test-*.sh | grep -vE '^[[:space:]]*#'"
+  if grep -qE -- '--upgrade\)' "${dir}install-target.sh"; then
+    assert_ok "${name}: a test runs --upgrade" bash -c "${tests_code} | grep -q -- '--upgrade'"
+  fi
+  assert_ok "${name}: a test checks a rollback that succeeds" bash -c "${tests_code} | grep -qE 'running.* again'"
+  assert_ok "${name}: a test checks a rollback that fails too" \
+    bash -c "${tests_code} | grep -qE 'did not (become healthy|answer|come back) either|failed too'"
+  # An upgrade with nothing to change leaves the target alone, and a test says so.
+  assert_ok "${name}: an unchanged upgrade does nothing" grep -q 'nothing to do' "${dir}install-target.sh"
+  assert_ok "${name}: and a test checks it" bash -c "grep -lq 'nothing to do' '${dir}'test-*.sh"
+done
+
+describe maya_update_switch
+# Maya's dashboard can fast-forward its own checkout (About > Updates) when the
+# server was started through maya.py, which maya.service does. That would move
+# /opt/maya off install-target.sh's pinned commit and its rollback ref, so the
+# unit must switch the updater off, and nothing may switch it back on: an
+# EnvironmentFile= value would override the Environment= line.
+maya="${ROOT}/targets/maya"
+assert_ok "maya.service turns the dashboard updater off" \
+  grep -qx 'Environment=MAYA_UPDATE_CHECK=0' "${maya}/maya.service"
+assert_eq "and sets MAYA_UPDATE_CHECK nowhere else" "1" \
+  "$(grep -c 'MAYA_UPDATE_CHECK' "${maya}/maya.service" | tr -d ' ')"
+assert_fail "the unit does not unset it" grep -q '^UnsetEnvironment=.*MAYA_UPDATE_CHECK' "${maya}/maya.service"
+assert_fail "the generated maya.env cannot override it" grep -q 'MAYA_UPDATE_CHECK' "${maya}/install-target.sh"
+assert_ok "CI checks the update switch against the pinned upstream code" \
+  grep -q 'targets/maya/test-pinned-run-script.py' "${ROOT}/.gitea/workflows/tests.yml"
+
 describe venv_permissions
 # Venvs are built after the secret-bearing tree (umask 077); the service account
 # must still be able to run them (litellm-proxy failed with 203/EXEC otherwise).

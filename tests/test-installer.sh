@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Unit tests for the functions in ollama-smart-router-install.sh
 #
 # Functions are extracted (heredoc-aware) and sourced in isolation, so no
@@ -151,6 +153,8 @@ assert_ok   "accepts Strata on port 11434" valid_ollama_addr strata://10.0.0.8:1
 assert_ok   "accepts strata+http url"    valid_ollama_addr strata+http://h:8080
 assert_ok   "accepts basalt://host"      valid_ollama_addr basalt://10.0.0.7
 assert_ok   "accepts basalt+http url"    valid_ollama_addr basalt+http://h:8080
+assert_ok   "accepts maya://host"        valid_ollama_addr maya://10.0.0.9
+assert_ok   "accepts maya+http url"      valid_ollama_addr maya+http://h:8080
 
 describe normalize_ollama_url
 assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
@@ -170,6 +174,8 @@ unset STRATA_PORT
 assert_eq "strata+http passes through"      "strata+http://h:8081"   "$(normalize_ollama_url strata+http://h:8081/)"
 assert_eq "basalt:// default port"          "basalt+http://h:8080"   "$(normalize_ollama_url basalt://h)"
 assert_eq "basalt+http passes through"      "basalt+http://h:8081"   "$(normalize_ollama_url basalt+http://h:8081/)"
+assert_eq "maya:// default port"            "maya+http://h:8080"     "$(normalize_ollama_url maya://h)"
+assert_eq "maya+http passes through"        "maya+http://h:8081"     "$(normalize_ollama_url maya+http://h:8081/)"
 
 describe valid_tier_selection
 MODEL_SERVER_COUNT=3
@@ -640,6 +646,9 @@ assert_eq "installer keeps Strata on port 11434" "strata+http://10.0.0.8:11434" 
 MODEL_SERVERS=(); MODEL_SERVER_COUNT=1; MODEL_SERVER_1=basalt://10.0.0.7:11434
 prompt_model_servers > /dev/null 2>&1 <<< $'\n\n\n\n\n\n\n\n\n\n\n' || true
 assert_eq "installer keeps Basalt on port 11434" "basalt+http://10.0.0.7:11434" "${MODEL_SERVERS[0]}"
+MODEL_SERVERS=(); MODEL_SERVER_COUNT=1; MODEL_SERVER_1=maya://10.0.0.9:11434
+prompt_model_servers > /dev/null 2>&1 <<< $'\n\n\n\n\n\n\n\n\n\n\n' || true
+assert_eq "installer keeps Maya on port 11434" "maya+http://10.0.0.9:11434" "${MODEL_SERVERS[0]}"
 MODEL_SERVER_COUNT=3; MODEL_SERVER_1=10.0.0.51
 
 # ── python provisioning ───────────────────────────────────────────────────────

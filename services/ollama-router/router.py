@@ -84,13 +84,6 @@ _DEFAULTS = {
         # load models on demand. true: only route to models already loaded
         # there (no multi-second JIT load on the request path).
         "lmstudio_loaded_only": "false",
-        # Size assumed for a Strata server's default model id "strata", which
-        # reports no parameter count (Qwen3.8-Flash-Next, 125B total). Other
-        # unsized Strata ids (Coder, aliases) stay unknown. Blank: no default.
-        "strata_default_params": "125B",
-        # Basalt's default Qwen3.8-Flash-Next alias also omits parameter size.
-        "basalt_default_id": "qwen3.8-flash-next",
-        "basalt_default_params": "125B",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -124,6 +117,15 @@ _DEFAULTS = {
         # Bonus for a model that is already resident in memory (LM Studio
         # reports this per model; Ollama entries are neutral).
         "loaded_bonus": "0.1",
+    },
+    # Sizes for exact model ids that an OpenAI-compatible server (Strata,
+    # Basalt, Maya) lists without a parameter count. Matching is by the whole
+    # id, case-insensitive, so variants and aliases stay unknown-size unless
+    # given a line of their own. A blank value removes a built-in entry.
+    "model_sizes": {
+        "strata": "125B",               # Strata's default id: Qwen3.8-Flash-Next
+        "qwen3.8-flash-next": "125B",   # Basalt's default alias
+        "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
     },
 }
 ROUTER_INI = os.getenv(
@@ -227,10 +229,25 @@ DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
 CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
 LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
-STRATA_DEFAULT_PARAMS = _cfg.get("discovery", "strata_default_params").strip()
-STRATA_DEFAULT_ID = "strata"
-BASALT_DEFAULT_PARAMS = _cfg.get("discovery", "basalt_default_params").strip()
-BASALT_DEFAULT_ID = _cfg.get("discovery", "basalt_default_id").strip().lower()
+
+
+def _model_sizes(cp: configparser.ConfigParser) -> dict:
+    """[model_sizes] as {lowercase id: size}, blank entries dropped. The
+    per-kind keys of earlier router.ini files ([discovery]
+    strata_default_params, basalt_/maya_default_id + _params) still apply when
+    a committed router.ini sets them."""
+    sizes = {k.strip().lower(): v.strip() for k, v in cp.items("model_sizes")}
+    if cp.has_option("discovery", "strata_default_params"):
+        sizes["strata"] = cp.get("discovery", "strata_default_params").strip()
+    for kind in ("basalt", "maya"):
+        id_key, size_key = f"{kind}_default_id", f"{kind}_default_params"
+        if cp.has_option("discovery", id_key) and cp.has_option("discovery", size_key):
+            sizes[cp.get("discovery", id_key).strip().lower()] = \
+                cp.get("discovery", size_key).strip()
+    return {k: v for k, v in sizes.items() if k and v}
+
+
+MODEL_SIZES = _model_sizes(_cfg)
 BANDS = {
     "fast": _band(_cfg, "fast_params"),
     "medium": _band(_cfg, "medium_params"),
@@ -258,42 +275,52 @@ TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 
 # --- server kinds -----------------------------------------------------------------
-# A server entry is a base URL. OpenAI-compatible servers carry lmstudio+,
-# strata+ or basalt+ prefixes, so MODEL_SERVERS / BACKEND_* can mix the APIs.
-LMSTUDIO_PREFIX = "lmstudio+"
-STRATA_PREFIX = "strata+"
-BASALT_PREFIX = "basalt+"
-# Optional bearer token for LM Studio servers with authentication enabled
-# (LM Studio 0.4+ "Require authentication"). Lives in secrets.env.
-LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
-STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
-BASALT_API_KEY = (os.getenv("BASALT_API_KEY") or "").strip()
+# A server entry is a base URL. Entries for servers that are not Ollama carry a
+# kind prefix (lmstudio+http://host:1234, maya+http://host:8080, ...), so
+# MODEL_SERVERS / BACKEND_* can mix APIs. This table is the one place a kind is
+# described; monitor.py and manage-model-servers.sh keep matching tables, and
+# tests/test_router.py checks that all three agree.
+#   prefix   -- the entry prefix
+#   key_env  -- the secrets.env variable holding the router's bearer token
+#   label    -- the name used in logs and alerts
+#   openai   -- models are listed at <base>/v1/models (Strata-style servers)
+SERVER_KINDS = {
+    "lmstudio": {"prefix": "lmstudio+", "key_env": "LMSTUDIO_API_TOKEN",
+                 "label": "LM Studio", "openai": False},
+    "strata": {"prefix": "strata+", "key_env": "STRATA_API_KEY",
+               "label": "Strata", "openai": True},
+    "basalt": {"prefix": "basalt+", "key_env": "BASALT_API_KEY",
+               "label": "Basalt", "openai": True},
+    "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
+             "label": "Maya", "openai": True},
+}
+OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
+# Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
+# servers with "Require authentication" (0.4+).
+KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
+             for kind, spec in SERVER_KINDS.items()}
 
 
 def server_kind(server: str) -> str:
-    if server.startswith(LMSTUDIO_PREFIX):
-        return "lmstudio"
-    if server.startswith(STRATA_PREFIX):
-        return "strata"
-    if server.startswith(BASALT_PREFIX):
-        return "basalt"
+    for kind, spec in SERVER_KINDS.items():
+        if server.startswith(spec["prefix"]):
+            return kind
     return "ollama"
 
 
 def server_base(server: str) -> str:
     """The plain http(s) base URL of a server entry."""
     kind = server_kind(server)
-    return server.split("+", 1)[1] if kind != "ollama" else server
+    return server.removeprefix(SERVER_KINDS[kind]["prefix"]) if kind != "ollama" else server
 
 
 def backend_headers(server: str) -> dict:
     """Credentials the ROUTER adds for a backend (never the client's own)."""
-    kind = server_kind(server)
-    token = {"lmstudio": LMSTUDIO_API_TOKEN, "strata": STRATA_API_KEY,
-             "basalt": BASALT_API_KEY}.get(kind, "")
+    token = KIND_KEYS.get(server_kind(server), "")
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
+
 
 CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
 VISION_STRICT = _cfg.getboolean("classification", "vision_strict")
@@ -550,7 +577,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata or Basalt model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt or Maya model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -561,9 +588,6 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
         if not isinstance(models, list):
             raise ValueError("data is not a list")
         entries = []
-        defaults = {"strata": (STRATA_DEFAULT_ID, STRATA_DEFAULT_PARAMS),
-                    "basalt": (BASALT_DEFAULT_ID, BASALT_DEFAULT_PARAMS)}
-        default_id, default_size = defaults[server_kind(server)]
         for model in models:
             if not isinstance(model, dict) or not model.get("id"):
                 continue
@@ -576,10 +600,10 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
             if isinstance(state, dict):
                 state = state.get("value")
             size = model.get("parameter_size") or model.get("params_string")
-            # Only the known default IDs inherit sizes. Other aliases and
-            # variants stay unknown unless the API or model ID provides a size.
-            if not size and str(model["id"]).lower() == default_id:
-                size = default_size or None
+            # Only ids listed in [model_sizes] inherit a size. Other aliases
+            # and variants stay unknown unless the API or the id gives one.
+            if not size:
+                size = MODEL_SIZES.get(str(model["id"]).lower())
             raw = {"name": model["id"], "capabilities": caps,
                    "details": {"parameter_size": size},
                    "loaded": state == "loaded" if state is not None else None}
@@ -595,7 +619,7 @@ fetch_strata_models = fetch_openai_models  # preserve the existing callable
 async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
     if server_kind(server) == "lmstudio":
         return await fetch_lmstudio_models(client, server)
-    if server_kind(server) in ("strata", "basalt"):
+    if server_kind(server) in OPENAI_KINDS:
         return await fetch_openai_models(client, server)
     try:
         response = await client.get(f"{server}/api/tags", timeout=DISCOVERY_TIMEOUT)

@@ -43,6 +43,12 @@ reject 'BASALT_GPUS' BASALT_GPUS=none
 reject 'BASALT_MODEL' BASALT_MODEL='../wrong.basalt'
 reject 'BASALT_CONTEXT' BASALT_CONTEXT=0
 reject 'CUDA_VERSION' CUDA_VERSION=12.9
+reject 'cannot be installed in a debian13 CT' TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
+plan TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst CUDA_VERSION=13.1
+has 'CUDA 13.1 is available for debian13'
+has 'CUDA_VERSION=13.1'
+plan TEMPLATE=local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst
+has 'CUDA 13.0 is available for debian12'
 reject 'Duplicate GPU device' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia0'
 reject 'does not pass through /dev/nvidia1' BASALT_GPUS=0,1
 plan BASALT_GPUS=0,1 GPU_DEVICES='/dev/nvidia0 /dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm'
@@ -59,13 +65,27 @@ has 'https://example.com/custom.git main into /opt/basalt'
 
 installed=$(mktemp -d "${TMPDIR:-/tmp}/basalt-rerun-test.XXXXXX")
 trap 'rm -rf -- "$installed"' EXIT
-mkdir -p "$installed/opt/basalt/.git" "$installed/etc/systemd/system"
+mkdir -p "$installed/opt/basalt/.git" "$installed/etc/systemd/system" "$installed/etc/basalt-target"
 : > "$installed/etc/systemd/system/basalt.service"
-output=$(env -i "PATH=$PATH" BASALT_DIR="$installed/opt/basalt" \
-    UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1)
+# An installed target has a settings record; a rerun plans from it.
+printf 'BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt\nBASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt\nBASALT_ALIAS=qwen3.8-flash-next\nBASALT_GPUS=0\nBASALT_CONTEXT=32768\nBASALT_PORT=8123\nBASALT_ALLOW_NO_KEY=false\nCUDA_VERSION=13.0\n' > "$installed/etc/basalt-target/installed-env"
+rerun_plan() {
+    env -i "PATH=$PATH" BASALT_DIR="$installed/opt/basalt" BASALT_ETC_DIR="$installed/etc/basalt-target" \
+        UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1
+}
+output=$(rerun_plan)
 has 'before anything is stopped'
 has 'systemctl stop basalt.service'
 has 'previous commit locally (no network)'
+
+# Without any settings record the same checkout is refused, not planned with
+# fresh-install defaults.
+rm "$installed/etc/basalt-target/installed-env"
+if output=$(rerun_plan); then
+    printf 'FAIL a checkout without a settings record was planned\n%s\n' "$output" >&2; exit 1
+fi
+has 'Found an existing'
+has 'no readable settings record'
 
 unit=$here/basalt.service
 grep -Fqx 'ExecStart=/bin/sh ${BASALT_RUN_SCRIPT}' "$unit"

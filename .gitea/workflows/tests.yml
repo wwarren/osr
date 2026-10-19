@@ -1,8 +1,8 @@
 # Runs every test suite, shellcheck and ruff on each push and pull request.
 # Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image.
-# The "test" job talks to nothing beyond PyPI. The "strata-upstream" job also
-# fetches one pinned commit from github.com/Niko1221/Strata; it is a separate
-# job so a GitHub outage cannot hide the results of the main suites.
+# The "test" job talks to nothing beyond PyPI. The "strata-upstream" and
+# "maya-upstream" jobs each fetch one pinned commit from GitHub; they are
+# separate jobs so a GitHub outage cannot hide the results of the main suites.
 name: tests
 
 on:
@@ -46,20 +46,8 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck -S warning ollama-smart-router-install.sh manage-model-servers.sh install/manage-model-servers.sh \
-            install/apply-config.sh install/update-router.sh install_nvidia_580_173_02.sh tests/run-tests.sh \
-            tests/test-repo.sh tests/test-update.sh \
-            tests/test-nvidia.sh targets/llamacpp/install-target.sh \
-            targets/llamacpp/provision-lxc.sh targets/llamacpp/test-upgrade.sh \
-            targets/airllm/install-target.sh targets/airllm/provision-lxc.sh \
-            targets/airllm/test-install.sh targets/airllm/test-provision.sh \
-            targets/ollama/install-target.sh targets/ollama/provision-lxc.sh \
-            targets/ollama/test-install.sh targets/ollama/test-provision.sh \
-            targets/strata/install-target.sh targets/strata/provision-lxc.sh \
-            targets/strata/test-provision.sh targets/strata/test-install.sh \
-            targets/open-terminal/install-target.sh targets/open-terminal/provision-lxc.sh \
-            targets/open-terminal/test-install.sh targets/open-terminal/test-provision.sh \
-            tools/update-router-services.sh tests/test-remote-update.sh
+          mapfile -d '' -t scripts < <(git ls-files -z --cached --others --exclude-standard -- '*.sh')
+          shellcheck -S warning "${scripts[@]}"
 
       - name: ruff
         run: ruff check --select E,F,W,B --ignore E501 services targets tools tests
@@ -85,3 +73,26 @@ jobs:
 
       - name: Pinned launcher check
         run: python targets/strata/test-pinned-run-script.py "$RUNNER_TEMP/strata"
+
+  # Checks targets/maya/install-target.sh and maya.service against Project
+  # Maya's real code at the pinned release (PIN in
+  # targets/maya/test-pinned-run-script.py): the launcher line setup prints,
+  # the setup options, the dashboard update switch and the empty model list.
+  maya-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Maya commit
+        run: |
+          pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)".*$/\1/p' targets/maya/test-pinned-run-script.py)
+          test -n "$pin" || { echo "no PIN in test-pinned-run-script.py" >&2; exit 1; }
+          git init -q "$RUNNER_TEMP/maya"
+          git -C "$RUNNER_TEMP/maya" fetch -q --depth 1 https://github.com/mw00/project-maya.git "$pin"
+
+      - name: Pinned upstream check
+        run: python targets/maya/test-pinned-run-script.py "$RUNNER_TEMP/maya"

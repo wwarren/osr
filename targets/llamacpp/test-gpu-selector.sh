@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Exercise CUDA GPU selection helpers without querying a real PVE host or GPU.
 set -Eeuo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# shellcheck disable=SC1090
 source <(awk '
     /^# GPU configuration helpers \(read-only\)\./ { capture=1; next }
     /^# End GPU configuration helpers\./ { capture=0 }

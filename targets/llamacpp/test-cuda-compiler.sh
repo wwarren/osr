@@ -5,6 +5,7 @@ set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# shellcheck disable=SC1090
 source <(awk '
     /^# CUDA compiler discovery helpers / { capture=1; next }
     /^# End CUDA compiler discovery helpers\./ { capture=0 }

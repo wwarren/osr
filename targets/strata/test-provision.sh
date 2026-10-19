@@ -86,14 +86,29 @@ passed=$((passed + 1))
 
 installed=$(mktemp -d "${TMPDIR:-/tmp}/strata-rerun-test.XXXXXX")
 trap 'rm -rf -- "$installed"' EXIT
-mkdir -p "$installed/opt/strata/.git" "$installed/etc/systemd/system"
+mkdir -p "$installed/opt/strata/.git" "$installed/etc/systemd/system" "$installed/etc/strata-target"
 : > "$installed/etc/systemd/system/strata.service"
-output=$(env -i "PATH=$PATH" STRATA_DIR="$installed/opt/strata" \
-    UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1)
+# An installed target has a settings record; a rerun plans from it.
+printf 'STRATA_FAMILY=qwen\nSTRATA_MODEL=IQ2_XS\nSTRATA_CONTEXT=32768\nSTRATA_VISION=no\nSTRATA_PORT=8123\nSTRATA_ALLOW_NO_KEY=false\n' > "$installed/etc/strata-target/installed-env"
+rerun_plan() {
+    env -i "PATH=$PATH" STRATA_DIR="$installed/opt/strata" STRATA_ETC_DIR="$installed/etc/strata-target" \
+        UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1
+}
+output=$(rerun_plan)
 has 'git fetch --depth 1 https://github.com/Niko1221/Strata.git main (before anything is stopped'
 has 'nothing to do'
 has 'record the current commit; systemctl stop strata.service'
 has 'previous commit locally (no network)'
+passed=$((passed + 1))
+
+# Without any settings record the same checkout is refused, not planned with
+# fresh-install defaults.
+rm "$installed/etc/strata-target/installed-env"
+if output=$(rerun_plan); then
+    printf 'FAIL a checkout without a settings record was planned\n%s\n' "$output" >&2; exit 1
+fi
+has 'Found an existing'
+has 'no readable settings record'
 passed=$((passed + 1))
 
 output=$(env -i "PATH=$PATH" STRATA_PORT=11434 STRATA_REF=v0.1.40 bash "$guest" --dry-run 2>&1)

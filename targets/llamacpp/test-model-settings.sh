@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+# shellcheck disable=SC1090
 source <(awk '
     /^# Model configuration helpers / { capture=1; next }
     /^# End model configuration helpers\./ { capture=0 }
@@ -28,7 +29,7 @@ check() {
 }
 settings() {
     local entry
-    for entry in "$@"; do export "$entry"; done
+    for entry in "$@"; do export "${entry?}"; done
     configure_model
 }
 interactive() {
@@ -77,7 +78,9 @@ eval "original_$(declare -f valid_model_dir)"
 with_fixture_store() {
     valid_model_dir() { [[ $1 == "$fixture" || $1 == "$fixture"/* ]] || original_valid_model_dir "$1"; }
     model_prompt_available() { return 0; }
-    export MODEL_DIR=$fixture "$@"
+    local entry
+    export MODEL_DIR=$fixture
+    for entry in "$@"; do export "${entry?}"; done
     configure_model
 }
 check 'single GGUF in store is the default' ok "$fixture/only.gguf" with_fixture_store <<'INPUT'

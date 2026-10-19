@@ -8,7 +8,7 @@
 #
 # The upstream tag is checked against a pinned commit (tags can be moved), the
 # Python dependencies come from the hash-locked requirements.lock, and the
-# package itself is built offline from the verified checkout. Each commit gets
+# package itself is built offline from the verified checkout. Each commit and lock hash gets
 # its own venv; /opt/open-terminal/venv points at the active one, so a failed
 # upgrade switches straight back to the previous venv.
 set -Eeuo pipefail
@@ -131,7 +131,8 @@ for file in open-terminal.service requirements.in requirements.lock; do
     [[ -r $source_dir/$file ]] || die "Missing $source_dir/$file (push it with install-target.sh)."
 done
 src=$OT_OPT/source
-venv=$OT_OPT/venv-$COMMIT
+lock_sha256=$(sha256sum "$source_dir/requirements.lock" | cut -d' ' -f1)
+venv=$OT_OPT/venv-$COMMIT-$lock_sha256
 
 if (( dry_run )); then
     run apt-get update
@@ -169,8 +170,6 @@ install -d -m 0755 "$OT_OPT"
 chown root:root "$OT_ETC" "$OT_ETC/api-key"
 chmod 0700 "$OT_ETC"
 chmod 0600 "$OT_ETC/api-key"
-(umask 077 && service_env "$key" "$PORT" > "$OT_ETC/service.env.new")
-mv -f "$OT_ETC/service.env.new" "$OT_ETC/service.env"
 
 # Source: the tag, refetched (+ forces a moved tag to show up), then checked
 # against the pinned commit.
@@ -187,14 +186,27 @@ mismatch=$(deps_mismatch "$src/pyproject.toml" "$source_dir/requirements.in")
 [[ -z $mismatch ]] ||
     die "Open Terminal ${VERSION} needs different Python dependencies than requirements.lock was built for:"$'\n'"$mismatch"$'\n'"Update requirements.in and regenerate requirements.lock (README.md, \"Updating the pin\")."
 
-# A fresh venv per commit; the venv/bin scripts carry its absolute path, so the
+# Nothing to change: the commit and lock's venv is active, service.env and the
+# unit would be written exactly as they are, and the terminal is healthy.
+if [[ -f $venv/.install-complete && -x $venv/bin/open-terminal && $(readlink "$OT_OPT/venv" 2>/dev/null) == "$venv" ]] &&
+        cmp -s <(service_env "$key" "$PORT") "$OT_ETC/service.env" &&
+        cmp -s "$source_dir/open-terminal.service" "$UNIT_DIR/open-terminal.service" &&
+        systemctl is-active --quiet open-terminal.service && healthy "$PORT"; then
+    printf 'Open Terminal %s (%s) is already installed with these settings and is healthy; nothing to do.\n' "$VERSION" "$COMMIT"
+    exit 0
+fi
+
+# A fresh venv per commit and lock hash; scripts carry its absolute path, so the
 # venv is never moved, only the venv symlink is switched.
-if [[ ! -x $venv/bin/open-terminal ]]; then
+if [[ ! -f $venv/.install-complete || ! -x $venv/bin/open-terminal ]]; then
+    [[ $(readlink "$OT_OPT/venv" 2>/dev/null) != "$venv" ]] ||
+        die "The active venv is incomplete: $venv; inspect it before retrying."
     rm -rf -- "$venv"
     (umask 022
      python3 -m venv "$venv"
      "$venv/bin/python" -m pip install --no-cache-dir --require-hashes -r "$source_dir/requirements.lock"
-     "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src")
+     "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src"
+     touch "$venv/.install-complete")
 fi
 previous=''
 if [[ -L $OT_OPT/venv ]]; then
@@ -204,27 +216,70 @@ elif [[ -d $OT_OPT/venv ]]; then
     mv "$OT_OPT/venv" "$OT_OPT/venv-legacy"
     previous=$OT_OPT/venv-legacy
 fi
+# Only now, with the new venv ready, is the configuration changed. The unit
+# and service.env in use are kept as *.prev (this run's copies only), so a
+# rollback restores the configuration as well as the venv.
+unit_file=$UNIT_DIR/open-terminal.service
+rm -f -- "$OT_ETC/service.env.prev" "$OT_ETC/open-terminal.service.prev"
+[[ -f $OT_ETC/service.env ]] && (umask 077 && cp -p -- "$OT_ETC/service.env" "$OT_ETC/service.env.prev")
+[[ -f $unit_file ]] && cp -p -- "$unit_file" "$OT_ETC/open-terminal.service.prev"
+rollback() {
+    # Handle restart errors as well as timeouts, including settings-only updates.
+    trap - ERR
+    set +e
+    systemctl stop open-terminal.service 2>/dev/null
+    if [[ -n $previous && -x $previous/bin/open-terminal ]]; then
+        ln -sfn "$previous" "$OT_OPT/venv" || return 1
+    fi
+    if [[ -f $OT_ETC/service.env.prev ]]; then
+        mv -f -- "$OT_ETC/service.env.prev" "$OT_ETC/service.env" || return 1
+        prev_port=$(sed -n 's/^OPEN_TERMINAL_PORT=\([0-9]\{1,5\}\)$/\1/p' "$OT_ETC/service.env" | tail -n1)
+        [[ -n $prev_port ]] && PORT=$prev_port
+    else
+        rm -f -- "$OT_ETC/service.env"
+    fi
+    if [[ -f $OT_ETC/open-terminal.service.prev ]]; then
+        install -m 0644 "$OT_ETC/open-terminal.service.prev" "$unit_file" || return 1
+        rm -f -- "$OT_ETC/open-terminal.service.prev"
+    else
+        rm -f -- "$unit_file"
+    fi
+    systemctl daemon-reload || return 1
+    if [[ -n $previous && -x $previous/bin/open-terminal ]]; then
+        if systemctl restart open-terminal.service && wait_healthy; then
+            note 'Upgrade failed; the previous Open Terminal is running again.'
+        else
+            note 'Upgrade failed and the previous Open Terminal did not come back either; see journalctl -u open-terminal.'
+            return 1
+        fi
+    else
+        note 'Open Terminal installation failed; no previous installation was available.'
+        return 1
+    fi
+    return 0
+}
+# With set -E a failure inside a ( ... ) subshell fires this trap in the
+# subshell and again in the parent; only the main shell rolls back (a second
+# pass would find no *.prev and delete the configuration it just restored).
+trap '[[ $BASHPID == "$$" ]] || exit 1; rollback || note "Rollback failed; inspect the saved configuration and journalctl -u open-terminal."; exit 1' ERR
+(umask 077 && service_env "$key" "$PORT" > "$OT_ETC/service.env.new")
+mv -f "$OT_ETC/service.env.new" "$OT_ETC/service.env"
 ln -sfn "$venv" "$OT_OPT/venv"
-
-install -m 0644 "$source_dir/open-terminal.service" "$UNIT_DIR/open-terminal.service"
+install -m 0644 "$source_dir/open-terminal.service" "$unit_file"
 systemctl daemon-reload
 systemctl enable open-terminal.service
 systemctl restart open-terminal.service
-if wait_healthy; then
-    # Keep the active venv and the one before it; remove older ones.
+wait_healthy || false
+trap - ERR
+# The run succeeded, so the configuration it replaced is no longer needed
+# (service.env.prev holds the API key).
+rm -f -- "$OT_ETC/service.env.prev" "$OT_ETC/open-terminal.service.prev"
+# Keep the active venv and the one before it; remove older ones. A settings-only
+# change on the same commit removes nothing: "previous" is then the active venv
+# itself, and the previous environment remains the rollback target.
+if [[ $previous != "$venv" ]]; then
     for old in "$OT_OPT"/venv-*; do
         [[ -d $old && $old != "$venv" && $old != "$previous" ]] && rm -rf -- "$old"
     done
-    printf 'Open Terminal %s (%s) is healthy on port %s.\n' "$VERSION" "$COMMIT" "$PORT"
-    exit 0
 fi
-
-systemctl status --no-pager open-terminal.service >&2 || true
-if [[ -n $previous && $previous != "$venv" && -x $previous/bin/open-terminal ]]; then
-    note "Open Terminal ${VERSION} did not become healthy; switching back to ${previous}."
-    ln -sfn "$previous" "$OT_OPT/venv"
-    systemctl restart open-terminal.service
-    wait_healthy && die "Upgrade failed; the previous Open Terminal is running again."
-    die "Upgrade failed and the previous Open Terminal did not come back either; see journalctl -u open-terminal."
-fi
-die "Open Terminal did not become healthy within ${HEALTH_TIMEOUT} seconds; see journalctl -u open-terminal."
+printf 'Open Terminal %s (%s) is healthy on port %s.\n' "$VERSION" "$COMMIT" "$PORT"

@@ -7,6 +7,7 @@ set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# shellcheck disable=SC1090
 source <(awk '
     /^download_requested_gguf\(\)/ { capture=1 }
     /^MODE=install$/ { capture=0 }

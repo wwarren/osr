@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Exercise model-volume selection and Hugging Face URL helpers without installing or downloading.
 set -Eeuo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# shellcheck disable=SC1090
 source <(awk '
     /^# Model configuration helpers / { capture=1; next }
     /^# End model configuration helpers\./ { capture=0 }

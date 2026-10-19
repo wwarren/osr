@@ -1,37 +1,40 @@
 # Ollama Smart Router — Service Architecture
 
 **System:** `ollama-smart-router`
-**Platform:** Proxmox VE, unprivileged Debian 13 LXC
-**Status:** as provisioned by `ollama-smart-router-install.sh`
+**Platform:** Proxmox VE; an unprivileged Debian 13 LXC for the router, one LXC per inference target
+**Built by:** `ollama-smart-router-install.sh` and `targets/*/provision-lxc.sh`
+**Last reviewed:** 2026-10-18
+
+Operating procedures are in [README.md](README.md); this document explains how
+the system is put together and why.
 
 ---
 
 ## 1. Purpose and scope
 
-The Ollama Smart Router presents a **single OpenAI-compatible API endpoint** in
-front of a pool of self-hosted Ollama servers, and decides *per request* which
-model on which host should answer it. It exists to solve three problems:
+The router presents a **single OpenAI-compatible endpoint** in front of a pool
+of self-hosted model servers (Ollama, LM Studio, llama.cpp, AirLLM, Strata,
+Basalt, Project Maya) and decides *per request* which model on which host
+answers. It addresses three problems:
 
-1. **Model sprawl.** A pool of Ollama hosts serves different models of different
-   sizes. Clients shouldn't need to know which host has what.
-2. **Cost/latency mismatch.** Sending "hi" to a 32B model wastes capacity;
-   sending an architectural analysis to a 3B model wastes the answer.
-3. **Operational drift.** Models get pulled and removed on individual hosts.
-   Static configuration goes stale silently.
+1. **Model sprawl.** Clients should not need to know which host serves what.
+2. **Cost/latency mismatch.** Small prompts should not occupy a large model, and
+   hard prompts should not go to a small one.
+3. **Operational drift.** Models come and go on hosts, so static configuration
+   goes stale.
 
-The system covers routing, load spreading, health alerting, a chat UI, and the
-configuration lifecycle. It explicitly does **not** cover running Ollama itself
-— the model hosts are external dependencies, managed separately.
+The router CT covers routing, load spreading, health alerting, a chat UI and
+the configuration lifecycle. `targets/` provisions inference servers (§16) and
+an Open Terminal companion (§17) in their own LXCs. Once provisioned, the
+router treats a target like any other external host.
 
-### Quality attributes prioritised
-
-| Attribute | How it is addressed |
+| Quality attribute | How it is addressed |
 |---|---|
-| **Availability** | No service start depends on Gitea; routing degrades through three fallback layers; failed hosts are skipped mid-request |
-| **Correctness of routing** | Live inventory rather than static assumptions; embedding models structurally excluded from chat |
-| **Operability** | Every routing decision is inspectable via headers and endpoints; config is version controlled |
-| **Reproducibility** | Whole system rebuilt from one script plus a git repo |
-| **Least privilege** | One unprivileged service account; localhost-bound internals; hardened units |
+| **Availability** | No service start depends on Gitea; three-layer degradation; failed hosts skipped mid-request |
+| **Correct routing** | Live inventory, not static assumptions; embedding models structurally excluded |
+| **Operability** | Every decision inspectable via headers and endpoints; config version controlled; every change can be rolled back |
+| **Reproducibility** | Router rebuilt from one script plus a git repo; targets from their own scripts |
+| **Least privilege** | One unprivileged account per CT; localhost-bound internals; hardened units; secrets outside git |
 
 ---
 
@@ -40,176 +43,157 @@ configuration lifecycle. It explicitly does **not** cover running Ollama itself
 ```mermaid
 flowchart LR
     subgraph clients[Clients]
-        api["API clients<br/>(OpenAI SDK, curl, agents)"]
+        api["API clients"]
         browser["Browsers"]
     end
-
     subgraph ct["ollama-smart-router LXC"]
         router["Smart Router<br/>:8000"]
         webui["Open WebUI<br/>:8080"]
         litellm["LiteLLM<br/>127.0.0.1:4000"]
         monitor["Health Monitor"]
     end
-
-    subgraph pool["Ollama model pool (1-20 hosts)"]
-        o1["ollama :11434"]
-        o2["ollama :11434"]
-        oN["ollama :11434"]
+    subgraph pool["Model pool (1-20 hosts)"]
+        o1["Ollama / llama.cpp bridge / AirLLM<br/>:11434"]
+        o2["LM Studio<br/>:1234"]
+        o3["Strata / Basalt / Maya<br/>:8080"]
     end
+    term["Open Terminal LXC<br/>:8000"]
+    gitea["Gitea"]
+    mm["Mattermost"]
 
-    gitea["Gitea<br/>config repository"]
-    mm["Mattermost<br/>alert channel"]
-
-    api -->|"HTTPS/HTTP<br/>OpenAI API"| router
+    api --> router
     browser --> webui
     webui -->|OpenAI API| router
-    router -->|"direct dispatch<br/>(discovery mode)"| pool
-    router -.->|"fallback"| litellm
+    webui -->|terminal tool| term
+    router -->|direct dispatch| pool
+    router -.->|fallback| litellm
     litellm --> pool
-    monitor -->|"GET /api/tags"| pool
-    monitor -->|"webhook"| mm
-    gitea -.->|"clone at provisioning"| ct
+    monitor -->|probes| pool
+    monitor -->|webhook| mm
+    gitea -.->|clone at provisioning| ct
 ```
 
-### External dependencies
+| Dependency | Criticality | If unavailable |
+|---|---|---|
+| Model hosts (`:11434`, `:1234`, `:8080`) | **Critical** | Fail forward to other hosts; all down → 502 |
+| Gitea (HTTPS) | Provisioning only | Install falls back to local config; running system unaffected |
+| Mattermost (webhook) | Optional | Alerts logged and retried |
+| Open Terminal (`:8000`) | Optional | Terminal tool unavailable; chat unaffected |
 
-| Dependency | Protocol | Criticality | Behaviour if unavailable |
-|---|---|---|---|
-| Ollama hosts | HTTP `:11434` | **Critical** | Router fails forward to other hosts; total loss → 502 |
-| Gitea | HTTPS | **Provisioning only** | Install falls back to local config; running system unaffected |
-| Mattermost | HTTPS webhook | Optional | Monitor logs alerts instead of posting |
-| Proxmox host | — | Provisioning only | — |
-
-> **Key design property:** after provisioning, the only runtime dependency is
-> the Ollama pool. Gitea and Mattermost outages cannot stop the service or
-> prevent it from booting.
+> After provisioning, the only runtime dependency is the model pool. Gitea and
+> Mattermost outages cannot stop the service or prevent it booting.
 
 ---
 
 ## 3. Deployment view
 
-All four services run in a single unprivileged LXC container as the same
-non-login system account (`ollama-router`).
+All four services run in one unprivileged LXC (default 2 vCPU, 4 GB, 32 GB)
+as the non-login account `ollama-router`.
 
 ```mermaid
 flowchart TB
-    subgraph host["Proxmox host"]
-        subgraph ctr["LXC (unprivileged) — 2 vCPU / 4 GB / 32 GB"]
-            direction TB
-            subgraph units["systemd units"]
-                A["open-webui.service<br/>0.0.0.0:8080"]
-                B["ollama-router.service<br/>0.0.0.0:8000"]
-                C["litellm-proxy.service<br/>127.0.0.1:4000"]
-                D["ollama-monitor.service<br/>no listener"]
-            end
-            subgraph fs["Filesystem"]
-                E["/app/router<br/>code, .ini, .env, venv (py3.13)"]
-                F["/app/openwebui<br/>.env, venv (py3.12), data"]
-                G["/app/config-repo<br/>git clone, root-only 0700"]
-                H["/opt/python<br/>standalone CPython 3.12"]
-            end
-        end
+    subgraph ctr["LXC (unprivileged)"]
+        A["open-webui.service<br/>0.0.0.0:8080"]
+        B["ollama-router.service<br/>0.0.0.0:8000"]
+        C["litellm-proxy.service<br/>127.0.0.1:4000"]
+        D["ollama-monitor.service<br/>no listener"]
     end
-
     A -->|Requires| B
-    B -->|Requires| C
-    D -->|Requires| C
+    B -.->|Wants| C
+    D -.->|Wants| C
 ```
 
-### Unit dependency rationale
+* `open-webui` **Requires** the router, its only backend. The router and
+  monitor only **Want** LiteLLM: it is a fallback, and `Requires=` would let
+  every LiteLLM restart cascade into the router and UI.
+* All units are `Restart=always`. `open-webui` has `TimeoutStartSec=600`,
+  because its first start downloads an embedding model.
+* Every unit reads `/app/router/secrets.env` as an optional second
+  `EnvironmentFile=` (§9).
 
-* `open-webui` **Requires** `ollama-router`, because the UI's only backend is
-  the router.
-* `ollama-router` and `ollama-monitor` only **Want** `litellm-proxy`. LiteLLM
-  is the router's *fallback* path, and a hard `Requires=` let every LiteLLM
-  restart cascade into the router and the UI.
-* All units are `Restart=always`. `open-webui` carries `TimeoutStartSec=600`
-  because its first start downloads a local embedding model.
-
-### Hardening applied to every unit
+**Hardening applied to every unit:**
 
 ```
-User=ollama-router            Group=ollama-router
-NoNewPrivileges=true          PrivateTmp=true        PrivateDevices=true
-ProtectSystem=strict          ProtectHome=true       UMask=0027
-RestrictSUIDSGID=true         LockPersonality=true   SystemCallArchitectures=native
-CapabilityBoundingSet=        RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+User=/Group= service account   NoNewPrivileges=true   PrivateTmp=true   PrivateDevices=true
+ProtectSystem=strict           ProtectHome=true       UMask=0027        CapabilityBoundingSet=
+RestrictSUIDSGID=true          LockPersonality=true   SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-`ProtectSystem=strict` makes the whole filesystem read-only except for
-explicit exemptions:
-
-| Unit | Writable |
-|---|---|
-| `ollama-router` | nothing (`PYTHONDONTWRITEBYTECODE=1`) |
-| `litellm-proxy` | nothing. Verified serving with a read-only install tree and no writable `HOME`. |
-| `ollama-monitor` | `StateDirectory=ollama-monitor`, which holds the startup-notice timestamp |
-| `open-webui` | `ReadWritePaths=/app/openwebui` (data directory and model cache) |
-
-A unit that fails to start under these settings is caught by
-`manage-model-servers apply`. It health-checks every restarted service and
-rolls back the unit files with the rest of the configuration.
+Writable exceptions: `open-webui` → `/app/openwebui`; `ollama-monitor` →
+`StateDirectory=ollama-monitor` (startup-notice timestamp); the router and
+LiteLLM → nothing. `tests/test-repo.sh` checks `ProtectSystem=strict` and an
+empty capability set on every unit. A unit that cannot start under them is
+caught by `manage-model-servers apply`, which rolls it back (§6.1).
 
 ---
 
 ## 4. Component view
 
-### 4.1 Smart Router (`ollama-router.service`) — the core
+### 4.1 Smart Router (`ollama-router.service`)
 
-FastAPI/uvicorn service on `:8000`. The only component that makes routing
-decisions.
+FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | Main path — classify, select target, dispatch |
-| `GET /v1/models` | Advertises discovered models + `auto` and tier aliases |
-| `GET /routing/inventory` | Live inventory, per-host up/down and errors |
-| `POST /routing/refresh` | Force an immediate re-poll |
-| `POST /routing/explain` | Show the decision and scored candidates, no execution |
-| `GET /healthz` | Liveness of the router process itself |
-| `ANY /v1/{path}` | Transparent passthrough to LiteLLM (embeddings, etc.) |
+| `POST /v1/chat/completions` | Classify, select, dispatch |
+| `GET /v1/models` | `auto`, tier aliases and discovered chat models (`owned_by` = server kind) |
+| `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state; force a re-poll |
+| `POST /routing/explain` | Decision and scored candidates, without executing |
+| `GET /healthz` | Process liveness (never needs the key) |
+| `ANY /v1/{path}` | Passthrough to LiteLLM (embeddings, etc.) |
 
-Internally it has three collaborating parts:
+With `ROUTER_API_KEY` set, every path except `/healthz` needs
+`Authorization: Bearer <key>`. Without a key on a non-loopback address, the
+router logs a warning at start-up.
 
-* **Discovery task** — an asyncio background loop polling every configured host's
-  `/api/tags` on `refresh_seconds`. Writes a new inventory dict wholesale, so a
-  reader never observes a half-built structure.
-* **Classifier** — turns a conversation into requirements: size class
-  (fast/medium/large/xlarge), whether it looks like code, whether it carries an
-  image.
-* **Selector + dispatcher** — scores every `(host, model)` pair, ranks them, and
-  dispatches to the best, failing forward on error.
+* **Discovery task** — polls each host every `refresh_seconds` through its own
+  API (§15) and swaps in a new inventory atomically. A host whose connection
+  fails during dispatch is marked down until its next good poll.
+* **Classifier** — size class (fast/medium/large/xlarge), code or not, image
+  or not. Only the newest user message is judged
+  (`[classification] scope = last_user`), so a system prompt cannot pin a
+  conversation to one tier. Images are looked for in every message.
+* **Selector + dispatcher** — scores every `(host, model)` pair and fails
+  forward through the ranking (§5).
 
 ### 4.2 LiteLLM proxy (`litellm-proxy.service`)
 
-Bound to `127.0.0.1:4000` — **not reachable from the network**. Serves two
-purposes: it is the fallback dispatch path when discovery is unavailable, and it
-backs the passthrough routes for non-chat OpenAI endpoints. Its
-`litellm_config.yaml` is generated at install time with one deployment per
-`(tier, host)` pair and `latency-based-routing` plus cross-tier fallbacks.
+On `127.0.0.1:4000`, not reachable from the network. It is the fallback
+dispatch path and backs the non-chat passthrough. `manage-model-servers`
+generates `litellm_config.yaml` with one deployment per (tier, host), using
+each kind's provider (`ollama/`, `lm_studio/`, `openai/`) and token reference,
+`latency-based-routing` and cross-tier fallbacks. Everything under
+`router_settings` (fallbacks included) is passed to `litellm.Router` as
+keyword arguments (checked against the pinned 1.75.5.post1). It has no master
+key; the loopback binding is its access control. It has its own hash-locked
+venv, because `litellm[proxy]` pins fastapi/uvicorn versions that conflict
+with the router's.
 
 ### 4.3 Open WebUI (`open-webui.service`)
 
-Chat UI on `:8080`. Points at the **router**, not at LiteLLM, so UI traffic is
-smart-routed. Runs from its own virtualenv on **Python 3.12** — every
-`open-webui` release requires `>=3.11,<3.13` while Debian 13 ships 3.13, so the
-installer provisions a dedicated interpreter for it (see §7.3).
+Chat UI on `:8080`. It points at the **router**, not LiteLLM, and authenticates
+with `ROUTER_API_KEY` (as `OPENAI_API_KEYS`). It runs on Python 3.12 in its
+own venv (§7.3). The version is pinned in
+`services/open-webui/requirements.txt`.
 
 ### 4.4 Health monitor (`ollama-monitor.service`)
 
-No listener. Polls each distinct host once per cycle and maps the result onto
-every `(tier, host)` pair that uses it, so a host shared by two tiers is probed
-once but alerted per tier. Posts state *transitions* only — down and recovery —
-plus a startup notice that doubles as a webhook permission check.
+No listener. Every `interval_seconds` (15) it probes each distinct host in
+`MODEL_SERVERS`/`BACKEND_*` once, labelling alerts with that host's tiers:
+Ollama on `/api/tags`, other kinds on `/v1/models` with their token.
+Strata/Basalt/Maya also count as down while that list is empty, and a rejected
+token counts as down. It also probes LiteLLM, the router's `/healthz` and Open
+WebUI's `/health`. A state change needs `fail_threshold` (3) or
+`recover_threshold` (2) consecutive results, and only transitions are posted.
+Undelivered alerts are retried every cycle. A startup notice, at most once per
+`notice_interval_seconds` (3600), doubles as a webhook check.
 
-It also runs the **keep-alive maintainer**. Ollama's OpenAI-compatible endpoint
-does not accept a `keep_alive` field, so a model driven through the router would
-always use the server default and unload after ~5 minutes idle. The maintainer
-works around this by periodically calling each healthy host's *native*
-`/api/chat` with an empty message list and the configured `keep_alive`, which
-loads the model and resets its unload timer without generating anything. It runs
-only when `OLLAMA_KEEP_ALIVE` is set; blank leaves each server's own setting in
-charge. Down hosts are skipped so a dead host never stalls the cycle.
+The **keep-alive maintainer** (own thread) exists because Ollama's OpenAI
+endpoint ignores `keep_alive`. When `OLLAMA_KEEP_ALIVE` is set, every 240 s it
+calls the native `/api/chat` on each up Ollama host of a tier, with an empty
+message list, the tier's model and that keep-alive. This loads the model and
+resets its timer without generating anything. Other kinds are skipped.
 
 ---
 
@@ -219,199 +203,139 @@ charge. Down hosts are skipped so a dead host never stalls the cycle.
 
 ```mermaid
 flowchart TD
-    start["POST /v1/chat/completions"] --> parse["Parse body, extract messages"]
-    parse --> disc{"Discovery enabled<br/>AND inventory non-empty?"}
-    disc -->|No| legacy["Classify -> tier name"]
-    legacy --> lite["Forward to LiteLLM :4000"]
-    lite --> resp["Response<br/>X-Router-Mode: litellm"]
-
-    disc -->|Yes| named{"Explicit real model<br/>requested?"}
-    named -->|Yes| findhost["Find hosts serving it"]
-    named -->|No| classify["Classify: size class,<br/>code?, vision?"]
-    classify --> alias{"Tier alias given?"}
-    alias -->|Yes| pin["Pin size class"]
-    alias -->|No| rank
-    pin --> rank["Score every (host, model)"]
-    findhost --> dispatch
+    start["POST /v1/chat/completions"] --> disc{"Discovery on AND<br/>inventory non-empty?"}
+    disc -->|No| lite["Classify -> tier -> LiteLLM<br/>X-Router-Mode: litellm"]
+    disc -->|Yes| named{"Real model named?"}
+    named -->|"Yes, on an up host"| hosts["Hosts serving it"]
+    named -->|"Embedding-only"| e400["400 embedding_model_not_chat"]
+    named -->|"No / auto / tier alias /<br/>its hosts down"| classify["Classify: size, code?, vision?<br/>(tier alias pins the size)"]
+    classify --> rank["Score every (host, model)"]
+    hosts --> dispatch
     rank --> dispatch["Dispatch to best candidate"]
-    dispatch --> ok{"Connected and < 500?"}
-    ok -->|Yes| resp2["Stream response<br/>X-Router-Mode: discovery"]
+    dispatch --> ok{"Connected, not 404/5xx<br/>(or last candidate)?"}
+    ok -->|Yes| resp["Stream response<br/>X-Router-Mode: discovery"]
     ok -->|No| next{"More candidates?"}
     next -->|Yes| dispatch
     next -->|No| err["502 with last error"]
 ```
 
-### 5.2 Scoring heuristics
+A named model whose hosts are all down is routed by content with
+`X-Router-Warning: model-unavailable`. An image request with no vision
+candidate gets `X-Router-Warning: no-vision-model`, or a 400 when
+`vision_strict = true`.
 
-Each `(host, model)` pair is scored; highest wins.
+### 5.2 Scoring
 
 | Signal | Effect |
 |---|---|
-| **Size-band fit** | Request class maps to a parameter band (`0:9`, `9:20`, `20:70`, `70:999` billions). Ceilings are **exclusive**, so the bands are disjoint. In-band scores 1.0; outside decays linearly by `band_falloff` rather than disqualifying. When *nothing* is in band, candidates are ordered by distance to the band instead of by score — the falloff floors at zero, so otherwise every candidate ties and load-rotation would pick arbitrarily |
-| **Code specialisation** | `+code_match` when a code request meets a code model; `−code_match × offtask_penalty` when a code model takes prose |
-| **Vision** | `+vision_match` when an image request meets a vision model; `−vision_match` when it doesn't; small off-task penalty for a vision model on plain text |
-| **Extremes within class** | Large requests bias larger, fast requests bias smaller |
-| **Unknown size** | Scores `unknown_params` (0.3) — usable but never preferred |
-| **Embeddings** | **Structurally excluded.** Never eligible for chat, regardless of prompt. Explicitly requesting an embedding-only model on the chat endpoint is a 400 (`embedding_model_not_chat`), never a silent substitute. A named chat model whose hosts are all down is routed by content with `X-Router-Warning: model-unavailable` |
-| **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load across hosts serving the same model |
+| **Size-band fit** | Class → band `0:9`, `9:20`, `20:70`, `70:999` B, ceilings exclusive. In band scores 1.0; outside decays by `band_falloff`. If nothing is in band, candidates are ordered by distance to it (otherwise all would tie at the zero floor) |
+| **Extremes within class** | Large requests bias larger, fast requests smaller |
+| **Code** | `+code_match` for code→code model; `−code_match × offtask_penalty` for a code model on prose |
+| **Vision** | `+vision_match` for image→vision model; `−vision_match` otherwise; small penalty for a vision model on text |
+| **Residency** | `+loaded_bonus` for models reported loaded (LM Studio, Strata, Basalt, Maya); `lmstudio_loaded_only` excludes cold LM Studio models |
+| **Unknown size** | `unknown_params` (0.3): usable, never preferred |
+| **Embeddings** | Structurally excluded; naming one on the chat endpoint is a 400 |
+| **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load |
 
-Parameter counts come from `details.parameter_size`, falling back to parsing the
-tag (`qwen3:14b` → 14B) when the field is absent.
+Sizes come from `details.parameter_size` (Ollama), `params_string` (LM Studio)
+or `parameter_size` (OpenAI-style). Failing that, from the tag (`qwen3:14b` →
+14B), or from `[model_sizes]` for an exact ID (§15). All weights, bands and
+keyword lists live in `router.ini`.
 
-All weights, bands and classification keyword lists live in `router.ini` in the
-config repo — routing behaviour changes by commit, not by editing Python.
+### 5.3 Dispatch and degradation
 
-### 5.3 Dispatch sequence (discovery mode)
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant R as Router :8000
-    participant I as Inventory (in-memory)
-    participant O1 as Best host
-    participant O2 as Next-best host
-
-    C->>R: POST /v1/chat/completions
-    R->>R: classify(messages)
-    R->>I: rank candidates
-    I-->>R: ordered (host, model) list
-    R->>O1: POST /v1/chat/completions (real model name)
-    O1--xR: connection refused (host died since last poll)
-    R->>O2: POST /v1/chat/completions
-    O2-->>R: 200, streaming
-    R-->>C: stream + X-Router-Model / -Server / -Class
-```
-
-Retry is only attempted **before** any response body is streamed. Once bytes
-reach the client the exchange is committed, since a partial stream cannot be
-replayed against a different host.
-
-### 5.4 Three-layer degradation
+Chat is sent to `<base>/v1/chat/completions` with the real model name and the
+backend's own token from `secrets.env`; the client's `Authorization` is never
+forwarded. Retry happens only **before** the first byte reaches the client,
+because a partial stream cannot be replayed. A 404/5xx from the *last*
+candidate is passed through as-is.
 
 | Layer | Trigger | Behaviour |
 |---|---|---|
-| 1. Best candidate | Normal | Direct dispatch to highest-scoring host |
-| 2. Fail-forward | Connect error / 5xx | Next candidate in ranked order |
-| 3. LiteLLM fallback | Discovery off, or inventory empty | Static tier routing with LiteLLM's own fallbacks |
+| 1. Best candidate | Normal | Direct dispatch |
+| 2. Fail-forward | Connect error/timeout (host marked down), transport error, 404, 5xx | Next candidate |
+| 3. LiteLLM | Discovery off or inventory empty | Static tiers with LiteLLM's own fallbacks |
+
+`[http] connect_timeout_seconds` (3) bounds how long a dead host delays
+failover; `read_timeout_seconds` (300) bounds the gap between bytes.
 
 ---
 
 ## 6. Configuration architecture
 
 Configuration is **version controlled in Gitea and injected at provisioning
-time** — a deliberate middle ground between baked-in config and full GitOps.
+time**.
 
 ```
 services/ollama-router/     router.py  router.ini  requirements.txt  *.service
-services/litellm-proxy/     litellm_config.yaml    requirements.txt  *.service
+services/litellm-proxy/     litellm_config.yaml  requirements.txt/.lock  *.service
 services/ollama-monitor/    monitor.py monitor.ini requirements.txt  *.service
-services/open-webui/        requirements.txt       *.service
-env/router.env              shared env for router / litellm / monitor
+services/open-webui/        requirements.txt  *.service
+env/router.env              shared env for router/LiteLLM/monitor (no secrets)
 env/openwebui.env           Open WebUI environment
 install/apply-config.sh     copies everything into its runtime location
+install/manage-model-servers.sh   management tool (§6.1)
+install/update-router.sh    in-container component updater
+targets/<name>/             inference targets and companion (§16, §17)
+tools/                      sync-embedded.py, update-router-services.sh
+tests/, .gitea/workflows/   tests and CI (§18)
 ```
 
-One directory per service means each service's unit, code, tunables and
-dependency pins version independently.
+One directory per service lets each service's unit, code, tunables and pins
+version independently. Secrets live outside git in `/app/router/secrets.env`.
 
-### 6.1 Changing the server list — `manage-model-servers`
+**Why pull at provisioning, not on start.** A `git pull` in `ExecStartPre`
+would make Gitea a boot dependency of every service, and a bad commit would
+break startup instead of failing at install. Changes on a running CT are an
+explicit act: `git pull` followed by `manage-model-servers apply`.
 
-`install/manage-model-servers.sh` is seeded into the repo and symlinked to
-`/usr/local/bin/manage-model-servers`, so it versions alongside the config it
-edits and a `git pull` updates the command.
+### 6.1 `manage-model-servers`
 
-```
-manage-model-servers list | status | discover | models
-manage-model-servers add <addr> [--tier fast,large] [--apply] [--commit]
-manage-model-servers remove <addr|#> [--apply]
-manage-model-servers set-tier  <tier> <addr...>  [--apply]
-manage-model-servers set-model <tier> <model>    [--apply]
-```
+Seeded at `install/manage-model-servers.sh` and symlinked to
+`/usr/local/bin/manage-model-servers`, so a `git pull` updates the command (the
+command list is in the README). It rewrites `MODEL_SERVERS` and `BACKEND_*` in
+`env/router.env` and regenerates `litellm_config.yaml`. Design points:
 
-It rewrites `MODEL_SERVERS` and the per-tier `BACKEND_*` entries in
-`env/router.env`, regenerates `litellm_config.yaml` from the tier assignments,
-then optionally applies and restarts. Design points:
+* **Servers are keyed by URL, never by index.** Non-Ollama servers carry a kind
+  prefix (`maya+http://host:8080`), and a typed `host:port` resolves to the
+  stored entry whatever its kind.
+* **New hosts are identified before they are accepted** (§15.3), and must list
+  their models (`--no-probe` overrides). Model tags are checked on the
+  affected servers before they are written.
+* **Models are per (tier, server)**, as in LiteLLM's model list. Regeneration
+  keeps each pair's tag and the whole `router_settings` block, so hand edits
+  survive. Fallbacks are rebuilt from existing tiers.
+* A tier's tag governs only the LiteLLM path and keep-alive pinning; discovery
+  picks from the live inventory.
+* The env rewrite keeps the file's `0640 root:ollama-router` mode. Secret keys
+  are refused in `env/router.env` and written to `secrets.env`.
+* **`apply` validates, snapshots, applies, health-checks and restores on
+  failure.** It restarts only services whose inputs changed and brings the
+  LiteLLM and Open WebUI venvs in line with their pins (backing up `webui.db`
+  first). The LiteLLM venv itself is not rolled back.
+* **No automatic migration** of old tier names. The services do read the old
+  env keys through a read-only fallback chain, and anything `router.ini` omits
+  uses the defaults in `router.py`, so older configs still start.
+* `commit` pushes with the deploy token through a temporary 0600 credential
+  file. The credential uses the remote's URL scheme, because git will not match
+  `https://` credentials to an `http://` request. Prompting is disabled, so a
+  bad token fails at once.
+* Guard rails: server count limits, unknown tier, unconfigured server,
+  duplicate address, `ollama/` prefix, empty-tier warning.
 
-* **Servers are keyed by URL, never by index** — removing one can never
-  silently re-point another tier at the wrong host.
-* New hosts are **probed for `/api/tags`** before being accepted (`--no-probe`
-  overrides).
-* Model tags and the whole `router_settings` block are **read back from the
-  existing YAML** and preserved, so hand edits survive regeneration.
-* The `.env` rewrite copies content rather than replacing the file, keeping its
-  `0640 root:ollama-router` mode.
-* Models are held per **(tier, server)** deployment, matching LiteLLM's own
-  model_list structure, so hosts of different capability inside one tier can
-  serve different models. `set-model <tier> <model>` sets them all;
-  `set-server-model <tier> <server> <model>` sets exactly one. Regeneration
-  preserves each pair's existing tag — collapsing a tier to a single tag would
-  silently discard per-server assignments on the next add/remove.
-* Both verify the tag is **actually present** on the affected server(s) before
-  writing it (`models` lists what is available; `--no-probe` overrides for a
-  not-yet-pulled model).
-* **No automatic config migration.** The tiers were renamed twice
-  (`BACKEND_QWEN_HEAVY` → `BACKEND_HEAVY` → `BACKEND_LARGE`, and
-  `model_name: qwen-heavy` → `heavy` → `large`), but the management script does
-  not rewrite an older config — upgrading is reprovisioning or a hand edit, so
-  nothing mutates a deployment behind the operator's back. The Python services
-  do still resolve the old env key names through a read-only fallback chain, so
-  a service starting against an un-migrated `router.env` finds its backends
-  instead of coming up healthy with none. Anything `router.ini` omits falls back
-  to the built-in defaults in `router.py`, so a config predating the `xlarge`
-  tier still loads.
-* `commit` authenticates with the deploy token from `/app/router/secrets.env`. Gitea rejects
-  account passwords for git-over-HTTP, and the stored git credentials are
-  deleted after provisioning, so the token is written to a temporary 0600
-  credential file for the duration of the push — never onto the command line.
-  The credential entry uses the **same URL scheme as the remote**; git will not
-  match an `https://` credential against an `http://` request. Interactive
-  prompting is disabled so a bad token fails immediately rather than hanging.
-* Guard rails: minimum/maximum server count, unknown tier, unconfigured server,
-  duplicate address, `ollama/` prefix, and a warning when a tier is left empty.
+**Component updates.** `install/update-router.sh` (in the CT) takes only
+installer-owned code (`INSTALLER_OWNED_CODE`), plus `router.ini`/`monitor.ini`
+with `--with-tunables`. It checks LF endings and bash/Python syntax, commits to
+the config repo, rebuilds the router venv if requirements changed, runs
+`apply` (`--all` after a venv change) and pushes. A failed apply resets the
+commit and restores the venv's packages. `tools/update-router-services.sh`
+drives it from the Proxmox host or a second clone.
 
-Note that a tier's model tag governs the **LiteLLM fallback path**. In discovery
-mode the router selects a model from the live inventory, so changing the tag
-does not by itself change discovery-mode routing — the tool says so when you
-change it.
-
-The router picks up an added host on its next discovery poll; `--apply` mainly
-matters for LiteLLM's static path.
-
-### Why provisioning-time pull, not pull-on-start
-
-A `git pull` in `ExecStartPre` would make **Gitea a boot dependency of every
-service**. A Gitea outage during a container restart would then take down
-routing entirely, and a bad commit would break startup rather than being caught
-at install. Pulling once at provisioning keeps the blast radius of the config
-system confined to install time.
-
-Changing config on a running container is an explicit, reversible act:
-
-```bash
-cd /app/config-repo && git pull
-manage-model-servers apply      # validate, snapshot, restart what changed, roll back on failure
-```
-
-Updating the components themselves (new router, monitor, units, requirements
-or management tools) from a local copy of the repository is
-`install/update-router.sh`, run inside the container. It takes only the
-installer-owned code (`INSTALLER_OWNED_CODE`) plus itself, never `env/*.env`,
-`litellm_config.yaml` or secrets, and the `router.ini` / `monitor.ini`
-tunables only with `--with-tunables`. It checks the source (LF endings,
-bash/Python syntax), commits the changes into the config repo, refreshes the
-router venv when the router/monitor requirements changed, runs
-`manage-model-servers apply` (with `--all` after a venv change), and pushes to
-Gitea. A failed apply resets the commit and restores the venv's previous
-package set, so repo, venv and running files stay consistent.
-
-Config changes are serialized by an `flock` on
-`/run/lock/ollama-smart-router-config.lock`, taken by `update-router.sh` and by
-the `manage-model-servers` commands that write. `update-router.sh` hands its
-held descriptor to the `manage-model-servers apply`/`commit` it runs
-(`CONFIG_LOCK_INHERITED_FD`); the child accepts it only when that descriptor
-is open on the lock file and the lock is really taken. An flock ends with its
-process, so nothing is left locked after a crash; `manage-model-servers
-clear-lock [--force]` reports, and on request stops, a hung holder.
+**Config lock.** Writers take an `flock` on
+`/run/lock/ollama-smart-router-config.lock`. `update-router.sh` hands its held
+descriptor to the `apply`/`commit` it runs (`CONFIG_LOCK_INHERITED_FD`), and
+the child checks that the descriptor really holds the lock. The lock ends with
+its process; `clear-lock [--force]` reports, or stops, a hung holder.
 
 ---
 
@@ -420,84 +344,57 @@ clear-lock [--force]` reports, and on request stops, a hung holder.
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant I as Installer (Proxmox host)
+    participant I as Installer (PVE host)
     participant G as Gitea
     participant CT as Container
-
-    Op->>I: run script as root
-    I->>Op: prompt network / Gitea / Mattermost / model servers
-    I->>G: verify username + token
-    G-->>I: identity (token owner)
-    I->>G: resolve or create config repository
-    I->>I: build config tree from answers
-    I->>G: seed missing files only
-    I->>CT: pct create + start
-    I->>CT: wait for systemd + DNS, install base packages
-    I->>CT: create service account and directories
+    Op->>I: run as root
+    I->>Op: prompts (network, storage, Gitea, Mattermost, servers)
+    I->>G: verify token, resolve or create repo
+    I->>G: seed missing files, update installer-owned code
+    I->>CT: pct create + start, wait for systemd + DNS, base packages
     CT->>G: git clone config repo
-    I->>CT: run install/apply-config.sh
-    I->>CT: build venvs from requirements.txt
-    I->>CT: provision Python 3.12 for Open WebUI
-    I->>CT: write MOTD, enable and start units
+    I->>CT: apply-config.sh, build venvs, Python 3.12 for Open WebUI
+    I->>CT: MOTD, firewall rules, enable + start units
 ```
 
 ### 7.1 Fail-fast ordering
 
-Everything that can be validated cheaply happens **before** `pct create`:
-prompts, input validation, Gitea authentication and repo resolution, and
-storage capacity. A typo, a bad token, or a disk without room costs a re-prompt
-rather than a wasted build. An `ERR` trap destroys a half-provisioned container
-so a failed run never leaves debris.
+Everything checkable cheaply happens **before** `pct create`: prompts, input
+validation, Gitea authentication and repo resolution, and storage capacity.
+An `ERR` trap destroys a half-provisioned CT. Without `GITEA_SERVER_URL`
+the install is local; a token without a URL stops it.
 
-**Storage selection** resolves candidates in three steps, because
-`pvesm status -content <type>` returns an empty table on some setups:
-
-1. the server-side filter, if it returns rows;
-2. otherwise the full `pvesm status` table intersected with the `content=`
-   lines in `/etc/pve/storage.cfg`;
-3. if that config is readable and declares the type nowhere, that is treated as
-   a definitive "none" — offering a storage that cannot hold a container would
-   only move the failure into `pct create`. If the config is unreadable, all
-   active storages are offered with a warning that they are unverified.
-
-Failure prints full diagnostics (both pvesm invocations, the declared content
-types, and the `pvesm set <storage> --content rootdir,images` fix) and allows a
-manually typed storage name. Only storages with enough free space for the
-chosen rootfs are selectable; the rest are listed but not. Columns are located by header name, not position. Two things make a fixed
-index wrong: `pvesm` has reordered `used`/`available` between releases, and the
-header carries unit annotations as separate whitespace-delimited tokens
-(`Total (KiB)  Used (KiB)  Available (KiB)`), so the header has 10 fields while
-the data rows have 7. Parenthesised units are stripped before column positions
-are computed — without that, `Available` resolves to field 8, every 7-field data
-row fails the bounds check, and the installer reports "no storage found" on a
-perfectly healthy host. Sizes are KiB (pvesm divides bytes by 1024) and are floored to GiB so
-a capacity report is never optimistic. Inactive storages are excluded. The same
-check guards the template storage against `TEMPLATE_MIN_GIB`.
+**Storage selection.** `pvesm status -content <type>` returns nothing on some
+setups. The installer then intersects the full `pvesm status` table with the
+`content=` lines in `/etc/pve/storage.cfg`. If the readable config declares
+the type nowhere, that is a definite "none", and the installer prints the
+`pvesm set <storage> --content rootdir,images` fix. If the config is
+unreadable, all active storages are offered with a warning. Columns are found
+by header name, with parenthesised units stripped: pvesm has reordered
+columns between releases, and `Total (KiB)` splits into extra tokens. KiB are
+floored to GiB. Only storages with room for the rootfs are selectable, and the
+same check guards the template storage against `TEMPLATE_MIN_GIB`.
 
 ### 7.2 Seeding policy
 
-The installer pushes files the repository **does not already have**, so
-committed edits to *configuration* always win over generated defaults.
-Installer-owned *code* (the services, their units and requirements, and the
-management tool; see `INSTALLER_OWNED_CODE`) is **updated** in place when it
-differs (`CONFIG_UPDATE_CODE=true`), so a re-install never leaves stale code
-running. The repo files are the source of truth, and
-`tools/sync-embedded.py` keeps the installer's embedded copies identical. If no usable token exists,
-the tree is shipped into the container directly and applied through the same
-`apply-config.sh` path — identical end state, minus version control.
+Files the repo **does not already have** are pushed, so committed
+*configuration* always wins. Installer-owned *code* is **updated** when it
+differs (`CONFIG_UPDATE_CODE=true`), so a re-install never leaves stale code.
+The repo files are the source of truth; `tools/sync-embedded.py` keeps the
+installer's embedded copies identical (checked by the tests). With no token,
+the tree is shipped into the CT and applied the same way.
 
 ### 7.3 Dual Python runtimes
 
 | Runtime | Used by | Source |
 |---|---|---|
-| System Python 3.13 | router + monitor (`/app/router/venv`); LiteLLM (`/app/litellm/venv`, `litellm[proxy]`, hash-locked) | Debian 13 |
-| Python 3.12 | Open WebUI (own venv) | Existing binary → distro package → `uv` standalone build in `/opt/python` |
+| System Python 3.13 | Router + monitor (`/app/router/venv`); LiteLLM (`/app/litellm/venv`, hash-locked) | Debian 13 |
+| Python 3.12 | Open WebUI | Existing binary → distro package → `uv` standalone in `/opt/python` |
 
-Open WebUI requires `>=3.11,<3.13`; Debian 13 ships 3.13, so **every**
-`open-webui` release is filtered out by pip's `Requires-Python` gate. Candidate
-interpreters are validated by executing them **as the service account** — an
-interpreter under `/root` satisfies a root-run check but produces a venv that
-fails at service start.
+Open WebUI requires `>=3.11,<3.13`, so pip filters out every release on
+Debian's 3.13. Candidate interpreters are tested **as the service account**,
+because one under `/root` passes a root check and then fails at service
+start. Venvs are built with `umask 022`.
 
 ---
 
@@ -505,307 +402,483 @@ fails at service start.
 
 | Port | Service | Binding | Exposure |
 |---|---|---|---|
-| 8000 | Smart Router | `0.0.0.0` | LAN — the OpenAI-compatible API |
-| 8080 | Open WebUI | `0.0.0.0` | LAN — browser UI |
-| 4000 | LiteLLM | `127.0.0.1` | **Container-local only** |
-| 11434 | Ollama hosts | outbound | Router and monitor → model pool |
+| 8000 | Smart Router | `0.0.0.0` | LAN API |
+| 8080 | Open WebUI | `0.0.0.0` | LAN UI (port chosen at install) |
+| 4000 | LiteLLM | `127.0.0.1` | CT-local only |
+| 11434 / 1234 / 8080 | Model hosts | outbound | Router, LiteLLM, monitor → pool |
+| 8000 | Open Terminal CT | outbound | Open WebUI → terminal |
 
-When the container firewall is enabled, the installer writes explicit accept
-rules for 8000 and 8080 from a trusted CIDR. LiteLLM needs no rule because it
-never leaves the loopback interface.
+With the CT firewall enabled, the installer accepts TCP 22, 8000 and the Open
+WebUI port from `API_ALLOW_CIDR`. SSH is included because enabling the
+firewall sets the input policy to drop. Target CTs are created with
+`firewall=1`. Open Terminal admits only the router CT; model targets leave the
+rules to the operator.
 
 ---
 
 ## 9. Security model
 
-### Identity and privilege
-
-* Unprivileged LXC; services run as the non-login `ollama-router` account.
-* systemd hardening as listed in §3.
-* The root password is set over stdin via `chpasswd`, never passed as a
-  command-line argument where it would appear in the Proxmox host's process list.
-
-### Secret handling
+* Unprivileged LXCs; non-login service accounts (one per target, §16);
+  hardened units (§3).
+* The root password is set with `chpasswd` over stdin, never as an argument.
+* Config files are **built on the host and pushed in**, never assembled by an
+  inner shell, so `'`, `$` or backticks in a token cannot break quoting.
+* The cloned repo is `root:root` and `go-rwx` (git writes 0644 by default).
+* Tokens reach curl through a file descriptor, never `ps`.
 
 | Secret | At rest | Notes |
 |---|---|---|
-| Gitea deploy token, Mattermost webhook | `/app/router/secrets.env`, `0640 root:ollama-router` | Never committed; migrated out of `env/router.env` by `commit`/`apply` |
-| Router API key (`ROUTER_API_KEY` = Open WebUI's `OPENAI_API_KEYS`) | `/app/router/secrets.env` | Generated on new installs; `manage-model-servers set-api-key` |
-| Mattermost webhook | same | Also committed |
-| Container root password | `/etc/shadow` | Never written to a file by the installer |
+| Gitea deploy token, Mattermost webhook | `/app/router/secrets.env` (0640 root:ollama-router) | Never committed; moved out of `env/router.env` by `commit`/`apply` |
+| `ROUTER_API_KEY` (= Open WebUI `OPENAI_API_KEYS`) | `secrets.env` | Generated on new installs; `set-api-key` |
+| `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
+| Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT | Generated in the CT; never in a unit, log or the router's process list |
+| Open Terminal key | `/etc/open-terminal/api-key`; Open WebUI connection settings | Generated in the terminal CT |
 
-Configuration files are **built on the Proxmox host and pushed in**, never
-assembled by an inner shell. This closes an injection and mangling class:
-a token containing `'`, `$` or a backtick would otherwise break quoting or be
-silently expanded.
-
-The cloned repository is `chown root:root` + `chmod -R go-rwx`, because `git
-clone` writes mode 0644 by default — without this the clone would be *more*
-permissive than the 0640 runtime copy it feeds.
-
-### Accepted risks
-
-| Risk | Rationale | Mitigation available |
-|---|---|---|
-| **Secrets committed to git** | Chosen for operational simplicity; repo is private | Rotate the token if the repo is ever shared or mirrored |
-| **`GITEA_VERIFY_TLS=false`** | TurnKey appliance ships a self-signed certificate | Install the appliance CA and flip the flag in `prompt_gitea_credentials` |
-| **No auth on the router API** | Trusted LAN deployment | Firewall CIDR; add a reverse proxy with auth if exposed |
-| **Deploy token grants access to the Gitea storing it** | Same-system credential | Scope the token to the single repository |
+| Accepted risk | Mitigation |
+|---|---|
+| Commits before 2026-09 hold the old deploy token | Rotate it, especially before sharing or mirroring the repo |
+| `GITEA_VERIFY_TLS=false` (TurnKey self-signed cert) | Install the appliance CA and flip the flag in `prompt_gitea_credentials` |
+| Router API key optional | `set-api-key --generate`; firewall CIDR; TLS reverse proxy if exposed |
+| Backend traffic is plain HTTP | Keep targets on a trusted segment; restrict their ports |
+| A Strata-family key is also its admin key (Maya's dashboard) | Restrict the target port to the router CT |
+| Deploy token lives on the Gitea it accesses | Scope it to the one repository |
+| LiteLLM has no master key | It listens only on 127.0.0.1; add a master key before exposing it |
 
 ---
 
 ## 10. Failure modes
 
-| Failure | Detection | System behaviour | Operator signal |
+| Failure | Detection | Behaviour | Operator signal |
 |---|---|---|---|
-| One Ollama host down | Connect error mid-request; next poll | Fail-forward to next candidate; dropped from inventory | Mattermost alert; `/routing/inventory` |
-| All Ollama hosts down | Empty inventory | Falls back to LiteLLM path, which also fails → 502 | Alerts per host |
-| A model removed from a host | Next discovery poll | Stops being a candidate within `refresh_seconds` | Inventory diff |
-| Gitea unreachable at install | Auth probe | Local config mode; provisioning completes | Explicit console warning |
-| Gitea unreachable at runtime | — | **No effect** — nothing reads it | — |
-| Mattermost webhook rejected | HTTP status check | Alerts logged instead | `journalctl -u ollama-monitor` |
-| LiteLLM down | Unit failure | Discovery path unaffected; fallback path fails | `systemctl status` |
-| Router down | Unit failure | UI and API unavailable; `Restart=always` recovers | — |
-| Bad `router.ini` committed | Config parse | Built-in defaults fill missing keys; service still starts | — |
-| Provisioning failure | `ERR` trap | Container destroyed, no debris | Script exits non-zero |
+| One model host down | Connect error; next poll | Fail-forward; marked down until it answers a poll | Alert after 3 failed checks; `/routing/inventory` |
+| All hosts down | Empty inventory | LiteLLM path, which also fails → 502 | Per-host alerts |
+| Model removed from a host | Next poll | No longer a candidate within `refresh_seconds` | Inventory |
+| Strata/Basalt/Maya engine stopped | Empty `/v1/models` | No candidates from that host | Host reported down |
+| Backend token wrong/missing | 401 on discovery/probe | Host's models absent | Host reported down |
+| Named model on a down host | Inventory | Routed by content | `X-Router-Warning: model-unavailable` |
+| Prompt exceeds a model's context | 4xx from host | Not failed forward | Client error |
+| Gitea unreachable | Install: auth probe; runtime: — | Install: local mode. Runtime: no effect | Console warning |
+| Webhook rejected | HTTP status | Logged and retried | `journalctl -u ollama-monitor` |
+| LiteLLM down | Unit/local check | Discovery unaffected; fallback fails | Monitor alert |
+| Router down | Unit/local check | UI and API down until `Restart=always` recovers | Monitor alert |
+| Bad `router.ini` | Validation | Missing keys default; bad syntax or values can stop startup | `apply` refuses it |
+| Failed `apply` | Post-restart health checks | Snapshot restored, services restarted | Non-zero exit |
+| Provisioning failure | `ERR` trap | Router CT destroyed (target CTs are kept for inspection) | Non-zero exit |
+| Target upgrade failure | Target readiness check | Previous code and config restored and health-checked (§16) | "running again" or "failed too"; non-zero exit |
 
 ---
 
 ## 11. Scaling and performance
 
-* **Horizontal:** 1–20 Ollama hosts. Tiers may hold several hosts; LiteLLM
-  load-balances the static path, and the router rotates tied candidates on the
-  discovery path.
-* **Vertical:** the container itself is I/O-bound glue — inference happens
-  entirely on the model hosts. 2 vCPU / 4 GB is sized for Open WebUI's embedding
-  model, not for routing.
-* **Disk:** a default Open WebUI install pulls CUDA-enabled torch plus ~4.5 GB
-  of `nvidia-*` wheels, giving a ~7.5 GB venv (measured). The container has no
-  GPU, so `TORCH_CPU_ONLY` defaults to **true**: CPU-only torch is installed
-  before Open WebUI, leaving pip's torch requirement satisfied so the CUDA stack
-  is never resolved. Upgrades additionally purge orphaned `nvidia-*`/`triton`
-  wheels. The CPU install is attempted first, before anything is removed, so an
-  unreachable index degrades to the CUDA build instead of breaking the venv.
-* **Discovery cost:** one `GET /api/tags` per host per `refresh_seconds`,
-  independent of request volume. Routing decisions are pure in-memory scoring.
+* **Horizontal:** 1–20 hosts; tiers may hold several. LiteLLM load-balances the
+  static path, and the router rotates tied candidates.
+* **Vertical:** the CT is I/O-bound glue. 2 vCPU / 4 GB is sized for Open
+  WebUI's embedding model, not routing.
+* **Disk:** default Open WebUI pulls CUDA torch (~7.5 GB venv). The CT has no
+  GPU, so `TORCH_CPU_ONLY=true` installs CPU torch first and `apply` purges
+  orphaned `nvidia-*`/`triton` wheels. If the CPU index is unreachable, it
+  falls back to the CUDA build and removes nothing.
+* **Discovery cost:** one model list per host per `refresh_seconds` (plus
+  cached `/api/show` for Ollama), independent of traffic.
+* **Targets:** AirLLM and Maya (by default) serve one sequence at a time,
+  which the router cannot see (§14).
 
 ---
 
 ## 12. Observability
 
-| Surface | What it answers |
+| Surface | Answers |
 |---|---|
-| `X-Router-Model` / `-Server` / `-Class` / `-Mode` / `-Candidates` | Why did *this* request go where it went |
-| `GET /routing/inventory` | What does each host currently serve; who is down and why |
-| `POST /routing/explain` | What *would* happen to this prompt, with scores |
-| `journalctl -u <unit>` | Service logs; monitor logs suppressed alerts too |
-| Mattermost `#ollama-monitor` | Host up/down transitions and startup confirmation |
-| `/etc/motd` | Ports, tier map, config paths at login |
+| `X-Router-Model` / `-Server` / `-Class` / `-Mode` / `-Candidates` | Why this request went where it went |
+| `X-Router-Warning` | `model-unavailable`, `no-vision-model`: answered, but not as asked |
+| `GET /routing/inventory` | What each host serves; who is down and why |
+| `POST /routing/explain` | What would happen to a prompt, with scores |
+| `journalctl -u <unit>` | Every route decision (router); undelivered alerts (monitor) |
+| Mattermost channel | Host and local-service transitions; startup notice |
+| `manage-model-servers status` / `discover` / `models` | Configured hosts with live probe; router inventory; tags per host |
+| `/etc/motd` | Ports, tier map and paths at login |
 
 ---
 
 ## 13. Key design decisions
 
-| Decision | Alternative rejected | Reason |
+| Decision | Rejected alternative | Reason |
 |---|---|---|
-| Routing logic in the router, not LiteLLM | Extend LiteLLM config | LiteLLM's model map is static YAML; dynamic discovery would mean regenerating and reloading config per change |
-| Direct dispatch when discovery succeeds | Always route via LiteLLM | Router-side ranking is inventory-aware; fail-forward replaces LiteLLM's fallbacks with something better informed |
-| Keep LiteLLM as fallback | Remove it | Preserves a tested static path when discovery is unavailable, and serves non-chat OpenAI routes |
-| Pull config at provisioning | `ExecStartPre` git pull | Avoids making Gitea a boot dependency of every service |
-| Separate venv + Python for Open WebUI | Shared venv | Hard version constraint (`<3.13`) and conflicting pins with LiteLLM |
-| Keyword lists as JSON arrays in `.ini` | Comma-separated | Preserves exact spacing — `"def "` must not match `default` |
-| Seed only missing files | Always overwrite | Operator commits win over generated defaults |
-| Embeddings structurally excluded | Score them low | A low score is still selectable; an embedding model cannot serve chat at all |
+| Routing in the router | Extend LiteLLM | LiteLLM's map is static YAML; discovery would mean reloading config per change |
+| Direct dispatch | Always via LiteLLM | Inventory-aware ranking and better-informed fail-forward |
+| Keep LiteLLM as fallback | Remove it | A tested static path, plus the non-chat routes |
+| Pull config at provisioning | `ExecStartPre` pull | Gitea must not be a boot dependency |
+| Separate Python + venv for Open WebUI | Shared venv | `<3.13` constraint; pins conflicting with LiteLLM |
+| Keyword lists as JSON arrays | Comma-separated | Exact spacing matters: `"def "` must not match `default` |
+| Seed only missing config | Always overwrite | Operator commits win |
+| Embeddings excluded structurally | Score them low | A low score is still selectable |
+| Kind in the entry prefix | Separate kind list | One string tells every component the API |
+| One kind table per component, cross-checked by a test | Shared module | Router, monitor and the bash manager deploy separately |
+| Secrets in `secrets.env` | Committed env | Tokens out of git, still readable by every unit |
+| Targets in their own LXCs | Engines in the router CT | GPU, memory and disk stay off the router; a failed target is just a down host |
 
 ---
 
 ## 14. Known limitations
 
-1. **The host list changes out-of-band.** Discovery finds *models* on configured
-   hosts, not new hosts. Adding or removing a host is a deliberate act via
-   `manage-model-servers` (§6.1) rather than something the system detects.
-2. **Classification is lexical.** Prompt length and keyword matching approximate
-   complexity; they will misclassify adversarial or unusual phrasing. Thresholds
-   are tunable, but there is no semantic understanding of difficulty.
-3. **Router authentication is a single shared bearer key** (`ROUTER_API_KEY`),
-   not per-user; Open WebUI provides the user accounts.
-4. **No queue or concurrency control.** A saturated host is not detected as
-   "busy" — only as up or down. Latency-aware selection is limited to LiteLLM's
-   static path.
-5. **Single container.** The router itself is not redundant; the container is a
-   single point of failure for the API surface.
-6. **Secrets are outside git** since 2026-09 (`/app/router/secrets.env`), but
-   earlier commits still contain the old token. Rotate it; see §9.
+1. **Hosts are configured, not discovered.** Discovery finds models on known
+   hosts; adding a host is a deliberate `manage-model-servers` act.
+2. **Classification is lexical** (length and keywords), not semantic.
+3. **One shared router key**, not per-user; Open WebUI provides user accounts.
+4. **No concurrency awareness.** A saturated host is only "up". Single-sequence
+   targets queue extra requests; one that times out before its first byte fails
+   forward, but the target keeps working on it.
+5. **Context windows are ignored.** A long prompt may land on a model with a
+   small context, and the resulting 4xx does not fail forward.
+6. **The router CT is a single point of failure** for the API.
+7. **Old secrets remain in git history** (before 2026-09); rotate them.
 
-### Natural next steps
-
-* Feed observed latency back into candidate scoring (turn health into a gradient
-  rather than a boolean).
-* Add hosts dynamically via a config endpoint, rather than via the CLI tool.
-* Track in-flight requests per host to avoid piling onto a saturated one.
+Next steps: feed observed latency into scoring; track in-flight requests per
+host (e.g. Maya's `/slots`); keep context length in the inventory and exclude
+models too small for the prompt; add hosts through an endpoint.
 
 ---
 
-## 14b. LM Studio servers
+## 15. Model server kinds
 
-`MODEL_SERVERS` and `BACKEND_*` may mix Ollama hosts (`http://host:11434`)
-and LM Studio servers (`lmstudio+http://host:1234`). The prefix is the only
-place the kind is recorded, and each component branches on it:
+`MODEL_SERVERS` and `BACKEND_*` may mix five APIs. Ollama entries are plain base
+URLs; other kinds are identified only by their prefix.
 
-* **The router** discovers LM Studio models through LM Studio's native API.
-  It tries `/api/v1/models` (0.4+: `key`, `params_string`,
-  `capabilities.vision`, `loaded_instances`), then `/api/v0/models` (0.3.x:
-  `type` llm/vlm/embeddings, `state`), then the name-only `/v1/models`. It
-  dispatches to `<base>/v1/chat/completions`, adding `LMSTUDIO_API_TOKEN`
-  itself; the client's key is never forwarded. Entries carry `loaded`:
-  resident models get `loaded_bonus`, and `lmstudio_loaded_only` excludes
-  cold ones so a request never waits on, or causes, a just-in-time load.
-* **The monitor** probes `/v1/models`. An auth failure counts as down. The
-  keep-alive pinner skips LM Studio, which manages residency with its own
-  idle TTL.
-* **manage-model-servers** detects the kind when adding (Ollama `/api/tags`,
-  else LM Studio `/api/v1|v0/models`, a 401 included). It writes LiteLLM
-  deployments as `lm_studio/<model>` against `<base>/v1`, and resolves
-  `host:port` to the stored prefixed entry for remove, set-tier and
-  set-server-model.
+| Kind | Entry | Models listed at | LiteLLM provider | Token (`secrets.env`) |
+|---|---|---|---|---|
+| Ollama (incl. llama.cpp bridge, AirLLM) | `http://host:11434` | `/api/tags` (+ `/api/show`) | `ollama/` | — |
+| LM Studio | `lmstudio+http://host:1234` | `/api/v1/models` → `/api/v0/models` → `/v1/models` | `lm_studio/` | `LMSTUDIO_API_TOKEN` |
+| Strata | `strata+http://host:8080` | `/v1/models` | `openai/` | `STRATA_API_KEY` |
+| Basalt | `basalt+http://host:8080` | `/v1/models` | `openai/` | `BASALT_API_KEY` |
+| Maya | `maya+http://host:8080` | `/v1/models` | `openai/` | `MAYA_API_KEY` |
+
+### 15.1 The kind table
+
+Each non-Ollama kind is one row in `SERVER_KINDS` (`router.py`, `monitor.py`)
+and in `server_kinds`/`kind_field` (`manage-model-servers.sh`). A row holds the
+prefix, secret key, label, default port and whether the server is
+Strata-style. Everything else is derived: kind detection, base URL, token,
+discovery path, monitor probe, LiteLLM provider, `--type` and
+`set-<kind>-token`. `tests/test_monitor.py` fails when the three tables
+disagree. A new Strata-style server is one row in each table plus a detection
+fingerprint.
+
+### 15.2 LM Studio
+
+The 0.4+ API gives `params_string`, `capabilities.vision` and
+`loaded_instances`. The 0.3.x API gives `type` (llm/vlm/embeddings) and
+`state`. `/v1/models` gives names only. Loaded models get `loaded_bonus`, and
+`lmstudio_loaded_only` excludes cold ones. Keep-alive is not sent, because LM
+Studio uses its own idle TTL.
+
+### 15.3 Strata-style servers (Strata, Basalt, Maya)
+
+* **Discovery:** model ID, image support (`input_modalities` or
+  `architecture.input_modalities`), residency (`status`), `parameter_size` if
+  given.
+* **Sizes:** `[model_sizes]` maps exact IDs (case-insensitive): `strata` and
+  `qwen3.8-flash-next` 125B, `glm-5.3-flash` 321B. A blank value removes an
+  entry. The legacy `[discovery] strata_default_params`,
+  `basalt_/maya_default_id`/`_params` keys are still read.
+* **Health:** an empty `/v1/models` means the engine is not running, so the
+  host counts as down.
+* **Detection without a key:** Strata and Basalt by the `service` field of
+  their public `/health`; Maya by `glm-5.3-flash` plus a `version` field.
+  Strata also has older fingerprints. A keyed server that cannot identify
+  itself is added as `kind://host`.
+* **Keep-alive** is never sent.
 
 ---
 
-## 15. llama.cpp inference targets (`targets/llamacpp/`)
+## 16. Inference targets (`targets/`)
 
-An alternative to an Ollama host. It is a dedicated Debian 12 LXC that runs
-one resident GGUF model under `llama-server`, plus a small FastAPI **bridge**
-that answers on the Ollama port (11434) with enough of the Ollama and OpenAI
-APIs for the router, LiteLLM and the monitor. To the router it is just another
-entry in `MODEL_SERVERS`.
+Each target is an unprivileged LXC built by `provision-lxc.sh` (on the PVE
+host: validates, creates the CT, passes GPU nodes through, pushes files) and
+`install-target.sh` (in the CT: installs, starts, health-checks; `--upgrade`).
+Every provisioner offers `--dry-run`; the Strata, Basalt and Maya guest
+installers also offer it. Each target has its own README and tests. The router
+sees the result as one more host of the matching kind.
+
+| Target | Kind | Port | Engine and model | Notes |
+|---|---|---|---|---|
+| `llamacpp` | Ollama (bridge) | 11434 | `llama-server`, one GGUF | Debian 12; GPU gid 993 |
+| `airllm` | Ollama | 11434 | AirLLM, one HF model streamed from disk | Seconds–minutes per token |
+| `ollama` | Ollama | 11434 | Ollama from the PVE community script | Adopted with a drop-in |
+| `strata` | `strata` | 8080 | Strata, Qwen3.8-Flash-Next (125B) | Options parsed from `setup.sh --help` |
+| `basalt` | `basalt` | 8080 | Basalt, `.basalt` pack of Qwen3.8-Flash-Next | Blackwell (sm_120), CUDA 13 |
+| `maya` | `maya` | 8080 | Project Maya, GLM-5.3-Flash (321B, 18B active) | CUDA 12.8 default; V100 and newer |
+
+**Common conventions**
+
+* Own service account; unit with `ProtectSystem=strict`, no capabilities, and
+  only its install and data directories writable.
+* GPU nodes get a non-root group (`GPU_GID`, default 44 `video`; 993 for
+  llama.cpp) that the account joins. Nodes owned by group root are refused.
+* The bundled NVIDIA user-space helper matches host driver 580.173.02. Use
+  `NVIDIA_GUEST_INSTALLER` for another driver.
+* Strata, Basalt and Maya: `lxc.prlimit.memlock: unlimited` and
+  `LimitMEMLOCK=infinity`. The API key is generated in the CT and never written
+  to the unit. The previous commit is kept under a local ref, so rollback needs
+  no network.
+
+**Upgrade contract** (exercised by each target's tests; `tests/test-repo.sh`
+`upgrade_contract` checks that no target drops a part):
+
+1. **Prepare first.** Sources are fetched and verified before stopping.
+   Strata, Basalt and Maya stop and snapshot their checkout before setup or
+   compilation. llama.cpp, AirLLM, Ollama and Open Terminal prepare the new
+   build, venv or release while the old one runs, then restart. A failed fetch
+   leaves the service running. Every Strata, Basalt and Maya rerun, with or
+   without `--upgrade`, starts from the installation's own settings
+   (`installed-env`; for older installs the `installed-settings`
+   fingerprint) and applies non-empty environment overrides. An override of
+   Strata's family or Maya's CUDA version drops the saved model or nvcc that
+   depends on it. A malformed record is refused before anything changes.
+   A fresh install writes the settings it runs with to `pending-env` before
+   its first change and removes it on success, so an interrupted first install
+   resumes with them. This checkpoint precedes API-key generation as well as
+   package installation. Settings records and new API keys are written to
+   private temporary files in the same directory, flushed to disk (`sync`) and
+   atomically renamed. The containing directory is flushed after each rename,
+   including between settings and fingerprint publication; the parent is
+   flushed when the record directory is created. Checkpoint removal is also
+   flushed after both installed records are durable. Leftovers of a killed run
+   are removed before the next write. A real run takes an exclusive `flock`
+   on `/etc/<target>-target.lock` before reading settings and holds it until
+   exit; overlapping runs fail before reading or changing installation state.
+   Commands run as the service account get the lock's descriptor closed, and
+   `git fetch` runs its housekeeping in the foreground, so nothing left running
+   in the background holds the lock after the installer exits. Dry runs create
+   no lock file. Both installed records are staged before
+   either is published, and
+   `installed-env` is published before the `installed-settings` fingerprint,
+   so an interruption between the two re-applies the new settings once rather
+   than reverting them. A failed staging write preserves previous records and the
+   pending checkpoint.
+   Existing checkouts, units or `pending-env` files with no
+   readable record (missing, unreadable or dangling) require every setting
+   explicitly. Only a fresh install uses the defaults.
+2. **Unchanged means nothing to do.** No reinstall, no restart, and the kept
+   `*.prev` stays. "Unchanged" means:
+   * Strata, Basalt, Maya: the same commit, settings fingerprint and unit.
+   * llama.cpp: the same commit, requested ref, backend, `bridge.py`,
+     requirements and both units, with no new settings to add
+     (`FORCE_REBUILD=true` always rebuilds).
+   * AirLLM: the same `server.py`, requirements, lock, README and unit, with no
+     new settings to add.
+   * Ollama: the installed release is the requested one (checked before
+     downloading).
+   * Open Terminal: the commit and dependency lock hash identify the active
+     venv, and `service.env` and the unit would be unchanged.
+
+   An unchanged target is left alone only while healthy, or while explicitly
+   stopped (`ActiveState=inactive`) for llama.cpp, AirLLM and Ollama. A failed
+   or unhealthy unit is re-applied. Strata, Basalt, Maya and Open Terminal also
+   bring a stopped service back. AirLLM still needs `ALLOW_INTERRUPT=true`
+   while its model loads.
+3. **Success requires the target's own readiness check**, unless an explicitly
+   stopped service is kept stopped.
+4. **Rollback restores code and configuration** without network:
+   * Strata, Basalt, Maya stop the service and snapshot the runnable checkout
+     (venv, build, launcher), its launcher env and unit to
+     `/var/lib/<target>-target/` (root-only, 0700) before changing anything.
+     Rollback resets to the previous commit and restores that snapshot at the
+     same paths, without setup, pip or a compiler, then health-checks it with
+     the settings of the last good install (`installed-env`; the fingerprint's
+     port for older installs). The snapshot is deleted after a successful
+     upgrade or rollback and kept only when the rollback fails. If the
+     snapshot itself fails, the upgrade is aborted and the old service
+     restarted. It may hold secrets and needs disk for one copy of the
+     runtime; model stores outside the checkout are not copied. Each success
+     records `installed-settings` (fingerprint) and `installed-env`, and
+     healthy legacy reruns backfill the latter.
+   * llama.cpp and AirLLM set aside every file they replace and copy every
+     settings file before editing it (`*.prev`).
+   * The ERR traps act only in the main shell (`$BASHPID == $$`), so a failure
+     inside a subshell rolls back once; `test-repo.sh` checks every target.
+   * Ollama replaces only its release directory (`/usr/local/lib/ollama.prev`).
+   * Open Terminal switches the venv symlink back and restores `service.env`
+     and the unit, including after failed restarts or settings-only changes.
+5. **The rollback is health-checked** and reported as "running again" or
+   failed too. Either way the run exits non-zero. An explicitly stopped service
+   stays stopped (llama.cpp, AirLLM, Ollama).
+
+### 16.1 llama.cpp (`targets/llamacpp/`)
 
 ```
 router / LiteLLM / monitor
           | :11434  (Ollama + OpenAI subset)
-          v
-llama-ollama-bridge.service   bridge.py (FastAPI, uvicorn)
-          | 127.0.0.1:8081    (OpenAI API)
-          v
-llama-server.service          llama.cpp, one GGUF, GPU via passed-through /dev/nvidia*
+llama-ollama-bridge.service   bridge.py (FastAPI)
+          | 127.0.0.1:8081
+llama-server.service          llama.cpp, one GGUF, GPU via /dev/nvidia*
 ```
 
-* **Provisioning.** On the Proxmox host, `provision-lxc.sh` creates the
-  unprivileged CT (GPU device nodes mapped to gid 993). It copies the
-  deployment files and optionally runs the NVIDIA user-space installer and
-  `install-target.sh` inside the CT. `install-target.sh` builds llama.cpp from
-  a pinned release, creates the service account, venv and units, and never
-  overwrites an existing install.
-* **Upgrades.** `install-target.sh --upgrade` rebuilds only when the llama.cpp
-  ref resolves to a new commit. It always refreshes the bridge, venv and
-  units, health-checks `/healthz`, and restores everything it replaced
-  (`*.prev`) on failure.
-* **What the bridge reports.** `/api/tags` and `/api/show` return the model
-  with its parameter size. The size comes from llama-server's `n_params` when
-  not configured, so the router can size-band the target. `capabilities` come
-  from `MODEL_CAPABILITIES`, and the router's capability probe uses them.
-  `/api/ps` lists the resident model.
-* **Compatibility boundary.** Per-request sampling options are forwarded.
-  Load-time options such as `num_ctx` or `num_gpu` are ignored and reported in
-  `X-Bridge-Ignored-Options`. Model lifecycle calls (pull, delete,
-  `keep_alive: 0`) return 501, because the model is managed by systemd on the
-  target.
-* **Tuning.** `CONTEXT_SIZE`, `PARALLEL_SLOTS`, `THREADS` and `GPU_LAYERS` live
-  in `/etc/llama-target/llama-server.env`. `LLAMA_EXTRA_ARGS` passes any other
-  llama-server flag.
-* **Hardening.** Both units run as `llama-target` with
-  `ProtectSystem=strict`. llama-server may write only `/var/lib/llama-target`,
-  and the bridge nothing at all.
+* **Install** builds llama.cpp from a pinned release (`BACKEND=cuda|cpu`) and
+  never overwrites an existing install. **`--upgrade`** rebuilds when the
+  resolved commit or the backend differs from `build-info.txt`, always
+  refreshes the bridge, venv and units, and checks `/healthz`. Existing
+  settings are never rewritten, except that a backend switch sets
+  `GPU_LAYERS` for the new backend (`auto`/`0`, or the given `GPU_LAYERS`).
+* **The bridge** reports the model and its size (from llama-server's
+  `n_params` if not configured) on `/api/tags`/`/api/show`, capabilities from
+  `MODEL_CAPABILITIES`, and the resident model on `/api/ps`. Sampling options
+  are forwarded. Load-time options (`num_ctx`, `num_gpu`) are ignored and
+  listed in `X-Bridge-Ignored-Options`. Pull, delete and `keep_alive: 0` return
+  501.
+* **Tuning** in `/etc/llama-target/llama-server.env`: `CONTEXT_SIZE`,
+  `PARALLEL_SLOTS`, `THREADS`, `GPU_LAYERS`, and `LLAMA_EXTRA_ARGS` for any
+  other flag. Only llama-server may write, and only to `/var/lib/llama-target`.
 
-See `targets/llamacpp/README.md` for the step-by-step procedure and the NVIDIA
-baseline.
+### 16.2 AirLLM (`targets/airllm/`)
 
-## 16. AirLLM inference targets (`targets/airllm/`)
+Serves one Hugging Face model far larger than RAM/VRAM, a layer at a time from
+disk. The CT (Debian 12/13, Ubuntu 24.04/26.04) needs disk for the weights
+twice (download plus shards). Code is in `/opt/airllm-target` (hash-locked
+venv), settings in `/etc/airllm-target/airllm.env` (0640, holds `HF_TOKEN`),
+data in `/var/lib/airllm-target`. `/api/tags` and `/healthz` answer 503 until
+the model is loaded. A failed load exits; systemd retries three times, then
+leaves the unit failed. `/api/chat` and `/api/generate` handle one generation
+at a time within `AIRLLM_MAX_SEQ_LEN` (the oldest tokens are dropped), with no
+tools, images or embeddings. Give it its own tier, never a fallback chain, and
+mind LiteLLM's 600 s timeout.
 
-An AirLLM target serves one Hugging Face model that is far larger than the
-target's RAM or VRAM by streaming it from disk a layer at a time. It follows
-the llama.cpp target's conventions, so the router treats it as one more Ollama
-server:
+### 16.3 Ollama (`targets/ollama/`)
 
-* **Deployment.** `provision-lxc.sh` on the PVE host creates an unprivileged
-  CT (Debian 12/13 or Ubuntu 24.04/26.04) whose root disk is sized for the
-  model's weights twice (download + shards) and, with `GPU_DEVICES`, passes the
-  GPU through and runs the NVIDIA 580.173.02 user-space helper.
-  `install-target.sh` inside the CT installs `server.py` into
-  `/opt/airllm-target` with a hash-locked venv, settings in
-  `/etc/airllm-target/airllm.env` (0640, holds `HF_TOKEN`), and data in
-  `/var/lib/airllm-target`. `--upgrade` refreshes code, venv and unit and rolls
-  back when the target is not healthy again; it will not interrupt a download
-  unless told to.
-* **Readiness.** `/api/tags` and `/healthz` answer 503 until the model is
-  loaded, so discovery and the monitor ignore a downloading or broken target.
-  A failed load exits the process; systemd retries three times and then leaves
-  the unit failed.
-* **API.** `/api/chat` and `/api/generate` (streamed or not), one generation
-  at a time. Prompt plus reply fit `AIRLLM_MAX_SEQ_LEN`; long prompts lose
-  their oldest tokens. No tools, images or embeddings.
-* **Speed.** Seconds to minutes per token. Put it in its own tier, never in a
-  fallback chain, and remember LiteLLM's 600 s request timeout.
-* **Hardening.** `airllm-ollama-api.service` runs as `airllm-target` with
-  `ProtectSystem=strict`; only `/var/lib/airllm-target` is writable.
+The CT and first install come from the PVE community script `ct/ollama.sh`,
+run with this repo's `var_*` preset. Its SHA-256 is printed, and
+`COMMUNITY_SCRIPT_SHA256` pins it. `install-target.sh` adopts the install with
+the drop-in `ollama.service.d/10-ollama-target.conf`: user `ollama`, hardened,
+`/etc/ollama-target/ollama.env`, models moved from `/root/.ollama` to
+`/var/lib/ollama-target/models`. `--upgrade` installs a pinned release checked
+against `sha256sum.txt` (and optionally `OLLAMA_SHA256`), and succeeds only
+when the server reports that version.
 
-See `targets/airllm/README.md` for the procedure and the migration from the
-earlier `/opt/airllm-ollama-api` layout.
+### 16.4 Strata (`targets/strata/`)
 
-## 17. Ollama inference targets (`targets/ollama/`)
+[Strata](https://github.com/Niko1221/Strata) runs as `strata` on 8080 (or
+11434). Its `setup.sh` options vary by release, so the installer reads
+`setup.sh --help`, passes only supported options, and refuses to run without
+`--host`, `--no-start` and the others it relies on. It also refuses to run
+without `--api-key` unless `STRATA_ALLOW_NO_KEY=true`. Family, model and
+vision are checked against the listed choices. `STRATA_REF` defaults to
+`main`, so pin `STRATA_COMMIT` in production. The unit runs the `run-*.sh`
+that setup reports (recorded in `strata.env`). CI's `strata-upstream` job runs
+the launcher generator at the pinned commit.
 
-A plain Ollama server in its own CT. Unlike the other targets, the CT and the
-first Ollama install are not built here: `provision-lxc.sh` runs the Proxmox
-VE community script `ct/ollama.sh` with this repository's settings preset as
-its `var_*` variables (larger RAM and disk defaults, GPU passthrough when the
-host has an NVIDIA device), then copies the target files in.
+### 16.5 Basalt (`targets/basalt/`)
 
-* **Adoption.** `install-target.sh` inside the CT leaves the community unit
-  untouched and adds a drop-in, `ollama.service.d/10-ollama-target.conf`: the
-  service runs as the unprivileged `ollama` user with `ProtectSystem=strict`
-  and no capabilities, reads `/etc/ollama-target/ollama.env` (which overrides
-  the unit's `Environment=` lines), and keeps models in
-  `/var/lib/ollama-target/models` (moved from `/root/.ollama`, not
-  re-downloaded). Re-running it is safe.
-* **Upgrades.** `--upgrade` installs a pinned release into the community
-  layout (`/usr/local/lib/ollama`) after checking it against the release's
-  `sha256sum.txt` (and optionally `OLLAMA_SHA256`), and restores the previous
-  release if the server does not report the new version. The community
-  script's `update` still works, since the drop-in survives it.
-* **Trust.** The community script is fetched from its `main` branch at run
-  time; the wrapper prints its SHA-256 and `COMMUNITY_SCRIPT_SHA256` pins it.
+[Basalt](https://github.com/jesdga95/basalt) is built for compute capability
+12.0 with CUDA 13 and CMake. It downloads one `.basalt` model (default: the
+81 GiB IQ3_S pack of Qwen3.8-Flash-Next) and serves it as `basalt` on 8080
+under `BASALT_ALIAS`. Defaults are 128 GiB RAM and a 200 GiB disk. The build is
+fixed upstream, so nothing is parsed from help output. As with Maya, both
+scripts refuse a CUDA release the CT's NVIDIA repository lacks (Debian 13 needs
+`CUDA_VERSION=13.1` or later) unless a toolkit that meets it is installed.
 
-See `targets/ollama/README.md` for the procedure.
+### 16.6 Project Maya (`targets/maya/`)
+
+[Project Maya](https://github.com/mw00/project-maya) (GLM-5.3-Flash) runs as
+`maya` on 8080.
+
+* **CUDA:** an exact toolkit (`/usr/local/cuda-<ver>`, 12.8 default) from
+  NVIDIA's repository for the CT's distro. Both scripts refuse a release that
+  repository lacks: Ubuntu 24.04 starts at 12.5, Ubuntu 22.04 at 11.7, Debian 12
+  at 12.3, Debian 13 at 13.1 (no V100). A toolkit of that exact release already
+  at `MAYA_NVCC` is accepted regardless (`cuda-toolkit.sh --check`; the host
+  uses `--check-repo`).
+* **Install:** the newest `vX.Y.Z` tag (or `MAYA_REF`/`MAYA_COMMIT`), then
+  upstream `setup.sh --setup --no-start --yes --download-model` with `--draft`
+  (default `mtp`) and `--nvcc`, after checking the options against the help.
+  The unit runs the `run-maya-<quant>.sh` that setup prints (it must be under
+  `/opt/maya`).
+* **Update switch:** `maya.service` sets `MAYA_UPDATE_CHECK=0`, so the
+  dashboard cannot move `/opt/maya` off the pin. `test-repo.sh` asserts this,
+  and CI's `maya-upstream` job checks the upstream behaviour at the pin.
+* **Health:** `/health` `status=ok` and the model listed in `/v1/models`. One
+  sequence at a time by default.
+
+---
+
+## 17. Open Terminal companion (`targets/open-terminal/`)
+
+Not a model host. A separate Debian LXC runs
+[Open Terminal](https://github.com/open-webui/open-terminal) as
+`open-terminal`, from a pinned tag verified against a reviewed commit with a
+hash-locked venv per commit and dependency lock hash. It is registered in the
+router's Open WebUI as a
+**system Open Terminal connection**. The provisioner reaches Open WebUI by CT
+ID (`pct exec`) or root SSH, verifies it before creating anything, and adds the
+connection through the admin API, keeping other connections. The admin
+credential is prompted without echo and deleted after use. The connection is
+admin-only by default; everyone granted access shares one shell and
+`/srv/open-terminal/workspace`. A bearer key protects the API, and with the PVE
+firewall on, only the router CT may reach TCP 8000.
+
+---
+
+## 18. Verification and CI
+
+* `tests/run-tests.sh` runs every shell and pytest suite and every
+  `targets/*/test-*.sh`. It enforces a test for every installer and manager
+  function. Nothing touches the network, a CT or a GPU. Target end-to-end cases
+  need root (or `unshare -r`) and skip otherwise.
+* `tests/test-repo.sh` checks repository invariants: unit hardening, no secrets
+  in `env/`, UTF-8, embedded copies in sync, Maya's update switch and the
+  upgrade contract.
+* `.gitea/workflows/tests.yml` runs the suites, shellcheck and ruff, with
+  separate router and bridge venvs. ShellCheck discovers all repository shell
+  files, including test helpers. The `strata-upstream` and `maya-upstream`
+  jobs fetch one pinned commit each, kept separate so a GitHub outage cannot
+  hide the main results.
 
 ---
 
 ## Appendix A — Runtime file layout
 
+Router CT:
+
 ```
 /app/router/.env                  shared runtime config (0640, no secrets)
-/app/router/secrets.env           deploy token + webhook URL (0640, not in git)
-/app/router/router.py             complexity router + discovery + proxy
-/app/router/router.ini            routing thresholds, keywords, weights, bands
-/app/router/monitor.py            backend health monitor
-/app/router/monitor.ini           polling tunables
-/app/router/litellm_config.yaml   tier -> backend mapping, fallbacks
-/app/router/venv/                 router + monitor deps (py3.13)
-/app/litellm/venv/                litellm[proxy] (py3.13, own venv)
-/app/openwebui/.env               Open WebUI config (0640)
-/app/openwebui/venv/              Open WebUI deps (py3.12)
-/app/openwebui/data/              Open WebUI state (DATA_DIR)
+/app/router/secrets.env           deploy token, webhook, router key, backend tokens (0640, not in git)
+/app/router/router.py, router.ini routing code and tunables
+/app/router/monitor.py, monitor.ini   health monitor and tunables
+/app/router/litellm_config.yaml   tier -> backend deployments, fallbacks
+/app/router/venv/                 router + monitor (py3.13)
+/app/litellm/venv/                litellm[proxy] (py3.13, hash-locked)
+/app/openwebui/.env, venv/, data/ Open WebUI config (0640), venv (py3.12), state
 /app/config-repo/                 cloned config repo (root-only, 0700)
 /opt/python/                      standalone CPython 3.12 (if uv-provisioned)
+/usr/local/bin/manage-model-servers   symlink into the config repo
+/var/lib/ollama-monitor/          monitor state
+/var/backups/ollama-smart-router/ apply snapshots (root-only)
+/run/lock/ollama-smart-router-config.lock
 /etc/systemd/system/*.service     the four units
 /etc/motd                         login summary
+```
+
+Strata-style target CTs (`<name>` = strata, basalt, maya):
+
+```
+/opt/<name>/                      upstream checkout, venv, build, launcher
+/var/lib/<name>/                  models and engine data
+/etc/<name>-target.lock           installer lock (0600; kept between runs)
+/etc/<name>-target/api-key        API key (0600)
+/etc/<name>-target/<name>.env     launcher path for the unit
+/etc/<name>-target/installed-settings, installed-env   last good install (fingerprint, settings)
+/etc/<name>-target/pending-env    settings of a first install in progress (removed on success)
+/var/lib/<name>-target/rollback-runtime.tar, rollback.env, rollback.service   pre-upgrade snapshot (0700 dir; only during an upgrade or after a failed rollback)
+/etc/systemd/system/<name>.service
 ```
 
 ## Appendix B — Configuration surface
 
 | File | Owns |
 |---|---|
-| `router.ini` | Size thresholds, keyword lists, tier names, discovery bands and weights |
-| `monitor.ini` | Poll interval, timeout, health path, keep-alive maintenance |
-| `env/router.env` | Backend URLs per tier, full host list, per-tier model tags, keep-alive, LiteLLM URLs (no credentials) |
+| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe), `[weights]`, `[model_sizes]` |
+| `monitor.ini` | Interval, timeout, Ollama health path, alert thresholds, startup notice, local services, keep-alive |
+| `env/router.env` | Hosts, per-tier backends and model tags, keep-alive, LiteLLM URLs, Gitea/Mattermost settings (no credentials) |
+| `secrets.env` (not in git) | Gitea token, webhook, router key, backend tokens |
 | `env/openwebui.env` | UI port, data dir, upstream API base, auth toggle |
-| `litellm_config.yaml` | Static tier → host deployments, routing strategy, fallbacks |
-| `requirements.txt` (×4) | Dependency pins, per service |
+| `litellm_config.yaml` | Static tier → host deployments, strategy, fallbacks |
+| `requirements.txt` / `.lock` | Pins per service; LiteLLM hash-locked |
+| `/etc/<target>-target/*.env` (target CTs) | Engine settings and launcher |

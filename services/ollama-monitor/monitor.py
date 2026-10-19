@@ -132,28 +132,39 @@ BACKENDS = {tier: _url_list(_tier_env(tier)) for tier in ("fast", "medium", "lar
 BACKENDS = {tier: urls for tier, urls in BACKENDS.items() if urls}
 
 
-# OpenAI-compatible entries use kind prefixes in the shared server lists.
-LMSTUDIO_PREFIX = "lmstudio+"
-STRATA_PREFIX = "strata+"
-BASALT_PREFIX = "basalt+"
+# Entries for servers that are not Ollama carry a kind prefix in the shared
+# server lists. Same table as router.py's SERVER_KINDS (tests/test_router.py
+# checks that they agree):
+#   prefix / key_env / label -- entry prefix, secrets.env token, alert name
+#   openai -- a Strata-style server: probed on /v1/models, and up only while
+#             that list names a model (its engine answers 200 with an empty
+#             list when it is not running, and the router cannot use it then)
+SERVER_KINDS = {
+    "lmstudio": {"prefix": "lmstudio+", "key_env": "LMSTUDIO_API_TOKEN",
+                 "label": "LM Studio", "openai": False},
+    "strata": {"prefix": "strata+", "key_env": "STRATA_API_KEY",
+               "label": "Strata", "openai": True},
+    "basalt": {"prefix": "basalt+", "key_env": "BASALT_API_KEY",
+               "label": "Basalt", "openai": True},
+    "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
+             "label": "Maya", "openai": True},
+}
+KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
+             for kind, spec in SERVER_KINDS.items()}
 LMSTUDIO_HEALTH_PATH = os.getenv("MONITOR_LMSTUDIO_HEALTH_PATH", "/v1/models")
-LMSTUDIO_API_TOKEN = (os.getenv("LMSTUDIO_API_TOKEN") or "").strip()
-STRATA_API_KEY = (os.getenv("STRATA_API_KEY") or "").strip()
-BASALT_API_KEY = (os.getenv("BASALT_API_KEY") or "").strip()
+OPENAI_HEALTH_PATH = "/v1/models"
 
 
 def server_kind(server: str) -> str:
-    if server.startswith(LMSTUDIO_PREFIX):
-        return "lmstudio"
-    if server.startswith(STRATA_PREFIX):
-        return "strata"
-    if server.startswith(BASALT_PREFIX):
-        return "basalt"
+    for kind, spec in SERVER_KINDS.items():
+        if server.startswith(spec["prefix"]):
+            return kind
     return "ollama"
 
 
 def server_base(server: str) -> str:
-    return server.split("+", 1)[1] if server_kind(server) != "ollama" else server
+    kind = server_kind(server)
+    return server.removeprefix(SERVER_KINDS[kind]["prefix"]) if kind != "ollama" else server
 
 
 def ollama_hosts() -> dict:
@@ -189,9 +200,11 @@ class Check:
     notified -- the last state successfully delivered to Mattermost
     The two differ exactly when an alert still has to go out."""
 
-    def __init__(self, key: str, url: str, label: str, headers: dict = None):
+    def __init__(self, key: str, url: str, label: str, headers: dict = None,
+                 require_models: bool = False):
         self.key, self.url, self.label = key, url, label
         self.headers = headers or {}
+        self.require_models = require_models
         self.status = self.notified = "up"
         self.fails = self.passes = 0
         self.last_error = ""
@@ -224,25 +237,15 @@ def build_checks() -> list:
     checks = []
     for url, tiers in ollama_hosts().items():
         served = ", ".join(tiers) if tiers else "no tier (discovery only)"
-        if server_kind(url) == "lmstudio":
-            headers = ({"Authorization": f"Bearer {LMSTUDIO_API_TOKEN}"}
-                       if LMSTUDIO_API_TOKEN else {})
-            checks.append(Check(url, f"{server_base(url)}{LMSTUDIO_HEALTH_PATH}",
-                                f"LM Studio host `{server_base(url)}` (serving: {served})",
-                                headers))
-        elif server_kind(url) == "strata":
-            headers = ({"Authorization": f"Bearer {STRATA_API_KEY}"}
-                       if STRATA_API_KEY else {})
-            # /v1/models stays available while Strata's engine is unloaded.
-            checks.append(Check(url, f"{server_base(url)}/v1/models",
-                                f"Strata host `{server_base(url)}` (serving: {served})",
-                                headers))
-        elif server_kind(url) == "basalt":
-            headers = ({"Authorization": f"Bearer {BASALT_API_KEY}"}
-                       if BASALT_API_KEY else {})
-            checks.append(Check(url, f"{server_base(url)}/v1/models",
-                                f"Basalt host `{server_base(url)}` (serving: {served})",
-                                headers))
+        kind = server_kind(url)
+        if kind != "ollama":
+            spec, base = SERVER_KINDS[kind], server_base(url)
+            token = KIND_KEYS[kind]
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            path = OPENAI_HEALTH_PATH if spec["openai"] else LMSTUDIO_HEALTH_PATH
+            checks.append(Check(url, f"{base}{path}",
+                                f"{spec['label']} host `{base}` (serving: {served})",
+                                headers, require_models=spec["openai"]))
         else:
             checks.append(Check(url, f"{url}{HEALTH_PATH}",
                                 f"Ollama host `{url}` (serving: {served})"))
@@ -367,12 +370,18 @@ def send_startup_notice(checks: list) -> None:
         )
 
 
-def probe(url: str, client: httpx.Client, headers: dict = None) -> tuple:
-    """(ok, error) for one health URL. A 401/403 counts as down: an LM Studio
-    that rejects the token cannot serve the router either."""
+def probe(url: str, client: httpx.Client, headers: dict = None,
+          require_models: bool = False) -> tuple:
+    """(ok, error) for one health URL. A 401/403 counts as down: a server
+    that rejects the token cannot serve the router either. With
+    require_models, the OpenAI model list must also name at least one model."""
     try:
         resp = client.get(url, timeout=CHECK_TIMEOUT, headers=headers or {})
         resp.raise_for_status()
+        if require_models:
+            models = resp.json().get("data")
+            if not isinstance(models, list) or not models:
+                return False, "no model loaded (the model list is empty)"
         return True, ""
     except Exception as exc:  # noqa: BLE001 - any failure is "unhealthy"
         return False, f"{type(exc).__name__}: {exc}"[:200]
@@ -383,7 +392,8 @@ def run_cycle(checks: list, client: httpx.Client, pool: ThreadPoolExecutor,
     """Probe every check in parallel, update state, deliver pending alerts.
     An undelivered alert stays pending and is retried on the next cycle."""
     notify = notify or post_mattermost
-    results = list(pool.map(lambda c: probe(c.url, client, c.headers), checks))
+    results = list(pool.map(lambda c: probe(c.url, client, c.headers, c.require_models),
+                            checks))
     for check, (ok, error) in zip(checks, results, strict=True):
         before = check.status
         check.record(ok, error)

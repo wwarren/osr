@@ -161,6 +161,12 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for file in install-target.sh basalt.service cuda-toolkit.sh; do
     [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
+# The template decides which NVIDIA CUDA repository the CT uses; refuse a
+# combination that repository cannot install before any CT is created.
+[[ $TEMPLATE =~ :vztmpl/(ubuntu|debian)-([0-9]+)(\.([0-9]+))?- ]]
+template_dist=${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[4]}
+CUDA_DIST=$template_dist CUDA_VERSION=$CUDA_VERSION bash "$source_dir/cuda-toolkit.sh" --check-repo ||
+    die "CUDA_VERSION=$CUDA_VERSION cannot be installed in a $template_dist CT (see above)."
 # The NVIDIA LXC user-space helper lives at the repository root, two levels up.
 NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../install_nvidia_580_173_02.sh}
 [[ -r $NVIDIA_GUEST_INSTALLER ]] || die "Missing NVIDIA LXC user-space helper: $NVIDIA_GUEST_INSTALLER"

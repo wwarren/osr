@@ -34,12 +34,11 @@ LITELLM_DIR="${LITELLM_DIR:-/app/litellm}"
 LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
-# LM Studio's server port. LM Studio servers are stored with a scheme prefix,
-# lmstudio+http://host:1234, so every consumer knows which API to speak.
+# Default ports of the other server kinds are in kind_field (LM Studio 1234,
+# Strata/Basalt/Maya 8080); LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT and
+# MAYA_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
-STRATA_PORT="${STRATA_PORT:-8080}"
-BASALT_PORT="${BASALT_PORT:-8080}"
-SERVER_TYPE="auto"   # --type ollama|lmstudio|strata|basalt|auto for add / set-tier
+SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8000}"
@@ -85,9 +84,9 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             LM Studio, Strata and Basalt are detected automatically,
+                             LM Studio, Strata, Basalt and Maya are detected automatically,
                              or use lmstudio://host / strata://host /
-                             basalt://host or --type. Detection sends no API key.
+                             basalt://host / maya://host or --type. Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
@@ -119,6 +118,9 @@ Commands:
   set-basalt-token [token|--off]
                              Bearer token for Basalt servers with an API key
                              (stored in secrets.env)
+  set-maya-token [token|--off]
+                             Bearer token for Maya servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on the router
                              API (Open WebUI is given the same key)
@@ -132,7 +134,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -164,21 +166,73 @@ note() { echo "$*" >&2; }
 valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 
 # --- server kinds -------------------------------------------------------------
-server_kind() {
-  if [[ "$1" == lmstudio+* ]]; then echo lmstudio
-  elif [[ "$1" == strata+* ]]; then echo strata
-  elif [[ "$1" == basalt+* ]]; then echo basalt
-  else echo ollama; fi
+# One table for every server kind that is not Ollama. Their entries are stored
+# as <kind>+http://host:port, so each consumer knows which API to speak.
+# router.py and monitor.py keep matching SERVER_KINDS tables, and
+# tests/test_monitor.py checks that all three agree. Adding a kind here (and
+# there) is all the manager needs: detection fingerprints aside, nothing below
+# names a kind.
+#   key    -- secrets.env variable with the bearer token for that kind
+#   label  -- human name in messages
+#   port   -- default port (overridable through the <KIND>_PORT variable)
+#   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
+#             openai provider), 0 for LM Studio (its own API and provider)
+server_kinds() { printf '%s\n' lmstudio strata basalt maya; }
+kind_field() {
+  local spec key label port_var port_default openai value
+  case "$1" in
+    lmstudio) spec='LMSTUDIO_API_TOKEN|LM Studio|LMSTUDIO_PORT|1234|0' ;;
+    strata)   spec='STRATA_API_KEY|Strata|STRATA_PORT|8080|1' ;;
+    basalt)   spec='BASALT_API_KEY|Basalt|BASALT_PORT|8080|1' ;;
+    maya)     spec='MAYA_API_KEY|Maya|MAYA_PORT|8080|1' ;;
+    *) return 1 ;;
+  esac
+  IFS='|' read -r key label port_var port_default openai <<< "$spec"
+  case "$2" in
+    key) printf '%s\n' "$key" ;;
+    label) printf '%s\n' "$label" ;;
+    port) value="${!port_var:-}"; printf '%s\n' "${value:-$port_default}" ;;
+    openai) printf '%s\n' "$openai" ;;
+    *) return 1 ;;
+  esac
 }
-server_base() { local base="${1#lmstudio+}"; base="${base#strata+}"; printf '%s\n' "${base#basalt+}"; }
+is_server_kind() { [[ -n "$1" ]] && server_kinds | grep -qx -- "$1"; }
+is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
+openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
+# "Ollama, LM Studio, Strata, Basalt or Maya"
+kind_labels() {
+  local out=Ollama k label last=""
+  for k in $(server_kinds); do
+    label="$(kind_field "$k" label)"
+    [[ -n "$last" ]] && out+=", ${last}"
+    last="$label"
+  done
+  printf '%s or %s\n' "$out" "$last"
+}
+# The secret's name in messages: "LM Studio token", "Maya API key".
+kind_secret_name() {
+  if [[ "$1" == lmstudio ]]; then echo "LM Studio token"
+  else printf '%s API key\n' "$(kind_field "$1" label)"; fi
+}
+
+server_kind() {
+  local k
+  for k in $(server_kinds); do
+    [[ "$1" == "$k"+* ]] && { echo "$k"; return 0; }
+  done
+  echo ollama
+}
+server_base() {
+  local kind; kind="$(server_kind "$1")"
+  if [[ "$kind" == ollama ]]; then printf '%s\n' "$1"; else printf '%s\n' "${1#"$kind"+}"; fi
+}
 # LiteLLM provider prefix and api_base for a server entry. OpenAI-compatible
 # servers use /v1; LM Studio uses LiteLLM's lm_studio/ provider.
 litellm_provider() {
-  case "$(server_kind "$1")" in
-    lmstudio) echo lm_studio ;;
-    strata|basalt) echo openai ;;
-    *) echo ollama ;;
-  esac
+  local kind; kind="$(server_kind "$1")"
+  if [[ "$kind" == lmstudio ]]; then echo lm_studio
+  elif is_openai_kind "$kind"; then echo openai
+  else echo ollama; fi
 }
 litellm_api_base() {
   if [[ "$(server_kind "$1")" != ollama ]]; then
@@ -191,12 +245,11 @@ litellm_api_base() {
 # curl against a server entry, with its API token when there is one.
 # The header goes through a file descriptor so the token never shows in `ps`.
 server_curl() {
-  local url="$1" path="$2" token=""
-  case "$(server_kind "$url")" in
-    lmstudio) token="$(env_get LMSTUDIO_API_TOKEN 2>/dev/null)" ;;
-    strata) token="$(env_get STRATA_API_KEY 2>/dev/null)" ;;
-    basalt) token="$(env_get BASALT_API_KEY 2>/dev/null)" ;;
-  esac
+  local url="$1" path="$2" token="" kind
+  kind="$(server_kind "$url")"
+  if [[ "$kind" != ollama ]]; then
+    token="$(env_get "$(kind_field "$kind" key)" 2>/dev/null)"
+  fi
   if [[ -n "$token" ]]; then
     curl -fsS --max-time "$PROBE_TIMEOUT" -H @<(printf 'Authorization: Bearer %s\n' "$token") \
       "$(server_base "$url")${path}"
@@ -208,13 +261,12 @@ server_curl() {
 valid_addr() {
   local raw="$1" port
   [[ -n "$raw" ]] || return 1
-  # Kind prefixes select the non-Ollama server APIs.
-  raw="${raw#lmstudio+}"
-  [[ "$raw" == lmstudio://* ]] && raw="${raw#lmstudio://}"
-  raw="${raw#strata+}"
-  [[ "$raw" == strata://* ]] && raw="${raw#strata://}"
-  raw="${raw#basalt+}"
-  [[ "$raw" == basalt://* ]] && raw="${raw#basalt://}"
+  # Kind prefixes (maya+http://..., maya://host) select the non-Ollama APIs.
+  local k
+  for k in $(server_kinds); do
+    raw="${raw#"$k"+}"
+    [[ "$raw" == "$k"://* ]] && raw="${raw#"$k"://}"
+  done
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     [[ "$raw" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/.*)?$ ]]
     return $?
@@ -233,26 +285,12 @@ valid_addr() {
 # plus http://host:port for the OpenAI-compatible servers. $2 (or SERVER_TYPE)
 # may force the kind; the default port follows it.
 normalize_addr() {
-  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base
-  if [[ "$raw" == lmstudio+* ]]; then
-    kind=lmstudio; raw="${raw#lmstudio+}"
-  elif [[ "$raw" == lmstudio://* ]]; then
-    kind=lmstudio; raw="${raw#lmstudio://}"
-  elif [[ "$raw" == strata+* ]]; then
-    kind=strata; raw="${raw#strata+}"
-  elif [[ "$raw" == strata://* ]]; then
-    kind=strata; raw="${raw#strata://}"
-  elif [[ "$raw" == basalt+* ]]; then
-    kind=basalt; raw="${raw#basalt+}"
-  elif [[ "$raw" == basalt://* ]]; then
-    kind=basalt; raw="${raw#basalt://}"
-  fi
-  case "$kind" in
-    lmstudio) port="$LMSTUDIO_PORT" ;;
-    strata) port="${STRATA_PORT:-8080}" ;;
-    basalt) port="${BASALT_PORT:-8080}" ;;
-    *) port="$OLLAMA_PORT" ;;
-  esac
+  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base k
+  for k in $(server_kinds); do
+    if [[ "$raw" == "$k"+* ]]; then kind="$k"; raw="${raw#"$k"+}"; break; fi
+    if [[ "$raw" == "$k"://* ]]; then kind="$k"; raw="${raw#"$k"://}"; break; fi
+  done
+  if is_server_kind "$kind"; then port="$(kind_field "$kind" port)"; else port="$OLLAMA_PORT"; fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     base="$raw"
   elif [[ "$raw" == *:* ]]; then
@@ -260,12 +298,12 @@ normalize_addr() {
   else
     base="http://${raw}:${port}"
   fi
-  if [[ "$kind" == lmstudio || "$kind" == strata || "$kind" == basalt ]]; then
+  if is_server_kind "$kind"; then
     printf '%s+%s\n' "$kind" "$base"
   else printf '%s\n' "$base"; fi
 }
 
-# Which API answers at a plain http base URL: ollama, lmstudio, strata, basalt, or nothing.
+# Which API answers at a plain http base URL.
 detect_server_kind() {
   local base="$1" body
   if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/api/tags" 2>/dev/null)" &&
@@ -279,6 +317,10 @@ detect_server_kind() {
     fi
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"basalt\" ]]; then
       echo basalt; return 0
+    fi
+    if [[ "$body" =~ \"model\"[[:space:]]*:[[:space:]]*\"glm-5\.3-flash\" ]] &&
+       [[ "$body" == *'"version"'* ]]; then
+      echo maya; return 0
     fi
   fi
   local code path status_code=''
@@ -303,7 +345,9 @@ detect_server_kind() {
         echo lmstudio; return 0
       fi
       note "  ${base} requires authentication, so its API cannot be identified without sending a key."
-      note "  Add it as strata://${base#*://}, basalt://${base#*://} or lmstudio://${base#*://} (or use --type)."
+      local k forms=()
+      for k in $(openai_kinds) lmstudio; do forms+=("${k}://${base#*://}"); done
+      note "  Add it as one of: ${forms[*]} (or use --type)."
       return 1
     fi
   done
@@ -314,17 +358,13 @@ detect_server_kind() {
 # lmstudio+http://10.0.0.9:1234 without the prefix having to be typed. Prints
 # the normalized form when nothing matches.
 configured_entry() {
-  local url alt
+  local url alt k
   url="$(normalize_addr "$1")"
   get_servers | contains_line "$url" && { printf '%s\n' "$url"; return 0; }
-  alt="$(normalize_addr "$1" lmstudio)"
-  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
-  alt="$(normalize_addr "$1" ollama)"
-  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
-  alt="$(normalize_addr "$1" strata)"
-  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
-  alt="$(normalize_addr "$1" basalt)"
-  get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
+  for k in lmstudio ollama $(openai_kinds); do
+    alt="$(normalize_addr "$1" "$k")"
+    get_servers | contains_line "$alt" && { printf '%s\n' "$alt"; return 0; }
+  done
   printf '%s\n' "$url"
 }
 
@@ -342,22 +382,22 @@ resolve_server() {
     normalize_addr "$base" "$kind"; return 0
   fi
   # A bare host got Ollama's port; another API may be on its own port instead.
+  # Each distinct default port is probed once, and whichever OpenAI-style
+  # server answers there is accepted (they share 8080 unless overridden).
   if [[ "$addr" != *:* ]]; then
     alt="$(server_base "$(normalize_addr "$addr" lmstudio)")"
     if kind="$(detect_server_kind "$alt")" && [[ "$kind" == lmstudio ]]; then
       normalize_addr "$alt" lmstudio; return 0
     fi
-    alt="$(server_base "$(normalize_addr "$addr" strata)")"
-    if kind="$(detect_server_kind "$alt")" && [[ "$kind" == strata || "$kind" == basalt ]]; then
-      normalize_addr "$alt" "$kind"; return 0
-    fi
-    # Strata and Basalt default to 8080, but either port can be overridden.
-    if [[ "${BASALT_PORT:-8080}" != "${STRATA_PORT:-8080}" ]]; then
-      alt="$(server_base "$(normalize_addr "$addr" basalt)")"
-      if kind="$(detect_server_kind "$alt")" && [[ "$kind" == basalt ]]; then
-        normalize_addr "$alt" basalt; return 0
+    local k tried=" "
+    for k in $(openai_kinds); do
+      alt="$(server_base "$(normalize_addr "$addr" "$k")")"
+      [[ "$tried" == *" $alt "* ]] && continue
+      tried+="$alt "
+      if kind="$(detect_server_kind "$alt")" && is_openai_kind "$kind"; then
+        normalize_addr "$alt" "$kind"; return 0
       fi
-    fi
+    done
   fi
   return 1
 }
@@ -365,8 +405,9 @@ resolve_server() {
 # --- env file access ----------------------------------------------------------
 # Keys that must never be written to the version-controlled env file.
 secret_keys() {
-  printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS \
-    LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY
+  local k
+  printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS
+  for k in $(server_kinds); do kind_field "$k" key; done
 }
 is_secret_key() { secret_keys | grep -qx -- "$1"; }
 
@@ -526,7 +567,7 @@ server_models() {
   local url="$1" body path
   if [[ "$(server_kind "$url")" == ollama ]]; then
     body="$(server_curl "$url" /api/tags 2>/dev/null)" || return 1
-  elif [[ "$(server_kind "$url")" == strata || "$(server_kind "$url")" == basalt ]]; then
+  elif is_openai_kind "$(server_kind "$url")"; then
     body="$(server_curl "$url" /v1/models 2>/dev/null)" || return 1
   else
     for path in /api/v1/models /api/v0/models /v1/models; do
@@ -738,11 +779,12 @@ if rows:
 regenerate_litellm() {
   local tmp tier name tag tier_tag url tail_block keep_alive fallbacks sig
   local -a sig_lines=()
-  local lms_token strata_token basalt_token
+  local kind key_env k
+  local -A kind_has_token=()
   keep_alive="$(env_get OLLAMA_KEEP_ALIVE)"
-  lms_token="$(env_get LMSTUDIO_API_TOKEN)"
-  strata_token="$(env_get STRATA_API_KEY)"
-  basalt_token="$(env_get BASALT_API_KEY)"
+  for k in $(server_kinds); do
+    [[ -n "$(env_get "$(kind_field "$k" key)")" ]] && kind_has_token[$k]=1
+  done
   $DRY_RUN && { echo "  [dry-run] would regenerate ${LITELLM_YAML}"; return 0; }
   [[ -f "$LITELLM_YAML" ]] || die "missing ${LITELLM_YAML}"
   tmp="$(mktemp)"
@@ -772,24 +814,19 @@ regenerate_litellm() {
         printf '    litellm_params:\n'
         printf '      model: %s/%s\n' "$(litellm_provider "$url")" "$tag"
         printf '      api_base: %s\n' "$(litellm_api_base "$url")"
-        if [[ "$(server_kind "$url")" == lmstudio ]]; then
-          # LM Studio: token only when set (secrets.env, loaded by the unit);
-          # keep_alive is an Ollama setting and is not sent.
-          [[ -n "$lms_token" ]] && printf '      api_key: os.environ/LMSTUDIO_API_TOKEN\n'
-        elif [[ "$(server_kind "$url")" == strata ]]; then
-          if [[ -n "$strata_token" ]]; then
-            printf '      api_key: os.environ/STRATA_API_KEY\n'
-          else
-            printf '      api_key: none\n'
-          fi
-        elif [[ "$(server_kind "$url")" == basalt ]]; then
-          if [[ -n "$basalt_token" ]]; then
-            printf '      api_key: os.environ/BASALT_API_KEY\n'
-          else
-            printf '      api_key: none\n'
-          fi
-        else
+        kind="$(server_kind "$url")"
+        if [[ "$kind" == ollama ]]; then
           [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
+        else
+          # Tokens come from secrets.env, which the LiteLLM unit loads.
+          # keep_alive is an Ollama setting and is never sent elsewhere.
+          key_env="$(kind_field "$kind" key)"
+          if [[ -n "${kind_has_token[$kind]:-}" ]]; then
+            printf '      api_key: os.environ/%s\n' "$key_env"
+          elif is_openai_kind "$kind"; then
+            # LiteLLM's openai provider needs some key even for a keyless server.
+            printf '      api_key: none\n'
+          fi
         fi
         sig+="${tag}@${url} "
       done < <(get_tier "$tier")
@@ -826,7 +863,7 @@ confirm() {
 
 cmd_add() {
   local -a wanted=("$@")
-  local addr url current count tier
+  local addr url current count tier kind
   (( ${#wanted[@]} > 0 )) || die "add: no address given"
   current="$(get_servers | lines_to_csv)"
   count="$(get_servers | grep -c . || true)"
@@ -835,11 +872,10 @@ cmd_add() {
   for addr in "${wanted[@]}"; do
     valid_addr "$addr" || die "not a valid address: '${addr}'"
     if ! url="$(resolve_server "$addr")"; then
-      die "${addr} is not reachable as Ollama, LM Studio or Strata. Use --type and/or --no-probe to add anyway."
+      die "${addr} is not reachable as $(kind_labels). Use --type and/or --no-probe to add anyway."
     fi
-    [[ "$(server_kind "$url")" == lmstudio ]] && note "  ${addr}: LM Studio server -> ${url}"
-    [[ "$(server_kind "$url")" == strata ]] && note "  ${addr}: Strata server -> ${url}"
-    [[ "$(server_kind "$url")" == basalt ]] && note "  ${addr}: Basalt server -> ${url}"
+    kind="$(server_kind "$url")"
+    [[ "$kind" == ollama ]] || note "  ${addr}: $(kind_field "$kind" label) server -> ${url}"
     if get_servers | contains_line "$url"; then
       note "  already configured, skipping: ${url}"
       continue
@@ -850,12 +886,8 @@ cmd_add() {
     fi
     if ! $NO_PROBE; then
       if [[ "$(probe_server "$url")" == "-" ]]; then
-        if [[ "$(server_kind "$url")" == lmstudio ]]; then
-          die "${url} did not list its models. Is the LM Studio server running? If it requires authentication, run set-lmstudio-token first. Use --no-probe to add anyway."
-        elif [[ "$(server_kind "$url")" == strata ]]; then
-          die "${url} did not list its models. Is Strata running? If it requires authentication, run set-strata-token first. Use --no-probe to add anyway."
-        elif [[ "$(server_kind "$url")" == basalt ]]; then
-          die "${url} did not list its models. Is Basalt running? If it requires authentication, run set-basalt-token first. Use --no-probe to add anyway."
+        if [[ "$kind" != ollama ]]; then
+          die "${url} did not list its models. Is the $(kind_field "$kind" label) server running? If it requires authentication, run set-${kind}-token first. Use --no-probe to add anyway."
         fi
         die "${url} is not reachable (no /api/tags). Use --no-probe to add anyway."
       fi
@@ -2102,75 +2134,42 @@ cmd_set_api_key() {
   CHANGED=true
 }
 
-# Token for LM Studio servers with "Require authentication" on. One token for
-# every LM Studio server; stored outside the repo like the other secrets.
-cmd_set_lmstudio_token() {
-  local token="${1:-}" confirm_token=""
+# Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
+# LM Studio servers with "Require authentication" on, or Strata, Basalt and
+# Maya servers started with an API key. One token per kind, stored in
+# secrets.env (outside the repo) like the other secrets.
+cmd_set_kind_token() {
+  local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd
+  is_server_kind "$kind" || die "unknown server kind '${kind}'"
+  key_env="$(kind_field "$kind" key)"
+  name="$(kind_secret_name "$kind")"
+  noun="${name##* }"                     # token / key
+  cmd="set-${kind}-token"
   if [[ "$token" == --off ]]; then
-    env_set LMSTUDIO_API_TOKEN ""
-    echo "LM Studio token cleared."
+    env_set "$key_env" ""
+    echo "${name} cleared."
     regenerate_litellm
     CHANGED=true
     return 0
   fi
   if [[ -z "$token" ]]; then
-    [[ "$ASSUME_YES" == "true" ]] && die "set-lmstudio-token: no token given"
-    read -r -s -p "LM Studio API token: " token; echo
-    read -r -s -p "Confirm token: " confirm_token; echo
-    [[ "$token" == "$confirm_token" ]] || die "tokens did not match"
+    [[ "$ASSUME_YES" == "true" ]] && die "${cmd}: no ${noun} given"
+    read -r -s -p "$(kind_field "$kind" label) API ${noun}: " token; echo
+    read -r -s -p "Confirm ${noun}: " confirm_token; echo
+    [[ "$token" == "$confirm_token" ]] || die "${noun}s did not match"
   fi
-  [[ -n "$token" ]] || die "set-lmstudio-token: empty token"
-  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "set-lmstudio-token: unexpected characters in token"
-  env_set LMSTUDIO_API_TOKEN "$token"
-  echo "Stored the LM Studio token in ${SECRETS_FILE}."
+  [[ -n "$token" ]] || die "${cmd}: empty ${noun}"
+  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "${cmd}: unexpected characters in ${noun}"
+  env_set "$key_env" "$token"
+  echo "Stored the ${name} in ${SECRETS_FILE}."
   regenerate_litellm
   CHANGED=true
 }
 
-cmd_set_strata_token() {
-  local token="${1:-}" confirm_token=""
-  if [[ "$token" == --off ]]; then
-    env_set STRATA_API_KEY ""
-    echo "Strata API key cleared."
-    regenerate_litellm
-    CHANGED=true
-    return 0
-  fi
-  if [[ -z "$token" ]]; then
-    [[ "$ASSUME_YES" == "true" ]] && die "set-strata-token: no key given"
-    read -r -s -p "Strata API key: " token; echo
-    read -r -s -p "Confirm key: " confirm_token; echo
-    [[ "$token" == "$confirm_token" ]] || die "keys did not match"
-  fi
-  [[ -n "$token" ]] || die "set-strata-token: empty key"
-  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "set-strata-token: unexpected characters in key"
-  env_set STRATA_API_KEY "$token"
-  echo "Stored the Strata API key in ${SECRETS_FILE}."
-  regenerate_litellm
-  CHANGED=true
-}
-
-cmd_set_basalt_token() {
-  local token="${1:-}" confirm_token=""
-  if [[ "$token" == --off ]]; then
-    env_set BASALT_API_KEY ""
-    echo "Basalt API key cleared."
-    regenerate_litellm
-    CHANGED=true
-    return 0
-  fi
-  if [[ -z "$token" ]]; then
-    [[ "$ASSUME_YES" == "true" ]] && die "set-basalt-token: no key given"
-    read -r -s -p "Basalt API key: " token; echo
-    read -r -s -p "Confirm key: " confirm_token; echo
-    [[ "$token" == "$confirm_token" ]] || die "keys did not match"
-  fi
-  [[ -n "$token" ]] || die "set-basalt-token: empty key"
-  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "set-basalt-token: unexpected characters in key"
-  env_set BASALT_API_KEY "$token"
-  echo "Stored the Basalt API key in ${SECRETS_FILE}."
-  regenerate_litellm
-  CHANGED=true
+# The kind a set-<kind>-token command names, or nothing.
+token_command_kind() {
+  local kind="${1#set-}"; kind="${kind%-token}"
+  [[ "$1" == "set-${kind}-token" ]] && is_server_kind "$kind" && printf '%s\n' "$kind"
 }
 
 cmd_commit() {
@@ -2207,8 +2206,8 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-lmstudio-token|set-strata-token|set-basalt-token|set-webhook|set-webui-version) return 0 ;;
-    *) return 1 ;;
+    set-token|set-api-key|set-webhook|set-webui-version) return 0 ;;
+    *) [[ -n "$(token_command_kind "$1")" ]] ;;
   esac
 }
 
@@ -2441,7 +2440,7 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || die "$1 needs a value"
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
-      [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-lmstudio-token" || "$COMMAND" == "set-strata-token" || "$COMMAND" == "set-basalt-token" ]] || die "unknown option: $1"
+      [[ "$COMMAND" == "set-api-key" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -2454,10 +2453,9 @@ done
 for tier in $(csv_to_lines "${TIER_ARG:-}"); do
   tier_env_key "$tier" >/dev/null
 done
-case "$SERVER_TYPE" in
-  auto|ollama|lmstudio|strata|basalt) ;;
-  *) die "--type must be ollama, lmstudio, strata, basalt or auto (got '${SERVER_TYPE}')" ;;
-esac
+if [[ "$SERVER_TYPE" != auto && "$SERVER_TYPE" != ollama ]] && ! is_server_kind "$SERVER_TYPE"; then
+  die "--type must be ollama, $(server_kinds | paste -sd, - | sed 's/,/, /g') or auto (got '${SERVER_TYPE}')"
+fi
 
 ensure_config_or_forward
 if command_writes "$COMMAND" && ! $DRY_RUN && ! lock_inherited; then
@@ -2480,9 +2478,10 @@ case "$COMMAND" in
   commit)   cmd_commit "${ARGS[0]:-Update model server list}" ;;
   set-token) cmd_set_token "${ARGS[0]:-}" ;;
   set-api-key) cmd_set_api_key "${ARGS[0]:-}" ;;
-  set-lmstudio-token) cmd_set_lmstudio_token "${ARGS[0]:-}" ;;
-  set-strata-token) cmd_set_strata_token "${ARGS[0]:-}" ;;
-  set-basalt-token) cmd_set_basalt_token "${ARGS[0]:-}" ;;
+  set-*-token)
+    token_kind="$(token_command_kind "$COMMAND")"
+    [[ -n "$token_kind" ]] || die "unknown command '${COMMAND}' (try --help)"
+    cmd_set_kind_token "$token_kind" "${ARGS[0]:-}" ;;
   test-alert) cmd_test_alert "${ARGS[0]:-}" ;;
   set-webhook) cmd_set_webhook ${ARGS[@]+"${ARGS[@]}"} ;;
   set-webui-version) cmd_set_webui_version "${ARGS[0]:-}" ;;
@@ -2504,7 +2503,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-lmstudio-token|set-strata-token|set-basalt-token)
+  set-api-key|set-*-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac

@@ -103,11 +103,31 @@ install_server() {
       "$TARGET_ROOT/venv/bin/python" -m py_compile "$TARGET_ROOT/server.py"
       "$TARGET_ROOT/venv/bin/python" -m pip freeze > "$TARGET_ROOT/python-packages.txt" )
 }
+# upgrade_unchanged SOURCE_DIR: would --upgrade change nothing? The same
+# server, requirements, lock, README and unit, a venv, and every setting the
+# upgrade adds already present in the env file.
+upgrade_unchanged() {
+    local src=$1 file key
+    for file in server.py requirements.txt requirements.lock README.md; do
+        cmp -s "$src/$file" "$TARGET_ROOT/$file" || return 1
+    done
+    cmp -s "$src/$SERVICE" "$TARGET_UNITS/$SERVICE" || return 1
+    [[ -x $TARGET_ROOT/venv/bin/python ]] || return 1
+    for key in AIRLLM_EXIT_ON_LOAD_FAILURE AIRLLM_DELETE_ORIGINAL AIRLLM_MODEL_FAMILY AIRLLM_MODEL_PARAMETER_SIZE; do
+        grep -q "^$key=" "$TARGET_ENV" || return 1
+    done
+}
 # Move $1 aside as $1.prev (replacing an older .prev); a no-op when absent.
 set_aside() {
     [[ -e $1 || -L $1 ]] || return 0
     rm -rf -- "$1.prev"
     mv -- "$1" "$1.prev"
+}
+# Like set_aside, but leaves $1 in place to be edited (settings files).
+copy_aside() {
+    [[ -e $1 ]] || return 0
+    rm -rf -- "$1.prev"
+    cp -a -- "$1" "$1.prev"
 }
 # Undo set_aside: put $1.prev back in place of whatever is at $1.
 restore_aside() {
@@ -177,27 +197,51 @@ if [[ $MODE == upgrade ]]; then
         die "No installation under $TARGET_ROOT and $TARGET_ETC; run without --upgrade to install."
     getent passwd "$TARGET_USER" >/dev/null || die "The $TARGET_USER user is missing; this is not an installed target."
     was_active=false
-    systemctl is-active --quiet "$SERVICE" && was_active=true
-    if $was_active && [[ $(http_status "$(target_url /healthz)") != 200 && ${ALLOW_INTERRUPT:-false} != true ]]; then
+    [[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
+    # Nothing to change: leave a healthy (or deliberately stopped) target alone.
+    if upgrade_unchanged "$source_dir"; then
+        if ! $was_active; then
+            printf 'The server, unit and settings are unchanged; nothing to do (the service stays stopped).\n'
+            exit 0
+        elif systemctl is-active --quiet "$SERVICE" && [[ $(http_status "$(target_url /healthz)") == 200 ]]; then
+            printf 'The server, unit and settings are unchanged and the target is healthy; nothing to do.\n'
+            exit 0
+        fi
+        printf 'Nothing changed, but the target is not healthy.\n'
+    fi
+    if systemctl is-active --quiet "$SERVICE" && [[ $(http_status "$(target_url /healthz)") != 200 && ${ALLOW_INTERRUPT:-false} != true ]]; then
         die 'The target is still downloading or loading its model. Wait for /healthz to answer 200, or rerun with ALLOW_INTERRUPT=true (downloads resume, but splitting restarts).'
     fi
     # Only what THIS run set aside is restored.
     aside=()
     stash() { set_aside "$1"; aside+=("$1"); }
+    stash_copy() { copy_aside "$1"; aside+=("$1"); }
+    # Put back everything this run replaced, code and settings alike, then
+    # check that the previous installation really serves again.
     rollback() {
         local path
         printf 'Upgrade failed; restoring the previous installation...\n' >&2
         systemctl stop "$SERVICE" 2>/dev/null || true
         for path in "${aside[@]}"; do restore_aside "$path"; done
         systemctl daemon-reload
-        if $was_active; then systemctl start "$SERVICE" || true; fi
+        if ! $was_active; then
+            printf 'Upgrade failed; the previous files are back, and the service stays stopped as it was.\n' >&2
+        elif systemctl start "$SERVICE" && wait_for "$(target_url /healthz)" "${UPGRADE_HEALTH_TIMEOUT:-900}"; then
+            printf 'Upgrade failed; the previous installation is running again.\n' >&2
+        else
+            printf 'Upgrade failed, and the previous installation did not become healthy either; see journalctl -u %s.\n' "$SERVICE" >&2
+        fi
     }
-    trap 'rollback; exit 1' ERR
+    # With set -E a failure inside a ( ... ) subshell fires this trap in the
+    # subshell and again in the parent; only the main shell rolls back.
+    trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
     for path in server.py requirements.txt requirements.lock README.md venv; do stash "$TARGET_ROOT/$path"; done
     install_server "$source_dir"
     stash "$TARGET_UNITS/$SERVICE"
     install -o root -g root -m 0644 "$source_dir/$SERVICE" "$TARGET_UNITS/$SERVICE"
     # New settings get their defaults; existing values are never rewritten.
+    # The settings file is set aside too, so a rollback restores it.
+    stash_copy "$TARGET_ENV"
     ensure_env_key "$TARGET_ENV" AIRLLM_EXIT_ON_LOAD_FAILURE true
     ensure_env_key "$TARGET_ENV" AIRLLM_DELETE_ORIGINAL false
     ensure_env_key "$TARGET_ENV" AIRLLM_MODEL_FAMILY ''

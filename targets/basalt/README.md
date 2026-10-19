@@ -11,6 +11,13 @@ CUDA 13, CMake 3.24 or newer, and enough RAM for its expert arena. The guest
 installer supplies a newer CMake in its virtual environment when the system
 version is too old.
 
+The toolkit comes from NVIDIA's apt repository for the CT's distribution.
+Ubuntu 22.04/24.04 and Debian 12 carry the default CUDA 13.0; **Debian 13
+starts at 13.1**, so use `CUDA_VERSION=13.1` (or later) with a Debian 13
+template. `provision-lxc.sh` and `install-target.sh` refuse a combination the
+repository cannot provide before anything is created or changed, unless a
+toolkit that meets `CUDA_VERSION` is already installed in the CT.
+
 ## Before running
 
 Run on the Proxmox GPU host as root. The host needs Proxmox VE 9, an unused CT
@@ -71,14 +78,28 @@ manage-model-servers set-server-model xlarge basalt://192.0.2.80 qwen3.8-flash-n
 Replace the address with the CT's IP. If you changed `BASALT_ALIAS` during
 provisioning, use that alias in `set-server-model`. Basalt's public `/health`
 endpoint also allows auto-detection from a bare address. Use `basalt://` to
-select the API explicitly, including when it listens on a custom port. Set
-`[discovery] basalt_default_id` in the router's `router.ini` to that alias if
-you want discovery to use the default 125B size assumption.
+select the API explicitly, including when it listens on a custom port. For a
+custom alias, add `<alias> = 125B` to `[model_sizes]` in the router's
+`router.ini` if you want discovery to size it like the default alias.
 
 ## Upgrade and check
 
+Every rerun of the installer, with or without `--upgrade`, keeps the
+installation's settings from `/etc/basalt-target/installed-env`, including custom
+model, context and port values. An install from before that record existed uses
+its `installed-settings` fingerprint instead. Non-empty environment settings
+override the corresponding saved values.
+Only a fresh install uses the defaults. A fresh install records the settings
+it runs with in `/etc/basalt-target/pending-env` before its first change, so a
+first install that stops part-way resumes with them on the next run;
+the file is removed once the install succeeds. An existing checkout or service
+unit with no readable record (missing, unreadable or dangling) requires every
+setting explicitly before the installer can proceed. A malformed `installed-env`
+must be repaired or removed before retrying.
+
 Push the three deployment files into the existing CT, then rerun the guest
-installer. It can also be invoked with `--upgrade` explicitly:
+installer with `--upgrade` (a plain rerun does the same and keeps the same
+settings):
 
 ```bash
 pct push 250 targets/basalt/install-target.sh /root/basalt-target-deploy/install-target.sh --perms 0755
@@ -87,7 +108,27 @@ pct push 250 targets/basalt/basalt.service /root/basalt-target-deploy/basalt.ser
 pct exec 250 -- bash /root/basalt-target-deploy/install-target.sh --upgrade
 ```
 
-Without Proxmox or a GPU, run `bash targets/basalt/test-provision.sh` and
-`bash targets/basalt/test-install.sh` to check plans, validation, shell
-syntax and failed-download handling. A real build, model download and service
+The installer fetches before stopping anything and does nothing when the
+commit, settings, model, unit and health are unchanged. Otherwise it stops
+Basalt, rebuilds, relaunches and waits for `/health` to report a loaded model.
+Before changing the checkout it stops the service and snapshots the runnable
+checkout, venv, launcher and unit. If the upgrade fails, it restores the
+previous commit and runtime at the original paths without rebuilding or
+running pip, then health-checks the old service. Model files in the separate
+data directory are kept. Healthy unchanged legacy reruns backfill missing
+`installed-env` records.
+
+Without Proxmox or a GPU, run `bash targets/basalt/test-provision.sh`,
+`bash targets/basalt/test-install.sh` and `bash targets/basalt/test-upgrade.sh`
+(as root, against stubs: install, no-op rerun, upgrade and rollback) to check
+plans, validation, shell syntax, failed-download handling and the upgrade
+path. A real build, model download and service
 health check require the target host.
+
+The root-only `/var/lib/basalt-target/` holds the runtime snapshot (including any
+configuration secrets) during an upgrade. It is deleted once the upgrade or the
+rollback succeeds, and kept for inspection only when the rollback fails too.
+Allow disk space for one copy of the checkout, in addition to the model and
+build. The default `/var/lib/basalt` model store is outside the snapshot; weights
+placed inside `/opt/basalt` are copied with that checkout.
+A snapshot failure aborts the upgrade and restarts the original service.

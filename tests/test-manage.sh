@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Fixture variables are consumed by dynamically extracted helpers.
+# shellcheck disable=SC2034
 # Unit tests for the functions in manage-model-servers.sh
 #
 # Each test gets a throwaway config repo, so nothing touches a real deployment.
@@ -116,30 +118,36 @@ assert_ok   "strata://host"          valid_addr strata://10.0.0.8
 assert_ok   "strata+http url"        valid_addr strata+http://h:8080
 assert_ok   "basalt://host"          valid_addr basalt://10.0.0.8
 assert_ok   "basalt+http url"        valid_addr basalt+http://h:8080
+assert_ok   "maya://host"            valid_addr maya://10.0.0.9
+assert_ok   "maya+http url"          valid_addr maya+http://h:8080
 
 describe server_kind
 assert_eq "ollama"   "ollama"   "$(server_kind http://h:11434)"
 assert_eq "lmstudio" "lmstudio" "$(server_kind lmstudio+http://h:1234)"
 assert_eq "strata"   "strata"   "$(server_kind strata+http://h:8080)"
 assert_eq "basalt"   "basalt"   "$(server_kind basalt+http://h:8080)"
+assert_eq "maya"     "maya"     "$(server_kind maya+http://h:8080)"
 
 describe server_base
 assert_eq "strips the prefix" "http://h:1234" "$(server_base lmstudio+http://h:1234)"
 assert_eq "ollama unchanged"  "http://h:11434" "$(server_base http://h:11434)"
 assert_eq "strata prefix"     "http://h:8080"  "$(server_base strata+http://h:8080)"
 assert_eq "basalt prefix"     "http://h:8080"  "$(server_base basalt+http://h:8080)"
+assert_eq "maya prefix"       "http://h:8080"  "$(server_base maya+http://h:8080)"
 
 describe litellm_provider
 assert_eq "ollama"   "ollama"    "$(litellm_provider http://h:11434)"
 assert_eq "lmstudio" "lm_studio" "$(litellm_provider lmstudio+http://h:1234)"
 assert_eq "strata uses OpenAI" "openai" "$(litellm_provider strata+http://h:8080)"
 assert_eq "basalt uses OpenAI" "openai" "$(litellm_provider basalt+http://h:8080)"
+assert_eq "maya uses OpenAI"   "openai" "$(litellm_provider maya+http://h:8080)"
 
 describe litellm_api_base
 assert_eq "ollama base as-is"      "http://h:11434"   "$(litellm_api_base http://h:11434)"
 assert_eq "lmstudio OpenAI base"   "http://h:1234/v1" "$(litellm_api_base lmstudio+http://h:1234)"
 assert_eq "strata OpenAI base"     "http://h:8080/v1" "$(litellm_api_base strata+http://h:8080)"
 assert_eq "basalt OpenAI base"     "http://h:8080/v1" "$(litellm_api_base basalt+http://h:8080)"
+assert_eq "maya OpenAI base"       "http://h:8080/v1" "$(litellm_api_base maya+http://h:8080)"
 
 describe normalize_addr
 assert_eq "adds scheme+port"   "http://10.0.0.5:11434" "$(normalize_addr 10.0.0.5)"
@@ -156,6 +164,8 @@ assert_eq "strata:// keeps port 11434"       "strata+http://h:11434" "$(normaliz
 assert_eq "strata+http passes through"        "strata+http://h:8888" "$(normalize_addr strata+http://h:8888/)"
 assert_eq "basalt:// default port"            "basalt+http://h:8080" "$(normalize_addr basalt://h)"
 assert_eq "basalt+http passes through"        "basalt+http://h:8888" "$(normalize_addr basalt+http://h:8888/)"
+assert_eq "maya:// default port"              "maya+http://h:8080"   "$(normalize_addr maya://h)"
+assert_eq "maya+http passes through"          "maya+http://h:8888"   "$(normalize_addr maya+http://h:8888/)"
 STRATA_PORT=11434
 assert_eq "Strata default port can be 11434" "strata+http://h:11434" "$(normalize_addr strata://h)"
 unset STRATA_PORT
@@ -368,6 +378,7 @@ EOF
 assert_eq "then to /v1/models" "plain" "$(server_models lmstudio+http://h:1234)"
 assert_eq "Strata reads /v1/models" "plain" "$(server_models strata+http://h:8080)"
 assert_eq "Basalt reads /v1/models" "plain" "$(server_models basalt+http://h:8080)"
+assert_eq "Maya reads /v1/models" "plain" "$(server_models maya+http://h:8080)"
 mock_command curl 7
 assert_status "unreachable LM Studio -> 1" 1 server_models lmstudio+http://h:1234
 
@@ -394,6 +405,12 @@ server_curl basalt+http://h:8080 /v1/models >/dev/null
 assert_contains "Basalt uses its own key" "http://h:8080/v1/models" "$(mock_calls)"
 assert_contains "Basalt key in header file" "-H @" "$(mock_calls)"
 assert_not_contains "Basalt key absent from argv" "basalt-tok-123" "$(mock_calls)"
+env_set MAYA_API_KEY "maya-tok-123"
+mock_reset_log
+server_curl maya+http://h:8080 /v1/models >/dev/null
+assert_contains "Maya uses its own key" "http://h:8080/v1/models" "$(mock_calls)"
+assert_contains "Maya key in header file" "-H @" "$(mock_calls)"
+assert_not_contains "Maya key absent from argv" "maya-tok-123" "$(mock_calls)"
 mock_reset_log
 server_curl http://h:11434 /api/tags >/dev/null
 assert_not_contains "never sent to Ollama" "-H" "$(mock_calls)"
@@ -433,6 +450,16 @@ EOF
 mock_reset_log
 assert_eq "keyed Basalt identified from public health" "basalt" "$(detect_server_kind http://h:11434)"
 assert_not_contains "Basalt detection sends no key" "-H @" "$(mock_calls)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok","model":"glm-5.3-flash","version":"1.1.13"}';;
+  *) exit 22;;
+esac
+EOF
+mock_reset_log
+assert_eq "keyed Maya identified from public health" "maya" "$(detect_server_kind http://h:8080)"
+assert_not_contains "Maya detection sends no key" "-H @" "$(mock_calls)"
 mock_script curl <<'EOF'
 case "$*" in
   *"/v1/status"*) printf '{"loaded":true,"auto_load":true}\n200';;
@@ -501,6 +528,13 @@ case "$*" in
 esac
 EOF
 assert_eq "bare Basalt host on default port detected" "basalt+http://10.0.0.9:8080" "$(resolve_server 10.0.0.9)"
+mock_script curl <<'EOF'
+case "$*" in
+  *":8080/health"*) printf '{"status":"ok","model":"glm-5.3-flash","version":"1.1.13"}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "bare Maya host on default port detected" "maya+http://10.0.0.9:8080" "$(resolve_server 10.0.0.9)"
 BASALT_PORT=8181
 mock_script curl <<'EOF'
 case "$*" in
@@ -517,6 +551,7 @@ assert_eq "--no-probe assumes Ollama"             "http://10.0.0.9:11434" "$(res
 assert_eq "an explicit lmstudio:// needs no probe" "lmstudio+http://10.0.0.9:1234" "$(resolve_server lmstudio://10.0.0.9)"
 assert_eq "explicit Strata on port 11434 needs no probe" "strata+http://10.0.0.9:11434" "$(resolve_server strata://10.0.0.9:11434)"
 assert_eq "explicit Basalt on port 11434 needs no probe" "basalt+http://10.0.0.9:11434" "$(resolve_server basalt://10.0.0.9:11434)"
+assert_eq "explicit Maya on port 11434 needs no probe" "maya+http://10.0.0.9:11434" "$(resolve_server maya://10.0.0.9:11434)"
 SERVER_TYPE=lmstudio
 assert_eq "--type lmstudio needs no probe"        "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
 SERVER_TYPE=strata
@@ -640,6 +675,20 @@ env_set BASALT_API_KEY "basalt-key"
 regenerate_litellm >/dev/null 2>&1
 assert_file_contains "Basalt key reference" "api_key: os.environ/BASALT_API_KEY" "$LITELLM_YAML"
 assert_fail "Basalt key never enters YAML" grep -q 'basalt-key' "$LITELLM_YAML"
+reset_repo
+
+env_set MODEL_SERVERS "maya+http://10.0.0.9:8080"
+env_set BACKEND_XLARGE "maya+http://10.0.0.9:8080"
+TIER_MODEL_OVERRIDE[xlarge]="glm-5.3-flash"
+regenerate_litellm >/dev/null 2>&1
+TIER_MODEL_OVERRIDE=()
+assert_file_contains "Maya OpenAI provider" "model: openai/glm-5.3-flash" "$LITELLM_YAML"
+assert_file_contains "Maya /v1 base" "api_base: http://10.0.0.9:8080/v1" "$LITELLM_YAML"
+assert_file_contains "Maya no-key placeholder" "api_key: none" "$LITELLM_YAML"
+env_set MAYA_API_KEY "maya-key"
+regenerate_litellm >/dev/null 2>&1
+assert_file_contains "Maya key reference" "api_key: os.environ/MAYA_API_KEY" "$LITELLM_YAML"
+assert_fail "Maya key never enters YAML" grep -q 'maya-key' "$LITELLM_YAML"
 reset_repo
 
 describe litellm_fallbacks
@@ -1270,34 +1319,69 @@ cmd_set_api_key --off >/dev/null 2>&1
 assert_eq "--off clears it" "" "$(env_get ROUTER_API_KEY)"
 reset_repo
 
-describe cmd_set_lmstudio_token
-reset_repo
-cmd_set_lmstudio_token "lms-abc.123" >/dev/null 2>&1
-assert_eq "stores the token" "lms-abc.123" "$(env_get LMSTUDIO_API_TOKEN)"
-assert_fail "in the secrets file, not the repo" grep -q LMSTUDIO_API_TOKEN "$ENV_FILE"
-assert_fail "rejects odd characters" cmd_set_lmstudio_token 'a b;c'
-cmd_set_lmstudio_token --off >/dev/null 2>&1
-assert_eq "--off clears it" "" "$(env_get LMSTUDIO_API_TOKEN)"
-reset_repo
+describe server_kinds
+assert_eq "kinds, in detection order" "lmstudio strata basalt maya" "$(server_kinds | paste -sd' ' -)"
 
-describe cmd_set_strata_token
-reset_repo
-cmd_set_strata_token "strata-abc.123" >/dev/null 2>&1
-assert_eq "stores the key" "strata-abc.123" "$(env_get STRATA_API_KEY)"
-assert_fail "keeps it out of the repo" grep -q STRATA_API_KEY "$ENV_FILE"
-assert_fail "rejects odd characters" cmd_set_strata_token 'a b;c'
-cmd_set_strata_token --off >/dev/null 2>&1
-assert_eq "--off clears it" "" "$(env_get STRATA_API_KEY)"
-reset_repo
+describe kind_field
+assert_eq "maya key" MAYA_API_KEY "$(kind_field maya key)"
+assert_eq "maya label" Maya "$(kind_field maya label)"
+assert_eq "LM Studio default port" 1234 "$(kind_field lmstudio port)"
+assert_eq "a <KIND>_PORT overrides the default" 9090 "$(MAYA_PORT=9090 kind_field maya port)"
+assert_eq "LM Studio is not an OpenAI-style kind" 0 "$(kind_field lmstudio openai)"
+assert_fail "Ollama is not in the table" kind_field ollama key
+assert_fail "unknown field" kind_field maya colour
 
-describe cmd_set_basalt_token
-reset_repo
-cmd_set_basalt_token "basalt-abc.123" >/dev/null 2>&1
-assert_eq "stores the key" "basalt-abc.123" "$(env_get BASALT_API_KEY)"
-assert_fail "keeps it out of the repo" grep -q BASALT_API_KEY "$ENV_FILE"
-assert_fail "rejects odd characters" cmd_set_basalt_token 'a b;c'
-cmd_set_basalt_token --off >/dev/null 2>&1
-assert_eq "--off clears it" "" "$(env_get BASALT_API_KEY)"
+describe is_server_kind
+assert_ok "maya is a kind" is_server_kind maya
+assert_fail "ollama is the default, not a table entry" is_server_kind ollama
+assert_fail "empty is not a kind" is_server_kind ""
+
+describe is_openai_kind
+assert_ok "basalt is OpenAI-style" is_openai_kind basalt
+assert_fail "LM Studio is not" is_openai_kind lmstudio
+assert_fail "nor is Ollama" is_openai_kind ollama
+
+describe openai_kinds
+assert_eq "OpenAI-style kinds" "strata basalt maya" "$(openai_kinds | paste -sd' ' -)"
+
+describe kind_labels
+assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt or Maya" "$(kind_labels)"
+
+describe kind_secret_name
+assert_eq "LM Studio has a token" "LM Studio token" "$(kind_secret_name lmstudio)"
+assert_eq "Maya has an API key" "Maya API key" "$(kind_secret_name maya)"
+
+describe token_command_kind
+assert_eq "set-maya-token names maya" maya "$(token_command_kind set-maya-token)"
+assert_eq "set-lmstudio-token names lmstudio" lmstudio "$(token_command_kind set-lmstudio-token)"
+assert_eq "set-token is not a kind command" "" "$(token_command_kind set-token)"
+assert_eq "set-ollama-token is not a kind command" "" "$(token_command_kind set-ollama-token)"
+assert_ok "token commands take the config lock" command_writes set-basalt-token
+assert_fail "unknown token commands do not" command_writes set-bogus-token
+
+describe secret_keys
+assert_eq "secrets include every kind's key" \
+  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY" \
+  "$(secret_keys | tail -n 4 | paste -sd' ' -)"
+
+describe litellm_provider
+assert_eq "litellm provider for maya" openai "$(litellm_provider maya+http://h:8080)"
+assert_eq "litellm provider for LM Studio" lm_studio "$(litellm_provider lmstudio+http://h:1234)"
+assert_eq "litellm provider for Ollama" ollama "$(litellm_provider http://h:11434)"
+assert_eq "server_base strips only the kind prefix" "http://h:8080" "$(server_base maya+http://h:8080)"
+
+describe cmd_set_kind_token
+for kind in $(server_kinds); do
+  key_env="$(kind_field "$kind" key)"
+  reset_repo
+  cmd_set_kind_token "$kind" "${kind}-abc.123" >/dev/null 2>&1
+  assert_eq "${kind}: stores the token" "${kind}-abc.123" "$(env_get "$key_env")"
+  assert_fail "${kind}: keeps it out of the repo" grep -q "$key_env" "$ENV_FILE"
+  assert_fail "${kind}: rejects odd characters" cmd_set_kind_token "$kind" 'a b;c'
+  cmd_set_kind_token "$kind" --off >/dev/null 2>&1
+  assert_eq "${kind}: --off clears it" "" "$(env_get "$key_env")"
+done
+assert_fail "an unknown kind is refused" cmd_set_kind_token bogus abc
 reset_repo
 
 describe cmd_commit

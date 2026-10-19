@@ -20,12 +20,13 @@ Exit status is non-zero if any assertion fails **or** any function has no
 
 Requirements: `bash` 4.4+, `python3`, and the usual coreutils. No network.
 
-Current state: **753 assertions in the two main suites, 158/158 functions covered.**
+`run-tests.sh` reports current assertion totals and function coverage at the
+end of each run. Use `--coverage` for the function coverage report alone.
 
-| Suite | Script under test | Functions | Assertions |
-|---|---|---|---|
-| `installer` | `ollama-smart-router-install.sh` | 63 | 296 |
-| `manage` | `install/manage-model-servers.sh` | 95 | 457 |
+| Suite | Script under test |
+|---|---|
+| `installer` | `ollama-smart-router-install.sh` |
+| `manage` | `install/manage-model-servers.sh` |
 
 `run-tests.sh` also runs these suites, which have no per-function coverage:
 
@@ -48,7 +49,9 @@ Current state: **753 assertions in the two main suites, 158/158 functions covere
 Set `ROUTER_PYTHON` / `BRIDGE_PYTHON` to run the pytest suites under a
 specific interpreter; the router and the bridge pin different fastapi versions.
 CI (`.gitea/workflows/tests.yml`) builds one venv for each. Test tooling is
-pinned in `tests/requirements-dev.txt`.
+pinned in `tests/requirements-dev.txt`. CI discovers every repository `.sh`
+file for ShellCheck, including helper fixtures; scoped directives explain
+intentional dynamic sourcing and settings consumed by extracted functions.
 
 Every suite starts with `exec </dev/null`, so a prompt under test that is not
 fed input explicitly fails instead of blocking on the runner's stdin.

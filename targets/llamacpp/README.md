@@ -419,13 +419,10 @@ bash test-gpu-selector.sh
 bash test-upgrade.sh
 ```
 
-Local validation passed: **33 API tests, 40 provisioning dry-run cases,
-23 model-configuration cases, 11 upgrade cases, 10 model-storage/download URL cases, 8 GGUF
-downloader cases, 6 CUDA compiler/toolkit cases, 50 container-configuration
-cases, 15 GPU-selector cases, and Bash syntax checks for the provisioning,
-target-install, and NVIDIA-helper scripts**.
-The adapter tests use mock llama.cpp
-HTTP responses and do not need a GPU.
+The suites cover API translation, provisioning plans, model settings and
+storage, downloads, CUDA compiler discovery, container settings, GPU selection,
+and upgrades with rollback. Each suite reports its current case count. Adapter
+tests use mock llama.cpp HTTP responses and do not need a GPU.
 They do not establish real GPU performance, GGUF/chat-template compatibility,
 or successful PVE provisioning. Complete the live checks above on each GPU
 class before replacing an existing Ollama target. No live Proxmox container was
@@ -440,18 +437,27 @@ LLAMA_CPP_REF=<new-release-tag-or-commit> bash install-target.sh --upgrade
 
 `--upgrade` keeps the model, `/etc/llama-target/*.env` and the service
 account. It only adds settings that are new (for example `LLAMA_EXTRA_ARGS=`)
-and never rewrites existing ones. It does the following:
+and never rewrites existing ones. When nothing would change (the same commit,
+requested ref and backend, the same `bridge.py`, requirements and unit files,
+and no new settings) and the target is healthy, or its services are stopped,
+it prints "nothing to do" and leaves everything as it is, including the kept
+`*.prev`. Otherwise it does the following:
 
-1. Rebuilds llama.cpp only when the ref resolves to a different commit than
-   `build-info.txt` records (`FORCE_REBUILD=true` forces a rebuild). The
-   backend comes from `build-info.txt` unless `BACKEND` is set.
-2. Always refreshes `bridge.py`, its venv and both unit files. Updating only
-   the bridge therefore needs no llama.cpp change.
+1. Rebuilds llama.cpp when the resolved commit or backend differs from
+   `build-info.txt` (`FORCE_REBUILD=true` also forces a rebuild). The
+   backend comes from `build-info.txt` unless `BACKEND` is set. A backend
+   change also sets `GPU_LAYERS` for the new backend (`auto` for cuda, `0` for
+   cpu), unless `GPU_LAYERS` is given on the command line; a CPU build refuses
+   anything but `0`. Otherwise `GPU_LAYERS` is never rewritten.
+2. Refreshes `bridge.py`, its venv and both unit files. Updating only the
+   bridge therefore needs no llama.cpp change.
 3. Restarts services that were running, and waits up to
    `UPGRADE_HEALTH_TIMEOUT` seconds (default 300) for `/healthz`.
-4. Keeps every replaced file as `*.prev`. On any failure (build, pip, or
-   health) it restores exactly what this run replaced and restarts the
-   previous build.
+4. Keeps every replaced file as `*.prev`, including copies of
+   `llama-server.env` and `bridge.env` before new settings are added. On any
+   failure (build, pip, or health) it restores exactly what this run replaced,
+   restarts the previous build if it was running, waits for it to report
+   healthy, and says whether it did.
 
 Snapshot the CT first if you want a fallback that covers the GGUF too. The
 fresh-install path still refuses to overwrite an existing install.
@@ -465,3 +471,6 @@ to `install-target.sh` or `provision-lxc.sh`. Only letters, digits, spaces and
 
 `MODEL_ALIAS` follows the same rule in both scripts: `name` or `name:tag`, and
 a bare name becomes `name:latest`.
+
+Only an explicitly inactive service is kept stopped during upgrades. Failed
+units are reapplied and restarted, even when the deployed files are unchanged.

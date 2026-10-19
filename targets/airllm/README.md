@@ -88,10 +88,14 @@ bash install-target.sh --upgrade
 ```
 
 Refreshes `server.py`, the venv and the unit and keeps the model, settings and
-data. It refuses to restart a target that is still downloading or loading
+data. When the server files, unit and settings are already current and the
+target is healthy (or stopped), it prints "nothing to do" and changes nothing. It refuses to restart a target that is still downloading or loading
 unless `ALLOW_INTERRUPT=true` (the download resumes, but splitting starts
 over). If the target is not healthy again within `UPGRADE_HEALTH_TIMEOUT`
-seconds (default 900), everything it replaced is put back.
+seconds (default 900), everything it replaced is put back, including
+`airllm.env` as it was before new settings were added. The previous
+installation is then restarted, health-checked, and reported as running
+again or not.
 
 ### Migrating the earlier `airllm-ollama-api` install
 
@@ -162,3 +166,6 @@ CI, so watch the first load after changing a pin.
 From the repository root: `bash tests/run-tests.sh airllm` (pytest), and
 `bash targets/airllm/test-install.sh`, `bash targets/airllm/test-provision.sh`.
 `run-tests.sh` runs all of them.
+
+Upgrades keep an explicitly inactive service stopped. A failed unit is
+reapplied and restarted rather than treated as deliberately stopped.

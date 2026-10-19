@@ -73,10 +73,16 @@ bash /root/ollama-target-deploy/install-target.sh --upgrade             # pinned
 OLLAMA_VERSION=v0.35.0 bash /root/ollama-target-deploy/install-target.sh --upgrade
 ```
 
-`--upgrade` downloads the release archive and its `sha256sum.txt`, refuses a
+When the requested version is already installed and the server answers as
+that version (or the service is stopped), `--upgrade` prints "nothing to do"
+without downloading anything. Otherwise it downloads the release archive and
+its `sha256sum.txt`, refuses a
 mismatch (and, with `OLLAMA_SHA256`, anything but that exact archive), keeps
 the old release as `/usr/local/lib/ollama.prev`, and restores it if the server
-does not report the new version within `UPGRADE_HEALTH_TIMEOUT` seconds.
+does not report the new version within `UPGRADE_HEALTH_TIMEOUT` seconds. The
+upgrade touches only the release directory, never the drop-in or
+`ollama.env`. After a rollback it waits for the previous version to answer and
+reports whether it did.
 
 ## Adding it to the router
 
@@ -88,3 +94,6 @@ It listens on all interfaces without authentication, like the other targets:
 keep it on the isolated network or firewall TCP 11434 to the router's address.
 The monitor pins tier models with the router's `OLLAMA_KEEP_ALIVE`; the
 server-side `OLLAMA_KEEP_ALIVE` in `ollama.env` covers everything else.
+
+Upgrades keep an explicitly inactive service stopped. A failed unit is
+reapplied and restarted rather than treated as deliberately stopped.

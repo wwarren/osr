@@ -61,7 +61,13 @@ log=$tmp_root/calls.log
 releases=$tmp_root/releases
 stub() { printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n%s\n' "$1" "$log" "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
 for command_name in getent groupadd useradd usermod sleep; do stub "$command_name" 'exit 0'; done
-stub systemctl 'case "$1" in is-active) exit "${FAKE_ACTIVE_RC:-0}";; esac; exit 0'
+stub systemctl 'case "$1" in
+    show) if [[ $* == *ActiveState* ]]; then
+              if [[ -n ${FAKE_ACTIVE_STATE:-} ]]; then echo "$FAKE_ACTIVE_STATE"
+              elif [[ ${FAKE_ACTIVE_RC:-0} == 0 ]]; then echo active; else echo inactive; fi
+          else echo not-found; fi ;;
+    is-active) [[ ${FAKE_ACTIVE_STATE:-} == failed ]] && exit 3; exit "${FAKE_ACTIVE_RC:-0}" ;;
+esac; exit 0'
 stub zstd 'shift; cat -- "${@: -1}"'   # zstd -dc -- FILE: the test archives are plain tar
 # Downloads come from $releases/<version>/<file>; /api/version reports FAKE_SERVED.
 stub curl 'out=""; url="${@: -1}"; while (( $# )); do [[ $1 == -o ]] && out=$2; shift; done
@@ -95,6 +101,7 @@ target() {
         OLLAMA_LINK="$tmp_root/usr/bin/ollama" LEGACY_MODEL_DIRS="$tmp_root/rootmodels $tmp_root/none" \
         RELEASE_BASE=https://github.test/ollama/releases/download SYSTEMD_RUN_DIR="$tmp_root/run" \
         FAKE_SERVED="${FAKE_SERVED-0.30.0}" FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" UPGRADE_HEALTH_TIMEOUT=6 \
+        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
         "$@" bash "$script_dir/install-target.sh" ${ARGS:-}
 }
 dropin=$tmp_root/units/ollama.service.d/10-ollama-target.conf
@@ -139,11 +146,39 @@ out=$(FAKE_SERVED=0.35.0 upgrade 2>&1) || die "healthy upgrade failed: $out"
 cmp -s "$script_dir/ollama-target.conf" "$dropin" || die 'drop-in lost'
 pass 'healthy upgrade: verified release in place, old one kept, drop-in untouched'
 
+# The same release again: nothing is downloaded or restarted.
+: > "$log"
+out=$(FAKE_SERVED=0.35.0 upgrade 2>&1) || die "unchanged upgrade failed: $out"
+[[ $out == *'already installed and serving; nothing to do'* ]] || die "unchanged upgrade did work: $out"
+! grep -qE 'systemctl (stop|start|restart)|sha256sum.txt|tar.zst' "$log" || die "an unchanged upgrade touched the target: $(cat "$log")"
+[[ $("$tmp_root/usr/lib/ollama.prev/bin/ollama") == 'ollama version is 0.30.0' ]] || die 'an unchanged upgrade replaced the kept .prev'
+out=$(FAKE_ACTIVE_RC=3 upgrade 2>&1) || die "unchanged upgrade of a stopped service failed: $out"
+[[ $out == *'nothing to do (the service stays stopped)'* ]] || die "stopped no-op: $out"
+: > "$log"
+out=$(FAKE_SERVED=0.30.0 upgrade 2>&1) && die 'a server answering as another version was accepted'
+[[ $out == *'does not answer as that version; reinstalling'* ]] || die "mismatched server not reinstalled: $out"
+grep -q 'sha256sum.txt' "$log" || die 'the reinstall did not download and verify the release'
+pass 'an unchanged upgrade does nothing; a server that answers as another version is reinstalled'
+
+adopted; make_release v0.35.0
+: > "$log"
+out=$(FAKE_ACTIVE_STATE=failed FAKE_SERVED=0.35.0 upgrade 2>&1) || die "failed service recovery: $out"
+grep -q 'systemctl start' "$log" || die 'a failed service was mistaken for deliberately stopped'
+pass 'a failed service is restarted instead of treated as deliberately stopped'
+
+
 adopted; make_release v0.35.0
 out=$(FAKE_SERVED=0.30.0 upgrade 2>&1) && die 'upgrade reported success while the old version answered'
 [[ $("$tmp_root/usr/bin/ollama") == 'ollama version is 0.30.0' && ! -e $tmp_root/usr/lib/ollama.prev ]] || die 'not rolled back'
 grep -q 'systemctl start ollama.service' "$log" || die 'service not restarted after rollback'
-pass 'unhealthy upgrade: the previous release is restored and restarted'
+[[ $out == *'the previous release (0.30.0) is running again'* ]] || die "rollback outcome not reported: $out"
+pass 'unhealthy upgrade: the previous release is restored, restarted and checked to answer as 0.30.0'
+
+adopted; make_release v0.35.0
+out=$(FAKE_SERVED='' upgrade 2>&1) && die 'an upgrade with no answering server reported success'
+[[ $("$tmp_root/usr/bin/ollama") == *0.30.0 ]] || die 'not rolled back'
+[[ $out == *'the previous release did not answer either'* ]] || die "failed rollback not reported: $out"
+pass 'a rollback whose server does not answer is reported as such'
 
 adopted; make_release v0.35.0
 echo tampered >> "$releases/v0.35.0/ollama-linux-amd64.tar.zst"

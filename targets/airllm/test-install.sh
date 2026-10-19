@@ -25,7 +25,8 @@ source <(awk '
     capture { print }
 ' "$script_dir/install-target.sh")
 for helper in valid_model_id valid_alias valid_device env_value set_env_value ensure_env_key model_billions \
-    required_disk_gb free_disk_gb install_server set_aside restore_aside target_url wait_for migrate_legacy; do
+    required_disk_gb free_disk_gb install_server set_aside copy_aside restore_aside target_url wait_for migrate_legacy \
+    upgrade_unchanged; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
 
@@ -80,9 +81,17 @@ stub groupadd 'exit 0'
 stub useradd 'exit 0'
 stub sleep 'exit 0'
 stub nvidia-smi 'exit 1'
-stub systemctl 'case "$1" in is-active) exit "${FAKE_ACTIVE_RC:-0}";; esac; exit 0'
+stub df 'printf "Avail\n100G\n"'
+stub systemctl 'case "$1" in
+    show) if [[ $* == *ActiveState* ]]; then
+              if [[ -n ${FAKE_ACTIVE_STATE:-} ]]; then echo "$FAKE_ACTIVE_STATE"
+              elif [[ ${FAKE_ACTIVE_RC:-0} == 0 ]]; then echo active; else echo inactive; fi
+          else echo not-found; fi ;;
+    is-active) [[ ${FAKE_ACTIVE_STATE:-} == failed ]] && exit 3; exit "${FAKE_ACTIVE_RC:-0}" ;;
+esac; exit 0'
 # /healthz and /api/version: 200 when FAKE_HEALTH=ok, 503 otherwise.
-stub curl 'if [[ ${FAKE_HEALTH:-ok} == ok ]]; then printf 200; else printf 503; fi'
+# FAKE_HEALTH=old-only: only the previous server.py answers.
+stub curl 'case ${FAKE_HEALTH:-ok} in ok) printf 200;; old-only) if grep -qx "old server" "$TARGET_ROOT/server.py"; then printf 200; else printf 503; fi;; *) printf 503;; esac'
 # python3 -m venv DIR makes a venv whose python accepts pip / py_compile / freeze.
 stub python3 'if [[ $1 == -m && $2 == venv ]]; then mkdir -p "$3/bin"; printf "#!/bin/sh\necho \"venv-python \$*\" >> %s\n[ \"\${FAKE_PIP:-ok}\" = ok ]\n" "'"$log"'" > "$3/bin/python"; chmod +x "$3/bin/python"; fi; exit 0'
 
@@ -97,6 +106,7 @@ target() {
         TARGET_STATE="$tmp_root/state" TARGET_UNITS="$tmp_root/units" TARGET_USER=root \
         LEGACY_ROOT="$tmp_root/legacy" SYSTEMD_RUN_DIR="$tmp_root/run" OS_RELEASE_FILE="$tmp_root/os-release" \
         FAKE_HEALTH="${FAKE_HEALTH:-ok}" FAKE_PIP="${FAKE_PIP:-ok}" FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" \
+        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
         UPGRADE_HEALTH_TIMEOUT=10 "$@" bash "$script_dir/install-target.sh" ${ARGS:-}
 }
 
@@ -171,17 +181,48 @@ grep -q '^AIRLLM_EXIT_ON_LOAD_FAILURE=true$' "$tmp_root/etc/airllm.env" || die '
 grep -q 'systemctl restart airllm-ollama-api.service' "$log" || die 'not restarted'
 pass 'healthy upgrade: refreshes code, venv and unit, keeps settings, restarts'
 
+# A second upgrade with the same files and settings changes nothing.
+: > "$log"
+cp "$tmp_root/opt/server.py.prev" "$tmp_root/prev-before"
+out=$(upgrade 2>&1) || die "unchanged upgrade failed: $out"
+[[ $out == *'unchanged and the target is healthy; nothing to do'* ]] || die "unchanged upgrade did work: $out"
+! grep -qE 'systemctl (stop|restart|start)|venv-python' "$log" || die "an unchanged upgrade touched the target: $(cat "$log")"
+cmp -s "$tmp_root/opt/server.py.prev" "$tmp_root/prev-before" || die 'an unchanged upgrade replaced the kept .prev'
+out=$(FAKE_ACTIVE_RC=3 upgrade 2>&1) || die "unchanged upgrade of a stopped service failed: $out"
+[[ $out == *'nothing to do (the service stays stopped)'* ]] || die "stopped no-op: $out"
+pass 'an unchanged upgrade does nothing, running or stopped, and keeps the previous .prev'
+
+: > "$log"
+out=$(FAKE_ACTIVE_STATE=failed upgrade 2>&1) || die "failed service recovery: $out"
+grep -q 'systemctl restart' "$log" || die 'a failed service was mistaken for deliberately stopped'
+pass 'an unchanged failed service is restarted'
+
+
+: > "$log"
+out=$(FAKE_HEALTH=down upgrade 2>&1) && die 'an unchanged, loading target was interrupted'
+[[ $out == *'not healthy'* && $out == *ALLOW_INTERRUPT* ]] || die "unhealthy unchanged target: $out"
+! grep -q 'systemctl restart' "$log" || die 'a loading target was restarted without ALLOW_INTERRUPT'
+pass 'an unchanged but unhealthy target still needs ALLOW_INTERRUPT before it is re-applied'
+
 make_install
 out=$(FAKE_HEALTH=down upgrade 2>&1) && die 'upgrade interrupted a loading target'
 [[ $out == *ALLOW_INTERRUPT* && $(cat "$tmp_root/opt/server.py") == 'old server' ]] || die 'loading target was touched'
 pass 'upgrade refuses to interrupt a download unless ALLOW_INTERRUPT=true'
 
 make_install
-FAKE_HEALTH=down upgrade ALLOW_INTERRUPT=true >/dev/null 2>&1 && die 'an unhealthy upgrade reported success'
+cp "$tmp_root/etc/airllm.env" "$tmp_root/settings-before"
+out=$(FAKE_HEALTH=old-only upgrade 2>&1) && die 'an unhealthy upgrade reported success'
 [[ $(cat "$tmp_root/opt/server.py") == 'old server' && -f $tmp_root/opt/venv/marker ]] || die 'code/venv not rolled back'
 [[ $(cat "$tmp_root/units/airllm-ollama-api.service") == 'old unit' ]] || die 'unit not rolled back'
-[[ ! -e $tmp_root/opt/server.py.prev ]] || die 'rollback left a .prev behind'
-pass 'unhealthy upgrade: everything is rolled back'
+cmp -s "$tmp_root/etc/airllm.env" "$tmp_root/settings-before" || die 'settings file not rolled back'
+[[ ! -e $tmp_root/opt/server.py.prev && ! -e $tmp_root/etc/airllm.env.prev ]] || die 'rollback left a .prev behind'
+[[ $out == *'the previous installation is running again'* ]] || die "rollback outcome not reported: $out"
+pass 'unhealthy upgrade: code, unit and settings are rolled back, and the old server is checked healthy'
+
+make_install
+out=$(FAKE_HEALTH=down upgrade ALLOW_INTERRUPT=true 2>&1) && die 'an unhealthy upgrade reported success'
+[[ $out == *'did not become healthy either'* ]] || die "failed rollback not reported: $out"
+pass 'a rollback that does not become healthy is reported as such'
 
 make_install
 echo 'stale' > "$tmp_root/units/airllm-ollama-api.service.prev"
@@ -190,10 +231,24 @@ FAKE_PIP=fail upgrade >/dev/null 2>&1 && die 'a failed pip install reported succ
 [[ $(cat "$tmp_root/opt/server.py") == 'old server' ]] || die 'failed pip changed the install'
 pass 'rollback restores only what this run replaced'
 
+# A failure inside a subshell (pip in install_server) must not fire the ERR
+# trap twice: the second pass would stop the restored service and wait again.
+make_install
+: > "$log"
+out=$(FAKE_PIP=fail upgrade 2>&1) && die 'a failed pip install reported success'
+[[ $(grep -c 'restoring the previous installation' <<< "$out") == 1 ]] || die "pip failure rolled back more than once: $out"
+[[ $(grep -c '^systemctl start' "$log") == 1 ]] || die "the restored service was restarted more than once: $(grep systemctl "$log")"
+[[ $(cat "$tmp_root/opt/server.py") == 'old server' && -f $tmp_root/opt/venv/marker ]] || die 'pip failure: install not restored'
+pass 'a failure inside a subshell rolls back exactly once'
+
 make_install
 FAKE_ACTIVE_RC=3 upgrade >/dev/null 2>&1 || die 'upgrade of a stopped service failed'
 ! grep -q 'systemctl restart' "$log" || die 'a stopped service was started'
-pass 'a stopped service stays stopped'
+make_install
+out=$(FAKE_ACTIVE_RC=3 FAKE_PIP=fail upgrade 2>&1) && die 'a failed upgrade of a stopped service reported success'
+[[ $out == *'service stays stopped as it was'* ]] || die "stopped rollback not reported: $out"
+! grep -q 'systemctl start' "$log" || die 'a rollback started a stopped service'
+pass 'a stopped service stays stopped, on success and on rollback'
 
 reset_tree
 upgrade >/dev/null 2>&1 && die 'upgrade without an installation succeeded'

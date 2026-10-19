@@ -26,6 +26,7 @@ def load_router(monkeypatch, **env):
         "LMSTUDIO_API_TOKEN": "",
         "STRATA_API_KEY": "",
         "BASALT_API_KEY": "",
+        "MAYA_API_KEY": "",
         "LITELLM_BASE_URL": "http://litellm.test",
     }
     base.update(env)
@@ -712,21 +713,48 @@ def test_lmstudio_loaded_only_does_not_exclude_unloaded_strata(router, monkeypat
     assert router.rank_candidates(need, inv) == [entry]
 
 
-def test_strata_default_params_is_configurable(monkeypatch, tmp_path):
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
-    assert "strata_default_params = 125B" in ini
+def _sizes_router(monkeypatch, tmp_path, ini_text, server, ids):
     custom = tmp_path / "router.ini"
-    custom.write_text(ini.replace("strata_default_params = 125B", "strata_default_params ="))
+    custom.write_text(ini_text)
 
     def handler(request):
-        return httpx.Response(200, json={"data": [{"id": "strata"}, {"id": "coder:62b"}]})
+        return httpx.Response(200, json={"data": [{"id": i} for i in ids]})
 
-    router = load_router(monkeypatch, MODEL_SERVERS=STRATA, ROUTER_INI=str(custom))
+    router = load_router(monkeypatch, MODEL_SERVERS=server, ROUTER_INI=str(custom))
     router._HTTP["transport"] = httpx.MockTransport(handler)
     with TestClient(router.app):
-        models = {e["name"]: e for e in router.INVENTORY["models"]}
-    assert models["strata"]["params_b"] == 0          # blank: no assumed size
-    assert models["coder:62b"]["params_b"] == 62      # a sized tag still parses
+        return {e["name"]: e["params_b"] for e in router.INVENTORY["models"]}
+
+
+def test_model_sizes_are_configurable(monkeypatch, tmp_path):
+    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    assert "\n[model_sizes]\n" in ini and "\nstrata = 125B\n" in ini
+    # A blank value removes a built-in size; a sized tag still parses.
+    sizes = _sizes_router(monkeypatch, tmp_path, ini.replace("\nstrata = 125B\n", "\nstrata =\n"),
+                          STRATA, ["strata", "coder:62b"])
+    assert sizes == {"strata": 0, "coder:62b": 62}
+    # A custom alias gets a size from a line of its own, on any OpenAI kind.
+    sizes = _sizes_router(monkeypatch, tmp_path, ini + "My-Basalt = 125B\n",
+                          "basalt+http://10.0.0.7:8080", ["my-basalt", "qwen3.8-flash-next"])
+    assert sizes == {"my-basalt": 125, "qwen3.8-flash-next": 125}
+
+
+def test_model_sizes_default_without_a_router_ini(monkeypatch, tmp_path):
+    router = load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini"))
+    assert router.MODEL_SIZES == {"strata": "125B", "qwen3.8-flash-next": "125B",
+                                  "glm-5.3-flash": "321B"}
+
+
+def test_legacy_per_kind_size_keys_still_apply(monkeypatch, tmp_path):
+    """router.ini files committed before [model_sizes] keep their meaning."""
+    legacy = ("[discovery]\nstrata_default_params =\n"
+              "basalt_default_id = my-basalt\nbasalt_default_params = 100B\n"
+              "maya_default_id = glm-5.3-flash\nmaya_default_params = 300B\n")
+    custom = tmp_path / "router.ini"
+    custom.write_text(legacy)
+    router = load_router(monkeypatch, ROUTER_INI=str(custom))
+    assert router.MODEL_SIZES == {"qwen3.8-flash-next": "125B", "my-basalt": "100B",
+                                  "glm-5.3-flash": "300B"}
 
 
 @pytest.mark.parametrize("port", [8080, 11434])
@@ -771,35 +799,40 @@ def test_basalt_discovery_and_dispatch(monkeypatch, port):
     assert all(h["authorization"] == "Bearer basalt-secret" for _, h in calls)
 
 
-def test_basalt_default_params_is_configurable(monkeypatch, tmp_path):
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
-    custom = tmp_path / "router.ini"
-    custom.write_text(ini.replace("basalt_default_params = 125B", "basalt_default_params ="))
+def test_maya_discovery_and_dispatch(monkeypatch):
+    maya = "maya+http://10.0.0.9:8080"
+    calls = []
 
     def handler(request):
-        return httpx.Response(200, json={"data": [{"id": "qwen3.8-flash-next"}]})
+        calls.append((request.url.path, request.headers.get("authorization")))
+        if request.headers.get("authorization") != "Bearer maya-secret":
+            return httpx.Response(401)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [
+                {"id": "glm-5.3-flash", "status": {"value": "loaded"},
+                 "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "custom-alias", "status": {"value": "unloaded"}}]})
+        if request.url.path == "/v1/chat/completions":
+            return streamed(200, {"model": json.loads(request.content)["model"]})
+        return httpx.Response(404)
 
-    router = load_router(monkeypatch, MODEL_SERVERS="basalt+http://10.0.0.7:8080",
-                         ROUTER_INI=str(custom))
+    router = load_router(monkeypatch, MODEL_SERVERS=maya,
+                         MAYA_API_KEY="maya-secret", ROUTER_API_KEY="client-secret")
     router._HTTP["transport"] = httpx.MockTransport(handler)
-    with TestClient(router.app):
-        assert router.INVENTORY["models"][0]["params_b"] == 0
-
-
-def test_basalt_default_id_is_configurable(monkeypatch, tmp_path):
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
-    custom = tmp_path / "router.ini"
-    custom.write_text(ini.replace("basalt_default_id = qwen3.8-flash-next",
-                                  "basalt_default_id = my-basalt"))
-
-    def handler(request):
-        return httpx.Response(200, json={"data": [{"id": "my-basalt"}]})
-
-    router = load_router(monkeypatch, MODEL_SERVERS="basalt+http://10.0.0.7:8080",
-                         ROUTER_INI=str(custom))
-    router._HTTP["transport"] = httpx.MockTransport(handler)
-    with TestClient(router.app):
-        assert router.INVENTORY["models"][0]["params_b"] == 125
+    with TestClient(router.app) as client:
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+        response = client.post("/v1/chat/completions",
+                               headers={"Authorization": "Bearer client-secret"},
+                               json={"model": "glm-5.3-flash", "messages": [user("hi")]})
+    assert router.server_kind(maya) == "maya"
+    assert router.server_base(maya) == "http://10.0.0.9:8080"
+    assert models["glm-5.3-flash"]["params_b"] == 321
+    assert models["glm-5.3-flash"]["is_vision"] and models["glm-5.3-flash"]["loaded"]
+    assert models["custom-alias"]["params_b"] == 0
+    assert response.status_code == 200 and response.json()["model"] == "glm-5.3-flash"
+    assert response.headers["x-router-server"] == maya
+    assert calls == [("/v1/models", "Bearer maya-secret"),
+                     ("/v1/chat/completions", "Bearer maya-secret")]
 
 
 # --- named models on unreachable hosts ----------------------------------------

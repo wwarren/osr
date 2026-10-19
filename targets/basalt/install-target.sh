@@ -20,6 +20,8 @@ BASALT_URL=${BASALT_URL:-https://github.com/jesdga95/basalt.git}
 BASALT_DIR=${BASALT_DIR:-/opt/basalt}
 BASALT_DATA_DIR=${BASALT_DATA_DIR:-/var/lib/basalt}
 BASALT_ETC_DIR=${BASALT_ETC_DIR:-/etc/basalt-target}
+# Root-only scratch for the pre-upgrade runtime snapshot (removed after use).
+BASALT_STATE_DIR=${BASALT_STATE_DIR:-/var/lib/basalt-target}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 SERVICE_USER=${SERVICE_USER:-basalt}
 # GPU device nodes whose group the service user joins (glob-expanded).
@@ -48,6 +50,10 @@ otherwise it upgrades with rollback to the previous commit on failure.
 --upgrade moves an existing install to BASALT_COMMIT (or the current tip of
 BASALT_REF), rebuilds, restarts and health-checks the service, and returns to
 the previous commit if any step fails. The model is not downloaded twice.
+
+Reruns, with or without --upgrade, keep the settings of the existing installation
+(installed-env, or installed-settings for older installs); explicit, non-empty
+environment values override them. A fresh install uses the defaults below.
 
 Environment:
   BASALT_URL=https://github.com/jesdga95/basalt.git
@@ -102,14 +108,131 @@ start_env() {
 # finds the same commit, these settings, the model and the unit does nothing.
 settings_fingerprint() {
     local key_hash
-    key_hash=$(printf '%s' "${api_key:-}" | sha256sum | cut -d' ' -f1)
+    key_hash=$(printf '%s' "${api_key:-}" | sha256sum | cut -d' ' -f1) || return 1
     printf 'model=%s\nhf_repo=%s\nalias=%s\ngpus=%s\ncontext=%s\nport=%s\ndata_dir=%s\ncuda_version=%s\nallow_no_key=%s\nkey_sha256=%s\n' \
         "$BASALT_MODEL" "$BASALT_HF_REPO" "$BASALT_ALIAS" "$BASALT_GPUS" \
         "$BASALT_CONTEXT" "$BASALT_PORT" "$BASALT_DATA_DIR" "$CUDA_VERSION" "$BASALT_ALLOW_NO_KEY" "$key_hash"
 }
+
+# The settings that decide how Basalt is built and launched. save_settings
+# records them after every successful install or upgrade, so a failed upgrade
+# can roll back to what last worked rather than relaunching with the settings
+# that failed (including another model).
+SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
+
+# validate_settings: die unless every setting has a value this script accepts.
+validate_settings() {
+    [[ $BASALT_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $BASALT_MODEL == *.basalt ]] || die 'Invalid BASALT_MODEL (a .basalt file name).'
+    [[ $BASALT_HF_REPO =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_HF_REPO (must be an https URL).'
+    [[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
+    [[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'Invalid BASALT_GPUS (e.g. 0 or 0,1).'
+    [[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid BASALT_CONTEXT.'
+    [[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'Invalid BASALT_PORT.'
+    [[ $BASALT_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'BASALT_ALLOW_NO_KEY must be true or false.'
+    [[ $CUDA_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || die 'Invalid CUDA_VERSION.'
+}
+
+# settings_env: the settings as KEY=value lines (no secrets).
+settings_env() {
+    local key
+    for key in "${SETTING_KEYS[@]}"; do printf '%s=%s\n' "$key" "${!key}" || return 1; done
+}
+
+# load_settings FILE: set the recorded settings from FILE. The file is parsed,
+# never sourced: only the known keys are read, and nothing is changed unless
+# every key is present and valid. Returns 1 otherwise, for example for an
+# install made by an earlier version of this script (fingerprint only).
+load_settings() {
+    local file=$1 line key
+    local -A found=()
+    [[ -r $file ]] || return 1
+    while IFS= read -r line; do
+        [[ $line =~ ^([A-Z][A-Z_]*)=(.*)$ ]] || continue
+        [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
+        found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+    done < "$file"
+    for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
+    # Validate in a subshell first: validate_settings dies on a bad value.
+    (
+        for key in "${SETTING_KEYS[@]}"; do printf -v "$key" '%s' "${found[$key]}"; done
+        validate_settings
+    ) >/dev/null 2>&1 || return 1
+    for key in "${SETTING_KEYS[@]}"; do printf -v "$key" '%s' "${found[$key]}"; done
+    # Paths derived from the settings follow them.
+    model_path="$BASALT_DATA_DIR/models/$BASALT_MODEL"
+}
+
+# fingerprint_env FILE: an installed-settings fingerprint (written by every
+# version of this script) as the KEY=value lines load_settings reads.
+fingerprint_env() {
+    sed -n -e 's/^model=/BASALT_MODEL=/p' \
+        -e 's/^hf_repo=/BASALT_HF_REPO=/p' \
+        -e 's/^alias=/BASALT_ALIAS=/p' \
+        -e 's/^gpus=/BASALT_GPUS=/p' \
+        -e 's/^context=/BASALT_CONTEXT=/p' \
+        -e 's/^port=/BASALT_PORT=/p' \
+        -e 's/^cuda_version=/CUDA_VERSION=/p' \
+        -e 's/^allow_no_key=/BASALT_ALLOW_NO_KEY=/p' "$1"
+}
+
+# saved_settings: an existing installation keeps its settings on every rerun,
+# with or without --upgrade: the record of its last good install, or for an
+# install made before that record existed, its installed-settings fingerprint.
+# Explicit, non-empty environment values win. Only a fresh install with no
+# checkout, unit or settings record uses the defaults below.
+saved_settings() {
+    local key
+    local -A overrides=()
+    for key in "${SETTING_KEYS[@]}"; do
+        if [[ -n ${!key-} ]]; then overrides[$key]=${!key}; fi
+    done
+    if [[ -e $BASALT_ETC_DIR/installed-env ]]; then
+        load_settings "$BASALT_ETC_DIR/installed-env" ||
+            die "Invalid or incomplete $BASALT_ETC_DIR/installed-env. Fix it, or remove it to fall back to installed-settings; explicit settings in the environment still win."
+    elif [[ -e $BASALT_ETC_DIR/installed-settings || -L $BASALT_ETC_DIR/installed-settings ||
+            -e $BASALT_ETC_DIR/pending-env || -L $BASALT_ETC_DIR/pending-env ||
+            -e $BASALT_DIR/.git || -L $BASALT_DIR/.git ||
+            -e $UNIT_DIR/basalt.service || -L $UNIT_DIR/basalt.service ]]; then
+        # A checkout or unit still identifies an existing installation when
+        # its records have been lost. Never apply fresh defaults to it.
+        if [[ -f $BASALT_ETC_DIR/installed-settings && -r $BASALT_ETC_DIR/installed-settings ]] &&
+                load_settings <(fingerprint_env "$BASALT_ETC_DIR/installed-settings"); then
+            note "Using the settings recorded in $BASALT_ETC_DIR/installed-settings (an install from before installed-env)."
+        elif [[ ! -e $BASALT_ETC_DIR/installed-settings && ! -L $BASALT_ETC_DIR/installed-settings &&
+                -f $BASALT_ETC_DIR/pending-env && -r $BASALT_ETC_DIR/pending-env ]] &&
+                load_settings "$BASALT_ETC_DIR/pending-env"; then
+            # A first install that stopped part-way resumes with the settings it
+            # was started with, never with the defaults.
+            note "Resuming an interrupted install with the settings it was started with ($BASALT_ETC_DIR/pending-env)."
+        else
+            local missing
+            if [[ -e $BASALT_ETC_DIR/installed-settings || -L $BASALT_ETC_DIR/installed-settings ]]; then
+                missing="Cannot read this installation's settings from $BASALT_ETC_DIR/installed-settings"
+            else
+                missing="Found an existing Basalt installation (checkout, unit or pending-env) but no readable settings record (installed-env, installed-settings or pending-env in $BASALT_ETC_DIR)"
+            fi
+            for key in "${SETTING_KEYS[@]}"; do
+                [[ -v overrides[$key] ]] ||
+                    die "$missing; set ${SETTING_KEYS[*]} explicitly, or restore a record."
+            done
+        fi
+    fi
+    for key in "${!overrides[@]}"; do printf -v "$key" '%s' "${overrides[$key]}"; done
+}
+
 # End install helpers. ----------------------------------------------------------
 
-as_service() { runuser -u "$SERVICE_USER" -- env HOME="$BASALT_DATA_DIR" "$@"; }
+# as_service CMD...: run CMD as the service account. The installer lock's
+# descriptor is closed for it, so nothing it leaves running in the background
+# (git's detached housekeeping, an upstream script's helper) holds the lock
+# after the installer has exited.
+as_service() {
+    if [[ -n ${install_lock_fd:-} ]]; then
+        runuser -u "$SERVICE_USER" -- env HOME="$BASALT_DATA_DIR" "$@" {install_lock_fd}>&-
+    else
+        runuser -u "$SERVICE_USER" -- env HOME="$BASALT_DATA_DIR" "$@"
+    fi
+}
 git_root() { git -c safe.directory="$BASALT_DIR" -C "$BASALT_DIR" "$@"; }
 verify_source_origin() {
     local origin
@@ -125,7 +248,7 @@ fetch_target() {
         as_service git init -q "$BASALT_DIR"
         as_service git -C "$BASALT_DIR" remote add origin "$BASALT_URL"
     fi
-    as_service git -C "$BASALT_DIR" fetch -q --depth 1 origin "${BASALT_COMMIT:-$BASALT_REF}" >&2 || return 1
+    as_service git -c gc.autoDetach=false -c maintenance.autoDetach=false -C "$BASALT_DIR" fetch -q --depth 1 origin "${BASALT_COMMIT:-$BASALT_REF}" >&2 || return 1
     fetched=$(git_root rev-parse FETCH_HEAD) || return 1
     if [[ -n $BASALT_COMMIT && ${fetched,,} != "${BASALT_COMMIT,,}" ]]; then
         note "Fetched $fetched; expected $BASALT_COMMIT."
@@ -241,7 +364,7 @@ download_model() {
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BASALT_DATA_DIR/models"
     local url="$BASALT_HF_REPO/resolve/main/$BASALT_MODEL?download=true"
     note "Downloading $BASALT_MODEL to $model_path (this is tens of GiB and can take a long time)..."
-    as_service env "BASALT_MODEL=$BASALT_MODEL" "BASALT_MODEL_URL=$url" "BASALT_MODEL_PATH=$model_path" bash -lc '
+    as_service env "BASALT_MODEL=$BASALT_MODEL" "BASALT_MODEL_URL=$url" "BASALT_MODEL_PATH=$model_path" bash -c '
         set -euo pipefail
         cd "$(dirname "$BASALT_MODEL_PATH")"
         if [[ ! -f "$BASALT_MODEL" ]]; then
@@ -320,6 +443,7 @@ do_install() {
         do_upgrade
         return
     fi
+    write_pending
     if (( dry_run )); then
         printf '+ apt-get install ca-certificates curl git openssl python3 python3-venv python3-pip cmake g++ make\n'
         printf '+ bash cuda-toolkit.sh (CUDA >= %s toolkit, user-space only)\n' "$CUDA_VERSION"
@@ -336,6 +460,7 @@ do_install() {
     fi
     ensure_build_deps
     install_cuda_toolkit
+    ensure_api_key
     ensure_service_user
     install -d -m 0700 "$BASALT_ETC_DIR"
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$BASALT_DATA_DIR"
@@ -372,13 +497,60 @@ apply_checkout() {
     wait_ready
 }
 
+# Keep a complete runnable checkout at its original absolute path on rollback.
+# Models in the separate data directory are not copied. Stop the service before
+# taking this snapshot so configs, venv and binaries form one consistent state.
+snapshot_runtime() {
+    # Snapshots of an earlier revision lived in $BASALT_ETC_DIR.
+    rm -f -- "$BASALT_ETC_DIR/rollback-runtime.tar" "$BASALT_ETC_DIR/rollback-runtime.tar.new" "$BASALT_ETC_DIR/rollback.service" "$BASALT_ETC_DIR/rollback.env"
+    install -d -m 0700 "$BASALT_STATE_DIR"
+    (umask 077
+     tar -C "$BASALT_DIR" --exclude='./.git' -cpf "$BASALT_STATE_DIR/rollback-runtime.tar.new" . &&
+     mv -f -- "$BASALT_STATE_DIR/rollback-runtime.tar.new" "$BASALT_STATE_DIR/rollback-runtime.tar") || {
+        rm -f -- "$BASALT_STATE_DIR/rollback-runtime.tar.new"
+        return 1
+    }
+    cp -p -- "$UNIT_DIR/basalt.service" "$BASALT_STATE_DIR/rollback.service" || return 1
+    cp -p -- "$BASALT_ETC_DIR/basalt.env" "$BASALT_STATE_DIR/rollback.env"
+}
+
+# clear_snapshot: drop the snapshot once it is no longer needed (after a
+# successful upgrade or rollback). A failed rollback keeps it for inspection.
+clear_snapshot() {
+    rm -f -- "$BASALT_STATE_DIR/rollback-runtime.tar" "$BASALT_STATE_DIR/rollback-runtime.tar.new" "$BASALT_STATE_DIR/rollback.service" "$BASALT_STATE_DIR/rollback.env"
+}
+
+# restore_probe_settings: the port from the fingerprint, for installs made
+# before installed-env existed.
+restore_probe_settings() {
+    local port
+    port=$(sed -n 's/^port=//p' "$BASALT_ETC_DIR/installed-settings" 2>/dev/null | tail -n1) || true
+    if [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )); then BASALT_PORT=$port; fi
+}
+
+# No setup, pip, compiler or model download is invoked on this path. The
+# caller has set the settings the previous runtime ran with (wait_ready uses
+# its port).
+restore_runtime() {
+    set -e
+    [[ $BASALT_DIR != / && -d $BASALT_DIR/.git && -s $BASALT_STATE_DIR/rollback-runtime.tar ]]
+    as_service git -C "$BASALT_DIR" reset -q --hard "$1"
+    find "$BASALT_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+    tar -C "$BASALT_DIR" -xpf "$BASALT_STATE_DIR/rollback-runtime.tar"
+    install -m 0644 "$BASALT_STATE_DIR/rollback.service" "$UNIT_DIR/basalt.service"
+    cp -p -- "$BASALT_STATE_DIR/rollback.env" "$BASALT_ETC_DIR/basalt.env"
+    systemctl daemon-reload
+    systemctl restart basalt.service
+    wait_ready
+}
+
 do_upgrade() {
     if (( dry_run )); then
         printf '+ git fetch --depth 1 %s %s (before anything is stopped; a failed fetch changes nothing)\n' \
             "$BASALT_URL" "${BASALT_COMMIT:-$BASALT_REF}"
         printf '+ same commit, settings, model and unit, and /health healthy: nothing to do\n'
         printf '+ otherwise: record the current commit; systemctl stop basalt.service; checkout; rebuild; (re)download model; restart; wait for /health loaded=true\n'
-        printf '+ on failure: check out the previous commit locally (no network), rebuild, restart\n'
+        printf '+ on failure: check out the previous commit locally (no network), restore its runnable checkout, launcher and unit without rebuilding or downloads (%s/rollback-runtime.tar, removed afterwards)\n' "$BASALT_STATE_DIR"
         return 0
     fi
     [[ -d $BASALT_DIR/.git && -f $UNIT_DIR/basalt.service ]] ||
@@ -386,14 +558,20 @@ do_upgrade() {
     verify_source_origin
     ensure_build_deps
     install_cuda_toolkit
+    ensure_api_key
     ensure_service_user
     chown -R "$SERVICE_USER:$SERVICE_USER" "$BASALT_DIR" "$BASALT_DATA_DIR"
     local previous target
     previous=$(git_root rev-parse HEAD)
     # Keep the running commit reachable so rollback never needs the network.
     as_service git -C "$BASALT_DIR" update-ref refs/basalt/previous "$previous"
-    target=$(fetch_target) || die "Could not fetch $BASALT_URL ${BASALT_COMMIT:-$BASALT_REF}."
+    target=$(fetch_target) ||
+        die "Could not fetch $BASALT_URL ${BASALT_COMMIT:-$BASALT_REF}; Basalt was not stopped or changed."
     if [[ $previous == "$target" ]] && nothing_to_do; then
+        # A matching legacy fingerprint is sufficient to migrate its records.
+        if [[ ! -f $BASALT_ETC_DIR/installed-env ]]; then
+            save_settings
+        fi
         note 'Basalt is up to date and healthy; nothing to do.'
         return 0
     fi
@@ -403,27 +581,144 @@ do_upgrade() {
         printf 'Upgrading Basalt from %s to %s.\n' "$previous" "$target"
     fi
     systemctl stop basalt.service
+    if ! snapshot_runtime; then
+        note 'Could not snapshot the previous runtime; no upgrade was applied.'
+        (load_settings "$BASALT_ETC_DIR/installed-env" || restore_probe_settings
+         systemctl restart basalt.service; wait_ready) ||
+            die 'Snapshot failed and the previous service did not become ready.'
+        die 'Runtime snapshot failed; the previous service is running again.'
+    fi
     set +e
     ( apply_checkout "$target" )
     rc=$?
     set -e
     if (( rc == 0 )); then
         save_settings
+        clear_snapshot
         printf 'Basalt is running %s.\n' "$(git_root rev-parse HEAD)"
         return 0
     fi
     note "Upgrade failed; returning to $previous."
     systemctl stop basalt.service || true
+    # The settings the previous runtime ran with: the record of the last good
+    # install (the fingerprint's port for older installs). wait_ready checks
+    # the restored service on that port.
+    if load_settings "$BASALT_ETC_DIR/installed-env"; then
+        note "Restoring the settings it last ran with: $(settings_env | tr '\n' ' ')"
+    else
+        restore_probe_settings
+        note 'No record of the previous settings; restoring the complete runtime snapshot.'
+    fi
     set +e
-    ( apply_checkout "$previous" )
+    ( restore_runtime "$previous" )
     rc=$?
     set -e
-    (( rc == 0 )) || die "Rollback to $previous failed too; inspect journalctl -u basalt and $BASALT_DIR."
+    (( rc == 0 )) || die "Rollback to $previous failed too; inspect journalctl -u basalt and $BASALT_DIR; the snapshot is kept in $BASALT_STATE_DIR."
+    clear_snapshot
     die "Upgrade failed; Basalt is running $previous again."
 }
 
+# Serialize real runs before reading saved settings. Keep the descriptor open
+# for the entire installer; never unlink the lock file while another run may
+# be waiting on its inode. Dry runs do not write or take the lock.
+acquire_install_lock() {
+    (( dry_run )) && return 0
+    [[ $EUID -eq 0 ]] || die 'Run as root inside the Basalt LXC.'
+    [[ $BASALT_ETC_DIR =~ ^/[A-Za-z0-9._/-]+$ && $BASALT_ETC_DIR != *..* ]] || die 'Invalid BASALT_ETC_DIR.'
+    local previous_umask lock_directory
+    lock_directory=$(realpath -m -- "$BASALT_ETC_DIR") || return 1
+    previous_umask=$(umask)
+    umask 077
+    exec {install_lock_fd}>>"$lock_directory.lock"
+    umask "$previous_umask"
+    flock -n "$install_lock_fd" || die 'Another Basalt installer is already running (or a process it started still holds the lock).'
+}
+
+# A rename is durable only after its containing directory has been flushed.
+# In save_settings this also orders settings publication before the fingerprint.
+publish_record() {
+    local temporary=$1 destination=$2
+    mv -fT -- "$temporary" "$destination" || return 1
+    sync -- "${destination%/*}"
+}
+
+# Stage a complete, private record beside its destination. Only rename it
+# after the writer succeeds, so a failed write cannot truncate a good record.
+stage_record() {
+    local destination=$1 temporary
+    shift
+    # A run killed while staging leaves its mktemp file behind (an api-key one
+    # holds the key); drop such leftovers before staging a new one.
+    rm -f -- "$destination".?????? || return 1
+    temporary=$(mktemp "$destination.XXXXXX") || return 1
+    # Flush the contents before the caller renames the file into place, so a
+    # power loss cannot leave the new name pointing at an empty file.
+    if ! "$@" > "$temporary" || ! sync -- "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    printf '%s\n' "$temporary"
+}
+
+# write_pending: record the settings a fresh (or resumed) install runs with
+# before it changes anything, so an interrupted first install resumes with
+# them instead of the defaults. save_settings removes it.
+write_pending() {
+    (( dry_run )) && return 0
+    install -d -m 0700 "$BASALT_ETC_DIR"
+    # Persist a newly created record directory before relying on its checkpoint.
+    sync -- "$BASALT_ETC_DIR/.." || return 1
+    local temporary
+    temporary=$(stage_record "$BASALT_ETC_DIR/pending-env" settings_env) || return 1
+    if ! publish_record "$temporary" "$BASALT_ETC_DIR/pending-env"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
 save_settings() {
-    (umask 077 && settings_fingerprint > "$BASALT_ETC_DIR/installed-settings")
+    local fingerprint_temporary env_temporary
+    fingerprint_temporary=$(stage_record "$BASALT_ETC_DIR/installed-settings" settings_fingerprint) || return 1
+    if ! env_temporary=$(stage_record "$BASALT_ETC_DIR/installed-env" settings_env); then
+        rm -f -- "$fingerprint_temporary"
+        return 1
+    fi
+    # Prepare both records before publishing either. Each rename publishes a
+    # complete record. installed-env (the settings every rerun starts from) goes
+    # first and the fingerprint (the "nothing to do" marker) last: interrupted
+    # between the two, the next run has the new settings and an old marker, so
+    # it re-applies them once instead of reverting to the previous settings.
+    if ! publish_record "$env_temporary" "$BASALT_ETC_DIR/installed-env" ||
+        ! publish_record "$fingerprint_temporary" "$BASALT_ETC_DIR/installed-settings"; then
+        rm -f -- "$fingerprint_temporary" "$env_temporary"
+        return 1
+    fi
+    # installed.service was written by an earlier revision and is not used.
+    rm -f -- "$BASALT_ETC_DIR/installed.service" "$BASALT_ETC_DIR/pending-env" || return 1
+    sync -- "$BASALT_ETC_DIR"
+}
+
+generate_api_key() {
+    # 256 bits of CSPRNG from /dev/urandom, hex-encoded using coreutils.
+    od -An -v -N 32 -tx1 /dev/urandom | tr -d '[:space:]'
+}
+
+ensure_api_key() {
+    install -d -m 0700 "$BASALT_ETC_DIR"
+    # A key write killed mid-way leaves its staging file (holding a key) even
+    # when a key is in place by now; never keep such copies around.
+    rm -f -- "$BASALT_ETC_DIR/api-key".?????? || return 1
+    if [[ ! -s $BASALT_ETC_DIR/api-key ]]; then
+        local temporary
+        temporary=$(stage_record "$BASALT_ETC_DIR/api-key" generate_api_key) || return 1
+        if ! publish_record "$temporary" "$BASALT_ETC_DIR/api-key"; then
+            rm -f -- "$temporary"
+            return 1
+        fi
+    fi
+    chmod 0600 "$BASALT_ETC_DIR/api-key"
+    sync -- "$BASALT_ETC_DIR/api-key" "$BASALT_ETC_DIR" || return 1
+    api_key=$(< "$BASALT_ETC_DIR/api-key")
 }
 
 # --- argument parsing and validation -----------------------------------------
@@ -438,6 +733,8 @@ while (( $# )); do
     esac
     shift
 done
+acquire_install_lock
+saved_settings
 BASALT_REF=${BASALT_REF:-main}
 BASALT_COMMIT=${BASALT_COMMIT:-}
 BASALT_HF_REPO=${BASALT_HF_REPO:-https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt}
@@ -452,16 +749,9 @@ CUDA_VERSION=${CUDA_VERSION:-13.0}
 [[ $BASALT_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $BASALT_REF != HEAD && $BASALT_REF != *..* ]] || die 'Invalid BASALT_REF.'
 [[ $BASALT_URL =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_URL (must be an https URL).'
 [[ -z $BASALT_COMMIT || $BASALT_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'Invalid BASALT_COMMIT.'
-[[ $BASALT_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $BASALT_MODEL == *.basalt ]] || die 'Invalid BASALT_MODEL (a .basalt file name).'
-[[ $BASALT_HF_REPO =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_HF_REPO (must be an https URL).'
-[[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
-[[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'Invalid BASALT_GPUS (e.g. 0 or 0,1).'
-[[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid BASALT_CONTEXT.'
-[[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'Invalid BASALT_PORT.'
+validate_settings
 [[ $BASALT_READY_TIMEOUT =~ ^[1-9][0-9]{0,6}$ ]] || die 'Invalid BASALT_READY_TIMEOUT.'
-[[ $BASALT_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'BASALT_ALLOW_NO_KEY must be true or false.'
-[[ $CUDA_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || die 'Invalid CUDA_VERSION.'
-for path_var in BASALT_DIR BASALT_DATA_DIR BASALT_ETC_DIR UNIT_DIR; do
+for path_var in BASALT_DIR BASALT_DATA_DIR BASALT_ETC_DIR BASALT_STATE_DIR UNIT_DIR; do
     [[ ${!path_var} =~ ^/[A-Za-z0-9._/-]+$ && ${!path_var} != *..* ]] || die "Invalid $path_var."
 done
 [[ $SERVICE_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid SERVICE_USER.'
@@ -476,17 +766,13 @@ if (( ! dry_run )); then
     if [[ -e $BASALT_DIR && ! -d $BASALT_DIR/.git ]] && [[ -n $(ls -A "$BASALT_DIR" 2>/dev/null) ]]; then
         die "$BASALT_DIR exists but is not a Git checkout; inspect it before continuing."
     fi
+    # Before anything is installed or stopped: is a toolkit that meets
+    # CUDA_VERSION already here, or can this distro's NVIDIA repository provide it?
+    [[ -r $CUDA_TOOLKIT_SH ]] || die "Missing CUDA toolkit installer: $CUDA_TOOLKIT_SH"
+    CUDA_VERSION="$CUDA_VERSION" bash "$CUDA_TOOLKIT_SH" --check ||
+        die "CUDA $CUDA_VERSION is not available for this CT's distribution (see above)."
     command -v nvidia-smi >/dev/null || die 'nvidia-smi is missing; install host-matched guest NVIDIA userspace first.'
     nvidia-smi -L || die 'NVIDIA GPU is not accessible inside the CT.'
-    install -d -m 0700 "$BASALT_ETC_DIR"
-    if [[ ! -s $BASALT_ETC_DIR/api-key ]]; then
-        # 256 bits of CSPRNG from /dev/urandom, hex-encoded. Uses only coreutils
-        # (od/tr), so it does not depend on openssl being installed yet (that
-        # happens later, inside do_install, via ensure_build_deps).
-        (umask 077 && od -An -v -N 32 -tx1 /dev/urandom | tr -d '[:space:]' > "$BASALT_ETC_DIR/api-key")
-    fi
-    chmod 0600 "$BASALT_ETC_DIR/api-key"
-    api_key=$(< "$BASALT_ETC_DIR/api-key")
 fi
 
 if [[ $mode == upgrade ]]; then

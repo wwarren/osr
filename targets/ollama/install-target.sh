@@ -130,6 +130,10 @@ adopt_models() {
         fi
     done
 }
+# installed_version: the version of the installed release ("0.30.0"), from its binary.
+installed_version() {
+    "$OLLAMA_LIB/bin/ollama" --version 2>/dev/null | awk '{print $NF}' | tail -n1
+}
 # Move $1 aside as $1.prev (replacing an older .prev); a no-op when absent.
 set_aside() {
     [[ -e $1 || -L $1 ]] || return 0
@@ -173,21 +177,49 @@ if [[ $MODE == upgrade ]]; then
     [[ -f $DROPIN && -f $TARGET_ENV ]] || die 'This target has not been adopted yet; run install-target.sh without --upgrade first.'
     work=$(mktemp -d "${TMPDIR:-/tmp}/ollama-target.XXXXXX")
     trap 'rm -rf -- "$work"' EXIT
-    printf 'Installed Ollama: %s\nRequested: %s\n' "$("$OLLAMA_LIB/bin/ollama" --version 2>/dev/null | awk '{print $NF}' | tail -n1)" "$OLLAMA_VERSION"
+    printf 'Installed Ollama: %s\nRequested: %s\n' "$(installed_version)" "$OLLAMA_VERSION"
+    # The requested release is already the installed one: nothing to download
+    # or restart, unless a running server does not answer as that version.
+    # (OLLAMA_SHA256 is checked whenever a release is downloaded.)
+    if [[ $(installed_version) == "${OLLAMA_VERSION#v}" && $(readlink -f -- "$OLLAMA_LINK") == "$(readlink -f -- "$OLLAMA_LIB/bin/ollama")" ]]; then
+        if [[ $(systemctl show "$SERVICE" -p ActiveState --value) == inactive ]]; then
+            printf 'Ollama %s is already installed; nothing to do (the service stays stopped).\n' "$OLLAMA_VERSION"
+            exit 0
+        elif systemctl is-active --quiet "$SERVICE" && [[ $(served_version || true) == "${OLLAMA_VERSION#v}" ]]; then
+            printf 'Ollama %s is already installed and serving; nothing to do.\n' "$OLLAMA_VERSION"
+            exit 0
+        fi
+        printf 'Ollama %s is installed but the server does not answer as that version; reinstalling it.\n' "$OLLAMA_VERSION"
+    fi
     archive=$(fetch_release "$OLLAMA_VERSION" "$work")
     unpack_release "$archive" "$work/new"
 
     was_active=false
-    systemctl is-active --quiet "$SERVICE" && was_active=true
+    [[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
+    # What the running server reports now, so a rollback can check for it.
+    previous_version=''
+    if $was_active; then previous_version=$(served_version || true); fi
+    # The upgrade replaces only the release directory (the drop-in and
+    # ollama.env are untouched), so that is all a rollback has to put back;
+    # it then checks that the previous release really serves again.
     rollback() {
         printf 'Upgrade failed; restoring the previous release...\n' >&2
         systemctl stop "$SERVICE" 2>/dev/null || true
         restore_aside "$OLLAMA_LIB"
         ln -sfn -- "$OLLAMA_LIB/bin/ollama" "$OLLAMA_LINK"
-        if $was_active; then systemctl start "$SERVICE" || true; fi
         rm -rf -- "$work"
+        if ! $was_active; then
+            printf 'Upgrade failed; the previous release is back, and the service stays stopped as it was.\n' >&2
+        elif systemctl start "$SERVICE" &&
+                wait_for_version "$previous_version" "${UPGRADE_HEALTH_TIMEOUT:-120}"; then
+            printf 'Upgrade failed; the previous release%s is running again.\n' "${previous_version:+ ($previous_version)}" >&2
+        else
+            printf 'Upgrade failed, and the previous release did not answer either; see journalctl -u %s.\n' "$SERVICE" >&2
+        fi
     }
-    trap 'rollback; exit 1' ERR
+    # With set -E a failure inside a ( ... ) subshell fires this trap in the
+    # subshell and again in the parent; only the main shell rolls back.
+    trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
     if $was_active; then systemctl stop "$SERVICE"; fi
     set_aside "$OLLAMA_LIB"
     mv -- "$work/new" "$OLLAMA_LIB"
@@ -226,7 +258,7 @@ else
 fi
 
 was_active=false
-systemctl is-active --quiet "$SERVICE" && was_active=true
+[[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
 if $was_active; then systemctl stop "$SERVICE"; fi
 adopt_models
 chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_STATE"
