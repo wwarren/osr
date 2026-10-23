@@ -388,7 +388,9 @@ more than one call is pending; repeated pending calls to the same function are
 ambiguous and rejected. Streaming tool argument fragments are buffered until
 complete. Images must be base64 PNG/JPEG/WebP and require a suitable multimodal
 model/projector configured in the server. Capabilities are declared explicitly,
-not inferred from a file name.
+not inferred from a file name. Include `tools` in `MODEL_CAPABILITIES` when
+the GGUF's chat template supports tool calls: the router sends requests that
+offer tools (agents, Open WebUI function calling) only to models that report it.
 
 Embedding routes require a suitable model and server settings (`--embedding`,
 pooling, and related options); the supplied unit starts a generative model.

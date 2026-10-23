@@ -3,7 +3,7 @@
 **System:** `ollama-smart-router`
 **Platform:** Proxmox VE; an unprivileged Debian 13 LXC for the router, one LXC per inference target
 **Built by:** `ollama-smart-router-install.sh` and `targets/*/provision-lxc.sh`
-**Last reviewed:** 2026-10-18
+**Last reviewed:** 2026-10-22
 
 Operating procedures are in [README.md](README.md); this document explains how
 the system is put together and why.
@@ -24,9 +24,11 @@ answers. It addresses three problems:
    goes stale.
 
 The router CT covers routing, load spreading, health alerting, a chat UI and
-the configuration lifecycle. `targets/` provisions inference servers (§16) and
-an Open Terminal companion (§17) in their own LXCs. Once provisioned, the
-router treats a target like any other external host.
+the configuration lifecycle. `targets/` provisions inference servers (§16),
+an Open Terminal companion (§17), a Hermes Agent client (§17.1) and the Gitea
+and Mattermost services (§17.2) in their own LXCs. The router treats an inference target like any other external model
+host; Hermes consumes the router's public API and is offered in Open WebUI as
+one more model.
 
 | Quality attribute | How it is addressed |
 |---|---|
@@ -58,6 +60,7 @@ flowchart LR
         o3["Strata / Basalt / Maya<br/>:8080"]
     end
     term["Open Terminal LXC<br/>:8000"]
+    hermes["Hermes Agent LXC<br/>API server :8642"]
     gitea["Gitea"]
     mm["Mattermost"]
 
@@ -65,6 +68,8 @@ flowchart LR
     browser --> webui
     webui -->|OpenAI API| router
     webui -->|terminal tool| term
+    webui -->|"OpenAI API (hermes-agent)"| hermes
+    hermes -->|OpenAI API :8000| router
     router -->|direct dispatch| pool
     router -.->|fallback| litellm
     litellm --> pool
@@ -76,12 +81,16 @@ flowchart LR
 | Dependency | Criticality | If unavailable |
 |---|---|---|
 | Model hosts (`:11434`, `:1234`, `:8080`) | **Critical** | Fail forward to other hosts; all down → 502 |
-| Gitea (HTTPS) | Provisioning only | Install falls back to local config; running system unaffected |
-| Mattermost (webhook) | Optional | Alerts logged and retried |
+| Gitea (HTTP(S)) | Provisioning only | Install falls back to local config; running system unaffected. `targets/gitea` can provision a Debian CT from the community script, already set up for the router (§17.2) |
+| Mattermost (webhook) | Optional | Alerts logged and retried. `targets/mattermost` can provision one in its own CT from the community script, with its webhook (§17.2) |
 | Open Terminal (`:8000`) | Optional | Terminal tool unavailable; chat unaffected |
+| Hermes API server (`:8642`) | Optional | `hermes-agent` unavailable in Open WebUI; other models unaffected |
 
 > After provisioning, the only runtime dependency is the model pool. Gitea and
 > Mattermost outages cannot stop the service or prevent it booting.
+
+Hermes is an optional agent client. It calls the router's OpenAI-compatible
+`/v1` API with the router key; it is not part of the model pool (§17.1).
 
 ---
 
@@ -151,9 +160,11 @@ router logs a warning at start-up.
   API (§15) and swaps in a new inventory atomically. A host whose connection
   fails during dispatch is marked down until its next good poll.
 * **Classifier** — size class (fast/medium/large/xlarge), code or not, image
-  or not. Only the newest user message is judged
+  or not, tools or not. Only the newest user message is judged
   (`[classification] scope = last_user`), so a system prompt cannot pin a
-  conversation to one tier. Images are looked for in every message.
+  conversation to one tier. Images are looked for in every message. A request
+  that offers tools (non-empty `tools`/`functions`, `tool_choice` not `none`)
+  is raised to at least `tools_min_class` (default `large`).
 * **Selector + dispatcher** — scores every `(host, model)` pair and fails
   forward through the ranking (§5).
 
@@ -208,11 +219,11 @@ flowchart TD
     disc -->|Yes| named{"Real model named?"}
     named -->|"Yes, on an up host"| hosts["Hosts serving it"]
     named -->|"Embedding-only"| e400["400 embedding_model_not_chat"]
-    named -->|"No / auto / tier alias /<br/>its hosts down"| classify["Classify: size, code?, vision?<br/>(tier alias pins the size)"]
+    named -->|"No / auto / tier alias /<br/>its hosts down"| classify["Classify: size, code?, vision?, tools?<br/>(tier alias pins the size)"]
     classify --> rank["Score every (host, model)"]
     hosts --> dispatch
     rank --> dispatch["Dispatch to best candidate"]
-    dispatch --> ok{"Connected, not 404/5xx<br/>(or last candidate)?"}
+    dispatch --> ok{"Connected, not 404/5xx, not a<br/>tool rejection (or last candidate)?"}
     ok -->|Yes| resp["Stream response<br/>X-Router-Mode: discovery"]
     ok -->|No| next{"More candidates?"}
     next -->|Yes| dispatch
@@ -222,7 +233,9 @@ flowchart TD
 A named model whose hosts are all down is routed by content with
 `X-Router-Warning: model-unavailable`. An image request with no vision
 candidate gets `X-Router-Warning: no-vision-model`, or a 400 when
-`vision_strict = true`.
+`vision_strict = true`. Likewise, a tool request whose candidates are all known
+to lack tools gets `X-Router-Warning: no-tool-model`, or a 400
+`no_tool_model` when `tools_strict = true`.
 
 ### 5.2 Scoring
 
@@ -235,7 +248,8 @@ candidate gets `X-Router-Warning: no-vision-model`, or a 400 when
 | **Residency** | `+loaded_bonus` for models reported loaded (LM Studio, Strata, Basalt, Maya); `lmstudio_loaded_only` excludes cold LM Studio models |
 | **Unknown size** | `unknown_params` (0.3): usable, never preferred |
 | **Embeddings** | Structurally excluded; naming one on the chat endpoint is a 400 |
-| **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load |
+| **Tools** | On a tool request, models known to lack tools are excluded (kept only if nothing else is left); `+tool_match` for a model reported tool-capable over an unknown one. Support is known from Ollama's `/api/show` capabilities (also the llama.cpp bridge's `MODEL_CAPABILITIES` and AirLLM) and LM Studio's `trained_for_tool_use`; Strata-style servers and untrained LM Studio models are unknown. Shown per entry as `tools` in `/routing/inventory` |
+| **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load. For a tool request only the same model on several hosts rotates, so an agent loop keeps one model (and its prompt cache) |
 
 Sizes come from `details.parameter_size` (Ollama), `params_string` (LM Studio)
 or `parameter_size` (OpenAI-style). Failing that, from the tag (`qwen3:14b` →
@@ -253,7 +267,7 @@ candidate is passed through as-is.
 | Layer | Trigger | Behaviour |
 |---|---|---|
 | 1. Best candidate | Normal | Direct dispatch |
-| 2. Fail-forward | Connect error/timeout (host marked down), transport error, 404, 5xx | Next candidate |
+| 2. Fail-forward | Connect error/timeout (host marked down), transport error, 404, 5xx; on a tool request, a 400 that names tools (the model is then skipped for tool requests until the next poll) | Next candidate |
 | 3. LiteLLM | Discovery off or inventory empty | Static tiers with LiteLLM's own fallbacks |
 
 `[http] connect_timeout_seconds` (3) bounds how long a dead host delays
@@ -276,8 +290,8 @@ env/openwebui.env           Open WebUI environment
 install/apply-config.sh     copies everything into its runtime location
 install/manage-model-servers.sh   management tool (§6.1)
 install/update-router.sh    in-container component updater
-targets/<name>/             inference targets and companion (§16, §17)
-tools/                      sync-embedded.py, update-router-services.sh
+targets/<name>/             inference targets, companions and services (§16, §17)
+tools/                      sync-embedded.py, update-router-services.sh, install-{gitea,mattermost}.sh (forwarders to targets/, --create-only)
 tests/, .gitea/workflows/   tests and CI (§18)
 ```
 
@@ -348,14 +362,42 @@ sequenceDiagram
     participant G as Gitea
     participant CT as Container
     Op->>I: run as root
-    I->>Op: prompts (network, storage, Gitea, Mattermost, servers)
+    I->>Op: prompts (targets, network, storage, target CTs)
+    I->>I: selected services: Gitea, Mattermost CTs; their URL, token, webhook
+    I->>Op: prompts (Gitea, Mattermost, servers), pre-filled from the services
     I->>G: verify token, resolve or create repo
     I->>G: seed missing files, update installer-owned code
     I->>CT: pct create + start, wait for systemd + DNS, base packages
     CT->>G: git clone config repo
     I->>CT: apply-config.sh, build venvs, Python 3.12 for Open WebUI
     I->>CT: MOTD, firewall rules, enable + start units
+    I->>I: selected targets: model servers, keys to the router, then companions
 ```
+
+**Targets chosen at install.** An interactive install offers the `targets/`
+provisioners from a menu.
+* **Services first.** Selected Gitea and Mattermost targets are created right
+  after the target settings, before the Gitea and Mattermost prompts. Their
+  results (Gitea's URL, router account and token; Mattermost's webhook) are
+  read from the CTs and become those prompts' defaults, still verified there.
+  A failed service stops the install before the router exists.
+* **Before the router is built.** Each selected target's CT ID, static address,
+  storage and (for Strata, Basalt and Maya) template are asked with the other
+  settings and checked: no clash with the router or with each other. Model
+  targets are pre-filled as the first entries of the model-server prompt, so
+  the router is configured with them and gets their tiers.
+* **After the router runs.** The model targets are provisioned in turn. A
+  Strata-style target's generated key goes to the router through
+  `set-<kind>-token` on stdin, followed by one `apply`. The companions then
+  run against the router CT, after Open WebUI's first start and one admin-key
+  prompt.
+* **Isolation.** Each provisioner runs in a subshell from which the router's
+  CT, network and sizing variables are unset. The admin key reaches only the
+  companions, as an environment variable.
+* **Failures.** A failed target never touches the router: the run ends with a
+  per-target summary and a non-zero status. `NONINTERACTIVE=true` refuses
+  targets, since the Ollama community menu, GPU selection and the admin key
+  need a person.
 
 ### 7.1 Fail-fast ordering
 
@@ -407,12 +449,14 @@ start. Venvs are built with `umask 022`.
 | 4000 | LiteLLM | `127.0.0.1` | CT-local only |
 | 11434 / 1234 / 8080 | Model hosts | outbound | Router, LiteLLM, monitor → pool |
 | 8000 | Open Terminal CT | outbound | Open WebUI → terminal |
+| 8642 | Hermes CT API server | `0.0.0.0` in its CT | Open WebUI → Hermes; Hermes → router :8000 |
 
 With the CT firewall enabled, the installer accepts TCP 22, 8000 and the Open
 WebUI port from `API_ALLOW_CIDR`. SSH is included because enabling the
 firewall sets the input policy to drop. Target CTs are created with
-`firewall=1`. Open Terminal admits only the router CT; model targets leave the
-rules to the operator.
+`firewall=1`. Open Terminal and Hermes admit only the router's address; model
+targets leave the rules to the operator. The Hermes CT also restricts egress by
+default: the router's API, DNS and internet HTTP(S) only (§17.1).
 
 ---
 
@@ -433,6 +477,8 @@ rules to the operator.
 | `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
 | Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT | Generated in the CT; never in a unit, log or the router's process list |
 | Open Terminal key | `/etc/open-terminal/api-key`; Open WebUI connection settings | Generated in the terminal CT |
+| Hermes API server key | `/etc/hermes-target/api-key` (0600), `~hermes/.hermes/.env` (0600); Open WebUI connection settings | Generated in the Hermes CT |
+| `ROUTER_API_KEY` in the Hermes CT | `~hermes/.hermes/config.yaml` (`model.api_key`) and `.env` (0600, owned by `hermes`) | Pushed as a 0600 file, never in argv; `--reconfigure` after a rotation |
 
 | Accepted risk | Mitigation |
 |---|---|
@@ -441,8 +487,9 @@ rules to the operator.
 | Router API key optional | `set-api-key --generate`; firewall CIDR; TLS reverse proxy if exposed |
 | Backend traffic is plain HTTP | Keep targets on a trusted segment; restrict their ports |
 | A Strata-family key is also its admin key (Maya's dashboard) | Restrict the target port to the router CT |
-| Deploy token lives on the Gitea it accesses | Scope it to the one repository |
+| Gitea tokens cannot be restricted to one repository | Use a dedicated non-admin account with access only to the config repository; select the token scopes documented in README |
 | LiteLLM has no master key | It listens only on 127.0.0.1; add a master key before exposing it |
+| Hermes users can read the router key and share one agent memory | The agent runs as `hermes`, which owns its configuration. Keep `hermes-agent` admin-only or limited to one group; one Hermes profile per user or group for separation |
 
 ---
 
@@ -490,7 +537,7 @@ rules to the operator.
 | Surface | Answers |
 |---|---|
 | `X-Router-Model` / `-Server` / `-Class` / `-Mode` / `-Candidates` | Why this request went where it went |
-| `X-Router-Warning` | `model-unavailable`, `no-vision-model`: answered, but not as asked |
+| `X-Router-Warning` | `model-unavailable`, `no-vision-model`, `no-tool-model`: answered, but not as asked |
 | `GET /routing/inventory` | What each host serves; who is down and why |
 | `POST /routing/explain` | What would happen to a prompt, with scores |
 | `journalctl -u <unit>` | Every route decision (router); undelivered alerts (monitor) |
@@ -516,6 +563,7 @@ rules to the operator.
 | One kind table per component, cross-checked by a test | Shared module | Router, monitor and the bash manager deploy separately |
 | Secrets in `secrets.env` | Committed env | Tokens out of git, still readable by every unit |
 | Targets in their own LXCs | Engines in the router CT | GPU, memory and disk stay off the router; a failed target is just a down host |
+| Hermes as a second Open WebUI connection | Hermes as a model-server kind in the pool | `auto` could route to Hermes, which calls `auto`: a loop. Hermes has no size or capabilities to score |
 
 ---
 
@@ -815,18 +863,94 @@ admin-only by default; everyone granted access shares one shell and
 `/srv/open-terminal/workspace`. A bearer key protects the API, and with the PVE
 firewall on, only the router CT may reach TCP 8000.
 
+### 17.1 Hermes Agent (`targets/hermes/`)
+
+Not a model host. A separate Debian LXC runs
+[Hermes Agent](https://hermes-agent.nousresearch.com/), installed by the
+official `install.sh` as the unprivileged `hermes` account (optionally pinned
+by commit and installer SHA-256). Its custom provider is the router's `/v1`
+with `ROUTER_API_KEY` as `model.api_key`.
+
+```
+Open WebUI -> Hermes API server :8642 (hermes-gateway.service) -> router :8000/v1 -> pool
+```
+
+* **Provisioning.**
+  * The provisioner reads the router key from `secrets.env` into a 0600
+    file, detects the router's address for the new CT, and checks that the
+    router accepts the key before `pct create`.
+  * The guest installer sends one chat request that offers a tool, so the key,
+    tool support and inference are proven before Hermes is installed.
+  * A settings record (with a hash of the router key) makes an unchanged
+    rerun a no-op. A failure restores `config.yaml`, `.env` and the unit, and
+    health-checks the previous gateway.
+* **Open WebUI.** `integrate-webui.py` adds an OpenAI connection through the
+  admin API, keyed by URL, keeping the router's connection and any others. It
+  verifies through Open WebUI's backend, which also proves the firewall. It
+  also points the external task model at a router model, so titles and tags
+  do not start agent runs.
+* **Network.** Inbound, only the router's address may reach TCP 8642. Egress
+  (`EGRESS=restricted`) allows the router's API, DNS and HTTP(S) to
+  non-private addresses, so the agent's shell cannot reach the model hosts or
+  other LAN services. The API and router rules carry a rule comment, which
+  Proxmox keeps through GUI edits. `--reconfigure` rewrites only those two,
+  in two steps: before the guest step it adds the new rules next to the old
+  ones (so a moved router is reachable and a failure changes nothing that
+  worked), and after it removes the old ones. A file in which they cannot be
+  identified stops the run before the CT is touched; a missing file is left
+  missing.
+* **Upgrades.** Hermes's code is upgraded by its own `hermes update`, so the
+  §16 upgrade contract does not apply. `--reconfigure` re-pushes the current
+  router key and settings.
+* **Why not a pool member.** `auto` could select Hermes, which itself calls
+  `auto`: a loop. Hermes also has no size, residency or capabilities for the
+  scorer.
+
+### 17.2 Gitea and Mattermost services (`targets/gitea/`, `targets/mattermost/`)
+
+Not model hosts: the router's configuration repository and its alert channel.
+Each provisioner runs the Proxmox VE community script (`ct/gitea.sh`,
+`ct/mattermost.sh`) with the CT settings as `var_*` presets, optionally pinned
+by SHA-256. Then `install-target.sh` runs in the CT and replaces the browser
+setup:
+
+* **Gitea.** A locked `app.ini` (SQLite, generated secrets, registration off,
+  sign-in required), migrated before the restart. An administrator who must
+  change the generated password, and a non-admin router account with a
+  `write:repository,write:user` token. An existing locked `app.ini` is
+  adopted; a token that still authenticates is kept.
+* **Mattermost.** Local mode through a systemd drop-in, so `mmctl --local`
+  manages the server over a socket only root and `mattermost` can open. An
+  administrator, team and channel; incoming webhooks and username overrides
+  on; one incoming webhook, kept while it still exists.
+* **Results.** Root-only files in `/etc/<service>-target/`. The router
+  installer reads them with `pct exec … cat`, so no secret is on a command
+  line or in the host's process list.
+* **Modes.** `--create-only` is the earlier wrapper (community script plus
+  browser steps), and `tools/install-*.sh` forward to it. `--reconfigure`
+  reruns only the setup in an existing CT.
+* **Upgrades.** Gitea and Mattermost are upgraded by their community
+  scripts' update or apt, so the §16 upgrade contract does not apply.
+* **Exposure window.** Between the community script finishing and the setup
+  locking the server (seconds), the web installer or first-account sign-up is
+  open on the CT's address. Create these CTs on a trusted segment.
+
 ---
 
 ## 18. Verification and CI
 
 * `tests/run-tests.sh` runs every shell and pytest suite and every
   `targets/*/test-*.sh`. It enforces a test for every installer and manager
-  function. Nothing touches the network, a CT or a GPU. Target end-to-end cases
-  need root (or `unshare -r`) and skip otherwise.
+  function. Nothing touches the network, a CT or a GPU. Most target
+  end-to-end cases need root (or `unshare -r`) and skip otherwise; the result
+  lists every skip, and `--strict` (or `CI=true`) makes a skip fail the run.
+  The provisioner suites (Hermes, Gitea, Mattermost) stub `id` and need no
+  root.
 * `tests/test-repo.sh` checks repository invariants: unit hardening, no secrets
   in `env/`, UTF-8, embedded copies in sync, Maya's update switch and the
   upgrade contract.
-* `.gitea/workflows/tests.yml` runs the suites, shellcheck and ruff, with
+* `.gitea/workflows/tests.yml` runs the suites with `--strict` (so its job
+  container must run as root), shellcheck and ruff, with
   separate router and bridge venvs. ShellCheck discovers all repository shell
   files, including test helpers. The `strata-upstream` and `maya-upstream`
   jobs fetch one pinned commit each, kept separate so a GitHub outage cannot
@@ -871,11 +995,22 @@ Strata-style target CTs (`<name>` = strata, basalt, maya):
 /etc/systemd/system/<name>.service
 ```
 
+Hermes CT:
+
+```
+/home/hermes/.hermes/             Hermes checkout (hermes-agent/), config.yaml, .env (0600), memory, skills
+/home/hermes/.local/bin/hermes    launcher
+/etc/hermes-target/api-key        API server key (0600)
+/etc/hermes-target/settings       settings of the last good run (router key as a hash)
+/etc/hermes-target.lock           installer lock
+/etc/systemd/system/hermes-gateway.service   API server (only with Open WebUI integration)
+```
+
 ## Appendix B — Configuration surface
 
 | File | Owns |
 |---|---|
-| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe), `[weights]`, `[model_sizes]` |
+| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe), `[weights]`, `[model_sizes]` |
 | `monitor.ini` | Interval, timeout, Ollama health path, alert thresholds, startup notice, local services, keep-alive |
 | `env/router.env` | Hosts, per-tier backends and model tags, keep-alive, LiteLLM URLs, Gitea/Mattermost settings (no credentials) |
 | `secrets.env` (not in git) | Gitea token, webhook, router key, backend tokens |

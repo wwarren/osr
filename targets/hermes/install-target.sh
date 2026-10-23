@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# Run as root in the dedicated Hermes LXC (provision-lxc.sh pushes this file,
+# hermes-gateway.service and the router's API key). Hermes is a client of the
+# router, not an inference server: its CLI, profile and gateway run as the
+# unprivileged hermes account.
+#
+#   bash install-target.sh            install, or apply changed settings
+#   bash install-target.sh --dry-run  print the plan; change nothing
+set -Eeuo pipefail
+umask 077
+
+INSTALL_URL=https://hermes-agent.nousresearch.com/install.sh
+# Paths are overridable for tests only; hermes-gateway.service uses the defaults.
+HERMES_USER=${HERMES_USER:-hermes}
+HERMES_USER_HOME=${HERMES_USER_HOME:-/home/hermes}
+HERMES_ETC=${HERMES_ETC:-/etc/hermes-target}
+UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
+LOCK_FILE=${LOCK_FILE:-/etc/hermes-target.lock}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-60}
+# One real chat request with a tool, to prove auth, tool support and inference.
+CHAT_PROBE_TIMEOUT=${CHAT_PROBE_TIMEOUT:-300}
+# Hermes needs at least 64K context for agent work with tools.
+MIN_CONTEXT=64000
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+usage() {
+  cat <<'USAGE'
+Usage: ROUTER_URL=http://192.168.11.80:8000 bash install-target.sh [--dry-run]
+
+Installs Hermes Agent with the official POSIX installer and points its custom
+OpenAI-compatible provider at Ollama Smart Router. Rerun to change settings;
+an unchanged, healthy installation is left alone.
+
+Environment:
+  ROUTER_URL                   router base URL (host and port, no /v1)
+  ROUTER_API_KEY_FILE          file holding the router's ROUTER_API_KEY
+                               (default: router-api-key next to this script;
+                               absent: keep the key already configured)
+  HERMES_MODEL=auto            a model ID from the router's /v1/models
+  HERMES_CONTEXT_LENGTH=65536  context the model's host really serves (>=64000)
+  HERMES_CHANNEL=stable        upstream update channel (stable or main)
+  HERMES_COMMIT=<sha>          pin the Hermes checkout to this commit
+  HERMES_INSTALLER_SHA256      refuse an install.sh with another SHA-256
+  HERMES_API_SERVER=false      true: run hermes-gateway.service with Hermes's
+                               OpenAI-compatible API server (for Open WebUI)
+  HERMES_API_PORT=8642         API server port
+  HERMES_API_MODEL_NAME=hermes-agent   model name the API server advertises
+  HERMES_SKIP_CHAT_PROBE=false true: skip the test chat request
+Hermes code updates are made with `hermes update` as the hermes user.
+USAGE
+}
+
+# Install helpers (sourced by test-install.sh) -------------------------------
+
+# settings_record: the settings this installation runs with. The router key
+# is recorded only as a hash, so rotating it is a change.
+settings_record() {
+  printf 'ROUTER_URL=%s\n' "$ROUTER_URL"
+  printf 'HERMES_MODEL=%s\n' "$HERMES_MODEL"
+  printf 'HERMES_CONTEXT_LENGTH=%s\n' "$HERMES_CONTEXT_LENGTH"
+  printf 'HERMES_CHANNEL=%s\n' "$HERMES_CHANNEL"
+  printf 'HERMES_COMMIT=%s\n' "$HERMES_COMMIT"
+  printf 'HERMES_API_SERVER=%s\n' "$HERMES_API_SERVER"
+  printf 'HERMES_API_PORT=%s\n' "$HERMES_API_PORT"
+  printf 'HERMES_API_MODEL_NAME=%s\n' "$HERMES_API_MODEL_NAME"
+  printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
+  printf 'UNIT_SHA256=%s\n' "$unit_sha256"
+}
+
+# env_file_update FILE: set or remove KEY=VALUE lines in a dotenv file. The
+# changes come from the environment (ENV_SET_<KEY>=value sets, ENV_UNSET_<KEY>
+# removes; ENV_UNSET_IF_<KEY>=value removes only that value), never from argv.
+env_file_update() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+sets = {k[len("ENV_SET_"):]: v for k, v in os.environ.items() if k.startswith("ENV_SET_")}
+unsets = {k[len("ENV_UNSET_"):] for k in os.environ if k.startswith("ENV_UNSET_")
+          and not k.startswith("ENV_UNSET_IF_")}
+unset_if = {k[len("ENV_UNSET_IF_"):]: v for k, v in os.environ.items()
+            if k.startswith("ENV_UNSET_IF_")}
+try:
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+except FileNotFoundError:
+    lines = []
+out, done = [], set()
+for line in lines:
+    key, sep, value = line.partition("=")
+    key = key.strip()
+    if sep and key in unsets:
+        continue
+    if sep and key in unset_if and value.strip() == unset_if[key]:
+        continue
+    if sep and key in sets:
+        if key in done:
+            continue
+        line = f"{key}={sets[key]}"
+        done.add(key)
+    out.append(line)
+for key, value in sets.items():
+    if key not in done:
+        out.append(f"{key}={value}")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + ("\n" if out else ""))
+PY
+}
+
+# env_file_get FILE KEY: the first KEY=value in a dotenv file (empty if none).
+env_file_get() {
+  [[ -f $1 ]] || return 0
+  awk -v k="$2" -F= '$1==k {sub(/^[^=]*=/,""); print; exit}' "$1"
+}
+
+# models_has ID < /v1/models JSON: is ID listed?
+models_has() {
+  python3 -c 'import json,sys
+data = json.load(sys.stdin)
+sys.exit(0 if any(isinstance(m, dict) and m.get("id") == sys.argv[1] for m in data.get("data", [])) else 1)' "$1"
+}
+
+# chat_probe_body MODEL: a minimal chat request that offers one tool, so the
+# router has to pick (or the named model has to be) tool-capable.
+chat_probe_body() {
+  python3 -c 'import json,sys
+print(json.dumps({"model": sys.argv[1], "max_tokens": 16, "stream": False,
+  "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
+  "tools": [{"type": "function", "function": {"name": "noop",
+    "description": "Does nothing.", "parameters": {"type": "object", "properties": {}}}}]}))' "$1"
+}
+
+# error_message < JSON: the error text of an OpenAI-style error body.
+error_message() {
+  python3 -c 'import json,sys
+try:
+    body = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+error = body.get("error") if isinstance(body, dict) else None
+if isinstance(error, dict):
+    print(error.get("message") or error.get("code") or "")
+elif isinstance(body, dict) and body.get("detail"):
+    print(body["detail"])
+' 2>/dev/null || true
+}
+# End install helpers. ----------------------------------------------------------
+
+dry_run=0
+while (( $# )); do
+  case $1 in
+    --dry-run) dry_run=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROUTER_URL=${ROUTER_URL:-}
+ROUTER_API_KEY_FILE=${ROUTER_API_KEY_FILE:-$source_dir/router-api-key}
+HERMES_MODEL=${HERMES_MODEL:-auto}
+HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-65536}
+HERMES_CHANNEL=${HERMES_CHANNEL:-stable}
+HERMES_COMMIT=${HERMES_COMMIT:-}
+HERMES_INSTALLER_SHA256=${HERMES_INSTALLER_SHA256:-}
+HERMES_API_SERVER=${HERMES_API_SERVER:-false}
+HERMES_API_PORT=${HERMES_API_PORT:-8642}
+HERMES_API_MODEL_NAME=${HERMES_API_MODEL_NAME:-hermes-agent}
+HERMES_SKIP_CHAT_PROBE=${HERMES_SKIP_CHAT_PROBE:-false}
+HERMES_HOME=$HERMES_USER_HOME/.hermes
+HERMES_BIN=$HERMES_USER_HOME/.local/bin/hermes
+UNIT=hermes-gateway.service
+
+[[ $ROUTER_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
+  die 'ROUTER_URL must be an HTTP(S) host and port, such as http://192.168.11.80:8000.'
+ROUTER_URL=${ROUTER_URL%/}
+[[ $HERMES_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid HERMES_MODEL.'
+[[ $HERMES_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( HERMES_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
+  die "HERMES_CONTEXT_LENGTH must be at least $MIN_CONTEXT: Hermes needs 64K context for agent work with tools. The model's host must serve that much too."
+[[ $HERMES_CHANNEL =~ ^(stable|main)$ ]] || die 'HERMES_CHANNEL must be stable or main.'
+[[ -z $HERMES_COMMIT || $HERMES_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
+  die 'HERMES_COMMIT must be a full 40-digit lowercase SHA-1.'
+[[ -z $HERMES_INSTALLER_SHA256 || $HERMES_INSTALLER_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
+  die 'HERMES_INSTALLER_SHA256 must be 64 lowercase hex digits.'
+[[ $HERMES_API_SERVER =~ ^(true|false)$ ]] || die 'HERMES_API_SERVER must be true or false.'
+[[ $HERMES_SKIP_CHAT_PROBE =~ ^(true|false)$ ]] || die 'HERMES_SKIP_CHAT_PROBE must be true or false.'
+[[ $HERMES_API_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( HERMES_API_PORT <= 65535 )) || die 'Invalid HERMES_API_PORT.'
+# Hermes reserves 8644-8646 for other gateway adapters.
+(( HERMES_API_PORT < 8644 || HERMES_API_PORT > 8646 )) || die 'HERMES_API_PORT 8644-8646 are reserved by Hermes.'
+[[ $HERMES_API_MODEL_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || die 'Invalid HERMES_API_MODEL_NAME.'
+[[ $HEALTH_TIMEOUT =~ ^[1-9][0-9]{0,4}$ ]] || die 'Invalid HEALTH_TIMEOUT.'
+[[ $CHAT_PROBE_TIMEOUT =~ ^[1-9][0-9]{0,4}$ ]] || die 'Invalid CHAT_PROBE_TIMEOUT.'
+for path_var in HERMES_USER_HOME HERMES_ETC UNIT_DIR LOCK_FILE; do
+  [[ ${!path_var} =~ ^/[A-Za-z0-9._/-]+$ && ${!path_var} != *..* ]] || die "Invalid $path_var."
+done
+[[ $HERMES_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid HERMES_USER.'
+if [[ $HERMES_API_SERVER == true ]]; then
+  [[ -r $source_dir/$UNIT ]] || die "Missing $source_dir/$UNIT (provision-lxc.sh pushes it)."
+fi
+
+if (( dry_run )); then
+  printf '+ verify %s/v1/models (with the router API key) advertises %s\n' "$ROUTER_URL" "$HERMES_MODEL"
+  [[ $HERMES_SKIP_CHAT_PROBE == true ]] ||
+    printf '+ send one chat request offering a tool to %s/v1/chat/completions (model %s)\n' "$ROUTER_URL" "$HERMES_MODEL"
+  printf '+ apt-get install ca-certificates curl git tar coreutils libatomic1 python3 openssl util-linux\n'
+  printf '+ create unprivileged user %s; install Hermes via %s --non-interactive --skip-browser --skip-computer-use --channel %s%s\n' \
+    "$HERMES_USER" "$INSTALL_URL" "$HERMES_CHANNEL" "${HERMES_COMMIT:+ --commit $HERMES_COMMIT}"
+  printf '+ configure provider=custom, base_url=%s/v1, model=%s, context_length=%s, api_key=<router key>\n' \
+    "$ROUTER_URL" "$HERMES_MODEL" "$HERMES_CONTEXT_LENGTH"
+  if [[ $HERMES_API_SERVER == true ]]; then
+    printf '+ API server on 0.0.0.0:%s as model %s; key in %s/api-key and %s/.env\n' \
+      "$HERMES_API_PORT" "$HERMES_API_MODEL_NAME" "$HERMES_ETC" "$HERMES_HOME"
+    printf '+ install %s/%s, enable and start it, wait for /health and /v1/models\n' "$UNIT_DIR" "$UNIT"
+  else
+    printf '+ no API server: stop and remove %s if present\n' "$UNIT"
+  fi
+  exit 0
+fi
+
+[[ $EUID -eq 0 ]] || die 'Run as root inside the Hermes CT.'
+# A minimal Debian template may not have Python or curl, which the router
+# probes need. Install only these before touching Hermes.
+if ! command -v python3 >/dev/null || ! command -v curl >/dev/null || ! command -v flock >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl python3 util-linux
+fi
+
+# One run at a time. The lock is released when this shell exits.
+exec {install_lock_fd}>>"$LOCK_FILE"
+flock -n "$install_lock_fd" || die "Another install-target.sh run holds $LOCK_FILE."
+
+stage=$(mktemp -d "${TMPDIR:-/tmp}/hermes-target.XXXXXX")
+cleanup() { rm -rf -- "$stage"; }
+trap cleanup EXIT
+
+# --- the router key: the pushed file, else the one already configured ----------
+router_key=''
+key_source='none'
+if [[ -f $ROUTER_API_KEY_FILE ]]; then
+  router_key=$(tr -d '\r\n' < "$ROUTER_API_KEY_FILE")
+  key_source=$ROUTER_API_KEY_FILE
+elif [[ -f $HERMES_HOME/.env ]]; then
+  router_key=$(env_file_get "$HERMES_HOME/.env" ROUTER_API_KEY | tr -d '\r\n')
+  [[ -z $router_key ]] || key_source="$HERMES_HOME/.env"
+fi
+[[ -z $router_key || $router_key =~ ^[A-Za-z0-9._~+/=-]{8,512}$ ]] ||
+  die "The router API key in ${ROUTER_API_KEY_FILE} has unexpected characters."
+router_key_sha256=none
+if [[ -n $router_key ]]; then
+  router_key_sha256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)
+  # curl reads the header from this file, so the key never appears in argv.
+  printf 'Authorization: Bearer %s\n' "$router_key" > "$stage/router-auth"
+fi
+
+# api URL AUTH_FILE [BODY_FILE] [TIMEOUT]: print the HTTP status ("000" when no
+# connection); the body is left in $stage/response.
+api() {
+  local url=$1 auth=$2 body=${3:-} timeout=${4:-15}
+  local -a args=(--silent --show-error --max-time "$timeout" -o "$stage/response" -w '%{http_code}')
+  if [[ -s $auth ]]; then args+=(-H "@$auth"); fi
+  if [[ -n $body ]]; then args+=(-H 'Content-Type: application/json' --data-binary "@$body"); fi
+  : > "$stage/response"
+  curl "${args[@]}" "$url" 2>"$stage/curl-error" || true
+}
+
+# --- the router answers, accepts the key and serves the model -------------------
+status=$(api "$ROUTER_URL/v1/models" "$stage/router-auth")
+case $status in
+  200) ;;
+  401|403)
+    if [[ -z $router_key ]]; then
+      die "The router at $ROUTER_URL requires its API key. Run provision-lxc.sh --reconfigure, or put ROUTER_API_KEY from the router's /app/router/secrets.env into $ROUTER_API_KEY_FILE."
+    fi
+    die "The router at $ROUTER_URL rejected the API key from $key_source (HTTP $status). It may have been rotated with set-api-key: run provision-lxc.sh --reconfigure." ;;
+  000) die "The router at $ROUTER_URL is unreachable: $(head -c 300 "$stage/curl-error")" ;;
+  *) die "The router at $ROUTER_URL answered /v1/models with HTTP $status." ;;
+esac
+models_has "$HERMES_MODEL" < "$stage/response" ||
+  die "The router does not advertise model '$HERMES_MODEL'. Choose one from $ROUTER_URL/v1/models."
+if [[ $HERMES_SKIP_CHAT_PROBE != true ]]; then
+  chat_probe_body "$HERMES_MODEL" > "$stage/probe.json"
+  note "Sending one test chat request with a tool to $HERMES_MODEL (up to ${CHAT_PROBE_TIMEOUT}s)..."
+  status=$(api "$ROUTER_URL/v1/chat/completions" "$stage/router-auth" "$stage/probe.json" "$CHAT_PROBE_TIMEOUT")
+  if [[ $status != 200 ]]; then
+    reason=$(error_message < "$stage/response")
+    [[ -n $reason ]] || reason=$(head -c 300 "$stage/response")
+    [[ $status != 000 ]] || reason=$(head -c 300 "$stage/curl-error")
+    hint=''
+    if [[ $reason =~ [Tt]ool ]]; then
+      hint=' Hermes needs a tool-capable model: set HERMES_MODEL to one, or check the router inventory.'
+    fi
+    die "A test chat request with a tool failed (HTTP $status): ${reason}.${hint} Nothing was changed. (HERMES_SKIP_CHAT_PROBE=true skips this check.)"
+  fi
+  note 'The router answered a chat request that offers a tool.'
+fi
+
+# --- unchanged and healthy: nothing to do ---------------------------------------
+unit_sha256=none
+if [[ $HERMES_API_SERVER == true ]]; then
+  unit_sha256=$(sha256sum "$source_dir/$UNIT" | cut -d' ' -f1)
+fi
+settings=$(settings_record)
+
+# gateway_healthy [PORT] [MODEL_NAME]: /health is ok and /v1/models, with the
+# API key, lists the model. Defaults: the settings of this run.
+gateway_healthy() {
+  local port=${1:-$HERMES_API_PORT} name=${2:-$HERMES_API_MODEL_NAME} key_file=$stage/api-auth
+  [[ -s $HERMES_ETC/api-key ]] || return 1
+  printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' < "$HERMES_ETC/api-key")" > "$key_file"
+  [[ $(api "http://127.0.0.1:$port/health" /dev/null) == 200 ]] || return 1
+  grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' "$stage/response" || return 1
+  [[ $(api "http://127.0.0.1:$port/v1/models" "$key_file") == 200 ]] || return 1
+  models_has "$name" < "$stage/response"
+}
+wait_gateway() {
+  local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+  while (( SECONDS < deadline )); do
+    gateway_healthy "$@" && return 0
+    sleep 2
+  done
+  return 1
+}
+run_hermes() {
+  runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+    PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$HERMES_BIN" "$@"
+}
+installed_commit() {
+  git -C "$HERMES_HOME/hermes-agent" rev-parse HEAD 2>/dev/null || true
+}
+
+if [[ -x $HERMES_BIN && -f $HERMES_ETC/settings ]] &&
+   [[ $(< "$HERMES_ETC/settings") == "$settings" ]] &&
+   { [[ -z $HERMES_COMMIT ]] || [[ $(installed_commit) == "$HERMES_COMMIT" ]]; } &&
+   run_hermes --version >/dev/null 2>&1; then
+  if [[ $HERMES_API_SERVER == false ]] ||
+     { systemctl is-active --quiet "$UNIT" && gateway_healthy; }; then
+    rm -f -- "$ROUTER_API_KEY_FILE"
+    note 'Hermes is healthy with these settings; nothing to do.'
+    exit 0
+  fi
+  note "$UNIT is not running or not healthy; applying the settings again."
+fi
+
+# --- packages, account, Hermes itself -------------------------------------------
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl git tar coreutils libatomic1 python3 openssl util-linux
+if ! id "$HERMES_USER" >/dev/null 2>&1; then
+  useradd --create-home --home-dir "$HERMES_USER_HOME" --shell /bin/bash "$HERMES_USER"
+fi
+[[ $(getent passwd "$HERMES_USER" | cut -d: -f6) == "$HERMES_USER_HOME" ]] ||
+  die "Existing $HERMES_USER account has a different home."
+install -d -m 0700 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_HOME"
+install -d -m 0700 "$HERMES_ETC"
+
+if [[ ! -x $HERMES_BIN ]] || { [[ -n $HERMES_COMMIT ]] && [[ $(installed_commit) != "$HERMES_COMMIT" ]]; }; then
+  curl --fail --silent --show-error --location --max-time 60 "$INSTALL_URL" -o "$stage/install.sh"
+  installer_sha256=$(sha256sum "$stage/install.sh" | cut -d' ' -f1)
+  note "Hermes installer SHA-256: $installer_sha256 (pin it with HERMES_INSTALLER_SHA256)."
+  if [[ -n $HERMES_INSTALLER_SHA256 && $installer_sha256 != "$HERMES_INSTALLER_SHA256" ]]; then
+    die "The downloaded installer's SHA-256 is $installer_sha256, not HERMES_INSTALLER_SHA256. Nothing was installed."
+  fi
+  [[ $(head -n 1 "$stage/install.sh") == '#!'*sh* ]] ||
+    die 'The downloaded Hermes installer is not a shell script.'
+  installer_args=(--non-interactive --skip-browser --skip-computer-use --channel "$HERMES_CHANNEL")
+  [[ -z $HERMES_COMMIT ]] || installer_args+=(--commit "$HERMES_COMMIT")
+  # The unprivileged account must reach the installer, but not list the
+  # stage (which holds the router key, mode 0600).
+  install -d -m 0755 "$stage/installer"
+  install -m 0644 "$stage/install.sh" "$stage/installer/install.sh"
+  chmod 0711 "$stage"
+  ( cd "$stage/installer" && runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+      PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+      bash "$stage/installer/install.sh" "${installer_args[@]}" {install_lock_fd}>&- )
+  chmod 0700 "$stage"
+fi
+if [[ ! -x $HERMES_BIN ]]; then
+  # The launcher's location is upstream's choice; the unit expects this path.
+  found=$(runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" \
+    PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" sh -c 'command -v hermes' 2>/dev/null || true)
+  [[ -n $found && -x $found ]] || die "The Hermes launcher was not found at $HERMES_BIN or on the hermes PATH."
+  install -d -m 0755 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_USER_HOME/.local" "$HERMES_USER_HOME/.local/bin"
+  ln -sfn -- "$found" "$HERMES_BIN"
+fi
+if [[ -n $HERMES_COMMIT && $(installed_commit) != "$HERMES_COMMIT" ]]; then
+  die "The Hermes checkout is at $(installed_commit), not HERMES_COMMIT $HERMES_COMMIT."
+fi
+
+# --- configuration, with a rollback --------------------------------------------
+# Everything this run changes is set aside first; a failure puts it back.
+backup=$stage/backup
+install -d -m 0700 "$backup"
+for file in "$HERMES_HOME/config.yaml" "$HERMES_HOME/.env" "$UNIT_DIR/$UNIT" "$HERMES_ETC/settings"; do
+  if [[ -f $file ]]; then cp -a -- "$file" "$backup/$(basename "$file").prev"; fi
+done
+gateway_was_active=0
+if systemctl is-active --quiet "$UNIT" 2>/dev/null; then gateway_was_active=1; fi
+
+restore() {
+  local file name
+  for file in "$HERMES_HOME/config.yaml" "$HERMES_HOME/.env" "$UNIT_DIR/$UNIT" "$HERMES_ETC/settings"; do
+    name=$(basename "$file")
+    if [[ -f $backup/$name.prev ]]; then cp -a -- "$backup/$name.prev" "$file"; else rm -f -- "$file"; fi
+  done
+  systemctl daemon-reload || true
+  if (( gateway_was_active )); then
+    # Health-check the restored settings, not the ones that failed.
+    local port name
+    port=$(env_file_get "$HERMES_HOME/.env" API_SERVER_PORT)
+    name=$(env_file_get "$HERMES_HOME/.env" API_SERVER_MODEL_NAME)
+    systemctl restart "$UNIT" || true
+    if wait_gateway "${port:-8642}" "${name:-hermes-agent}"; then
+      note "The previous Hermes configuration is restored and $UNIT is running again."
+    else
+      note "The previous Hermes configuration is restored, but $UNIT did not become healthy either. Check: journalctl -u $UNIT"
+    fi
+  else
+    systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+    note 'The previous Hermes configuration is restored.'
+  fi
+}
+rollback() {
+  trap - ERR
+  restore
+}
+trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
+
+run_hermes config set model.provider custom
+run_hermes config set model.base_url "$ROUTER_URL/v1"
+run_hermes config set model.default "$HERMES_MODEL"
+run_hermes config set model.context_length "$HERMES_CONTEXT_LENGTH"
+# The router's key is Hermes's key for this provider; a router with
+# authentication off gets a placeholder, which OpenAI clients require.
+run_hermes config set model.api_key "${router_key:-no-key}"
+
+# .env: the API server settings; ROUTER_API_KEY keeps the key for reruns. The
+# placeholder OPENAI_API_KEY=no-key written by earlier versions is removed.
+touch "$HERMES_HOME/.env"
+if [[ $HERMES_API_SERVER == true ]]; then
+  if [[ ! -s $HERMES_ETC/api-key ]]; then
+    openssl rand -hex 32 > "$HERMES_ETC/api-key.new"
+    chmod 0600 "$HERMES_ETC/api-key.new"
+    mv -f -- "$HERMES_ETC/api-key.new" "$HERMES_ETC/api-key"
+  fi
+  ENV_SET_ROUTER_API_KEY=$router_key \
+  ENV_SET_API_SERVER_ENABLED=true \
+  ENV_SET_API_SERVER_HOST=0.0.0.0 \
+  ENV_SET_API_SERVER_PORT=$HERMES_API_PORT \
+  ENV_SET_API_SERVER_MODEL_NAME=$HERMES_API_MODEL_NAME \
+  ENV_SET_API_SERVER_KEY=$(tr -d '\r\n' < "$HERMES_ETC/api-key") \
+  ENV_UNSET_IF_OPENAI_API_KEY=no-key \
+    env_file_update "$HERMES_HOME/.env"
+else
+  ENV_SET_ROUTER_API_KEY=$router_key \
+  ENV_UNSET_API_SERVER_ENABLED=1 ENV_UNSET_API_SERVER_HOST=1 ENV_UNSET_API_SERVER_PORT=1 \
+  ENV_UNSET_API_SERVER_MODEL_NAME=1 ENV_UNSET_API_SERVER_KEY=1 \
+  ENV_UNSET_IF_OPENAI_API_KEY=no-key \
+    env_file_update "$HERMES_HOME/.env"
+fi
+chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.env"
+chmod 0600 "$HERMES_HOME/.env"
+run_hermes --version >/dev/null
+
+if [[ $HERMES_API_SERVER == true ]]; then
+  install -m 0644 "$source_dir/$UNIT" "$UNIT_DIR/$UNIT"
+  systemctl daemon-reload
+  systemctl enable "$UNIT" >/dev/null
+  systemctl restart "$UNIT"
+  if ! wait_gateway; then
+    trap - ERR
+    note "$UNIT did not answer /health and /v1/models within ${HEALTH_TIMEOUT}s. Check: journalctl -u $UNIT"
+    restore
+    exit 1
+  fi
+  note "Hermes API server: http://0.0.0.0:$HERMES_API_PORT/v1 (model $HERMES_API_MODEL_NAME)."
+elif [[ -f $UNIT_DIR/$UNIT ]]; then
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f -- "$UNIT_DIR/$UNIT"
+  systemctl daemon-reload
+  note "$UNIT was stopped and removed (HERMES_API_SERVER=false)."
+fi
+
+printf '%s\n' "$settings" > "$HERMES_ETC/settings.new"
+chmod 0600 "$HERMES_ETC/settings.new"
+mv -f -- "$HERMES_ETC/settings.new" "$HERMES_ETC/settings"
+trap - ERR
+# The key now lives in Hermes's own configuration.
+rm -f -- "$ROUTER_API_KEY_FILE"
+commit=$(installed_commit)
+note "Hermes${commit:+ $commit} is configured for $ROUTER_URL/v1 with model $HERMES_MODEL (context $HERMES_CONTEXT_LENGTH)."
+[[ -n $HERMES_COMMIT || -z $commit ]] || note "Pin this version with HERMES_COMMIT=$commit."
+note "Start a shell with: runuser -u $HERMES_USER -- env HOME=$HERMES_USER_HOME $HERMES_BIN"

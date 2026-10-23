@@ -65,6 +65,7 @@ class Upstream:
         self.chat = {}          # host -> status code or "connect" / "timeout"
         self.calls = []
         self.capabilities = {}  # model name -> list, None (404) or "boom"
+        self.tool_less = set()  # models whose chat rejects a tool request
         self.show_calls = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -82,6 +83,11 @@ class Upstream:
             if behaviour == "timeout":
                 raise httpx.ConnectTimeout("timed out", request=request)
             body = json.loads(request.content)
+            if body.get("tools") and body["model"] in self.tool_less:
+                # What Ollama answers for a model without tool support.
+                return streamed(400, {"error": {"message": (
+                    f"registry.ollama.ai/library/{body['model']} does not support tools"),
+                    "type": "api_error"}})
             return streamed(behaviour, {"served_by": host, "model": body["model"]},
                             {"x-upstream": "yes", "connection": "close"})
         if request.url.path == "/api/show":
@@ -865,3 +871,226 @@ def test_chat_copy_on_a_down_host_is_not_called_embedding_only(served):
     response = chat(client, model="dual:1b")
     assert response.status_code == 200          # not the embedding-only 400
     assert response.headers["x-router-warning"] == "model-unavailable"
+
+
+# --- tool requests (agents, function calling) -------------------------------------
+TOOLS = [{"type": "function", "function": {
+    "name": "terminal", "description": "Run a shell command",
+    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}]
+
+
+def tool_pool(router, upstream, client, a, b, caps):
+    """HOST_A serves model a, HOST_B model b; caps maps names to /api/show lists."""
+    upstream.inventory = {HOST_A: tags(a), HOST_B: tags(b)}
+    upstream.capabilities.update(caps)
+    router._CAPABILITIES.clear()
+    assert client.post("/routing/refresh").status_code == 200
+
+
+def tools_flag(router, name):
+    return [e["tools"] for e in router.INVENTORY["models"] if e["name"] == name]
+
+
+def test_discovery_records_tool_support(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("qwen3:14b", "14.8B", "qwen3"),
+              {"gemma3:12b": ["completion", "vision"], "qwen3:14b": ["completion", "tools"]})
+    assert tools_flag(router, "gemma3:12b") == [False]
+    assert tools_flag(router, "qwen3:14b") == [True]
+
+
+def test_tool_support_is_unknown_without_a_capability_list(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "CAPABILITY_PROBE", False)
+    client.post("/routing/refresh")
+    assert set(tools_flag(router, "qwen3:14b")) == {None}
+
+
+def test_lmstudio_trained_flag_means_tools_otherwise_unknown(router):
+    raws = router._lmstudio_v1_models({"models": [
+        {"key": "trained", "type": "llm", "capabilities": {"trained_for_tool_use": True}},
+        {"key": "plain", "type": "llm", "capabilities": {}},
+    ]})
+    entries = {r["name"]: router.build_entry("lmstudio+http://h:1234", r, r["capabilities"])
+               for r in raws}
+    assert entries["trained"]["tools"] is True
+    assert entries["plain"]["tools"] is None
+
+
+def test_openai_kind_tool_support_is_unknown(router):
+    entry = router.build_entry("maya+http://h:8080", {"name": "glm-5.3-flash"}, ["completion"])
+    assert entry["tools"] is None
+
+
+@pytest.mark.parametrize("body,expected", [
+    ({"tools": TOOLS}, True),
+    ({"functions": [{"name": "f", "parameters": {}}]}, True),
+    ({"tools": TOOLS, "tool_choice": "none"}, False),
+    ({"tools": []}, False),
+    ({"tools": "terminal"}, False),
+    ({}, False),
+])
+def test_wants_tools(router, body, expected):
+    assert router.wants_tools(body) is expected
+
+
+def test_tool_request_skips_a_model_known_to_lack_tools(served):
+    """The reproduced failure: a short agent prompt went to the closest small
+    model, which has no tool support, and every turn got a 400."""
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("qwen3:14b", "14.8B", "qwen3"),
+              {"gemma3:12b": ["completion", "vision"], "qwen3:14b": ["completion", "tools"]})
+    upstream.tool_less = {"gemma3:12b"}
+    for _ in range(4):
+        response = chat(client, tools=TOOLS, messages=[user("List the files in /etc")])
+        assert response.status_code == 200
+        assert response.json()["model"] == "qwen3:14b"
+        assert "x-router-warning" not in response.headers
+    assert set(served_hosts(upstream)) == {HOST_B}
+    # The same prompt without tools still goes by size.
+    assert chat(client, messages=[user("List the files in /etc")]).json()["model"] == "gemma3:12b"
+
+
+def test_tool_request_is_raised_to_tools_min_class(served):
+    router, _, client = served
+    plain = client.post("/routing/explain", json={"messages": [user("hi")]}).json()
+    tooled = client.post("/routing/explain",
+                         json={"messages": [user("hi")], "tools": TOOLS}).json()
+    assert plain["request"]["class"] == "fast"
+    assert tooled["request"]["class"] == router.TOOLS_MIN_CLASS == "large"
+    assert tooled["request"]["tools"] is True
+    assert chat(client, tools=TOOLS).headers["x-router-class"] == "large"
+
+
+def test_tool_floor_never_lowers_a_class(router):
+    need = router.apply_tool_needs({"class": "xlarge", "code": False, "vision": False},
+                                   {"tools": TOOLS})
+    assert need["class"] == "xlarge"
+
+
+def test_blank_tools_min_class_disables_the_floor(served, monkeypatch):
+    router, _, client = served
+    monkeypatch.setattr(router, "TOOLS_MIN_CLASS", "")
+    assert chat(client, tools=TOOLS).headers["x-router-class"] == "fast"
+
+
+def test_tier_alias_still_pins_the_class_of_a_tool_request(served):
+    router, _, client = served
+    response = chat(client, model=router.TIER_FAST, tools=TOOLS)
+    assert response.headers["x-router-class"] == "fast"
+
+
+def test_invalid_tools_min_class_is_ignored(monkeypatch, tmp_path):
+    ini = tmp_path / "router.ini"
+    ini.write_text((ROOT / "services/ollama-router/router.ini").read_text()
+                   .replace("tools_min_class = large", "tools_min_class = huge"))
+    module = load_router(monkeypatch, ROUTER_INI=str(ini))
+    assert module.TOOLS_MIN_CLASS == ""
+
+
+def test_known_tool_model_beats_an_unknown_one_of_equal_fit(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("mystery:14b", "14.8B", "x"),
+              ("qwen3:14b", "14.8B", "qwen3"), {"qwen3:14b": ["completion", "tools"]})
+    assert tools_flag(router, "mystery:14b") == [None]
+    for _ in range(3):
+        assert chat(client, tools=TOOLS).json()["model"] == "qwen3:14b"
+
+
+def test_tool_rejection_fails_forward_and_is_remembered(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("mystery:14b", "14.8B", "x"),
+              ("other:14b", "14.8B", "y"), {})
+    upstream.tool_less = {"mystery:14b"}
+    router._rotation.clear()
+    served_models = set()
+    for _ in range(4):
+        response = chat(client, tools=TOOLS)
+        assert response.status_code == 200
+        served_models.add(response.json()["model"])
+    assert served_models == {"other:14b"}
+    assert tools_flag(router, "mystery:14b") == [False]
+    # Once known, it is not even tried: at most the one rejected attempt.
+    assert served_hosts(upstream).count(HOST_A) == 1
+
+
+def test_a_400_that_is_not_about_tools_is_passed_through(served):
+    _, upstream, client = served
+    upstream.chat = {HOST_A: 400, HOST_B: 400}
+    response = chat(client, tools=TOOLS)
+    assert response.status_code == 400
+    assert "served_by" in response.json()          # the backend's own body
+    assert response.headers["x-router-mode"] == "discovery"
+    assert len(served_hosts(upstream)) == 1
+
+
+def test_last_candidate_tool_rejection_is_returned(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("mystery:14b", "14.8B", "x"),
+              ("mystery:14b", "14.8B", "x"), {})
+    upstream.tool_less = {"mystery:14b"}
+    response = chat(client, tools=TOOLS)
+    assert response.status_code == 400
+    assert "does not support tools" in response.json()["error"]["message"]
+
+
+def test_no_tool_model_is_flagged(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("phi4:14b", "14.7B", "phi3"),
+              {"gemma3:12b": ["completion"], "phi4:14b": ["completion"]})
+    response = chat(client, tools=TOOLS)
+    assert response.headers["x-router-warning"] == "no-tool-model"
+
+
+def test_tools_strict_rejects_when_no_model_has_tools(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "TOOLS_STRICT", True)
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("phi4:14b", "14.7B", "phi3"),
+              {"gemma3:12b": ["completion"], "phi4:14b": ["completion"]})
+    response = chat(client, tools=TOOLS)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "no_tool_model"
+    assert served_hosts(upstream) == []
+
+
+def test_named_model_is_honoured_for_a_tool_request(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("qwen3:14b", "14.8B", "qwen3"),
+              {"gemma3:12b": ["completion"], "qwen3:14b": ["completion", "tools"]})
+    response = chat(client, model="gemma3:12b", tools=TOOLS)
+    assert response.json()["model"] == "gemma3:12b"
+    assert "x-router-warning" not in response.headers
+
+
+def test_tool_requests_stay_on_one_model_but_share_its_hosts(served):
+    router, upstream, client = served
+    caps = {"qwen3:14b": ["completion", "tools"], "llama9:14b": ["completion", "tools"]}
+    tool_pool(router, upstream, client, ("qwen3:14b", "14B", "qwen3"),
+              ("llama9:14b", "14B", "llama"), caps)
+    router._rotation.clear()
+    plain = {chat(client).json()["model"] for _ in range(4)}
+    assert plain == {"qwen3:14b", "llama9:14b"}      # unchanged: ties rotate
+    tooled = {chat(client, tools=TOOLS).json()["model"] for _ in range(4)}
+    assert len(tooled) == 1                         # one model for an agent loop
+    # The same model on two hosts still shares the load.
+    tool_pool(router, upstream, client, ("qwen3:14b", "14B", "qwen3"),
+              ("qwen3:14b", "14B", "qwen3"), caps)
+    upstream.calls.clear()
+    for _ in range(4):
+        chat(client, tools=TOOLS)
+    assert set(served_hosts(upstream)) == {HOST_A, HOST_B}
+
+
+def test_explain_lists_tool_support(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("gemma3:12b", "12.2B", "gemma3"),
+              ("qwen3:14b", "14.8B", "qwen3"),
+              {"gemma3:12b": ["completion"], "qwen3:14b": ["completion", "tools"]})
+    body = client.post("/routing/explain", json={"messages": [user("hi")], "tools": TOOLS}).json()
+    assert [c["model"] for c in body["candidates"]] == ["qwen3:14b"]
+    assert body["candidates"][0]["tools"] is True

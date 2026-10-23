@@ -42,7 +42,10 @@ jobs:
         env:
           ROUTER_PYTHON: ${{ github.workspace }}/.venv-router/bin/python
           BRIDGE_PYTHON: ${{ github.workspace }}/.venv-bridge/bin/python
-        run: bash tests/run-tests.sh </dev/null
+        # --strict: a suite that skips cases (most end-to-end cases need root)
+        # fails the job, so a green run means they all ran. The runner's
+        # job container must therefore run as root, as act_runner's do.
+        run: bash tests/run-tests.sh --strict </dev/null
 
       - name: shellcheck
         run: |

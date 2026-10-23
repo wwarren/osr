@@ -6,9 +6,12 @@
 #   ./run-tests.sh installer       # run one suite
 #   ./run-tests.sh --coverage      # coverage report only, no tests
 #   ./run-tests.sh --list          # list suites
+#   ./run-tests.sh --strict        # also fail if any cases were skipped
 #
 # Exit status is non-zero if any suite fails OR any function is untested, so
-# this can be wired straight into CI.
+# this can be wired straight into CI. Suites skip cases they cannot run here
+# (most end-to-end cases need root); the result lists them. With --strict, or
+# when CI=true, a skip fails the run, so CI cannot pass without running them.
 
 set -uo pipefail
 
@@ -23,11 +26,11 @@ SUITES=(
 )
 # Suites without per-function coverage: repo consistency, the inference-target
 # scripts (llama.cpp, AirLLM), and their Python tests.
-EXTRA_NAMES=(repo nvidia update remote-update)
-EXTRA_KINDS=(shell shell shell shell)
-EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh" "${HERE}/test-remote-update.sh")
-EXTRA_PYTHONS=("" "" "" "")
-EXTRA_TESTS=("" "" "" "")
+EXTRA_NAMES=(repo nvidia update remote-update mattermost gitea)
+EXTRA_KINDS=(shell shell shell shell shell shell)
+EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh" "${HERE}/test-remote-update.sh" "${HERE}/test-mattermost.sh" "${HERE}/test-gitea.sh")
+EXTRA_PYTHONS=("" "" "" "" "" "")
+EXTRA_TESTS=("" "" "" "" "" "")
 for _t in "${ROOT}"/targets/*/test-*.sh; do
   [[ -f "$_t" ]] || continue
   _target=$(basename "$(dirname "$_t")")
@@ -54,21 +57,24 @@ EXTRA_TESTS+=(
   "${HERE}/test_monitor.py"
 )
 # Standard-library unittest scripts: no venv needed.
-EXTRA_NAMES+=(open-terminal-integration open-terminal-webui-probe)
-EXTRA_KINDS+=(python python)
-EXTRA_PATHS+=("${ROOT}/targets/open-terminal/test-integration.py" "${ROOT}/targets/open-terminal/test-webui-probe.py")
-EXTRA_PYTHONS+=(python3 python3)
-EXTRA_TESTS+=("" "")
+EXTRA_NAMES+=(open-terminal-integration open-terminal-webui-probe hermes-integration)
+EXTRA_KINDS+=(python python python)
+EXTRA_PATHS+=("${ROOT}/targets/open-terminal/test-integration.py" "${ROOT}/targets/open-terminal/test-webui-probe.py"
+              "${ROOT}/targets/hermes/test-integration.py")
+EXTRA_PYTHONS+=(python3 python3 python3)
+EXTRA_TESTS+=("" "" "")
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'
 [[ -t 1 ]] || { c_red=""; c_grn=""; c_yel=""; c_bld=""; c_off=""; }
 
-want=""; coverage_only=false; list_only=false
+want=""; coverage_only=false; list_only=false; strict=false
+case "${CI:-}" in true|1) strict=true ;; esac
 for arg in "$@"; do
   case "$arg" in
     --coverage) coverage_only=true ;;
     --list)     list_only=true ;;
-    -h|--help)  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --strict)   strict=true ;;
+    -h|--help)  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*)         echo "unknown option: $arg" >&2; exit 2 ;;
     *)          want="$arg" ;;
   esac
@@ -118,7 +124,23 @@ fi
 
 # ── run the suites ────────────────────────────────────────────────────────────
 failed_suites=()
+skipped=()
 ran_any=false
+suite_out="$(mktemp "${TMPDIR:-/tmp}/run-tests.XXXXXX")"
+trap 'rm -f -- "$suite_out"' EXIT
+
+# run_suite NAME CMD...: run one suite, showing its output, and note any cases
+# it skipped: "SKIP ..." lines, or assert.sh skips for want of root.
+run_suite() {
+  local name=$1 rc line
+  shift
+  "$@" 2>&1 | tee "$suite_out"
+  rc=${PIPESTATUS[0]}
+  while IFS= read -r line; do
+    skipped+=("${name}: ${line#SKIP }")
+  done < <(sed 's/\x1b\[[0-9;]*m//g' "$suite_out" | grep -E '^SKIP |^ *skip .*needs? root' | sed 's/^ *skip *//')
+  return "$rc"
+}
 for entry in "${SUITES[@]}"; do
   IFS=: read -r name script test <<< "$entry"
   [[ -n "$want" && "$want" != "$name" ]] && continue
@@ -130,7 +152,7 @@ for entry in "${SUITES[@]}"; do
     printf '%sMISSING%s script under test: %s\n' "$c_red" "$c_off" "$script"; failed_suites+=("$name"); continue
   fi
   printf '\n%s══ %s ══════════════════════════════════════════%s\n' "$c_bld" "$name" "$c_off"
-  bash "$test" "$script" || failed_suites+=("$name")
+  run_suite "$name" bash "$test" "$script" || failed_suites+=("$name")
 done
 
 for i in "${!EXTRA_NAMES[@]}"; do
@@ -140,11 +162,12 @@ for i in "${!EXTRA_NAMES[@]}"; do
   printf '\n%s══ %s ══════════════════════════════════════════%s\n' "$c_bld" "$name" "$c_off"
   case "${EXTRA_KINDS[$i]}" in
     shell)
-      bash "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
+      run_suite "$name" bash "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
       ;;
     pytest)
       if ! "${EXTRA_PYTHONS[$i]}" -c 'import pytest, fastapi, httpx' 2>/dev/null; then
         printf '  %sskip%s %s (needs: pip install pytest fastapi httpx)\n' "$c_yel" "$c_off" "$name"
+        skipped+=("${name}: the whole suite (needs: pip install pytest fastapi httpx)")
         continue
       fi
       "${EXTRA_PYTHONS[$i]}" -m pytest -q "${EXTRA_TESTS[$i]}" || failed_suites+=("$name")
@@ -177,5 +200,14 @@ fi
 if (( uncovered_total > 0 )); then
   printf '%s%d function(s) have no test%s\n' "$c_red" "$uncovered_total" "$c_off"
   rc=1
+fi
+if (( ${#skipped[@]} > 0 )); then
+  if $strict; then
+    printf '%sSKIPPED cases (not allowed with --strict or CI=true; run as root):%s\n' "$c_red" "$c_off"
+    rc=1
+  else
+    printf '%sskipped cases (run as root to include them; --strict fails on this):%s\n' "$c_yel" "$c_off"
+  fi
+  printf '  %s\n' "${skipped[@]}"
 fi
 exit $rc

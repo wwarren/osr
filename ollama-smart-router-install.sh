@@ -114,6 +114,24 @@ TIER_LARGE_SERVERS="${TIER_LARGE_SERVERS:-}"
 TIER_XLARGE_SERVERS="${TIER_XLARGE_SERVERS:-}"
 # Skip every prompt and use the values above / from the environment.
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
+# The Gitea and Mattermost services are targets too (targets/gitea,
+# targets/mattermost); true pre-selects them in the targets menu below.
+INSTALL_GITEA="${INSTALL_GITEA:-false}"
+INSTALL_MATTERMOST="${INSTALL_MATTERMOST:-false}"
+# Optional targets from targets/ (the Gitea and Mattermost services, model
+# servers, and the Open Terminal / Hermes companions), each in its own LXC.
+# Interactive installs ask which to create;
+# names or menu numbers, comma-separated, e.g. INSTALL_TARGETS=ollama,hermes
+# to pre-fill the answer. Unattended installs refuse a non-empty list.
+INSTALL_TARGETS="${INSTALL_TARGETS:-}"
+TARGETS_DIR="${TARGETS_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/targets}"
+TARGETS=""
+# How long to wait for Open WebUI's first start before adding companions.
+OPENWEBUI_WAIT_SECONDS="${OPENWEBUI_WAIT_SECONDS:-900}"
+# An Open WebUI admin key for the companions may be preset; it is taken out of
+# the environment at once, so no child process sees it.
+TARGET_ADMIN_TOKEN="${OPENWEBUI_ADMIN_TOKEN:-}"
+unset OPENWEBUI_ADMIN_TOKEN
 # Populated by the prompts: normalised base URLs, and 0-based index lists.
 MODEL_SERVERS=()
 TIER_FAST_IDX=""
@@ -260,31 +278,44 @@ require_command() {
   fi
 }
 find_next_ct_id() {
-  local candidate="" next_id=""
+  local next_id=""
   if [[ -n "$CT_ID" ]]; then
     if [[ ! "$CT_ID" =~ ^[0-9]+$ ]]; then
       echo "CT_ID must be numeric when provided." >&2
       return 1
     fi
-    if pct status "$CT_ID" >/dev/null 2>&1; then
-      echo "Requested CT_ID ${CT_ID} already exists." >&2
+    if ! ct_id_free "$CT_ID"; then
+      echo "Requested CT_ID ${CT_ID} is in use or not available in this cluster." >&2
       return 1
     fi
     printf '%s\n' "$CT_ID"
     return 0
   fi
-  if command -v pvesh >/dev/null 2>&1; then
-    next_id="$(pvesh get /cluster/nextid 2>/dev/null | awk 'NF {print $1; exit}')"
-    if [[ "$next_id" =~ ^[0-9]+$ ]] && ! pct status "$next_id" >/dev/null 2>&1; then
-      printf '%s\n' "$next_id"
-      return 0
-    fi
+  next_id="$(cluster_next_ct_id)" || return 1
+  if [[ -n "$next_id" ]] && ct_id_free "$next_id"; then
+    printf '%s\n' "$next_id"
+    return 0
   fi
-  candidate=100
-  while pct status "$candidate" >/dev/null 2>&1; do
-    candidate=$((candidate + 1))
-  done
-  printf '%s\n' "$candidate"
+  next_free_ct_id_excluding
+}
+
+# The cluster's own next free CT ID, or nothing when pvesh is not installed.
+# A pvesh that cannot answer means the guest list is unreadable (pve-cluster
+# down, /etc/pve not mounted): every later ID check would fail too, so stop
+# here instead of scanning IDs that can never be confirmed free.
+cluster_next_ct_id() {
+  local next_id=""
+  command -v pvesh >/dev/null 2>&1 || return 0
+  if ! next_id="$(pvesh get /cluster/nextid 2>/dev/null)"; then
+    next_id=""
+  fi
+  next_id="$(awk 'NF {print $1; exit}' <<< "$next_id")"
+  if [[ ! "$next_id" =~ ^[0-9]+$ ]]; then
+    echo "Cannot read the cluster's guest list (pvesh get /cluster/nextid failed)." >&2
+    echo "Check that pve-cluster is running and /etc/pve is mounted." >&2
+    return 1
+  fi
+  printf '%s\n' "$next_id"
 }
 # --- storage discovery -------------------------------------------------------
 # Content types a storage declares, read straight from the cluster config. Used
@@ -778,6 +809,519 @@ prompt_until_valid() {
   done
 }
 
+# True when no guest in the cluster uses the ID (pct only sees this node).
+ct_id_free() {
+  if command -v pvesh >/dev/null 2>&1; then
+    pvesh get /cluster/nextid --vmid "$1" >/dev/null 2>&1
+  else
+    ! pct status "$1" >/dev/null 2>&1
+  fi
+}
+
+# The lowest free CT ID that is not one of the arguments. The arguments are IDs
+# this run will use later (the router's CT_ID), which the cluster cannot know.
+# The scan is capped, so an ID check that never succeeds cannot loop forever.
+next_free_ct_id_excluding() {
+  local candidate="" id reserved tries=0
+  candidate="$(cluster_next_ct_id)" || return 1
+  [[ -n "$candidate" ]] || candidate=100
+  while (( tries < 1000 )); do
+    reserved=false
+    for id in "$@"; do [[ "$id" == "$candidate" ]] && reserved=true; done
+    if ! $reserved && ct_id_free "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    candidate=$((candidate + 1)); tries=$((tries + 1))
+  done
+  echo "No free CT ID found below ${candidate}." >&2
+  return 1
+}
+
+# A service LXC created in this run exists to give the router that feature, so
+# stop before building the router if its repository or webhook is not in use.
+require_companion_credentials() {
+  local status=0
+  if [[ " ${TARGETS:-} " == *" gitea "* && "$CONFIG_SOURCE" != "repo" ]]; then
+    echo "The new Gitea LXC (CT $(target_setting gitea CT_ID)) is ready, but the router is not" >&2
+    echo "using it (no Gitea URL, or its token or repository check failed). Rerun the" >&2
+    echo "router installer without selecting gitea, with GITEA_SERVER_URL, GITEA_ADMIN_USER" >&2
+    echo "and GITEA_DEPLOY_TOKEN from /etc/gitea-target/ in that CT." >&2
+    status=1
+  fi
+  if [[ " ${TARGETS:-} " == *" mattermost "* && -z "$MATTERMOST_WEBHOOK_URL" ]]; then
+    echo "The new Mattermost LXC (CT $(target_setting mattermost CT_ID)) is ready, but no alert" >&2
+    echo "webhook was kept. Rerun the router installer without selecting mattermost, with" >&2
+    echo "MATTERMOST_WEBHOOK_URL from /etc/mattermost-target/webhook-url in that CT." >&2
+    status=1
+  fi
+  return "$status"
+}
+
+# --- optional targets ---------------------------------------------------------
+# Services, inference targets and companions from targets/, each in its own
+# LXC, chosen at the start of an interactive install. Services (Gitea,
+# Mattermost) are created first, before the router is built, and give it their
+# URL, token or webhook. Model targets are added to the router's server list up
+# front and created after the router; companions need the router's Open WebUI,
+# so they come last.
+#
+# One line per target: name|phase|label|router entry (@IP@ and @PORT@ filled
+# in)|key kind (Strata-style servers generate an API key the router needs).
+target_table() {
+  printf '%s\n' \
+    'gitea|service|Gitea: the configuration repository (configured for the router)||' \
+    'mattermost|service|Mattermost: health alerts (team, channel and webhook made for you)||' \
+    'ollama|model|Ollama from the PVE community script (GPU passed through when present)|http://@IP@:11434|' \
+    'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (Debian 12)|http://@IP@:11434|' \
+    'airllm|model|AirLLM: one model larger than RAM/VRAM, streamed from disk (slow)|http://@IP@:11434|' \
+    'strata|model|Strata (Qwen3.8-Flash-Next) on an NVIDIA GPU|strata+http://@IP@:@PORT@|strata' \
+    'basalt|model|Basalt on a Blackwell GPU (CUDA 13)|basalt+http://@IP@:@PORT@|basalt' \
+    'maya|model|Project Maya (GLM-5.3-Flash) on an NVIDIA GPU|maya+http://@IP@:@PORT@|maya' \
+    'open-terminal|companion|Open Terminal: a shell tool for Open WebUI||' \
+    'hermes|companion|Hermes Agent: offered in Open WebUI as the model hermes-agent||'
+}
+# target_field NAME FIELD: one column of the table (phase, label, entry, key).
+target_field() {
+  local column
+  case "$2" in
+    phase) column=2 ;; label) column=3 ;; entry) column=4 ;; key) column=5 ;;
+    *) return 1 ;;
+  esac
+  target_table | awk -F'|' -v n="$1" -v c="$column" '$1 == n {print $c; found=1} END {exit !found}'
+}
+# target_var_prefix NAME: the prefix of a target's presets (OPEN_TERMINAL_CT_ID).
+target_var_prefix() { printf '%s\n' "$1" | tr 'a-z-' 'A-Z_'; }
+# target_setting NAME FIELD: a target's chosen or preset <PREFIX>_<FIELD>.
+target_setting() {
+  local var
+  var="$(target_var_prefix "$1")_$2"
+  printf '%s\n' "${!var:-}"
+}
+# llama.cpp's guest install needs a model; without one only the CT is made.
+llamacpp_model_given() {
+  [[ -n "${MODEL_ALIAS:-}" && ( -n "${MODEL_DOWNLOAD_URL:-}" || -n "${MODEL_PATH:-}" ) ]]
+}
+# Strata, Basalt and Maya take a template; the others choose or prompt for theirs.
+target_needs_template() { [[ "$1" == strata || "$1" == basalt || "$1" == maya ]]; }
+
+# A selection is blank, "none", or target names and/or menu numbers separated
+# by commas or spaces.
+valid_target_selection() {
+  local sel="${1//,/ }" token count
+  count="$(target_table | wc -l)"
+  [[ -z "${sel// /}" || "${sel// /}" == none ]] && return 0
+  for token in $sel; do
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      (( 10#$token >= 1 && 10#$token <= count )) || return 1
+    else
+      target_field "$token" phase >/dev/null || return 1
+    fi
+  done
+}
+# normalize_target_selection SEL: the selected names, in table order, once each.
+normalize_target_selection() {
+  local sel="${1//,/ }" token wanted=" " name i=0
+  [[ "${sel// /}" == none ]] && sel=""
+  for token in $sel; do
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      token="$(target_table | awk -F'|' -v n="$((10#$token))" 'NR == n {print $1}')"
+    fi
+    wanted+="${token} "
+  done
+  local picked=()
+  while IFS='|' read -r name _; do
+    i=$((i + 1))
+    if [[ "$wanted" == *" ${name} "* ]]; then picked+=("$name"); fi
+  done < <(target_table)
+  printf '%s\n' "${picked[*]:-}"
+}
+
+prompt_target_selection() {
+  local name phase label i=0 prev_phase=""
+  TARGETS=""
+  # INSTALL_GITEA / INSTALL_MATTERMOST (the earlier yes/no questions) pre-select.
+  [[ "$INSTALL_GITEA" != "true" ]] || INSTALL_TARGETS="gitea ${INSTALL_TARGETS:-}"
+  [[ "$INSTALL_MATTERMOST" != "true" ]] || INSTALL_TARGETS="mattermost ${INSTALL_TARGETS:-}"
+  if [[ "$NONINTERACTIVE" == "true" ]]; then
+    valid_target_selection "$INSTALL_TARGETS" || {
+      echo "Invalid INSTALL_TARGETS: '${INSTALL_TARGETS}'" >&2; return 1; }
+    if [[ -n "$(normalize_target_selection "$INSTALL_TARGETS")" ]]; then
+      echo "INSTALL_TARGETS (or INSTALL_GITEA/INSTALL_MATTERMOST) needs an interactive run" >&2
+      echo "(the community-script menus, GPU selection and the Open WebUI admin key)." >&2
+      echo "Install the router unattended without it, then run" >&2
+      echo "targets/<name>/provision-lxc.sh for each target." >&2
+      return 1
+    fi
+    return 0
+  fi
+  echo
+  echo "--- Optional targets, each in its own LXC ---"
+  while IFS='|' read -r name phase label _; do
+    i=$((i + 1))
+    if [[ "$phase" != "$prev_phase" ]]; then
+      case "$phase" in
+        service) echo "Services: created now, before the router, and connected to it." ;;
+        model) echo "Model servers: created after the router and added to its server list." ;;
+        companion) echo "Companions: added to the router's Open WebUI once it is running." ;;
+      esac
+    fi
+    printf '  %d) %-14s %s\n' "$i" "$name" "$label"
+    prev_phase="$phase"
+  done < <(target_table)
+  echo "Target-specific settings (GPU_DEVICES, STRATA_MODEL, HERMES_MODEL, ...) are read"
+  echo "from the environment as each target's README describes."
+  prompt_until_valid "Targets to create (numbers or names, comma-separated; none)" \
+    INSTALL_TARGETS "${INSTALL_TARGETS:-none}" valid_target_selection || return 1
+  TARGETS="$(normalize_target_selection "$INSTALL_TARGETS")"
+  [[ -n "$TARGETS" ]] || return 0
+  for name in $TARGETS; do
+    if [[ ! -r "${TARGETS_DIR}/${name}/provision-lxc.sh" ]]; then
+      echo "Cannot install ${name}: ${TARGETS_DIR}/${name}/provision-lxc.sh is missing." >&2
+      echo "Run the router installer from the full repository checkout." >&2
+      return 1
+    fi
+  done
+  echo "Selected targets: ${TARGETS}"
+}
+
+# Validators for the per-target prompts. TARGET_RESERVED_IDS / _IPS hold the
+# router's and the earlier targets' values.
+valid_target_ct_id() {
+  [[ "$1" =~ ^[1-9][0-9]{2,8}$ ]] || return 1
+  [[ " ${TARGET_RESERVED_IDS:-} " != *" $1 "* ]] || { echo "    CT $1 is already used by this install." >&2; return 1; }
+  ct_id_free "$1" || { echo "    CT $1 already exists." >&2; return 1; }
+}
+valid_target_ip() {
+  valid_cidr "$1" || return 1
+  [[ " ${TARGET_RESERVED_IPS:-} " != *" ${1%/*} "* ]] || { echo "    ${1%/*} is already used by this install." >&2; return 1; }
+}
+valid_target_template() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-22\.04|ubuntu-24\.04|debian-12|debian-13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]]
+}
+
+# default_gpu_target_template: the newest downloaded Ubuntu 24.04, Ubuntu
+# 22.04 or Debian 12 standard template (in that order), else the newest
+# Ubuntu 24.04 template pveam can download into TEMPLATE_STORAGE. (Debian 13
+# needs CUDA 13.1+, which Maya's and Basalt's defaults are not.)
+default_gpu_target_template() {
+  local storage distro ref name
+  for distro in ubuntu-24.04 ubuntu-22.04 debian-12; do
+    while IFS= read -r storage; do
+      ref="$(pveam list "$storage" 2>/dev/null |
+        awk -v p="^${storage}:vztmpl/${distro}-standard_" '$1 ~ p && $1 ~ /_amd64\.tar\.(zst|gz|xz)$/ {print $1}' |
+        sort -V | tail -n 1)"
+      if [[ -n "$ref" ]]; then printf '%s\n' "$ref"; return 0; fi
+    done < <(template_storages)
+  done
+  name="$(pveam available --section system 2>/dev/null |
+    awk '$2 ~ /^ubuntu-24\.04-standard_.*_amd64\.tar\.(zst|gz|xz)$/ {print $2}' | sort -V | tail -n 1)"
+  [[ -n "$name" ]] || return 1
+  printf '%s:vztmpl/%s\n' "$TEMPLATE_STORAGE" "$name"
+}
+# ensure_target_template REF: download REF with pveam unless it is there.
+ensure_target_template() {
+  local storage="${1%%:*}" name="${1#*:vztmpl/}"
+  pveam list "$storage" 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq -- "$1" && return 0
+  echo "Downloading template ${name} to ${storage}."
+  pveam download "$storage" "$name"
+}
+
+# For each selected target: CT ID, static address and storage (and a template
+# for Strata, Basalt and Maya), asked now so a typo costs a re-prompt. Presets:
+# <NAME>_CT_ID, <NAME>_IP_CIDR, <NAME>_STORAGE, <NAME>_TEMPLATE.
+prompt_target_settings() {
+  local name prefix id_var ip_var storage_var template_var default ip
+  [[ -n "${TARGETS:-}" ]] || return 0
+  echo
+  echo "--- Target containers ---"
+  echo "  Each target gets a static address on ${BRIDGE} with gateway ${GATEWAY},"
+  echo "  so the router can reach it."
+  TARGET_RESERVED_IDS="$CT_ID"
+  TARGET_RESERVED_IPS="${IP_CIDR%/*}"
+  for name in $TARGETS; do
+    prefix="$(target_var_prefix "$name")"
+    id_var="${prefix}_CT_ID"; ip_var="${prefix}_IP_CIDR"
+    storage_var="${prefix}_STORAGE"; template_var="${prefix}_TEMPLATE"
+    echo "  ${name}: $(target_field "$name" label)"
+    default="${!id_var:-}"
+    if [[ -z "$default" ]]; then
+      # shellcheck disable=SC2086  # a list of IDs
+      default="$(next_free_ct_id_excluding $TARGET_RESERVED_IDS)" || return 1
+    fi
+    prompt_until_valid "    CT ID" "$id_var" "$default" valid_target_ct_id || return 1
+    TARGET_RESERVED_IDS+=" ${!id_var}"
+    prompt_until_valid "    IP address / CIDR" "$ip_var" "${!ip_var:-}" valid_target_ip || return 1
+    ip="${!ip_var}"
+    TARGET_RESERVED_IPS+=" ${ip%/*}"
+    if ! ip_in_same_subnet "$ip" "$GATEWAY"; then
+      echo "    WARNING: gateway ${GATEWAY} is outside ${ip}." >&2
+    fi
+    prompt_until_valid "    Storage" "$storage_var" "${!storage_var:-$STORAGE}" valid_nonempty || return 1
+    if target_needs_template "$name"; then
+      default="${!template_var:-}"
+      [[ -n "$default" ]] || default="$(default_gpu_target_template)" || default=""
+      prompt_until_valid "    Template (Ubuntu 22.04/24.04 or Debian 12/13; downloaded if missing)" \
+        "$template_var" "$default" valid_target_template || return 1
+    fi
+  done
+}
+
+# target_server_entry NAME: the router's server entry for a model target.
+target_server_entry() {
+  local name="$1" prefix ip_var entry port_var
+  prefix="$(target_var_prefix "$name")"
+  ip_var="${prefix}_IP_CIDR"; port_var="${prefix}_PORT"
+  entry="$(target_field "$name" entry)" || return 1
+  [[ -n "$entry" ]] || return 1
+  entry="${entry//@IP@/${!ip_var%/*}}"
+  printf '%s\n' "${entry//@PORT@/${!port_var:-8080}}"
+}
+
+# The model targets go first in the server prompt, so they get tiers and are in
+# the router's configuration from the start. Configured defaults move behind
+# them; raise the count to keep existing servers too.
+preset_target_model_servers() {
+  local name i from to n entries=()
+  for name in ${TARGETS:-}; do
+    [[ "$(target_field "$name" phase)" == model ]] || continue
+    entries+=("$(target_server_entry "$name")")
+  done
+  n=${#entries[@]}
+  (( n > 0 )) || return 0
+  for (( i = MODEL_SERVER_MAX; i > n; i-- )); do
+    from="MODEL_SERVER_$(( i - n ))"; to="MODEL_SERVER_${i}"
+    printf -v "$to" '%s' "${!from:-}"
+  done
+  for (( i = 1; i <= n; i++ )); do
+    printf -v "MODEL_SERVER_${i}" '%s' "${entries[i - 1]}"
+  done
+  MODEL_SERVER_COUNT=$n
+  echo
+  echo "  The new model targets are servers 1-${n} below. They answer once they are"
+  echo "  created after the router; until then the router skips them. Raise the"
+  echo "  count to keep other servers as well."
+}
+
+# run_target_provisioner NAME: the target's provision-lxc.sh with its own CT
+# settings. Runs in a subshell: the router's CT_ID, IP_CIDR, CORES, ROOTFS_GB
+# and the like must not reach a target, and the admin token only reaches the
+# companions (as an environment variable, never an argument).
+run_target_provisioner() {
+  local name="$1" phase script id ip storage template
+  local -a flags=()
+  phase="$(target_field "$name" phase)" || return 1
+  script="${TARGETS_DIR}/${name}/provision-lxc.sh"
+  [[ -r "$script" ]] || { echo "Missing ${script}." >&2; return 1; }
+  id="$(target_setting "$name" CT_ID)"
+  ip="$(target_setting "$name" IP_CIDR)"
+  storage="$(target_setting "$name" STORAGE)"
+  template="$(target_setting "$name" TEMPLATE)"
+  [[ -n "$id" && -n "$ip" ]] || { echo "${name}: no CT ID or address was chosen." >&2; return 1; }
+  case "$name" in
+    ollama|airllm) flags=(--install-target) ;;
+    llamacpp) if llamacpp_model_given; then flags=(--install-target); fi ;;
+    open-terminal|hermes) template="${template:-${TEMPLATE_REF:-}}" ;;
+  esac
+  local script_url script_sha channel="${MATTERMOST_CHANNEL:-ollama-monitor}"
+  script_url="$(target_setting "$name" COMMUNITY_SCRIPT_URL)"
+  script_sha="$(target_setting "$name" COMMUNITY_SCRIPT_SHA256)"
+  (
+    local router_ct="$CT_ID" gateway="$GATEWAY" bridge="$BRIDGE" nameserver="$NAMESERVER"
+    local webui_port="$OPENWEBUI_PORT" admin_token="${TARGET_ADMIN_TOKEN:-}"
+    unset CT_ID CT_NAME CT_HOSTNAME IP_CIDR GATEWAY STORAGE BRIDGE NAMESERVER VLAN_TAG \
+      CORES MEMORY MEMORY_MB SWAP SWAP_MB ROOTFS_GB ONBOOT TEMPLATE FIREWALL NONINTERACTIVE \
+      ROUTER ROUTER_CT_ID ROUTER_SSH_HOST ROUTER_IP ROUTER_URL ROUTER_API_KEY \
+      OPENWEBUI_PORT OPENWEBUI_ADMIN_TOKEN TARGET_ADMIN_TOKEN
+    export CT_ID="$id" IP_CIDR="$ip" GATEWAY="$gateway" STORAGE="$storage" BRIDGE="$bridge"
+    [[ -z "$nameserver" ]] || export NAMESERVER="$nameserver"
+    [[ -z "$template" ]] || export TEMPLATE="$template"
+    # GITEA_COMMUNITY_SCRIPT_URL / _SHA256 (and MATTERMOST_*) select and pin a
+    # service's community script; the provisioner calls them COMMUNITY_SCRIPT_*.
+    unset COMMUNITY_SCRIPT_URL COMMUNITY_SCRIPT_SHA256
+    [[ -z "$script_url" ]] || export COMMUNITY_SCRIPT_URL="$script_url"
+    [[ -z "$script_sha" ]] || export COMMUNITY_SCRIPT_SHA256="$script_sha"
+    [[ "$name" != mattermost ]] || export MATTERMOST_CHANNEL="$channel"
+    if [[ "$phase" == companion ]]; then
+      export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
+      OPENWEBUI_ADMIN_TOKEN="$admin_token" exec bash "$script" "${flags[@]}"
+    fi
+    exec bash "$script" "${flags[@]}"
+  )
+}
+
+# service_result NAME FILE: one of a service CT's /etc/<name>-target/ results.
+service_result() {
+  pct exec "$(target_setting "$1" CT_ID)" -- cat "/etc/${1}-target/$2" 2>/dev/null | tr -d '\r\n'
+}
+
+# provision_service_targets: create the selected services now, before the
+# router is built, and take what the router needs from them: Gitea's URL,
+# router account and token, Mattermost's webhook. They become the defaults of
+# the Gitea and Mattermost prompts (which still check them). A failure stops
+# the install before anything for the router exists; the CT stays.
+provision_service_targets() {
+  local name id value
+  SERVICES_DONE=""
+  for name in ${TARGETS:-}; do
+    [[ "$(target_field "$name" phase)" == service ]] || continue
+    id="$(target_setting "$name" CT_ID)"
+    echo
+    echo "=== Target ${name} (CT ${id}), before the router ==="
+    if ! run_target_provisioner "$name"; then
+      echo "Creating ${name} failed. CT ${id}, if it was made, is kept: repair it with" >&2
+      echo "  CT_ID=${id} bash ${TARGETS_DIR}/${name}/provision-lxc.sh --reconfigure" >&2
+      echo "then rerun the router installer without selecting ${name}." >&2
+      return 1
+    fi
+    case "$name" in
+      gitea)
+        GITEA_SERVER_URL="$(service_result gitea url)"
+        GITEA_ADMIN_USER="$(service_result gitea router-user)"
+        GITEA_DEPLOY_TOKEN="$(service_result gitea router-token)"
+        if [[ -z "$GITEA_SERVER_URL" || -z "$GITEA_ADMIN_USER" || -z "$GITEA_DEPLOY_TOKEN" ]]; then
+          echo "Gitea in CT ${id} gave no URL, router account or token (/etc/gitea-target/)." >&2
+          return 1
+        fi
+        echo "Gitea at ${GITEA_SERVER_URL}: the router uses its account ${GITEA_ADMIN_USER}." ;;
+      mattermost)
+        value="$(service_result mattermost webhook-url)"
+        if [[ -z "$value" ]]; then
+          echo "Mattermost in CT ${id} gave no webhook URL (/etc/mattermost-target/webhook-url)." >&2
+          return 1
+        fi
+        MATTERMOST_WEBHOOK_URL="$value"
+        echo "Mattermost alerts go to its channel ${MATTERMOST_CHANNEL:-ollama-monitor}." ;;
+    esac
+    SERVICES_DONE+="${name} "
+  done
+}
+
+# register_target_key NAME: give the router a Strata-style target's generated
+# key (set-<kind>-token reads it from stdin, twice, so it never is an argument).
+# Targets without a key need nothing.
+register_target_key() {
+  local name="$1" kind id key
+  kind="$(target_field "$name" key)" || return 1
+  [[ -n "$kind" ]] || return 0
+  id="$(target_setting "$name" CT_ID)"
+  key="$(pct exec "$id" -- cat "/etc/${kind}-target/api-key" 2>/dev/null | tr -d '\r\n')" || key=""
+  if [[ -z "$key" ]]; then
+    echo "WARNING: could not read /etc/${kind}-target/api-key in CT ${id}; set it on the router" >&2
+    echo "         with: manage-model-servers set-${kind}-token --apply" >&2
+    return 1
+  fi
+  printf '%s\n%s\n' "$key" "$key" | run_ct /usr/local/bin/manage-model-servers "set-${kind}-token"
+}
+
+# wait_for_openwebui: Open WebUI's first start downloads an embedding model.
+wait_for_openwebui() {
+  local deadline=$(( SECONDS + ${OPENWEBUI_WAIT_SECONDS:-900} ))
+  echo "Waiting for Open WebUI to finish its first start..."
+  while (( SECONDS < deadline )); do
+    if run_ct curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:${OPENWEBUI_PORT}/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "Open WebUI did not answer within ${OPENWEBUI_WAIT_SECONDS:-900}s." >&2
+  return 1
+}
+
+# prompt_openwebui_admin_token: the companions register through Open WebUI's
+# admin API, and its first account (the admin) is created in the browser.
+prompt_openwebui_admin_token() {
+  [[ -z "${TARGET_ADMIN_TOKEN:-}" ]] || return 0
+  echo
+  echo "--- Open WebUI admin key for the companions ---"
+  echo "  1. Open http://${IP_CIDR%/*}:${OPENWEBUI_PORT} and create the admin account."
+  echo "  2. Admin Settings > Authentication: enable API keys."
+  echo "  3. Settings > Account > API keys: create a key, and paste it here."
+  read -r -s -p "Open WebUI admin API key or JWT (blank skips the companions): " TARGET_ADMIN_TOKEN || true
+  echo
+  [[ -n "$TARGET_ADMIN_TOKEN" ]]
+}
+
+# provision_selected_targets: after the router is up, create the model
+# targets, give the router their keys, then add the companions. A failed target
+# leaves the router as it is; the summary says how to retry.
+provision_selected_targets() {
+  local name id companions=false status=0
+  local -a key_targets=()
+  declare -A result=()
+  [[ -n "${TARGETS:-}" ]] || return 0
+  for name in $TARGETS; do
+    case "$(target_field "$name" phase)" in
+      service)
+        if [[ " ${SERVICES_DONE:-} " == *" ${name} "* ]]; then result[$name]="ok (created before the router)"; fi
+        continue ;;
+      companion) companions=true; continue ;;
+    esac
+    id="$(target_setting "$name" CT_ID)"
+    echo
+    echo "=== Target ${name} (CT ${id}) ==="
+    if target_needs_template "$name" &&
+       ! ensure_target_template "$(target_setting "$name" TEMPLATE)"; then
+      result[$name]="failed (template download)"; continue
+    fi
+    if ! run_target_provisioner "$name"; then
+      result[$name]=failed; continue
+    fi
+    result[$name]=ok
+    if [[ "$name" == llamacpp ]] && ! llamacpp_model_given; then
+      result[$name]="ok (CT only: run install-target.sh in it with a model)"
+    fi
+    if [[ -n "$(target_field "$name" key)" ]]; then
+      if register_target_key "$name"; then
+        key_targets+=("$name")
+      else
+        result[$name]="ok (router key not set)"
+      fi
+    fi
+  done
+  if (( ${#key_targets[@]} > 0 )); then
+    echo "Applying the target keys on the router."
+    if ! run_ct /usr/local/bin/manage-model-servers apply; then
+      echo "ERROR: manage-model-servers apply failed in router CT ${CT_ID}." >&2
+      for name in "${key_targets[@]}"; do
+        result[$name]="failed (router key apply)"
+      done
+    fi
+  fi
+  if $companions; then
+    if wait_for_openwebui && prompt_openwebui_admin_token; then
+      for name in $TARGETS; do
+        [[ "$(target_field "$name" phase)" == companion ]] || continue
+        echo
+        echo "=== Target ${name} (CT $(target_setting "$name" CT_ID)) ==="
+        if run_target_provisioner "$name"; then result[$name]=ok; else result[$name]=failed; fi
+      done
+    else
+      for name in $TARGETS; do
+        [[ "$(target_field "$name" phase)" == companion ]] && result[$name]="skipped (no Open WebUI admin key)"
+      done
+    fi
+    TARGET_ADMIN_TOKEN=""
+  fi
+  echo
+  echo "=============================================================================="
+  echo "Targets:"
+  for name in $TARGETS; do
+    id="$(target_setting "$name" CT_ID)"
+    printf '  %-14s CT %-6s %s\n' "$name" "$id" "${result[$name]:-not run}"
+    if [[ "${result[$name]:-}" != ok* || "${result[$name]}" == *"not set"* ]]; then
+      status=1
+      if [[ "${result[$name]}" == "failed (router key apply)" ]]; then
+        echo "                 run pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers apply"
+      else
+        echo "                 see targets/${name}/README.md; rerun targets/${name}/provision-lxc.sh"
+      fi
+    fi
+  done
+  echo "=============================================================================="
+  return "$status"
+}
+
 # --- interactive configuration ----------------------------------------------
 prompt_network_config() {
   echo
@@ -1260,11 +1804,16 @@ gitea_diagnose_rc() {
     6)  echo "WARNING: could not resolve the Gitea host in ${base}." >&2
         echo "         Check DNS for that name from this Proxmox host." >&2 ;;
     7)  echo "WARNING: could not connect to ${base}." >&2
-        echo "         The TurnKey Gitea appliance serves on 80/443 via nginx;" >&2
-        echo "         Gitea's own port 3000 is localhost-only inside that container." >&2 ;;
-    22) echo "WARNING: Gitea returned an HTTP error (likely 401 Unauthorized)." >&2
-        echo "         Check the token's scopes, and that the URL is https:// —" >&2
-        echo "         an http:// URL loses the token on the redirect." >&2 ;;
+        echo "         Check the scheme and port: a Gitea from tools/install-gitea.sh serves" >&2
+        echo "         http on port 3000, while the TurnKey appliance serves 80/443 via" >&2
+        echo "         nginx (its Gitea port 3000 is localhost-only inside that container)." >&2 ;;
+    22) echo "WARNING: Gitea returned an HTTP error (likely 401 Unauthorized or 403 Forbidden)." >&2
+        echo "         Existing repositories need read:user and write:repository." >&2
+        echo "         Automatic repository creation also needs write:user (includes read:user)." >&2
+        echo "         The same scopes cover an organisation-owned repository, but for any" >&2
+        echo "         repository it does not own, the account needs Write access to it." >&2
+        echo "         If the server redirects http:// to https://, use the https:// URL:" >&2
+        echo "         the token is dropped on that redirect." >&2 ;;
     60) echo "WARNING: TLS certificate verification failed for ${base}." >&2
         if [[ "$GITEA_VERIFY_TLS" == "true" ]]; then
           echo "         TurnKey appliances ship a self-signed certificate. Either" >&2
@@ -1546,9 +2095,11 @@ test_gitea_access() {
   auth="Authorization: token ${token}"
 
   if [[ "$base" == http://* ]]; then
-    echo "WARNING: GITEA_SERVER_URL uses http://. The TurnKey appliance redirects" >&2
-    echo "         to HTTPS, and curl drops the auth token across that redirect," >&2
-    echo "         which shows up as a 401. Use https:// instead." >&2
+    echo "NOTE: GITEA_SERVER_URL uses http://, so the token is sent unencrypted." >&2
+    echo "      That suits a Gitea on a trusted network (tools/install-gitea.sh serves" >&2
+    echo "      http on port 3000). If the server redirects to HTTPS, as the TurnKey" >&2
+    echo "      appliance does, use its https:// URL: curl drops the token on that" >&2
+    echo "      redirect, which shows up as a 401." >&2
   fi
 
   echo "Testing Gitea access at ${base} ..."
@@ -1567,7 +2118,16 @@ test_gitea_access() {
       ;;
     2)
       # Not found anywhere the token can see — create it under the token owner.
-      owner="${GITEA_REPO_OWNER:-$GITEA_OWNER}"
+      # POST /user/repos can only create there, so a different explicit owner
+      # (an organisation or another account) must hold the repository already.
+      if [[ -n "$GITEA_REPO_OWNER" && "${GITEA_REPO_OWNER,,}" != "${owner,,}" ]]; then
+        echo "WARNING: ${GITEA_REPO_OWNER}/${repo_name} does not exist, and the installer" >&2
+        echo "         creates repositories only under the token owner (${owner})." >&2
+        echo "         Create it in Gitea first and give ${owner} Write access to it," >&2
+        echo "         or unset GITEA_REPO_OWNER to create ${owner}/${repo_name}." >&2
+        return 1
+      fi
+      owner="$GITEA_OWNER"
       echo "Creating repository ${owner}/${repo_name}."
       payload="$(printf '{"name":"%s","private":%s,"auto_init":true,"default_branch":"main","description":"Provisioned by the ollama-smart-router installer"}' \
         "$repo_name" "$GITEA_REPO_PRIVATE")"
@@ -1622,6 +2182,9 @@ require_command pct
 require_command curl
 require_command python3
 
+# Which targets to create alongside the router (their settings follow below).
+prompt_target_selection || exit 1
+
 CT_ID="$(find_next_ct_id)"
 ROOT_PASSWORD=""
 GITEA_DEPLOY_TOKEN="${GITEA_DEPLOY_TOKEN:-}"
@@ -1633,6 +2196,10 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 # offers a default (Enter accepts); NONINTERACTIVE=true takes all defaults.
 prompt_network_config
 prompt_storage_config
+prompt_target_settings || exit 1
+# Gitea and Mattermost, if selected, are created now: the prompts below take
+# their URL, token and webhook.
+provision_service_targets || exit 1
 
 # Ask for the Gitea URL, username + auth token and verify them against the
 # server. GITEA_DEPLOY_TOKEN may be preset in the environment for unattended
@@ -1640,6 +2207,7 @@ prompt_storage_config
 prompt_gitea_credentials
 
 prompt_mattermost_config
+preset_target_model_servers
 prompt_model_servers
 
 # Ensure the config repo exists and that the token can write to it. Non-fatal:
@@ -1650,6 +2218,7 @@ if [[ "$CONFIG_SOURCE" == "repo" ]]; then
     CONFIG_SOURCE="local"
   fi
 fi
+require_companion_credentials || exit 1
 
 echo "Updating Proxmox appliance template index."
 pveam update
@@ -1803,7 +2372,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1854,6 +2423,14 @@ _DEFAULTS = {
         # discovered model looks vision-capable. false: route it anyway and
         # flag it with an X-Router-Warning header.
         "vision_strict": "false",
+        # Requests that carry tools (agents, function calling) are raised to at
+        # least this class: small models are poor at tool use. Blank: no floor.
+        # A tier alias named by the client still pins the class.
+        "tools_min_class": "large",
+        # true: a tool request fails with HTTP 400 when every discovered model
+        # is known to lack tool support. false: route it anyway, flagged with
+        # an X-Router-Warning header.
+        "tools_strict": "false",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -1908,6 +2485,9 @@ _DEFAULTS = {
         # Bonus for a model that is already resident in memory (LM Studio
         # reports this per model; Ollama entries are neutral).
         "loaded_bonus": "0.1",
+        # Bonus, on a tool request, for a model the server reports as
+        # tool-capable over one whose tool support is unknown.
+        "tool_match": "0.3",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
     # Basalt, Maya) lists without a parameter count. Matching is by the whole
@@ -2064,6 +2644,7 @@ W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
 W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
+W_TOOLS = _cfg.getfloat("weights", "tool_match")
 
 # --- server kinds -----------------------------------------------------------------
 # A server entry is a base URL. Entries for servers that are not Ollama carry a
@@ -2115,6 +2696,13 @@ def backend_headers(server: str) -> dict:
 
 CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
 VISION_STRICT = _cfg.getboolean("classification", "vision_strict")
+CLASS_ORDER = ("fast", "medium", "large", "xlarge")
+TOOLS_MIN_CLASS = _cfg.get("classification", "tools_min_class").strip().lower()
+if TOOLS_MIN_CLASS and TOOLS_MIN_CLASS not in CLASS_ORDER:
+    log.warning("ignoring [classification] tools_min_class = %r (use one of %s, "
+                "or blank)", TOOLS_MIN_CLASS, ", ".join(CLASS_ORDER))
+    TOOLS_MIN_CLASS = ""
+TOOLS_STRICT = _cfg.getboolean("classification", "tools_strict")
 CONNECT_TIMEOUT = _cfg.getfloat("http", "connect_timeout_seconds")
 READ_TIMEOUT = _cfg.getfloat("http", "read_timeout_seconds")
 
@@ -2245,6 +2833,15 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
     if caps:
         is_vision = "vision" in caps
         is_embedding = "embedding" in caps and "completion" not in caps
+    # Tool support: True, False, or None (unknown). Ollama's /api/show list is
+    # authoritative (the llama.cpp bridge and AirLLM answer it too). Other
+    # kinds say so explicitly in raw["tools"] or not at all.
+    if "tools" in raw:
+        tools = raw["tools"]
+    elif caps and server_kind(server) == "ollama":
+        tools = "tools" in caps
+    else:
+        tools = None
     return {
         "server": server,
         "name": name,
@@ -2256,6 +2853,7 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         "is_code": _matches_any(lowered, CODE_MODELS),
         "is_vision": is_vision,
         "is_embedding": is_embedding,
+        "tools": tools,
         # True/False when the server reports residency (LM Studio); None
         # when it does not (Ollama loads on demand and is not asked).
         "loaded": raw.get("loaded"),
@@ -2303,7 +2901,10 @@ def _lmstudio_v1_models(payload: dict) -> list:
         features = m.get("capabilities") or {}
         if features.get("vision"):
             caps.append("vision")
-        if features.get("trained_for_tool_use"):
+        # LM Studio gives untrained models its default tool format, so
+        # "not trained for tool use" is not "no tools": leave that unknown.
+        trained = bool(features.get("trained_for_tool_use"))
+        if trained:
             caps.append("tools")
         quant = m.get("quantization") or {}
         out.append({
@@ -2313,6 +2914,7 @@ def _lmstudio_v1_models(payload: dict) -> list:
                         "family": m.get("architecture") or "",
                         "quantization_level": quant.get("name") if isinstance(quant, dict) else quant},
             "capabilities": caps,
+            "tools": True if trained else None,
             "loaded": bool(m.get("loaded_instances")),
         })
     return out
@@ -2618,6 +3220,27 @@ def classify_request(messages: list) -> dict:
     image sent earlier still needs a vision model to see it."""
     need = classify_text(routing_text(messages))
     need["vision"] = any(_message_parts(m)[1] for m in (messages or []))
+    need["tools"] = False
+    return need
+
+
+def wants_tools(body: dict) -> bool:
+    """Does the request offer the model tools it may call? An empty list, or
+    tool_choice "none", asks for none."""
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools") or body.get("functions")
+    if not isinstance(tools, list) or not tools:
+        return False
+    return body.get("tool_choice") != "none" and body.get("function_call") != "none"
+
+
+def apply_tool_needs(need: dict, body: dict) -> dict:
+    """Mark a tool request, and raise its class to tools_min_class."""
+    need = dict(need, tools=wants_tools(body))
+    if need["tools"] and TOOLS_MIN_CLASS and \
+            CLASS_ORDER.index(need["class"]) < CLASS_ORDER.index(TOOLS_MIN_CLASS):
+        need["class"] = TOOLS_MIN_CLASS
     return need
 
 
@@ -2705,6 +3328,8 @@ def score_entry(entry: dict, need: dict) -> float:
             score += W_SMALLER * (1.0 - position)
     if entry.get("loaded"):
         score += W_LOADED
+    if need.get("tools") and entry.get("tools"):
+        score += W_TOOLS
     return score
 
 
@@ -2720,6 +3345,11 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
         if LMSTUDIO_LOADED_ONLY and entry["kind"] == "lmstudio" and entry.get("loaded") is False:
             continue  # would trigger a just-in-time load on LM Studio
         scored.append((score_entry(entry, need), entry))
+    if need.get("tools"):
+        # A model known to lack tools answers a tool request with an error.
+        # Keep the full list only when nothing else is left (the caller warns).
+        capable = [pair for pair in scored if pair[1].get("tools") is not False]
+        scored = capable or scored
     if not scored:
         return []
 
@@ -2753,8 +3383,16 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
             tied.append(e)
         else:
             rest.append(e)
+    if need.get("tools") and len(tied) > 1:
+        # An agent loop sends many requests for one task. Rotating between
+        # DIFFERENT models would change the model mid-task and discard the
+        # backend's prompt cache, so only the same model on several hosts
+        # shares the load.
+        best_name = tied[0]["name"]
+        rest = [e for e in tied if e["name"] != best_name] + rest
+        tied = [e for e in tied if e["name"] == best_name]
     if len(tied) > 1:
-        key = f"{need['class']}|{need['code']}|{need['vision']}"
+        key = f"{need['class']}|{need['code']}|{need['vision']}|{need.get('tools', False)}"
         index = _rotation.get(key, 0) % len(tied)
         _rotation[key] = index + 1
         tied = tied[index:] + tied[:index]
@@ -2864,6 +3502,22 @@ async def _stream_upstream(method: str, url: str, headers: dict,
 # Upstream statuses that mean "try the next candidate": the host is failing
 # (5xx) or no longer has the model (404, e.g. removed since the last poll).
 RETRYABLE_STATUS = {404} | set(range(500, 600))
+# A 400 that names tools, on a tool request, means "this model cannot call
+# tools" (Ollama: "... does not support tools"); the next candidate may.
+TOOL_ERROR_RE = re.compile(rb"\btools?\b|function.call", re.IGNORECASE)
+# Error bodies are small; never buffer more than this to inspect one.
+ERROR_PEEK_BYTES = 65536
+
+
+async def _read_raw(response: httpx.Response, limit: int = ERROR_PEEK_BYTES) -> bytes:
+    """The raw (still encoded) body of an error response, up to limit bytes."""
+    chunks, size = [], 0
+    async for chunk in response.aiter_raw():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= limit:
+            break
+    return b"".join(chunks)
 
 
 async def _dispatch_direct(candidates: list, body: dict, headers: dict,
@@ -2903,8 +3557,19 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             log.warning("dispatch: %s for %s; trying the next candidate",
                         last_error, entry["name"])
             continue
-        log.info("route class=%s code=%s vision=%s tokens~%s -> %s @ %s (%d/%d)",
-                 need["class"], need["code"], need["vision"],
+        buffered = None
+        if upstream_response.status_code == 400 and need.get("tools"):
+            buffered = await _read_raw(upstream_response)
+            await upstream_response.aclose()
+            if TOOL_ERROR_RE.search(buffered) and not is_last:
+                # Skip this model for tool requests until the next poll
+                # (which rebuilds the entry) instead of failing every turn.
+                entry["tools"] = False
+                last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
+                log.warning("dispatch: %s; trying the next candidate", last_error)
+                continue
+        log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)",
+                 need["class"], need["code"], need["vision"], need.get("tools", False),
                  need.get("approx_tokens"), entry["name"], entry["server"],
                  position + 1, len(candidates))
         router_headers = {
@@ -2915,6 +3580,9 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             "X-Router-Candidates": str(len(candidates)),
         }
         router_headers.update(extra_headers or {})
+        if buffered is not None:
+            return Response(content=buffered, status_code=upstream_response.status_code,
+                            headers=_response_headers(upstream_response, router_headers))
         return StreamingResponse(
             upstream_response.aiter_raw(),
             status_code=upstream_response.status_code,
@@ -2960,7 +3628,7 @@ async def routing_explain(request: Request):
     messages = body.get("messages")
     if not messages and isinstance(body.get("prompt"), str):
         messages = [{"role": "user", "content": body["prompt"]}]
-    need = classify_request(messages or [])
+    need = apply_tool_needs(classify_request(messages or []), body)
     candidates = rank_candidates(need)
     return JSONResponse({
         "request": need,
@@ -2969,7 +3637,7 @@ async def routing_explain(request: Request):
                    if candidates else None),
         "candidates": [
             {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
-             "score": round(score_entry(e, need), 4)}
+             "tools": e.get("tools"), "score": round(score_entry(e, need), 4)}
             for e in candidates[:10]
         ],
     })
@@ -2990,7 +3658,7 @@ async def route_chat_completion(request: Request):
         return _error(400, "Request body must be a JSON object.", "invalid_body")
     messages = body.get("messages") or []
     requested = str(body.get("model") or "").strip()
-    need = classify_request(messages)
+    need = apply_tool_needs(classify_request(messages), body)
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         # An explicitly requested real model is honoured; tier aliases and
@@ -3029,6 +3697,14 @@ async def route_chat_completion(request: Request):
                 return _error(400, message, "no_vision_model")
             log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
             warnings.append("no-vision-model")
+        if need["tools"] and not explicit and candidates \
+                and all(e.get("tools") is False for e in candidates):
+            message = ("The request offers tools, but every discovered model is "
+                       "known to lack tool support.")
+            if TOOLS_STRICT:
+                return _error(400, message, "no_tool_model")
+            log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
+            warnings.append("no-tool-model")
         if warnings:
             extra["X-Router-Warning"] = ", ".join(warnings)
         if candidates:
@@ -3773,6 +4449,14 @@ scope = last_user
 # true: an image request fails with HTTP 400 when no discovered model looks
 # vision-capable. false: route it anyway, flagged with X-Router-Warning.
 vision_strict = false
+# Requests that offer tools (agents such as Hermes, Open WebUI native function
+# calling) skip models whose server reports no tool support, are raised to at
+# least this class (small models are poor at tool use; blank: no floor), and
+# stay on one model across an agent loop. A tier alias still pins the class.
+tools_min_class = large
+# true: a tool request fails with HTTP 400 when every discovered model is
+# known to lack tools. false: route it anyway, flagged with X-Router-Warning.
+tools_strict = false
 
 [http]
 # Seconds to open a connection to a backend. This is how long a dead host can
@@ -3834,6 +4518,9 @@ tie_epsilon = 0.05
 # Bonus for a model that is already resident (LM Studio reports this; Ollama
 # entries are neutral). Small: it breaks near-ties, it does not override fit.
 loaded_bonus = 0.1
+# On a tool request, bonus for a model reported tool-capable over one whose
+# tool support is unknown (Strata/Basalt/Maya, LM Studio's untrained models).
+tool_match = 0.3
 
 [model_sizes]
 # Sizes for exact model ids that an OpenAI-compatible server (Strata, Basalt,
@@ -6843,3 +7530,9 @@ else
   echo "Config source: LOCAL (not version controlled — no usable Gitea token)"
 fi
 echo "=============================================================================="
+
+# The selected targets, now that the router they belong to is running. A failed
+# target never touches the router; the summary says how to retry it.
+if [[ -n "$TARGETS" ]]; then
+  provision_selected_targets || exit 1
+fi

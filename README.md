@@ -22,10 +22,19 @@ LiteLLM is used only when discovery is off or no host answers.
 
 The model pool can mix Ollama, LM Studio, Strata, Basalt and Project Maya
 servers. `targets/` provisions such servers in their own CTs (see
-[Inference targets](#inference-targets)), plus an optional
-[Open Terminal LXC](targets/open-terminal/README.md) for Open WebUI.
+[Inference targets](#inference-targets)), plus optional
+[Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
+service LXCs and [Open Terminal](targets/open-terminal/README.md) and
+[Hermes Agent](targets/hermes/README.md) companion LXCs.
 
 ## Install
+
+Gitea keeps the router's configuration history, and Mattermost receives its
+health alerts. Both are optional. If you do not run them yet, the installer can
+create each one in its own LXC at the start of the install, already set up for
+the router. You can also create them first with
+[`targets/gitea`](targets/gitea/README.md) and
+[`targets/mattermost`](targets/mattermost/README.md).
 
 Run as root on the Proxmox host:
 
@@ -33,7 +42,64 @@ Run as root on the Proxmox host:
 bash ollama-smart-router-install.sh
 ```
 
-It prompts for the CT root password, network (bridge, IP/CIDR, gateway, DNS),
+It first asks which [targets](#inference-targets) to create alongside the
+router, from a numbered menu:
+- the services `gitea` and `mattermost`;
+- the model servers `ollama`, `llamacpp`, `airllm`, `strata`, `basalt` and
+  `maya`;
+- the companions `open-terminal` and `hermes`.
+
+Answer with numbers or names, comma-separated, or Enter for none.
+
+For each selected target, it asks up front, with the other settings:
+- a CT ID (the next free one after the router's);
+- a static IP/CIDR (the router needs a fixed address);
+- a storage (default: the router's);
+- for Strata, Basalt and Maya, a template. The default is the newest
+  downloaded Ubuntu 24.04, Ubuntu 22.04 or Debian 12 standard template;
+  otherwise an Ubuntu 24.04 template that is downloaded when needed.
+
+**Services are created right away,** after the network and storage prompts and
+before anything for the router is built. Each runs its target's community
+script (choose **Default** in its menu), then is set up inside its CT without
+the browser:
+- **Gitea:** a locked `app.ini` with registration off, an administrator, and a
+  non-admin router account with a scoped token.
+- **Mattermost:** an administrator, the `ollama` team, the `ollama-monitor`
+  channel and an incoming webhook.
+
+The installer then reads Gitea's URL, router account and token, and
+Mattermost's webhook URL, from the CTs. They become the defaults of the Gitea
+and Mattermost prompts, which still verify them. The administrator passwords
+stay in each CT, in `/etc/<service>-target/admin-password`. A service that
+fails stops the install before the router is built; its CT is kept for
+`--reconfigure`.
+
+The selected model targets become servers 1…n of the model-server prompt, so
+they get tiers like any other server. Raise the count to keep existing servers
+too.
+
+After the router is running:
+1. Each model target's `provision-lxc.sh` runs in turn, with its own CT
+   settings:
+   - Ollama and AirLLM include their guest install.
+   - llama.cpp includes it only when `MODEL_ALIAS` plus `MODEL_DOWNLOAD_URL` or
+     `MODEL_PATH` are set; otherwise only the CT is made.
+   - Strata, Basalt and Maya generate keys, which are handed to the router with
+     `set-<kind>-token` on stdin, followed by one `apply`.
+2. The installer waits for Open WebUI and asks once for an admin API key: create
+   the admin account in the browser, enable API keys, and create one. It then
+   runs Open Terminal and Hermes against the router CT.
+
+Target-specific settings (`GPU_DEVICES`, `STRATA_MODEL`, `OLLAMA_PULL_MODELS`,
+`HERMES_MODEL`, …) come from the environment, as each target's README describes.
+The router's own `CT_ID`, `IP_CIDR`, `CORES`, `ROOTFS_GB` and similar settings
+never reach a target. A failed target leaves the router as it is. The run ends
+with a summary of every target and how to retry it, and exits non-zero if any
+target failed. The router monitor reports the new hosts as down until they have
+been created.
+
+It then prompts for the CT root password, network (bridge, IP/CIDR, gateway, DNS),
 rootfs size and storage, Gitea URL/user/repo/token, Mattermost webhook
 (blank disables alerts), and the model servers (1–20), their tiers and the
 model tag per tier. Every prompt has a default and re-prompts on bad input.
@@ -52,6 +118,15 @@ all defaults and skips the prompts):
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
+| Targets | `INSTALL_TARGETS` (e.g. `gitea,ollama,hermes`; pre-fills the menu answer), `INSTALL_GITEA` / `INSTALL_MATTERMOST` (`true` pre-selects that service), `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE` (`<NAME>` is `GITEA`, `MATTERMOST`, `OLLAMA`, `LLAMACPP`, …, `OPEN_TERMINAL`, `HERMES`), `GITEA_COMMUNITY_SCRIPT_URL` / `_SHA256` and the `MATTERMOST_*` equivalents (pin a service's community script), the services' own settings such as `GITEA_SITE_ADMIN` and `MATTERMOST_TEAM` (see their READMEs), `<NAME>_PORT` for Strata/Basalt/Maya (8080), `OPENWEBUI_ADMIN_TOKEN` (skips the admin key prompt), `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
+
+`NONINTERACTIVE=true` refuses a non-empty `INSTALL_TARGETS` (or `INSTALL_GITEA`
+/ `INSTALL_MATTERMOST=true`). The community scripts' menus, GPU selection and
+the Open WebUI admin key need a person. Install the router unattended instead,
+then run each target's `provision-lxc.sh` afterwards. A target's CT settings
+(`<NAME>_CT_ID`, …) are separate from the router's `CT_ID`, `IP_CIDR` and
+`STORAGE`; every target shares the router's bridge and gateway. Targets need
+the full repository checkout.
 
 **Model servers.** An address can be `10.0.0.5`, `host:port`, a URL, or
 `kind://host` for a non-Ollama server (e.g. `strata://10.0.0.8`). Only
@@ -68,16 +143,19 @@ Below four servers, the upper tiers share the last host:
 | 5 | 1 | 2 | 3 | 4,5 |
 | 8 | 1,2 | 3,4 | 5,6 | 7,8 |
 
-**Gitea.** Use an `https://` URL with no port (the TurnKey appliance serves on
-443). An `http://` URL is redirected to 443, and the token is dropped on the
-redirect, so the call fails with 401. TLS verification is always off for the
-appliance's self-signed certificate. To turn it on, install the CA and change
+**Gitea.** Use the server's actual scheme, address and port. The community
+installer below serves on `http://<ct-ip>:3000`; the TurnKey appliance serves
+on HTTPS port 443. If your server redirects HTTP to HTTPS, use its final HTTPS
+URL directly so the token is not dropped on the redirect. TLS verification
+is off by default for self-signed certificates. To turn it on, install the CA
+and change
 `GITEA_VERIFY_TLS=false` in `prompt_gitea_credentials`. The token is checked
 before anything is built, with up to 3 tries. If the token belongs to another
 account, its owner becomes the repo owner. The repo is `GITEA_REPO_NAME`, and
 its owner is resolved in this order: `GITEA_REPO_OWNER`, then the token owner,
 then an exact-name search across repos the token can see. The repo is created
-only when none matches. If several matches are ambiguous, the installer stops
+under the token owner only when none matches; a missing repo under any other
+`GITEA_REPO_OWNER` stops the check, so create that one in Gitea first. If several matches are ambiguous, the installer stops
 and you set `GITEA_REPO_OWNER`. With no usable token, the install continues in
 **local mode**: the same config is applied, but without version control. The
 installer's access-test commit is deleted again once it succeeds; remove
@@ -89,6 +167,23 @@ markers left by older runs with `git rm -r provisioning-tests`.
 http://<ct-ip>:8000/v1      OpenAI-compatible API (Bearer ROUTER_API_KEY)
 http://<ct-ip>:8080         Open WebUI: the first visitor creates the admin account
 ```
+
+**Gitea and Mattermost on their own.** `targets/gitea/provision-lxc.sh` and
+`targets/mattermost/provision-lxc.sh` create the same service CTs for an
+existing router, and print where their URL, token or webhook are. See
+[targets/gitea](targets/gitea/README.md) and
+[targets/mattermost](targets/mattermost/README.md).
+- `--create-only` keeps the earlier behaviour: the community script, then the
+  browser setup steps. `tools/install-gitea.sh` and
+  `tools/install-mattermost.sh` still do exactly that.
+- `--reconfigure` repairs the setup of an existing CT.
+- **A Gitea you already run.** Give the router a dedicated non-admin account
+  and its token. Reusing an existing repository needs the `read:user` and
+  `write:repository` scopes; creating it under that account needs `write:user`
+  and `write:repository`. Tokens cannot be limited to one repository, so limit
+  the account's access instead (a collaborator with Write access).
+- **Plain HTTP.** Gitea answers on `http://<ip>:3000`, so its token travels
+  unencrypted. Put a TLS reverse proxy in front of it on an untrusted network.
 
 The first Open WebUI start downloads an embedding model and is slow
 (`TimeoutStartSec=600`). `/etc/motd` summarises ports, tiers and paths. The
@@ -108,6 +203,13 @@ Every `(host, model)` pair is then scored:
 - **Specialisation** — code requests prefer code models, and image requests
   prefer vision models (Ollama's `/api/show` capabilities first, names as a
   fallback).
+- **Tools** — a request that offers tools (agents such as Hermes, Open WebUI
+  function calling) skips models whose server reports no tool support
+  (Ollama's `tools` capability; the llama.cpp bridge needs `tools` in
+  `MODEL_CAPABILITIES`). It is raised to at least the `large` class
+  (`[classification] tools_min_class`), and stays on one model across an agent
+  loop. A model that answers 400 "does not support tools" is skipped and the
+  next candidate tried.
 - **Never embeddings** — naming an embedding-only model on
   `/v1/chat/completions` returns 400 `embedding_model_not_chat`.
 - **Load spreading** — near-ties rotate across hosts.
@@ -120,7 +222,8 @@ Otherwise the request is routed by content with
 `X-Router-Warning: model-unavailable`. `auto` and the tier aliases mean
 "decide for me"; a tier alias pins the size class. An image request with no
 vision model is routed with `X-Router-Warning: no-vision-model`, or rejected
-if `vision_strict = true`.
+if `vision_strict = true`. A tool request with no tool-capable model gets
+`X-Router-Warning: no-tool-model`, or a 400 with `tools_strict = true`.
 
 Every response carries `X-Router-Model`, `-Server`, `-Class`, `-Mode` and
 `-Candidates`. For inspection:
@@ -335,6 +438,17 @@ also offer it.
 | [basalt](targets/basalt/README.md) | `basalt://` | 8080 | Basalt on a Blackwell GPU, CUDA 13 (13.1+ on Debian 13) |
 | [maya](targets/maya/README.md) | `maya://` | 8080 | Project Maya (GLM-5.3-Flash), CUDA 12.8 default |
 
+[Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
+are services for the router (configuration repository and alerts). They come
+from the Proxmox VE community scripts and are set up for the router by their
+`install-target.sh`.
+
+[Hermes Agent](targets/hermes/README.md) is an agent client, not a pool
+member. Its own CT uses the router's `:8000/v1` API (with `ROUTER_API_KEY`) as
+its model provider, and by default its API server is added to Open WebUI as the
+model `hermes-agent`. Needs a tool-capable model with 64K context. After
+`set-api-key`, run its `provision-lxc.sh --reconfigure`.
+
 Upgrades share one contract ([ARCHITECTURE.md §16](ARCHITECTURE.md#16-inference-targets-targets)):
 
 - Sources are fetched and verified before stopping. Strata, Basalt and Maya
@@ -401,6 +515,7 @@ curl -s -H "Authorization: Bearer $KEY" http://<ct-ip>:8000/routing/inventory
 | A host or its models are missing | Check `/routing/inventory` for the error. Common causes: a wrong or missing `set-<kind>-token` (401), a Strata-style engine not running (empty `/v1/models`), or a server bound to `127.0.0.1`. A refused connection takes a host out of rotation until its next good poll. |
 | Request went to an unexpected model | Look at the `X-Router-*` headers, or `POST /routing/explain`. `model-unavailable` means the named model's hosts were down. Unknown-size models score low; give them a `[model_sizes]` entry. |
 | Long prompt fails with 4xx | Context windows are not considered, and a 4xx does not fail forward. Use a model with a larger context. |
+| Agent or function-calling request fails with "does not support tools" | No discovered model reports tool support (`X-Router-Warning: no-tool-model`). Check `tools` per model in `/routing/inventory`; for llama.cpp add `tools` to `MODEL_CAPABILITIES`. |
 | Models unload after ~5 min | Set `OLLAMA_KEEP_ALIVE` (see above). If you rely on the host's own setting, check that it is in the unit (`Environment="OLLAMA_KEEP_ALIVE=2h"`, then `daemon-reload` and restart). |
 | No Mattermost alerts | `journalctl -u ollama-monitor` shows rejected webhooks. Use `set-webhook` and `test-alert`. Alerts fire after 3 failed checks and recover after 2; the startup notice is sent at most hourly. |
 | `apply` failed | The snapshot was restored and the services were restarted on the old files. Read the reported check, then `journalctl -u <unit>`. Snapshots are in `/var/backups/ollama-smart-router/`. |

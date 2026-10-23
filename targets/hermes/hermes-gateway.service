@@ -1,0 +1,40 @@
+[Unit]
+Description=Hermes Agent gateway (OpenAI-compatible API server for Open WebUI)
+Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes
+Environment=HOME=/home/hermes
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+# API_SERVER_* (including API_SERVER_KEY) come from /home/hermes/.hermes/.env,
+# which Hermes reads itself; install-target.sh writes them.
+ExecStart=/home/hermes/.local/bin/hermes gateway run
+# Upstream exits 75 when it attaches to a gateway that is already running;
+# systemd retries it like any other exit.
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+# --- sandboxing (same model as the other target units) ---
+# The agent's terminal and file tools run inside this sandbox too: they can
+# write only to the hermes home and a private /tmp.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

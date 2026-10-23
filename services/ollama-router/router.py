@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -63,6 +63,14 @@ _DEFAULTS = {
         # discovered model looks vision-capable. false: route it anyway and
         # flag it with an X-Router-Warning header.
         "vision_strict": "false",
+        # Requests that carry tools (agents, function calling) are raised to at
+        # least this class: small models are poor at tool use. Blank: no floor.
+        # A tier alias named by the client still pins the class.
+        "tools_min_class": "large",
+        # true: a tool request fails with HTTP 400 when every discovered model
+        # is known to lack tool support. false: route it anyway, flagged with
+        # an X-Router-Warning header.
+        "tools_strict": "false",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -117,6 +125,9 @@ _DEFAULTS = {
         # Bonus for a model that is already resident in memory (LM Studio
         # reports this per model; Ollama entries are neutral).
         "loaded_bonus": "0.1",
+        # Bonus, on a tool request, for a model the server reports as
+        # tool-capable over one whose tool support is unknown.
+        "tool_match": "0.3",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
     # Basalt, Maya) lists without a parameter count. Matching is by the whole
@@ -273,6 +284,7 @@ W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
 W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
+W_TOOLS = _cfg.getfloat("weights", "tool_match")
 
 # --- server kinds -----------------------------------------------------------------
 # A server entry is a base URL. Entries for servers that are not Ollama carry a
@@ -324,6 +336,13 @@ def backend_headers(server: str) -> dict:
 
 CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
 VISION_STRICT = _cfg.getboolean("classification", "vision_strict")
+CLASS_ORDER = ("fast", "medium", "large", "xlarge")
+TOOLS_MIN_CLASS = _cfg.get("classification", "tools_min_class").strip().lower()
+if TOOLS_MIN_CLASS and TOOLS_MIN_CLASS not in CLASS_ORDER:
+    log.warning("ignoring [classification] tools_min_class = %r (use one of %s, "
+                "or blank)", TOOLS_MIN_CLASS, ", ".join(CLASS_ORDER))
+    TOOLS_MIN_CLASS = ""
+TOOLS_STRICT = _cfg.getboolean("classification", "tools_strict")
 CONNECT_TIMEOUT = _cfg.getfloat("http", "connect_timeout_seconds")
 READ_TIMEOUT = _cfg.getfloat("http", "read_timeout_seconds")
 
@@ -454,6 +473,15 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
     if caps:
         is_vision = "vision" in caps
         is_embedding = "embedding" in caps and "completion" not in caps
+    # Tool support: True, False, or None (unknown). Ollama's /api/show list is
+    # authoritative (the llama.cpp bridge and AirLLM answer it too). Other
+    # kinds say so explicitly in raw["tools"] or not at all.
+    if "tools" in raw:
+        tools = raw["tools"]
+    elif caps and server_kind(server) == "ollama":
+        tools = "tools" in caps
+    else:
+        tools = None
     return {
         "server": server,
         "name": name,
@@ -465,6 +493,7 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         "is_code": _matches_any(lowered, CODE_MODELS),
         "is_vision": is_vision,
         "is_embedding": is_embedding,
+        "tools": tools,
         # True/False when the server reports residency (LM Studio); None
         # when it does not (Ollama loads on demand and is not asked).
         "loaded": raw.get("loaded"),
@@ -512,7 +541,10 @@ def _lmstudio_v1_models(payload: dict) -> list:
         features = m.get("capabilities") or {}
         if features.get("vision"):
             caps.append("vision")
-        if features.get("trained_for_tool_use"):
+        # LM Studio gives untrained models its default tool format, so
+        # "not trained for tool use" is not "no tools": leave that unknown.
+        trained = bool(features.get("trained_for_tool_use"))
+        if trained:
             caps.append("tools")
         quant = m.get("quantization") or {}
         out.append({
@@ -522,6 +554,7 @@ def _lmstudio_v1_models(payload: dict) -> list:
                         "family": m.get("architecture") or "",
                         "quantization_level": quant.get("name") if isinstance(quant, dict) else quant},
             "capabilities": caps,
+            "tools": True if trained else None,
             "loaded": bool(m.get("loaded_instances")),
         })
     return out
@@ -827,6 +860,27 @@ def classify_request(messages: list) -> dict:
     image sent earlier still needs a vision model to see it."""
     need = classify_text(routing_text(messages))
     need["vision"] = any(_message_parts(m)[1] for m in (messages or []))
+    need["tools"] = False
+    return need
+
+
+def wants_tools(body: dict) -> bool:
+    """Does the request offer the model tools it may call? An empty list, or
+    tool_choice "none", asks for none."""
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools") or body.get("functions")
+    if not isinstance(tools, list) or not tools:
+        return False
+    return body.get("tool_choice") != "none" and body.get("function_call") != "none"
+
+
+def apply_tool_needs(need: dict, body: dict) -> dict:
+    """Mark a tool request, and raise its class to tools_min_class."""
+    need = dict(need, tools=wants_tools(body))
+    if need["tools"] and TOOLS_MIN_CLASS and \
+            CLASS_ORDER.index(need["class"]) < CLASS_ORDER.index(TOOLS_MIN_CLASS):
+        need["class"] = TOOLS_MIN_CLASS
     return need
 
 
@@ -914,6 +968,8 @@ def score_entry(entry: dict, need: dict) -> float:
             score += W_SMALLER * (1.0 - position)
     if entry.get("loaded"):
         score += W_LOADED
+    if need.get("tools") and entry.get("tools"):
+        score += W_TOOLS
     return score
 
 
@@ -929,6 +985,11 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
         if LMSTUDIO_LOADED_ONLY and entry["kind"] == "lmstudio" and entry.get("loaded") is False:
             continue  # would trigger a just-in-time load on LM Studio
         scored.append((score_entry(entry, need), entry))
+    if need.get("tools"):
+        # A model known to lack tools answers a tool request with an error.
+        # Keep the full list only when nothing else is left (the caller warns).
+        capable = [pair for pair in scored if pair[1].get("tools") is not False]
+        scored = capable or scored
     if not scored:
         return []
 
@@ -962,8 +1023,16 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
             tied.append(e)
         else:
             rest.append(e)
+    if need.get("tools") and len(tied) > 1:
+        # An agent loop sends many requests for one task. Rotating between
+        # DIFFERENT models would change the model mid-task and discard the
+        # backend's prompt cache, so only the same model on several hosts
+        # shares the load.
+        best_name = tied[0]["name"]
+        rest = [e for e in tied if e["name"] != best_name] + rest
+        tied = [e for e in tied if e["name"] == best_name]
     if len(tied) > 1:
-        key = f"{need['class']}|{need['code']}|{need['vision']}"
+        key = f"{need['class']}|{need['code']}|{need['vision']}|{need.get('tools', False)}"
         index = _rotation.get(key, 0) % len(tied)
         _rotation[key] = index + 1
         tied = tied[index:] + tied[:index]
@@ -1073,6 +1142,22 @@ async def _stream_upstream(method: str, url: str, headers: dict,
 # Upstream statuses that mean "try the next candidate": the host is failing
 # (5xx) or no longer has the model (404, e.g. removed since the last poll).
 RETRYABLE_STATUS = {404} | set(range(500, 600))
+# A 400 that names tools, on a tool request, means "this model cannot call
+# tools" (Ollama: "... does not support tools"); the next candidate may.
+TOOL_ERROR_RE = re.compile(rb"\btools?\b|function.call", re.IGNORECASE)
+# Error bodies are small; never buffer more than this to inspect one.
+ERROR_PEEK_BYTES = 65536
+
+
+async def _read_raw(response: httpx.Response, limit: int = ERROR_PEEK_BYTES) -> bytes:
+    """The raw (still encoded) body of an error response, up to limit bytes."""
+    chunks, size = [], 0
+    async for chunk in response.aiter_raw():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= limit:
+            break
+    return b"".join(chunks)
 
 
 async def _dispatch_direct(candidates: list, body: dict, headers: dict,
@@ -1112,8 +1197,19 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             log.warning("dispatch: %s for %s; trying the next candidate",
                         last_error, entry["name"])
             continue
-        log.info("route class=%s code=%s vision=%s tokens~%s -> %s @ %s (%d/%d)",
-                 need["class"], need["code"], need["vision"],
+        buffered = None
+        if upstream_response.status_code == 400 and need.get("tools"):
+            buffered = await _read_raw(upstream_response)
+            await upstream_response.aclose()
+            if TOOL_ERROR_RE.search(buffered) and not is_last:
+                # Skip this model for tool requests until the next poll
+                # (which rebuilds the entry) instead of failing every turn.
+                entry["tools"] = False
+                last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
+                log.warning("dispatch: %s; trying the next candidate", last_error)
+                continue
+        log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)",
+                 need["class"], need["code"], need["vision"], need.get("tools", False),
                  need.get("approx_tokens"), entry["name"], entry["server"],
                  position + 1, len(candidates))
         router_headers = {
@@ -1124,6 +1220,9 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             "X-Router-Candidates": str(len(candidates)),
         }
         router_headers.update(extra_headers or {})
+        if buffered is not None:
+            return Response(content=buffered, status_code=upstream_response.status_code,
+                            headers=_response_headers(upstream_response, router_headers))
         return StreamingResponse(
             upstream_response.aiter_raw(),
             status_code=upstream_response.status_code,
@@ -1169,7 +1268,7 @@ async def routing_explain(request: Request):
     messages = body.get("messages")
     if not messages and isinstance(body.get("prompt"), str):
         messages = [{"role": "user", "content": body["prompt"]}]
-    need = classify_request(messages or [])
+    need = apply_tool_needs(classify_request(messages or []), body)
     candidates = rank_candidates(need)
     return JSONResponse({
         "request": need,
@@ -1178,7 +1277,7 @@ async def routing_explain(request: Request):
                    if candidates else None),
         "candidates": [
             {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
-             "score": round(score_entry(e, need), 4)}
+             "tools": e.get("tools"), "score": round(score_entry(e, need), 4)}
             for e in candidates[:10]
         ],
     })
@@ -1199,7 +1298,7 @@ async def route_chat_completion(request: Request):
         return _error(400, "Request body must be a JSON object.", "invalid_body")
     messages = body.get("messages") or []
     requested = str(body.get("model") or "").strip()
-    need = classify_request(messages)
+    need = apply_tool_needs(classify_request(messages), body)
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         # An explicitly requested real model is honoured; tier aliases and
@@ -1238,6 +1337,14 @@ async def route_chat_completion(request: Request):
                 return _error(400, message, "no_vision_model")
             log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
             warnings.append("no-vision-model")
+        if need["tools"] and not explicit and candidates \
+                and all(e.get("tools") is False for e in candidates):
+            message = ("The request offers tools, but every discovered model is "
+                       "known to lack tool support.")
+            if TOOLS_STRICT:
+                return _error(400, message, "no_tool_model")
+            log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
+            warnings.append("no-tool-model")
         if warnings:
             extra["X-Router-Warning"] = ", ".join(warnings)
         if candidates:

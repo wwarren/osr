@@ -55,6 +55,510 @@ source "$FUNCS"
 
 echo "Testing $(basename "$SCRIPT") — $(python3 "${HERE}/lib/extract-functions.py" "$SCRIPT" --list | wc -l) functions extracted"
 
+# ── a PATH without pvesh ──────────────────────────────────────────────────────
+# The "no pvesh" cases run with only these tools on PATH. /usr/bin:/bin would
+# not do: on a Proxmox host it holds the real pvesh, which those cases would
+# then query.
+NO_PVESH_BIN="$MOCK_BIN/no-pvesh-tools"
+mkdir -p "$NO_PVESH_BIN"
+for _tool in bash awk cat timeout; do
+  ln -s "$(command -v "$_tool")" "$NO_PVESH_BIN/$_tool"
+done
+unset _tool
+if env PATH="$NO_PVESH_BIN" bash -c 'command -v pvesh' >/dev/null 2>&1; then
+  echo "NO_PVESH_BIN unexpectedly finds pvesh" >&2; exit 1
+fi
+
+# ── CT IDs ────────────────────────────────────────────────────────────────────
+# Silent cluster stubs (not logged).
+# IDs listed in $_ids/used exist; pvesh offers $_ids/nextid as the next free ID.
+_ids="$(mktemp -d)"; _saved_path="$PATH"
+printf '%s\n' '#!/usr/bin/env bash' \
+  "used=\" \$(cat '$_ids/used') \"" \
+  'args="$*"; if [[ $args == *"--vmid "* ]]; then id=${args##*--vmid }; [[ $used != *" $id "* ]]; exit; fi' \
+  "cat '$_ids/nextid'" > "$_ids/pvesh"
+printf '%s\n' '#!/usr/bin/env bash' \
+  "used=\" \$(cat '$_ids/local-used') \"" \
+  '[[ $1 == status && $used == *" $2 "* ]]' > "$_ids/pct"
+chmod +x "$_ids/pvesh" "$_ids/pct"
+echo 905 > "$_ids/used"; echo 905 > "$_ids/local-used"; echo 910 > "$_ids/nextid"
+PATH="$_ids:$PATH"
+
+BRIDGE=vmbr2; NAMESERVER=192.0.2.53; MATTERMOST_CHANNEL=ollama-monitor
+CT_ID=910; IP_CIDR=192.0.2.80/24; GATEWAY=192.0.2.1; STORAGE=router-store
+ROOTFS_GB=32; CORES=8
+GITEA_CT_ID=911; GITEA_IP_CIDR=192.0.2.81/24
+GITEA_GATEWAY=192.0.2.1; GITEA_STORAGE=git-store
+GITEA_COMMUNITY_SCRIPT_URL=https://example.test/gitea.sh
+MATTERMOST_CT_ID=912; MATTERMOST_IP_CIDR=192.0.2.82/24
+MATTERMOST_GATEWAY=192.0.2.1; MATTERMOST_STORAGE=chat-store
+MATTERMOST_COMMUNITY_SCRIPT_URL=https://example.test/mattermost.sh
+
+describe ct_id_free
+assert_ok   "a free ID, asked of the cluster" ct_id_free 906
+assert_fail "a used ID, asked of the cluster" ct_id_free 905
+mkdir -p "$_ids/pct-only"; cp "$_ids/pct" "$_ids/pct-only/pct"
+assert_fail "without pvesh, pct status decides" \
+  env PATH="$_ids/pct-only:$NO_PVESH_BIN" bash -c 'source "$1"; ct_id_free 905' _ "$FUNCS"
+assert_ok   "and a free ID passes" \
+  env PATH="$_ids/pct-only:$NO_PVESH_BIN" bash -c 'source "$1"; ct_id_free 906' _ "$FUNCS"
+
+describe cluster_next_ct_id
+assert_eq "reads the cluster's next free ID" "910" "$(cluster_next_ct_id)"
+: > "$_ids/nextid"
+assert_fail "an unanswered nextid is an error" cluster_next_ct_id
+assert_contains "that says the guest list is unreadable" "Cannot read the cluster's guest list" \
+  "$(cluster_next_ct_id 2>&1)"
+assert_fail "rejects an ID printed by a failed pvesh" \
+  bash -c 'source "$1"; pvesh() { echo 910; return 1; }; cluster_next_ct_id' _ "$FUNCS"
+echo 910 > "$_ids/nextid"
+assert_eq "without pvesh there is no cluster answer, and no error" "" \
+  "$(env PATH="$_ids/pct-only:$NO_PVESH_BIN" bash -c 'source "$1"; cluster_next_ct_id' _ "$FUNCS")"
+
+describe next_free_ct_id_excluding
+assert_eq "takes the cluster's next free ID" "910" "$(next_free_ct_id_excluding)"
+assert_eq "skips an ID this run will use later" "911" "$(next_free_ct_id_excluding 910)"
+echo "905 911" > "$_ids/used"
+assert_eq "and IDs already in use" "912" "$(next_free_ct_id_excluding 910)"
+echo 905 > "$_ids/used"
+: > "$_ids/nextid"
+assert_fail "an unreadable guest list stops the search" next_free_ct_id_excluding 910
+echo 910 > "$_ids/nextid"
+assert_fail "a scan with no free ID gives up" \
+  env PATH="$_ids/pct-only:$NO_PVESH_BIN" timeout 30 bash -c \
+    'source "$1"; ct_id_free() { return 1; }; next_free_ct_id_excluding' _ "$FUNCS"
+
+describe require_companion_credentials
+TARGETS="ollama"; CONFIG_SOURCE=local; MATTERMOST_WEBHOOK_URL=""
+assert_ok "no new services, nothing to check" require_companion_credentials
+TARGETS="gitea ollama"; GITEA_CT_ID=911
+assert_fail "a new Gitea that fell back to local config stops the install" require_companion_credentials
+assert_contains "and says how to use it on a rerun" "without selecting gitea, with GITEA_SERVER_URL" \
+  "$(require_companion_credentials 2>&1)"
+assert_contains "naming its CT" "CT 911" "$(require_companion_credentials 2>&1)"
+CONFIG_SOURCE=repo
+assert_ok "a new Gitea with a working repository passes" require_companion_credentials
+TARGETS="mattermost"; MATTERMOST_CT_ID=912
+assert_fail "a new Mattermost without a webhook stops the install" require_companion_credentials
+assert_contains "and names where its webhook is" "/etc/mattermost-target/webhook-url" \
+  "$(require_companion_credentials 2>&1)"
+MATTERMOST_WEBHOOK_URL="https://chat.example.test/hooks/abc"
+assert_ok "a new Mattermost with a webhook passes" require_companion_credentials
+TARGETS=""
+
+# Restore what the rest of the suite expects.
+PATH="$_saved_path"; rm -rf "$_ids" "$_out"
+CT_ID=100; INSTALL_GITEA=false; INSTALL_MATTERMOST=false; NONINTERACTIVE=false
+unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL IP_CIDR GATEWAY STORAGE ROOTFS_GB CORES \
+  GITEA_CT_ID GITEA_IP_CIDR GITEA_GATEWAY GITEA_STORAGE GITEA_COMMUNITY_SCRIPT_URL \
+  MATTERMOST_CT_ID MATTERMOST_IP_CIDR MATTERMOST_GATEWAY MATTERMOST_STORAGE \
+  MATTERMOST_COMMUNITY_SCRIPT_URL _ids _saved_path _out
+
+# ── optional targets ──────────────────────────────────────────────────────────
+# Functions the target code calls out to are replaced by shell functions here
+# and restored by re-sourcing the extracted functions at the end.
+_tt="$(mktemp -d)"
+TARGETS_DIR="$_tt/targets"
+for _name in gitea mattermost ollama llamacpp airllm strata basalt maya open-terminal hermes; do
+  mkdir -p "$TARGETS_DIR/$_name"
+  # The fake provisioner records what it was given: settings, flags, and
+  # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
+  cat > "$TARGETS_DIR/$_name/provision-lxc.sh" <<'EOF'
+token=no; [[ -n ${OPENWEBUI_ADMIN_TOKEN:-} ]] && token=yes
+[[ ${OPENWEBUI_ADMIN_TOKEN:-} == "${EXPECT_TOKEN:-unset}" ]] && token=match
+printf 'provision %s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(basename "$(dirname "$0")")" \
+  "${CT_ID:-}" "${IP_CIDR:-}" "${GATEWAY:-}" "${STORAGE:-}" "${BRIDGE:-}" "${TEMPLATE:-}" \
+  "${CORES:-}" "${ROOTFS_GB:-}" "${ROUTER_CT_ID:-}" "${OPENWEBUI_PORT:-}" "$token" "$*" >> "$MOCK_LOG"
+[[ -z ${COMMUNITY_SCRIPT_URL:-}${COMMUNITY_SCRIPT_SHA256:-}${MATTERMOST_CHANNEL:-} ]] ||
+  printf 'service-env %s|%s|%s\n' "${COMMUNITY_SCRIPT_URL:-}" "${COMMUNITY_SCRIPT_SHA256:-}" "${MATTERMOST_CHANNEL:-}" >> "$MOCK_LOG"
+exit "${FAKE_PROVISION_RC:-0}"
+EOF
+done
+unset _name
+
+describe target_table
+assert_eq "lists the ten targets in menu order" \
+  "gitea mattermost ollama llamacpp airllm strata basalt maya open-terminal hermes" \
+  "$(target_table | cut -d'|' -f1 | paste -sd' ')"
+
+describe target_field
+assert_eq "model phase" model "$(target_field strata phase)"
+assert_eq "companion phase" companion "$(target_field hermes phase)"
+assert_eq "service phase" service "$(target_field gitea phase)"
+assert_eq "router entry template" "strata+http://@IP@:@PORT@" "$(target_field strata entry)"
+assert_eq "key kind" basalt "$(target_field basalt key)"
+assert_eq "no key for Ollama" "" "$(target_field ollama key)"
+assert_fail "an unknown target" target_field nope phase
+assert_fail "an unknown field" target_field ollama colour
+
+describe target_var_prefix
+assert_eq "dashes become underscores" OPEN_TERMINAL "$(target_var_prefix open-terminal)"
+assert_eq "letters are upper-cased" LLAMACPP "$(target_var_prefix llamacpp)"
+
+describe target_setting
+OPEN_TERMINAL_CT_ID=283
+assert_eq "reads <PREFIX>_<FIELD>" 283 "$(target_setting open-terminal CT_ID)"
+assert_eq "an unset field is empty" "" "$(target_setting open-terminal TEMPLATE)"
+unset OPEN_TERMINAL_CT_ID
+
+describe llamacpp_model_given
+unset MODEL_ALIAS MODEL_DOWNLOAD_URL MODEL_PATH
+assert_fail "no model by default" llamacpp_model_given
+MODEL_ALIAS=qwen3:8b
+assert_fail "an alias alone is not enough" llamacpp_model_given
+MODEL_DOWNLOAD_URL=https://huggingface.co/o/r/resolve/main/m.gguf
+assert_ok "an alias and a URL are" llamacpp_model_given
+unset MODEL_ALIAS MODEL_DOWNLOAD_URL
+
+describe target_needs_template
+assert_ok "Strata takes a template" target_needs_template strata
+assert_ok "Maya takes a template" target_needs_template maya
+assert_fail "llama.cpp prompts for its own" target_needs_template llamacpp
+assert_fail "Hermes uses the router's" target_needs_template hermes
+
+describe valid_target_selection
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8"; do
+  assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
+done
+for _sel in 0 11 bogus "ollama,bogus"; do
+  assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
+done
+unset _sel
+
+describe normalize_target_selection
+assert_eq "names and numbers, in menu order" "gitea ollama strata hermes" "$(normalize_target_selection 'hermes,3, 6,1')"
+assert_eq "each target once" ollama "$(normalize_target_selection '3,ollama')"
+assert_eq "none is empty" "" "$(normalize_target_selection none)"
+assert_eq "blank is empty" "" "$(normalize_target_selection '')"
+
+describe prompt_target_selection
+NONINTERACTIVE=true; INSTALL_TARGETS=""
+assert_ok "an unattended install without targets passes" prompt_target_selection
+INSTALL_TARGETS=ollama
+assert_fail "an unattended install refuses targets" prompt_target_selection
+assert_contains "and says what to do instead" "targets/<name>/provision-lxc.sh" "$(prompt_target_selection 2>&1)"
+INSTALL_TARGETS=bogus
+assert_fail "an invalid preset is refused" prompt_target_selection
+NONINTERACTIVE=false; INSTALL_TARGETS=""
+_out="$(mktemp)"
+prompt_target_selection > "$_out" 2>&1 <<< $'11\n4,hermes\n'
+assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
+assert_contains "the menu lists the companions" "10) hermes" "$(cat "$_out")"
+assert_contains "and separates them from the model servers" "Companions:" "$(cat "$_out")"
+assert_contains "the services come first" "Services: created now, before the router" "$(cat "$_out")"
+assert_contains "starting with Gitea" "1) gitea" "$(cat "$_out")"
+INSTALL_TARGETS=""; INSTALL_GITEA=true; INSTALL_MATTERMOST=true
+prompt_target_selection > /dev/null 2>&1 <<< $'\n'
+assert_eq "INSTALL_GITEA / INSTALL_MATTERMOST pre-select the services" "gitea mattermost" "$TARGETS"
+NONINTERACTIVE=true; INSTALL_TARGETS=""
+assert_fail "and are refused unattended, like any target" prompt_target_selection
+NONINTERACTIVE=false; INSTALL_GITEA=false; INSTALL_MATTERMOST=false
+INSTALL_TARGETS=""
+prompt_target_selection > /dev/null 2>&1 <<< $'\n'
+assert_eq "Enter selects none" "" "$TARGETS"
+rm "$TARGETS_DIR/maya/provision-lxc.sh"
+INSTALL_TARGETS=""
+assert_fail "a target missing from the checkout stops the install" prompt_target_selection <<< $'maya\n'
+assert_contains "naming the full checkout" "full repository checkout" \
+  "$(prompt_target_selection 2>&1 <<< $'maya\n')"
+cp "$TARGETS_DIR/ollama/provision-lxc.sh" "$TARGETS_DIR/maya/provision-lxc.sh"
+INSTALL_TARGETS=""; TARGETS=""
+
+describe valid_target_ct_id
+ct_id_free() { [[ $1 != 905 ]]; }
+TARGET_RESERVED_IDS="910 920"
+assert_ok "a free ID" valid_target_ct_id 921
+assert_fail "the router's or an earlier target's ID" valid_target_ct_id 920
+assert_fail "an ID in use on the cluster" valid_target_ct_id 905
+assert_fail "below 100" valid_target_ct_id 99
+
+describe valid_target_ip
+TARGET_RESERVED_IPS="192.0.2.80 192.0.2.90"
+assert_ok "a new static address" valid_target_ip 192.0.2.91/24
+assert_fail "the router's address" valid_target_ip 192.0.2.80/24
+assert_fail "an earlier target's address" valid_target_ip 192.0.2.90/24
+assert_fail "DHCP (the router needs a fixed address)" valid_target_ip dhcp
+assert_fail "no prefix" valid_target_ip 192.0.2.91
+
+describe valid_target_template
+assert_ok "Ubuntu 24.04" valid_target_template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_ok "Debian 12" valid_target_template nfs:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst
+assert_fail "another distro" valid_target_template local:vztmpl/alpine-3.20-default_20240908_amd64.tar.xz
+assert_fail "no storage" valid_target_template vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+
+describe default_gpu_target_template
+template_storages() { printf '%s\n' local nfs; }
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst 120MB'
+_pveam_list_nfs='NAME SIZE
+nfs:vztmpl/ubuntu-24.04-standard_24.04-1_amd64.tar.zst 140MB
+nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
+pveam() {
+  echo "pveam $*" >> "$MOCK_LOG"
+  case "$1 $2" in
+    "list local") printf '%s\n' "$_pveam_list_local" ;;
+    "list nfs") printf '%s\n' "$_pveam_list_nfs" ;;
+    "available --section") printf '%s\n' "system ubuntu-22.04-standard_22.04-1_amd64.tar.zst" \
+                                       "system ubuntu-24.04-standard_24.04-2_amd64.tar.zst" ;;
+    download*) return "${FAKE_DOWNLOAD_RC:-0}" ;;
+  esac
+}
+assert_eq "prefers the newest downloaded Ubuntu 24.04, on any storage" \
+  nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template)"
+_pveam_list_nfs='NAME SIZE'
+assert_eq "then Debian 12" local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst "$(default_gpu_target_template)"
+_pveam_list_local='NAME SIZE'; TEMPLATE_STORAGE=local
+assert_eq "else one to download into TEMPLATE_STORAGE" \
+  local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template)"
+
+describe ensure_target_template
+_pveam_list_local='NAME SIZE
+local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
+mock_reset_log
+assert_ok "a downloaded template is used" ensure_target_template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_not_contains "without downloading it" "pveam download" "$(mock_calls)"
+assert_ok "a missing one is downloaded" ensure_target_template local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst >/dev/null
+assert_contains "into its storage" "pveam download local ubuntu-22.04-standard_22.04-1_amd64.tar.zst" "$(mock_calls)"
+FAKE_DOWNLOAD_RC=1
+assert_fail "a failed download fails" ensure_target_template local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+unset FAKE_DOWNLOAD_RC
+
+describe prompt_target_settings
+next_free_ct_id_excluding() { local id max=0; for id in "$@"; do (( id > max )) && max=$id; done; echo $((max + 1)); }
+default_gpu_target_template() { echo local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst; }
+CT_ID=910; IP_CIDR=192.0.2.80/24; GATEWAY=192.0.2.1; BRIDGE=vmbr0; STORAGE=router-store
+TARGETS="ollama strata"
+unset OLLAMA_CT_ID OLLAMA_IP_CIDR OLLAMA_STORAGE STRATA_CT_ID STRATA_IP_CIDR STRATA_STORAGE STRATA_TEMPLATE
+_out="$(mktemp)"
+prompt_target_settings > "$_out" 2>&1 <<< $'\n192.0.2.80/24\n192.0.2.90/24\n\n\n192.0.2.90/24\n192.0.2.91/24\ngpu-store\n\n'
+assert_eq "the first target takes the ID after the router's" 911 "$OLLAMA_CT_ID"
+assert_eq "the next one skips it" 912 "$STRATA_CT_ID"
+assert_eq "the router's address is refused, the next answer kept" 192.0.2.90/24 "$OLLAMA_IP_CIDR"
+assert_eq "an address already taken is refused" 192.0.2.91/24 "$STRATA_IP_CIDR"
+assert_eq "storage defaults to the router's" router-store "$OLLAMA_STORAGE"
+assert_eq "or takes the answer" gpu-store "$STRATA_STORAGE"
+assert_eq "a GPU target gets a template" local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$STRATA_TEMPLATE"
+assert_eq "Ollama is not given one (the community script chooses)" "" "${OLLAMA_TEMPLATE:-}"
+OLLAMA_CT_ID=930; OLLAMA_IP_CIDR=10.9.9.9/24; TARGETS=ollama
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n'
+assert_eq "a preset CT ID is the default" 930 "$OLLAMA_CT_ID"
+assert_contains "an address outside the gateway's subnet is flagged" "outside 10.9.9.9/24" "$(cat "$_out")"
+TARGETS=""
+assert_ok "nothing selected, nothing asked" prompt_target_settings
+
+describe target_server_entry
+OLLAMA_IP_CIDR=192.0.2.90/24; STRATA_IP_CIDR=192.0.2.91/24; MAYA_IP_CIDR=192.0.2.92/24
+assert_eq "Ollama-kind targets on 11434" http://192.0.2.90:11434 "$(target_server_entry ollama)"
+assert_eq "Strata with its kind prefix" strata+http://192.0.2.91:8080 "$(target_server_entry strata)"
+MAYA_PORT=8123
+assert_eq "honouring <NAME>_PORT" maya+http://192.0.2.92:8123 "$(target_server_entry maya)"
+unset MAYA_PORT
+assert_fail "a companion is not a server" target_server_entry hermes
+
+describe preset_target_model_servers
+MODEL_SERVER_COUNT=3; MODEL_SERVER_MAX=20
+MODEL_SERVER_1=10.0.0.51; MODEL_SERVER_2=10.0.0.52; MODEL_SERVER_3=10.0.0.53
+TARGETS="ollama strata hermes"
+preset_target_model_servers > /dev/null
+assert_eq "the targets come first" "http://192.0.2.90:11434 strata+http://192.0.2.91:8080" "$MODEL_SERVER_1 $MODEL_SERVER_2"
+assert_eq "the configured defaults follow" "10.0.0.51 10.0.0.52 10.0.0.53" "$MODEL_SERVER_3 $MODEL_SERVER_4 $MODEL_SERVER_5"
+assert_eq "the count covers the targets" 2 "$MODEL_SERVER_COUNT"
+MODEL_SERVER_COUNT=3; MODEL_SERVER_1=10.0.0.51; TARGETS="hermes"
+preset_target_model_servers > /dev/null
+assert_eq "companions alone change nothing" "3 10.0.0.51" "$MODEL_SERVER_COUNT $MODEL_SERVER_1"
+for _i in 1 2 3 4 5; do unset "MODEL_SERVER_$_i"; done; unset _i
+
+describe run_target_provisioner
+CT_ID=910; GATEWAY=192.0.2.1; BRIDGE=vmbr2; NAMESERVER=""; OPENWEBUI_PORT=8080
+TEMPLATE_REF=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+export CORES=8 ROOTFS_GB=32 STORAGE=router-store
+OLLAMA_CT_ID=911; OLLAMA_STORAGE=t-store
+STRATA_CT_ID=912; STRATA_STORAGE=gpu-store; STRATA_TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+LLAMACPP_CT_ID=913; LLAMACPP_IP_CIDR=192.0.2.93/24; LLAMACPP_STORAGE=t-store
+HERMES_CT_ID=914; HERMES_IP_CIDR=192.0.2.94/24; HERMES_STORAGE=t-store
+TARGET_ADMIN_TOKEN=owui-admin-secret; export EXPECT_TOKEN=owui-admin-secret
+mock_reset_log
+assert_ok "runs Ollama's provisioner" run_target_provisioner ollama
+assert_eq "with its own CT, network and storage, and the guest install" \
+  "provision ollama|911|192.0.2.90/24|192.0.2.1|t-store|vmbr2||||||no|--install-target" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner strata
+assert_eq "a GPU target gets its template; the router's CORES/ROOTFS_GB and the token do not leak" \
+  "provision strata|912|192.0.2.91/24|192.0.2.1|gpu-store|vmbr2|local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst|||||no|" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner llamacpp
+assert_contains "llama.cpp without a model only gets its CT" "|no|" "$(mock_calls)"
+assert_not_contains "(no guest install)" "--install-target" "$(mock_calls)"
+MODEL_ALIAS=qwen3:8b MODEL_PATH=/var/lib/llama-target/models/m.gguf run_target_provisioner llamacpp
+assert_contains "with a model it installs" "|no|--install-target" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner hermes
+assert_eq "a companion gets the router CT, the router's template and the token" \
+  "provision hermes|914|192.0.2.94/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|" "$(mock_calls)"
+assert_not_contains "the token is never an argument" "owui-admin-secret" "$(mock_calls)"
+export FAKE_PROVISION_RC=3
+assert_fail "a failing provisioner fails" run_target_provisioner ollama
+unset FAKE_PROVISION_RC
+assert_fail "a target without settings is refused" run_target_provisioner basalt
+assert_eq "the caller's CT_ID is untouched" 910 "$CT_ID"
+GITEA_CT_ID=915; GITEA_IP_CIDR=192.0.2.95/24; GITEA_STORAGE=t-store
+GITEA_COMMUNITY_SCRIPT_URL=https://example.test/gitea.sh; GITEA_COMMUNITY_SCRIPT_SHA256=abc123
+export COMMUNITY_SCRIPT_URL=https://example.test/leaked.sh
+mock_reset_log
+run_target_provisioner gitea
+assert_contains "a service gets its own CT and network, and no flags" "provision gitea|915|192.0.2.95/24|192.0.2.1|t-store|vmbr2||||||no|" "$(mock_calls)"
+assert_contains "GITEA_COMMUNITY_SCRIPT_* become its COMMUNITY_SCRIPT_*" "service-env https://example.test/gitea.sh|abc123|" "$(mock_calls)"
+MATTERMOST_CT_ID=916; MATTERMOST_IP_CIDR=192.0.2.96/24; MATTERMOST_STORAGE=t-store; MATTERMOST_CHANNEL=alerts
+mock_reset_log
+run_target_provisioner mattermost
+assert_contains "Mattermost gets the router's alert channel, and no other service's script" "service-env ||alerts" "$(mock_calls)"
+unset COMMUNITY_SCRIPT_URL GITEA_COMMUNITY_SCRIPT_URL GITEA_COMMUNITY_SCRIPT_SHA256 MATTERMOST_CHANNEL
+export -n CORES ROOTFS_GB STORAGE; unset EXPECT_TOKEN
+
+describe service_result
+pct() { echo "pct $*" >> "$MOCK_LOG"; [[ $1 == exec && $2 == 915 && $5 == /etc/gitea-target/url ]] && printf 'http://192.0.2.95:3000\r\n'; }
+assert_eq "reads a result file from the service CT, without line ends" http://192.0.2.95:3000 "$(service_result gitea url)"
+assert_eq "a missing file is empty" "" "$(service_result gitea router-token)"
+
+describe provision_service_targets
+run_target_provisioner() { echo "run $1" >> "$MOCK_LOG"; [[ " ${FAKE_FAIL:-} " != *" $1 "* ]]; }
+service_result() {
+  case "$1/$2" in
+    gitea/url) echo http://192.0.2.95:3000 ;; gitea/router-user) echo ollama-router ;;
+    gitea/router-token) [[ -n ${FAKE_NO_TOKEN:-} ]] || echo 0123456789abcdef0123456789abcdef01234567 ;;
+    mattermost/webhook-url) echo http://192.0.2.96:8065/hooks/abcdefghijklmnopqrstuvwxyz ;;
+  esac
+}
+TARGETS="gitea mattermost ollama hermes"; GITEA_SERVER_URL=""; GITEA_ADMIN_USER=gitea; GITEA_DEPLOY_TOKEN=""; MATTERMOST_WEBHOOK_URL=""
+mock_reset_log
+provision_service_targets > "$_out" 2>&1; _rc=$?
+assert_eq "both services are created" 0 "$_rc"
+assert_eq "and only the services, in order" $'run gitea\nrun mattermost' "$(mock_calls)"
+assert_eq "Gitea's URL becomes the router's" http://192.0.2.95:3000 "$GITEA_SERVER_URL"
+assert_eq "its router account the Gitea user" ollama-router "$GITEA_ADMIN_USER"
+assert_eq "and its token the deploy token" 0123456789abcdef0123456789abcdef01234567 "$GITEA_DEPLOY_TOKEN"
+assert_eq "Mattermost's webhook becomes the alert webhook" http://192.0.2.96:8065/hooks/abcdefghijklmnopqrstuvwxyz "$MATTERMOST_WEBHOOK_URL"
+assert_eq "both are recorded as done" "gitea mattermost " "$SERVICES_DONE"
+assert_not_contains "the token is not printed" 0123456789abcdef "$(cat "$_out")"
+mock_reset_log
+FAKE_FAIL=gitea provision_service_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed service stops the install" 1 "$_rc"
+assert_contains "saying how to repair it" "--reconfigure" "$(cat "$_out")"
+assert_not_contains "before the next service" "run mattermost" "$(mock_calls)"
+FAKE_NO_TOKEN=1 provision_service_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a Gitea without a token is a failure" 1 "$_rc"
+TARGETS="ollama"; SERVICES_DONE="x"
+assert_ok "no services, nothing to do" provision_service_targets
+assert_eq "and nothing recorded" "" "$SERVICES_DONE"
+# shellcheck source=/dev/null
+source "$FUNCS"
+unset GITEA_SERVER_URL GITEA_DEPLOY_TOKEN SERVICES_DONE; GITEA_ADMIN_USER="tester"
+
+describe register_target_key
+_stdin="$_tt/stdin"
+pct() {
+  echo "pct $*" >> "$MOCK_LOG"
+  if [[ $1 == exec && $2 == 912 && $4 == cat ]]; then
+    [[ -n ${FAKE_NO_KEY:-} ]] || echo sk-strata-generated
+  elif [[ $1 == exec && $2 == 910 ]]; then
+    cat > "$_stdin"
+  fi
+}
+mock_reset_log
+assert_ok "a target without a key needs nothing" register_target_key ollama
+assert_eq "and runs nothing" "" "$(mock_calls)"
+assert_ok "Strata's key is handed to the router" register_target_key strata
+assert_contains "with set-strata-token in the router CT" "pct exec 910 -- /usr/local/bin/manage-model-servers set-strata-token" "$(mock_calls)"
+assert_eq "on stdin, twice (token and confirmation)" $'sk-strata-generated\nsk-strata-generated' "$(cat "$_stdin")"
+assert_not_contains "never as an argument" "sk-strata-generated" "$(mock_calls)"
+FAKE_NO_KEY=1
+assert_fail "an unreadable key is reported" register_target_key strata
+assert_contains "with the command to run instead" "set-strata-token --apply" "$(register_target_key strata 2>&1)"
+unset FAKE_NO_KEY
+
+describe wait_for_openwebui
+pct() { echo "pct $*" >> "$MOCK_LOG"; [[ -z ${FAKE_WEBUI_DOWN:-} ]]; }
+sleep() { :; }
+mock_reset_log
+assert_ok "returns once /health answers" wait_for_openwebui
+assert_contains "asking from inside the router CT" "pct exec 910 -- curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:8080/health" "$(mock_calls)"
+FAKE_WEBUI_DOWN=1 OPENWEBUI_WAIT_SECONDS=1
+assert_fail "gives up after OPENWEBUI_WAIT_SECONDS" wait_for_openwebui
+unset FAKE_WEBUI_DOWN OPENWEBUI_WAIT_SECONDS
+
+describe prompt_openwebui_admin_token
+TARGET_ADMIN_TOKEN=preset-token
+assert_ok "a preset token is used without asking" prompt_openwebui_admin_token < /dev/null
+TARGET_ADMIN_TOKEN=""
+prompt_openwebui_admin_token > "$_out" 2>&1 <<< $'typed-token\n'
+assert_eq "takes the typed token" typed-token "$TARGET_ADMIN_TOKEN"
+assert_contains "after saying where to create it" "Settings > Account > API keys" "$(cat "$_out")"
+assert_not_contains "without echoing it" typed-token "$(cat "$_out")"
+TARGET_ADMIN_TOKEN=""
+assert_fail "blank skips the companions" prompt_openwebui_admin_token <<< $'\n'
+
+describe provision_selected_targets
+run_target_provisioner() { echo "run $1" >> "$MOCK_LOG"; [[ " ${FAKE_FAIL:-} " != *" $1 "* ]]; }
+register_target_key() { echo "key $1" >> "$MOCK_LOG"; [[ -n "$(target_field "$1" key)" ]] || return 0; [[ -z ${FAKE_KEY_FAIL:-} ]]; }
+ensure_target_template() { echo "template $1" >> "$MOCK_LOG"; }
+wait_for_openwebui() { echo "wait" >> "$MOCK_LOG"; }
+prompt_openwebui_admin_token() { echo "token" >> "$MOCK_LOG"; [[ -z ${FAKE_NO_TOKEN:-} ]]; }
+run_ct() {
+  echo "router $*" >> "$MOCK_LOG"
+  [[ -z ${FAKE_APPLY_FAIL:-} || "$*" != '/usr/local/bin/manage-model-servers apply' ]]
+}
+TARGETS="ollama strata hermes"
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "all good is success" 0 "$_rc"
+assert_eq "model targets, their keys, one apply, then the companions" \
+  "$(printf '%s\n' 'run ollama' 'template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst' 'run strata' 'key strata' \
+     'router /usr/local/bin/manage-model-servers apply' wait token 'run hermes')" "$(mock_calls)"
+assert_contains "the summary lists each target" "strata         CT 912    ok" "$(cat "$_out")"
+mock_reset_log
+FAKE_APPLY_FAIL=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed router key apply fails the run" 1 "$_rc"
+assert_contains "the target is marked incomplete" "strata         CT 912    failed (router key apply)" "$(cat "$_out")"
+assert_contains "the summary gives the apply command" "pct exec 910 -- /usr/local/bin/manage-model-servers apply" "$(cat "$_out")"
+assert_contains "companions still run after an apply failure" "run hermes" "$(mock_calls)"
+mock_reset_log
+FAKE_FAIL=strata provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed target fails the run" 1 "$_rc"
+assert_contains "and says how to retry it" "rerun targets/strata/provision-lxc.sh" "$(cat "$_out")"
+assert_contains "while the others still run" "run hermes" "$(mock_calls)"
+assert_not_contains "and no key is applied for it" "manage-model-servers apply" "$(mock_calls)"
+FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "no admin key fails the run" 1 "$_rc"
+assert_contains "and the companions are skipped, not run" "skipped (no Open WebUI admin key)" "$(cat "$_out")"
+FAKE_KEY_FAIL=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a key the router did not get is a failure to fix" 1 "$_rc"
+assert_contains "named in the summary" "ok (router key not set)" "$(cat "$_out")"
+TARGETS="gitea ollama"; SERVICES_DONE="gitea "
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "services done before the router are not run again" "run ollama" "$(mock_calls)"
+assert_contains "but are in the summary" "ok (created before the router)" "$(cat "$_out")"
+assert_eq "and count as success" 0 "$_rc"
+SERVICES_DONE=""
+TARGETS=llamacpp; unset MODEL_ALIAS MODEL_PATH MODEL_DOWNLOAD_URL
+provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "llama.cpp with only its CT is not a failure" 0 "$_rc"
+assert_contains "but the summary says what is left" "CT only: run install-target.sh" "$(cat "$_out")"
+TARGETS=""
+assert_ok "no targets, nothing to do" provision_selected_targets
+
+# Restore the real functions and what the rest of the suite expects.
+# shellcheck source=/dev/null
+source "$FUNCS"
+unset -f pveam pct sleep
+rm -rf "$_tt" "$_out"
+CT_ID=100; TARGETS=""; INSTALL_TARGETS=""; TARGET_ADMIN_TOKEN=""
+unset TARGETS_DIR TARGET_RESERVED_IDS TARGET_RESERVED_IPS TEMPLATE_REF GATEWAY BRIDGE NAMESERVER \
+  OPENWEBUI_PORT STORAGE CORES ROOTFS_GB IP_CIDR _tt _out _rc _stdin _pveam_list_local _pveam_list_nfs \
+  OLLAMA_CT_ID OLLAMA_IP_CIDR OLLAMA_STORAGE STRATA_CT_ID STRATA_IP_CIDR STRATA_STORAGE STRATA_TEMPLATE \
+  LLAMACPP_CT_ID LLAMACPP_IP_CIDR LLAMACPP_STORAGE HERMES_CT_ID HERMES_IP_CIDR HERMES_STORAGE MAYA_IP_CIDR
+TEMPLATE_STORAGE="local"; MODEL_SERVER_COUNT=3
+
 # ── validators ────────────────────────────────────────────────────────────────
 describe valid_ipv4
 assert_ok   "accepts 1.2.3.4"            valid_ipv4 1.2.3.4
@@ -442,16 +946,41 @@ mock_script pct <<'EOF'
 [ "$1" = "status" ] && { case "$2" in 100|101) exit 0;; *) exit 1;; esac; }
 exit 0
 EOF
-mock_command pvesh 0 "102"
+mock_script pvesh <<'EOF'
+if [[ "$*" == *"--vmid "* ]]; then
+  case "${*: -1}" in 100|101|151) exit 1;; *) exit 0;; esac
+fi
+echo 102
+EOF
 CT_ID=""
 assert_eq "uses pvesh nextid when free" "102" "$(find_next_ct_id)"
 CT_ID="150"
 assert_eq "honours an explicit free CT_ID" "150" "$(find_next_ct_id)"
 CT_ID="100"
 assert_fail "rejects an occupied CT_ID" find_next_ct_id
+CT_ID="151"
+assert_fail "rejects an ID occupied on another cluster node" find_next_ct_id
 CT_ID="abc"
 assert_fail "rejects a non-numeric CT_ID" find_next_ct_id
+CT_ID="151"
+assert_contains "a refused ID names every cause" "is in use or not available in this cluster" \
+  "$(find_next_ct_id 2>&1)"
 CT_ID=""
+# A pvesh that cannot answer is an error at once, never an endless scan.
+_broken="$(mktemp -d)"
+printf '#!/bin/sh\nexit 1\n' > "$_broken/pvesh"
+printf '#!/bin/sh\nexit 1\n' > "$_broken/pct"
+chmod +x "$_broken/pvesh" "$_broken/pct"
+_rc=0
+_msg="$(env PATH="$_broken:$PATH" timeout 10 bash -c 'source "$1"; CT_ID=""; find_next_ct_id' _ "$FUNCS" 2>&1)" || _rc=$?
+assert_eq       "a failing pvesh stops instead of looping" "1" "$_rc"
+assert_contains "and says why" "Cannot read the cluster's guest list" "$_msg"
+_rc=0
+env PATH="$NO_PVESH_BIN" timeout 10 bash -c \
+  'source "$1"; ct_id_free() { return 1; }; CT_ID=""; find_next_ct_id' _ "$FUNCS" \
+  >/dev/null 2>&1 || _rc=$?
+assert_eq       "without pvesh, a node with no free ID gives up" "1" "$_rc"
+rm -rf "$_broken"; unset _broken _rc _msg
 
 describe run_ct
 CT_ID=999
@@ -488,7 +1017,13 @@ assert_contains "verification off adds --insecure" "--insecure" "${GITEA_CURL_OP
 describe gitea_diagnose_rc
 assert_contains "6 mentions DNS"          "DNS"         "$(gitea_diagnose_rc 6 https://g 2>&1)"
 assert_contains "7 mentions the appliance" "nginx"      "$(gitea_diagnose_rc 7 https://g 2>&1)"
+assert_contains "7 mentions the community port" "port 3000" "$(gitea_diagnose_rc 7 http://g:3000 2>&1)"
 assert_contains "22 mentions 401"          "401"        "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_contains "22 names the token scopes" "write:repository" "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_contains "22 explains existing-repo scopes" "Existing repositories need read:user and write:repository." "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_contains "22 names the extra creation scope" "Automatic repository creation also needs write:user" "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_contains "22 notes the account needs write access" "needs Write access" "$(gitea_diagnose_rc 22 https://g 2>&1)"
+assert_not_contains "22 does not request unnecessary organisation scope" "write:organization" "$(gitea_diagnose_rc 22 https://g 2>&1)"
 assert_contains "60 mentions certificate"  "certificate" "$(gitea_diagnose_rc 60 https://g 2>&1)"
 assert_contains "unknown code is reported" "99"         "$(gitea_diagnose_rc 99 https://g 2>&1)"
 
@@ -817,10 +1352,11 @@ out="$(test_gitea_access TOKEN 2>&1)"
 assert_contains "removes the marker again" "Removed the test marker" "$out"
 assert_contains "deletes with the blob sha" "abc123" "$(mock_calls)"
 
-# http:// remote: warn about the redirect that drops the Authorization header.
+# http:// remote: note the clear-text token and the redirect that drops it.
 GITEA_SERVER_URL="http://git.example.net"
 out="$(test_gitea_access TOKEN 2>&1)"
-assert_contains "warns about http:// losing the token" "drops the auth token" "$out"
+assert_contains "http:// notes the token is sent unencrypted" "sent unencrypted" "$out"
+assert_contains "http:// notes curl drops the token on an HTTPS redirect" "curl drops the token" "$out"
 GITEA_SERVER_URL="https://git.example.net"
 
 # Repo missing everywhere (404 + empty search) -> created under the token owner.
@@ -839,6 +1375,34 @@ EOF
 out="$(test_gitea_access TOKEN 2>&1)" || true
 assert_contains "creates the repo when it is missing" "Creating repository" "$out"
 assert_contains "and still commits into it"           "test commit succeeded" "$out"
+
+# An explicit owner that is not the token owner (e.g. an organisation) is never
+# created: POST /user/repos would put the repo under the token owner instead.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;
+esac
+case "$*" in
+  *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
+  *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
+  *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
+esac
+EOF
+GITEA_REPO_OWNER="org-team"
+mock_reset_log
+out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
+assert_eq       "a missing repo under another owner fails" "1" "$rc"
+assert_contains "and says to create it in Gitea first" "Create it in Gitea first" "$out"
+assert_eq       "without creating a repo under the token owner" "0" "$(mock_call_count 'user/repos')"
+assert_eq       "or writing a test commit" "0" "$(mock_call_count 'contents')"
+# The same owner in different case is the token owner, so creation proceeds.
+GITEA_REPO_OWNER="Tester"
+mock_reset_log
+out="$(test_gitea_access TOKEN 2>&1)" || true
+assert_contains "the token owner in another case is still created" "Creating repository tester/ollama-smart-router" "$out"
+assert_contains "and committed to"                     "test commit succeeded" "$out"
+GITEA_REPO_OWNER=""
 
 # Commit rejected -> non-zero and the HTTP code surfaced.
 mock_script curl <<'EOF'

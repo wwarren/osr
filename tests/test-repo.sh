@@ -24,7 +24,8 @@ assert_eq "installer heredocs match the repo files" "0" "$rc"
 
 describe installer_owned_list
 eval "$(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$INSTALLER")"
-embedded="$(python3 "${ROOT}/tools/sync-embedded.py" --list | sort)"
+# Windows Python emits CRLF even when invoked from Git Bash.
+embedded="$(python3 "${ROOT}/tools/sync-embedded.py" --list | tr -d '\r' | sort)"
 owned="$(printf '%s\n' "${INSTALLER_OWNED_CODE[@]}" | sort)"
 # Every embedded file except the tunables (*.ini) must be installer-owned...
 missing="$(comm -23 <(grep -v '\.ini$' <<< "$embedded") <(printf '%s\n' "$owned"))"
@@ -185,6 +186,10 @@ for t in "${ROOT}"/targets/*/install-target.sh; do
 done
 for dir in "${ROOT}"/targets/*/; do
   name=$(basename "$dir")
+  # Hermes (an agent client) and the Gitea and Mattermost services are upgraded
+  # by their own updaters (hermes update, the community script, apt); the
+  # inference-target rollback contract does not apply to them.
+  case $name in hermes|gitea|mattermost) continue ;; esac
   # Code lines of the target's tests (comments do not count as a test).
   tests_code="cat '${dir}'test-*.sh | grep -vE '^[[:space:]]*#'"
   if grep -qE -- '--upgrade\)' "${dir}install-target.sh"; then
