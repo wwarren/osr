@@ -363,7 +363,7 @@ sequenceDiagram
     participant CT as Container
     Op->>I: run as root
     I->>Op: prompts (targets, network, storage, target CTs)
-    I->>I: selected services: Gitea, Mattermost CTs; their URL, token, webhook
+    I->>I: selected services: Gitea and Mattermost CTs, then their URL, token and webhook
     I->>Op: prompts (Gitea, Mattermost, servers), pre-filled from the services
     I->>G: verify token, resolve or create repo
     I->>G: seed missing files, update installer-owned code
