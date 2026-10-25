@@ -19,6 +19,11 @@ trap cleanup EXIT
 passed=0
 pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$1"; }
 
+# The dependency check parses pyproject.toml with tomllib (Python 3.11+, as on
+# the CT's Debian 12/13). Say so instead of failing on an import error.
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' ||
+    fail "python3 is $(python3 -c 'import platform; print(platform.python_version())'); these cases need Python 3.11+ (tomllib)"
+
 # --- helpers in isolation ----------------------------------------------------
 # shellcheck disable=SC1090
 source <(awk '

@@ -198,7 +198,8 @@ token counts as down. It also probes LiteLLM, the router's `/healthz` and Open
 WebUI's `/health`. A state change needs `fail_threshold` (3) or
 `recover_threshold` (2) consecutive results, and only transitions are posted.
 Undelivered alerts are retried every cycle. A startup notice, at most once per
-`notice_interval_seconds` (3600), doubles as a webhook check.
+`notice_interval_seconds` (3600), doubles as a webhook check. That limit applies
+only to the notice; it does not delay host-down alerts.
 
 The **keep-alive maintainer** (own thread) exists because Ollama's OpenAI
 endpoint ignores `keep_alive`. When `OLLAMA_KEEP_ALIVE` is set, every 240 s it
@@ -267,7 +268,7 @@ candidate is passed through as-is.
 | Layer | Trigger | Behaviour |
 |---|---|---|
 | 1. Best candidate | Normal | Direct dispatch |
-| 2. Fail-forward | Connect error/timeout (host marked down), transport error, 404, 5xx; on a tool request, a 400 that names tools (the model is then skipped for tool requests until the next poll) | Next candidate |
+| 2. Fail-forward | Connect error/timeout (host marked down), transport error, 404, 5xx; on a tool request, a 400 that rejects tool support, such as "does not support tools" (the model is then skipped for tool requests until the next poll; from the last candidate the 400 is returned). Any other 400, including a malformed `tools` schema, is returned as-is and nothing is demoted | Next candidate |
 | 3. LiteLLM | Discovery off or inventory empty | Static tiers with LiteLLM's own fallbacks |
 
 `[http] connect_timeout_seconds` (3) bounds how long a dead host delays
@@ -359,19 +360,27 @@ its process; `clear-lock [--force]` reports, or stops, a hung holder.
 sequenceDiagram
     participant Op as Operator
     participant I as Installer (PVE host)
+    participant S as Service CTs
     participant G as Gitea
-    participant CT as Container
+    participant CT as Router CT
+    participant T as Target CTs
     Op->>I: run as root
-    I->>Op: prompts (targets, network, storage, target CTs)
-    I->>I: selected services: Gitea and Mattermost CTs, then their URL, token and webhook
-    I->>Op: prompts (Gitea, Mattermost, servers), pre-filled from the services
-    I->>G: verify token, resolve or create repo
-    I->>G: seed missing files, update installer-owned code
-    I->>CT: pct create + start, wait for systemd + DNS, base packages
-    CT->>G: git clone config repo
-    I->>CT: apply-config.sh, build venvs, Python 3.12 for Open WebUI
-    I->>CT: MOTD, firewall rules, enable + start units
-    I->>I: selected targets: model servers, keys to the router, then companions
+    I->>Op: choose targets, network, storage and CT settings
+    I->>S: provision Gitea and Mattermost
+    S-->>I: return URL, token and webhook
+    I->>Op: confirm services and model servers
+    I->>G: verify token and resolve repository
+    I->>I: build config tree from answers
+    I->>G: seed and update configuration
+    I->>CT: create router CT and install base packages
+    CT->>G: clone configuration
+    I->>CT: apply config and build venvs
+    I->>CT: set MOTD and firewall, start services
+    I->>T: provision model servers
+    T-->>I: generated keys (Strata, Basalt, Maya)
+    I->>CT: set-<kind>-token on stdin, then apply
+    I->>Op: ask for Open WebUI admin API key
+    I->>T: provision companions (Open Terminal, Hermes)
 ```
 
 **Targets chosen at install.** An interactive install offers the `targets/`
@@ -926,6 +935,11 @@ setup:
 * **Results.** Root-only files in `/etc/<service>-target/`. The router
   installer reads them with `pct exec … cat`, so no secret is on a command
   line or in the host's process list.
+* **Alerts during target provisioning.** The router monitor starts before
+  model targets are provisioned. A configured but absent host raises one down
+  alert after three failed checks; when the host becomes ready, two passing
+  checks trigger a recovery notice (both counts are the `[alerting]`
+  defaults). The startup-notice limit is separate.
 * **Modes.** `--create-only` is the earlier wrapper (community script plus
   browser steps), and `tools/install-*.sh` forward to it. `--reconfigure`
   reruns only the setup in an existing CT.

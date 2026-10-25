@@ -96,8 +96,14 @@ Target-specific settings (`GPU_DEVICES`, `STRATA_MODEL`, `OLLAMA_PULL_MODELS`,
 The router's own `CT_ID`, `IP_CIDR`, `CORES`, `ROOTFS_GB` and similar settings
 never reach a target. A failed target leaves the router as it is. The run ends
 with a summary of every target and how to retry it, and exits non-zero if any
-target failed. The router monitor reports the new hosts as down until they have
-been created.
+target failed. The router monitor reports each configured but absent model host
+as down after three failed checks and posts one down alert for it, retried
+every cycle until Mattermost accepts it. Once the host is ready, two passing
+checks send a recovery notice. (Both counts are defaults, set in
+`monitor.ini` `[alerting]`.)
+
+The monitor's startup notice is limited to one per hour; that limit does not
+delay host alerts.
 
 It then prompts for the CT root password, network (bridge, IP/CIDR, gateway, DNS),
 rootfs size and storage, Gitea URL/user/repo/token, Mattermost webhook
@@ -208,8 +214,9 @@ Every `(host, model)` pair is then scored:
   (Ollama's `tools` capability; the llama.cpp bridge needs `tools` in
   `MODEL_CAPABILITIES`). It is raised to at least the `large` class
   (`[classification] tools_min_class`), and stays on one model across an agent
-  loop. A model that answers 400 "does not support tools" is skipped and the
-  next candidate tried.
+  loop. A model that answers 400 "does not support tools" (or similar
+  wording) is skipped and the next candidate tried. Any other 400, such as a
+  malformed `tools` schema, goes back to the client unchanged.
 - **Never embeddings** — naming an embedding-only model on
   `/v1/chat/completions` returns 400 `embedding_model_not_chat`.
 - **Load spreading** — near-ties rotate across hosts.

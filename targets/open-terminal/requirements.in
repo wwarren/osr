@@ -1,8 +1,9 @@
-# Inputs for the hash-locked requirements-py3XX.lock files: the runtime
-# dependencies of open-terminal at OPEN_TERMINAL_VERSION (from its
-# pyproject.toml) plus hatchling, its build backend, so the verified checkout
-# builds without fetching anything unhashed. Regenerate both locks with
-# tools in targets/open-terminal/README.md ("Updating the pin").
+# Inputs for the hash-locked requirements.lock: the runtime dependencies of
+# open-terminal at OPEN_TERMINAL_VERSION (from its pyproject.toml) plus
+# hatchling, its build backend, so the verified checkout builds without
+# fetching anything unhashed. The one lock must resolve identically on Python
+# 3.11 (Debian 12) and 3.13 (Debian 13); regenerate and compare it as
+# targets/open-terminal/README.md describes ("Updating the pin").
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 click>=8.1.0

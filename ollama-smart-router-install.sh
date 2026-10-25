@@ -3502,9 +3502,16 @@ async def _stream_upstream(method: str, url: str, headers: dict,
 # Upstream statuses that mean "try the next candidate": the host is failing
 # (5xx) or no longer has the model (404, e.g. removed since the last poll).
 RETRYABLE_STATUS = {404} | set(range(500, 600))
-# A 400 that names tools, on a tool request, means "this model cannot call
-# tools" (Ollama: "... does not support tools"); the next candidate may.
-TOOL_ERROR_RE = re.compile(rb"\btools?\b|function.call", re.IGNORECASE)
+# Only a capability rejection warrants trying another model and temporarily
+# excluding this one from tool requests. A malformed tools payload can also
+# mention "tools" in a 400, but every candidate would receive that same error.
+TOOL_REJECTION_RE = re.compile(
+    rb"\b(?:does not|doesn't|do not|don't)\s+support\s+"
+    rb"(?:tools?|tool\s+(?:calls?|calling|use)|function\s+(?:calls?|calling))\b"
+    rb"|\b(?:tools?|tool\s+(?:calls?|calling|use)|function\s+(?:calls?|calling))"
+    rb"\s+(?:is|are)\s+not\s+supported\b",
+    re.IGNORECASE,
+)
 # Error bodies are small; never buffer more than this to inspect one.
 ERROR_PEEK_BYTES = 65536
 
@@ -3559,15 +3566,20 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
             continue
         buffered = None
         if upstream_response.status_code == 400 and need.get("tools"):
+            # The raw body is inspected as sent. A compressed error body will
+            # not match, so it is passed through and nothing is demoted.
             buffered = await _read_raw(upstream_response)
             await upstream_response.aclose()
-            if TOOL_ERROR_RE.search(buffered) and not is_last:
+            if TOOL_REJECTION_RE.search(buffered):
                 # Skip this model for tool requests until the next poll
                 # (which rebuilds the entry) instead of failing every turn.
+                # The last candidate is remembered too; its 400 is returned.
                 entry["tools"] = False
                 last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
-                log.warning("dispatch: %s; trying the next candidate", last_error)
-                continue
+                if not is_last:
+                    log.warning("dispatch: %s; trying the next candidate", last_error)
+                    continue
+                log.warning("dispatch: %s; no candidates left", last_error)
         log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)",
                  need["class"], need["code"], need["vision"], need.get("tools", False),
                  need.get("approx_tokens"), entry["name"], entry["server"],

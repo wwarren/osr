@@ -63,6 +63,7 @@ class Upstream:
             HOST_B: tags(("qwen3:14b", "14.8B", "qwen3")),
         }
         self.chat = {}          # host -> status code or "connect" / "timeout"
+        self.chat_errors = {}   # host -> custom error body
         self.calls = []
         self.capabilities = {}  # model name -> list, None (404) or "boom"
         self.tool_less = set()  # models whose chat rejects a tool request
@@ -88,6 +89,8 @@ class Upstream:
                 return streamed(400, {"error": {"message": (
                     f"registry.ollama.ai/library/{body['model']} does not support tools"),
                     "type": "api_error"}})
+            if behaviour == 400 and host in self.chat_errors:
+                return streamed(400, self.chat_errors[host])
             return streamed(behaviour, {"served_by": host, "model": body["model"]},
                             {"x-upstream": "yes", "connection": "close"})
         if request.url.path == "/api/show":
@@ -1026,6 +1029,22 @@ def test_a_400_that_is_not_about_tools_is_passed_through(served):
     assert len(served_hosts(upstream)) == 1
 
 
+def test_a_tools_schema_400_is_passed_through_without_demotion(served):
+    router, upstream, client = served
+    tool_pool(router, upstream, client, ("mystery:14b", "14.8B", "x"),
+              ("other:14b", "14.8B", "y"), {})
+    upstream.chat[HOST_A] = 400
+    upstream.chat_errors[HOST_A] = {"error": {
+        "message": "Invalid parameter 'tools': function parameters must be an object"}}
+    router._rotation.clear()
+
+    response = chat(client, tools=TOOLS)
+    assert response.status_code == 400
+    assert response.json() == upstream.chat_errors[HOST_A]
+    assert served_hosts(upstream) == [HOST_A]
+    assert tools_flag(router, "mystery:14b") == [None]
+
+
 def test_last_candidate_tool_rejection_is_returned(served):
     router, upstream, client = served
     tool_pool(router, upstream, client, ("mystery:14b", "14.8B", "x"),
@@ -1034,6 +1053,24 @@ def test_last_candidate_tool_rejection_is_returned(served):
     response = chat(client, tools=TOOLS)
     assert response.status_code == 400
     assert "does not support tools" in response.json()["error"]["message"]
+    # Both hosts' entries are remembered, the last one included.
+    assert tools_flag(router, "mystery:14b") == [False, False]
+
+
+def test_a_lone_tool_less_model_is_remembered_and_still_answers(served):
+    router, upstream, client = served
+    upstream.inventory = {HOST_A: tags(("mystery:14b", "14.8B", "x"))}
+    router._CAPABILITIES.clear()
+    assert client.post("/routing/refresh").status_code == 200
+    upstream.tool_less = {"mystery:14b"}
+    for _ in range(2):
+        # Known not to support tools, it is still the only candidate, so the
+        # client keeps getting the backend's own 400 rather than a 502.
+        response = chat(client, tools=TOOLS)
+        assert response.status_code == 400
+        assert "does not support tools" in response.json()["error"]["message"]
+        assert tools_flag(router, "mystery:14b") == [False]
+    assert served_hosts(upstream) == [HOST_A, HOST_A]
 
 
 def test_no_tool_model_is_flagged(served):

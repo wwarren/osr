@@ -118,6 +118,54 @@ def test_alert_is_sent_once_per_host_and_retried_until_delivered(monitor):
         assert len(sent) == 3
 
 
+@pytest.mark.parametrize("notice_throttled", [False, True],
+                         ids=["first-start", "startup-notice-throttled"])
+def test_new_host_alerts_once_during_provisioning_then_recovers(
+        monkeypatch, tmp_path, notice_throttled):
+    """A host configured before its target CT is ready: the down alert lands on
+    exactly the FAIL_THRESHOLD-th failed check and is not repeated, and the
+    recovery notice on exactly the RECOVER_THRESHOLD-th passing check. A
+    startup notice suppressed by the hourly limit does not delay either."""
+    module = load_monitor(monkeypatch, MODEL_SERVERS=B, BACKEND_FAST="", BACKEND_MEDIUM=B,
+                          BACKEND_LARGE="", MONITOR_STATE_DIR=str(tmp_path),
+                          MATTERMOST_WEBHOOK_URL="http://mm.test/hooks/x")
+    if notice_throttled:
+        module.record_startup_notice()          # a notice went out moments ago
+    checks = [c for c in module.build_checks() if c.key == B]
+    sent = []
+    monkeypatch.setattr(module, "post_mattermost",
+                        lambda message, emoji=None: sent.append(message) or True)
+
+    module.send_startup_notice(checks)
+    notices = 0 if notice_throttled else 1
+    assert len(sent) == notices
+    if not notice_throttled:
+        assert "monitor online" in sent[0]
+    alerts = sent[notices:]
+
+    with ThreadPoolExecutor(2) as pool:
+        with fake_client({B}) as absent:
+            for _ in range(module.FAIL_THRESHOLD - 1):
+                module.run_cycle(checks, absent, pool)
+            assert alerts == [] and sent[notices:] == []
+            module.run_cycle(checks, absent, pool)           # the threshold check
+            assert len(sent[notices:]) == 1
+            assert "Infrastructure Alert" in sent[-1] and B in sent[-1]
+            for _ in range(4):                               # still absent: quiet
+                module.run_cycle(checks, absent, pool)
+            assert len(sent[notices:]) == 1
+        with fake_client(set()) as ready:
+            for _ in range(module.RECOVER_THRESHOLD - 1):
+                module.run_cycle(checks, ready, pool)
+            assert len(sent[notices:]) == 1
+            module.run_cycle(checks, ready, pool)            # the threshold pass
+            assert len(sent[notices:]) == 2
+            assert "Recovery Notice" in sent[-1] and B in sent[-1]
+            for _ in range(3):                               # stays up: quiet
+                module.run_cycle(checks, ready, pool)
+    assert len(sent[notices:]) == 2
+
+
 def test_probes_run_in_parallel(monitor):
     checks = [monitor.Check(str(i), f"http://h{i}", str(i)) for i in range(4)]
 

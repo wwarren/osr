@@ -18,6 +18,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/.." && pwd)"
 EXTRACT="${HERE}/lib/extract-functions.py"
+SKIP_PARSER="${HERE}/lib/parse-skips.py"
 
 # suite-name : script-under-test : test-file
 SUITES=(
@@ -25,20 +26,34 @@ SUITES=(
   "manage:${ROOT}/install/manage-model-servers.sh:${HERE}/test-manage.sh"
 )
 # Suites without per-function coverage: repo consistency, the inference-target
-# scripts (llama.cpp, AirLLM), and their Python tests.
-EXTRA_NAMES=(repo nvidia update remote-update mattermost gitea)
-EXTRA_KINDS=(shell shell shell shell shell shell)
-EXTRA_PATHS=("${HERE}/test-repo.sh" "${HERE}/test-nvidia.sh" "${HERE}/test-update.sh" "${HERE}/test-remote-update.sh" "${HERE}/test-mattermost.sh" "${HERE}/test-gitea.sh")
-EXTRA_PYTHONS=("" "" "" "" "" "")
-EXTRA_TESTS=("" "" "" "" "" "")
+# scripts, the services' Python tests and the runner's own tests. Each suite is
+# one record, so its name, kind, interpreter and file cannot drift apart:
+#
+#   add_suite NAME shell  SCRIPT          bash SCRIPT
+#   add_suite NAME pytest FILE PYTHON     PYTHON -m pytest -q FILE
+#   add_suite NAME python FILE PYTHON     PYTHON FILE (standard-library unittest)
+EXTRA_NAMES=(); EXTRA_KINDS=(); EXTRA_PATHS=(); EXTRA_PYTHONS=()
+add_suite() {
+  local name=$1 kind=$2 path=$3 python=${4:-}
+  case "$kind" in
+    shell) [[ -z "$python" ]] || { echo "add_suite ${name}: a shell suite takes no interpreter" >&2; exit 2; } ;;
+    pytest|python) [[ -n "$python" ]] || { echo "add_suite ${name}: ${kind} needs an interpreter" >&2; exit 2; } ;;
+    *) echo "add_suite ${name}: unknown suite kind '${kind}'" >&2; exit 2 ;;
+  esac
+  [[ -n "$path" ]] || { echo "add_suite ${name}: no test file" >&2; exit 2; }
+  EXTRA_NAMES+=("$name"); EXTRA_KINDS+=("$kind"); EXTRA_PATHS+=("$path"); EXTRA_PYTHONS+=("$python")
+}
+add_suite repo          shell "${HERE}/test-repo.sh"
+add_suite nvidia        shell "${HERE}/test-nvidia.sh"
+add_suite update        shell "${HERE}/test-update.sh"
+add_suite remote-update shell "${HERE}/test-remote-update.sh"
+add_suite mattermost    shell "${HERE}/test-mattermost.sh"
+add_suite gitea         shell "${HERE}/test-gitea.sh"
+add_suite runner-skips  shell "${HERE}/test-runner-skips.sh"
 for _t in "${ROOT}"/targets/*/test-*.sh; do
   [[ -f "$_t" ]] || continue
   _target=$(basename "$(dirname "$_t")")
-  EXTRA_NAMES+=("${_target}-$(basename "$_t" .sh | sed 's/^test-//')")
-  EXTRA_KINDS+=(shell)
-  EXTRA_PATHS+=("$_t")
-  EXTRA_PYTHONS+=("")
-  EXTRA_TESTS+=("")
+  add_suite "${_target}-$(basename "$_t" .sh | sed 's/^test-//')" shell "$_t"
 done
 # The router and the llama.cpp bridge pin different fastapi versions, so each
 # pytest suite can run under its own interpreter (CI builds one venv per
@@ -46,23 +61,15 @@ done
 # server tests stub airllm/torch and only need the bridge's fastapi stack.
 ROUTER_PYTHON="${ROUTER_PYTHON:-python3}"
 BRIDGE_PYTHON="${BRIDGE_PYTHON:-python3}"
-EXTRA_NAMES+=(bridge airllm router monitor)
-EXTRA_KINDS+=(pytest pytest pytest pytest)
-EXTRA_PATHS+=("" "" "" "")
-EXTRA_PYTHONS+=("${BRIDGE_PYTHON}" "${BRIDGE_PYTHON}" "${ROUTER_PYTHON}" "${ROUTER_PYTHON}")
-EXTRA_TESTS+=(
-  "${ROOT}/targets/llamacpp/test_bridge.py"
-  "${ROOT}/targets/airllm/test_server.py"
-  "${HERE}/test_router.py"
-  "${HERE}/test_monitor.py"
-)
+add_suite bridge  pytest "${ROOT}/targets/llamacpp/test_bridge.py" "$BRIDGE_PYTHON"
+add_suite airllm  pytest "${ROOT}/targets/airllm/test_server.py"   "$BRIDGE_PYTHON"
+add_suite router  pytest "${HERE}/test_router.py"                  "$ROUTER_PYTHON"
+add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTHON"
 # Standard-library unittest scripts: no venv needed.
-EXTRA_NAMES+=(open-terminal-integration open-terminal-webui-probe hermes-integration)
-EXTRA_KINDS+=(python python python)
-EXTRA_PATHS+=("${ROOT}/targets/open-terminal/test-integration.py" "${ROOT}/targets/open-terminal/test-webui-probe.py"
-              "${ROOT}/targets/hermes/test-integration.py")
-EXTRA_PYTHONS+=(python3 python3 python3)
-EXTRA_TESTS+=("" "" "")
+add_suite open-terminal-integration python "${ROOT}/targets/open-terminal/test-integration.py" python3
+add_suite open-terminal-webui-probe python "${ROOT}/targets/open-terminal/test-webui-probe.py" python3
+add_suite hermes-integration        python "${ROOT}/targets/hermes/test-integration.py"        python3
+add_suite skip-report               python "${HERE}/test-skip-report.py"                       python3
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'
 [[ -t 1 ]] || { c_red=""; c_grn=""; c_yel=""; c_bld=""; c_off=""; }
@@ -129,16 +136,19 @@ ran_any=false
 suite_out="$(mktemp "${TMPDIR:-/tmp}/run-tests.XXXXXX")"
 trap 'rm -f -- "$suite_out"' EXIT
 
-# run_suite NAME CMD...: run one suite, showing its output, and note any cases
-# it skipped: "SKIP ..." lines, or assert.sh skips for want of root.
+# run_suite NAME CMD...: show and capture every kind of suite so skip reports
+# from shell, pytest and unittest all reach the strict-mode gate.
 run_suite() {
-  local name=$1 rc line
+  local name=$1 rc line reports
   shift
   "$@" 2>&1 | tee "$suite_out"
   rc=${PIPESTATUS[0]}
-  while IFS= read -r line; do
-    skipped+=("${name}: ${line#SKIP }")
-  done < <(sed 's/\x1b\[[0-9;]*m//g' "$suite_out" | grep -E '^SKIP |^ *skip .*needs? root' | sed 's/^ *skip *//')
+  reports="$(python3 "$SKIP_PARSER" "$suite_out")" || return 1
+  if [[ -n "$reports" ]]; then
+    while IFS= read -r line; do
+      skipped+=("${name}: ${line}")
+    done <<< "$reports"
+  fi
   return "$rc"
 }
 for entry in "${SUITES[@]}"; do
@@ -170,10 +180,10 @@ for i in "${!EXTRA_NAMES[@]}"; do
         skipped+=("${name}: the whole suite (needs: pip install pytest fastapi httpx)")
         continue
       fi
-      "${EXTRA_PYTHONS[$i]}" -m pytest -q "${EXTRA_TESTS[$i]}" || failed_suites+=("$name")
+      run_suite "$name" "${EXTRA_PYTHONS[$i]}" -m pytest -q "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
       ;;
     python)
-      "${EXTRA_PYTHONS[$i]}" "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
+      run_suite "$name" "${EXTRA_PYTHONS[$i]}" "${EXTRA_PATHS[$i]}" || failed_suites+=("$name")
       ;;
     *)
       printf 'ERROR: unknown suite type for %s\n' "$name" >&2
@@ -203,10 +213,10 @@ if (( uncovered_total > 0 )); then
 fi
 if (( ${#skipped[@]} > 0 )); then
   if $strict; then
-    printf '%sSKIPPED cases (not allowed with --strict or CI=true; run as root):%s\n' "$c_red" "$c_off"
+    printf '%sSKIPPED cases (not allowed with --strict or CI=true):%s\n' "$c_red" "$c_off"
     rc=1
   else
-    printf '%sskipped cases (run as root to include them; --strict fails on this):%s\n' "$c_yel" "$c_off"
+    printf '%sskipped cases (--strict fails on this):%s\n' "$c_yel" "$c_off"
   fi
   printf '  %s\n' "${skipped[@]}"
 fi

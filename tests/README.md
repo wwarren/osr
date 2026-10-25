@@ -20,9 +20,12 @@ Exit status is non-zero if any assertion fails **or** any function has no
 `describe` block, so this drops straight into CI.
 
 **Skipped cases.** Most end-to-end cases of the target installers need root,
-and their suites skip them otherwise ("SKIP …"). The run then still passes,
-and the result lists what was skipped. With `--strict`, or when `CI=true`, any
-skip fails the run, so CI cannot go green without them. The CI workflow uses
+and their suites skip them otherwise ("SKIP …"). The runner also recognizes
+other leading `skip`/`skipped:` lines and pytest/unittest skipped counts. The
+run then still passes and lists the skips. With `--strict`, or when `CI=true`,
+any skip fails the run, so CI cannot go green without them. Suites are
+registered in `run-tests.sh` with one `add_suite NAME KIND FILE [PYTHON]` line
+each. The CI workflow uses
 `--strict`, so its job must run as root. The provisioner suites (Hermes, Gitea,
 Mattermost) need no root: they stub `id`, so their whole runs always run.
 
@@ -41,6 +44,7 @@ end of each run. Use `--coverage` for the function coverage report alone.
 | Suite | What it checks |
 |---|---|
 | `repo` | installer heredocs match the repo files (`tools/sync-embedded.py --check`), the installer-owned code list, no CRLF, Windows-1252 double-encoded or invalid UTF-8 text (tracked files via `git ls-files`, or a tree walk outside a checkout; a scan that cannot run fails), no secrets in `env/*.env`, every unit hardened, every `targets/*` has the standard scripts and no nested `.git`, the Ollama drop-in is hardened, the AirLLM hash lock, a single management tool, LiteLLM's own venv, `[proxy]` extra and hash lock |
+| `runner-skips` / `skip-report` | `runner-skips` runs `run-tests.sh` itself: each pytest suite gets its own file and interpreter, and the last suite reaches the result line; in a scratch copy of the runner, a passing suite that reports a shell `skip`/`SKIP`/`skipped:` line, a pytest summary or a unittest summary fails `--strict` (and `CI=true`) but passes an ordinary run, which lists it. `skip-report` unit-tests the parser |
 | `update` | `tests/test-update.sh`: `install/update-router.sh` against a temporary config repo — owned-file list parsed as text, CRLF/syntax refusals, dry run, tunables and env kept, venv refresh, undo on a failed apply or pip install (end-to-end cases need root) |
 | `remote-update` | `tests/test-remote-update.sh`: update wrapper with mocked `pct` and container commands — location and CT prompts, arbitrary working directory, installed unit and runtime scan, host staging, container direct update, option forwarding, failure propagation, cleanup, root check, CRLF refusal before any CT is touched, root-owned archive, and container mode skipping its own clone (or refusing to run from the deployed config repo) |
 | `mattermost` | `tests/test-mattermost.sh`: `tools/install-mattermost.sh` forwards to `targets/mattermost/provision-lxc.sh --create-only`, and passes an explicit mode through |
