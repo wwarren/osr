@@ -72,6 +72,11 @@ stub systemd-detect-virt 'echo lxc'
 stub getent 'exit 0'
 stub sleep 'exit 0'
 stub ldd 'echo "	linux-vdso.so.1"'
+stub apt-get 'exit 0'
+stub runuser 'shift 3; "$@"'   # runuser -u USER -- CMD...
+# vulkaninfo --summary: a discrete GPU, or only Mesa's CPU renderer (FAKE_VK=cpu).
+stub vulkaninfo 'if [[ ${FAKE_VK:-discrete} == cpu ]]; then printf "GPU0:\n\tdeviceType = PHYSICAL_DEVICE_TYPE_CPU\n\tdeviceName = llvmpipe (LLVM 19.1.7, 256 bits)\n"
+else printf "GPU0:\n\tdeviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\n\tdeviceName = AMD Radeon RX 7900 XTX (RADV NAVI31)\n"; fi'
 stub systemctl 'case "$1" in
     show) if [[ $* == *ActiveState* ]]; then
               if [[ -n ${FAKE_ACTIVE_STATE:-} ]]; then echo "$FAKE_ACTIVE_STATE"
@@ -106,6 +111,7 @@ upgrade() {
         BACKEND="${BACKEND:-}" FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
         FORCE_REBUILD="${FORCE_REBUILD:-false}" UPGRADE_HEALTH_TIMEOUT=10 \
         GPU_LAYERS="${GPU_LAYERS:-}" CUDA_COMPILER="${CUDA_COMPILER:-}" \
+        DRI_DIR="$tmp_root/dri" FAKE_VK="${FAKE_VK:-discrete}" \
         bash "$script_dir/install-target.sh" --upgrade
 }
 
@@ -257,5 +263,40 @@ pass 'stopped services stay stopped, on success and on rollback'
 rm -rf "$tmp_root/opt/bin/llama-server"
 upgrade >/dev/null 2>&1 && die 'upgrade without an installation succeeded'
 pass 'upgrade refuses a target that is not installed'
+
+# Vulkan (AMD Radeon, Intel Arc) needs Debian 13; CUDA stays on Debian 12.
+mkdir -p "$tmp_root/dri"; : > "$tmp_root/dri/renderD128"
+make_install
+printf 'ID=debian\nVERSION_ID=13\n' > "$tmp_root/os-release"
+echo 'GPU_LAYERS=0' >> "$tmp_root/etc/llama-server.env"
+out=$(BACKEND=vulkan upgrade 2>&1) || die "cpu->vulkan upgrade failed: $out"
+grep -q 'apt-get install --no-install-recommends -y mesa-vulkan-drivers libvulkan1 libvulkan-dev glslc spirv-headers vulkan-tools' "$log" ||
+    die "Vulkan packages: $(cat "$log")"
+grep -q 'cmake .*-DGGML_CUDA=OFF -DGGML_VULKAN=ON' "$log" || die "Vulkan build flags: $(grep cmake "$log")"
+grep -q '^backend=vulkan$' "$tmp_root/opt/build-info.txt" || die 'vulkan backend not recorded'
+[[ $(layers) == auto && $out == *'RX 7900 XTX'* ]] || die "cpu->vulkan: GPU_LAYERS=$(layers) $out"
+: > "$log"
+out=$(upgrade 2>&1) || die "vulkan re-run failed: $out"
+grep -q 'apt-get install' "$log" && die 'an unchanged Vulkan target reinstalled packages'
+pass 'cpu -> vulkan on Debian 13: Mesa, Vulkan headers and glslc, a Vulkan build, GPU layers on'
+
+make_install
+printf 'ID=debian\nVERSION_ID=13\n' > "$tmp_root/os-release"
+out=$(FAKE_VK=cpu BACKEND=vulkan upgrade 2>&1) && die 'Vulkan without a GPU was accepted'
+[[ $out == *'Vulkan sees no discrete GPU (only: deviceName = llvmpipe'* ]] || die "no GPU: $out"
+grep -q 'cmake' "$log" && die 'built without a GPU'
+rm -f "$tmp_root/dri/renderD128"
+out=$(BACKEND=vulkan upgrade 2>&1) && die 'Vulkan without a render node was accepted'
+[[ $out == *'cannot open a GPU render node'* ]] || die "no render node: $out"
+: > "$tmp_root/dri/renderD128"
+make_install
+out=$(BACKEND=vulkan upgrade 2>&1) && die 'Vulkan on Debian 12 was accepted'
+[[ $out == *'The Vulkan build targets a Debian 13 guest'* ]] || die "debian 12 vulkan: $out"
+make_install
+printf 'ID=debian\nVERSION_ID=13\n' > "$tmp_root/os-release"
+out=$(BACKEND=cuda CUDA_COMPILER=$tmp_root/nvcc upgrade 2>&1) && die 'CUDA on Debian 13 was accepted'
+[[ $out == *'The CUDA 13.0 build targets a Debian 12 guest'* ]] || die "debian 13 cuda: $out"
+grep -qE 'cmake|systemctl (stop|restart)' "$log" && die 'a refused backend touched the target'
+pass 'Vulkan needs a discrete GPU through a render node, and Debian 13; CUDA stays on Debian 12'
 
 printf '%s upgrade cases passed. No system files, builds or services were touched.\n' "$passed"

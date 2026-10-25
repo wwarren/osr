@@ -1,0 +1,7 @@
+__pycache__/
+# Local settings and model data never belong in git.
+*.env
+!comfyui.env.example
+models/
+*.safetensors
+*.ckpt

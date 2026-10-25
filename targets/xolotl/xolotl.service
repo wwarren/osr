@@ -1,0 +1,46 @@
+[Unit]
+Description=Xolotl inference API (DeepSeek-V4.1-Flash)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=xolotl
+Group=xolotl
+WorkingDirectory=/opt/xolotl
+# Written by install-target.sh: XOLOTL_PORT. The engine settings, model paths
+# and API key are in the server config, which only root and the xolotl group
+# can read; the key is never on a command line.
+EnvironmentFile=/etc/xolotl-target/xolotl.env
+ExecStart=/opt/xolotl/.venv/bin/python /opt/xolotl/tools/v41/serve/serve_ds41.py --engine strata --config /etc/xolotl/xolotl-ds41.json --port ${XOLOTL_PORT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+# Unpinning the RAM arena (tens of GiB) takes a while.
+TimeoutStopSec=180
+# The engine pins its expert arena in RAM; the CT's lxc.prlimit.memlock must
+# allow it too (provision-lxc.sh sets it to unlimited).
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/xolotl
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The checkout (code, venv, engine build) stays read-only for the service;
+# models and caches live in the data directory.
+ReadWritePaths=/var/lib/xolotl /dev/shm
+PrivateTmp=true
+# Keep passed-through GPU devices visible. Access is restricted by CT devN
+# entries and by the device group the xolotl account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

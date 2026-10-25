@@ -20,12 +20,13 @@ four hardened systemd services as the `ollama-router` user:
 Normal request path: **client or Open WebUI → router :8000 → model host**.
 LiteLLM is used only when discovery is off or no host answers.
 
-The model pool can mix Ollama, LM Studio, Strata, Basalt and Project Maya
-servers. `targets/` provisions such servers in their own CTs (see
+The model pool can mix Ollama, LM Studio, Strata, Basalt, Project Maya and
+Xolotl servers. `targets/` provisions such servers in their own CTs (see
 [Inference targets](#inference-targets)), plus optional
 [Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
-service LXCs and [Open Terminal](targets/open-terminal/README.md) and
-[Hermes Agent](targets/hermes/README.md) companion LXCs.
+service LXCs and [Open Terminal](targets/open-terminal/README.md),
+[Hermes Agent](targets/hermes/README.md) and [ComfyUI](targets/comfyui/README.md)
+(image generation) companion LXCs.
 
 ## Install
 
@@ -45,9 +46,9 @@ bash ollama-smart-router-install.sh
 It first asks which [targets](#inference-targets) to create alongside the
 router, from a numbered menu:
 - the services `gitea` and `mattermost`;
-- the model servers `ollama`, `llamacpp`, `airllm`, `strata`, `basalt` and
-  `maya`;
-- the companions `open-terminal` and `hermes`.
+- the model servers `ollama`, `llamacpp`, `airllm`, `strata`, `basalt`,
+  `maya` and `xolotl`;
+- the companions `open-terminal`, `hermes` and `comfyui`.
 
 Answer with numbers or names, comma-separated, or Enter for none.
 
@@ -55,9 +56,43 @@ For each selected target, it asks up front, with the other settings:
 - a CT ID (the next free one after the router's);
 - a static IP/CIDR (the router needs a fixed address);
 - a storage (default: the router's);
-- for Strata, Basalt and Maya, a template. The default is the newest
+- for Strata, Basalt, Maya and Xolotl, a template. The default is the newest
   downloaded Ubuntu 24.04, Ubuntu 22.04 or Debian 12 standard template;
   otherwise an Ubuntu 24.04 template that is downloaded when needed.
+
+**The host's GPU driver comes next,** when GPU targets are selected. All the
+selected targets share one GPU vendor:
+
+| Target | GPU |
+|---|---|
+| Strata, Maya, Xolotl | NVIDIA, required |
+| Basalt | NVIDIA RTX 50, required |
+| llama.cpp | required unless `BACKEND=cpu`: NVIDIA (CUDA) or AMD Radeon / Intel Arc (Vulkan, on a Debian 13 CT) |
+| AirLLM | NVIDIA, only when `GPU_DEVICES` is set |
+| Ollama, ComfyUI | NVIDIA, AMD Radeon or Intel Arc, used when present |
+
+If a suitable GPU already works (`nvidia-smi` lists one, or an AMD/Intel card is
+bound to its driver with its render node), the installer just reports it.
+Otherwise [`tools/setup-host-gpu.sh`](tools/setup-host-gpu.sh) lists the cards on
+the PCI bus and asks which generation the card is, suggesting it from the
+card's ID: `rtx20`-`rtx50` (GeForce RTX 20-50), `rdna3` (Radeon RX 7000, PRO
+W7000), `rdna4` (Radeon RX 9000, AI PRO R9700), `arc-a` or `arc-b` (Intel Arc
+A/B). Once you agree, it sets the driver up: for NVIDIA it installs the
+repository's NVIDIA 580.173.02 driver (open kernel modules, DKMS, loaded at
+every boot with the `/dev/nvidia*` nodes the CTs pass through); for AMD and
+Intel, whose drivers are part of the Proxmox kernel, it installs `pve-firmware`
+when the card's firmware is missing and loads `amdgpu`, `i915` or `xe` now and
+at every boot (Arc B needs Linux 6.12+). A driver blacklisted in
+`/etc/modprobe.d` (often for VM passthrough) or a card bound to `vfio-pci` is
+reported, not changed. Unattended: `GPU_GENERATION=rtx40` (or `7900`, `9070`,
+`A770`, `B580`) `INSTALL_HOST_DRIVER=yes`. Without a GPU, targets that need one
+stop the install before anything is created, and Ollama and ComfyUI go on
+CPU-only. If the card needs a reboot (nouveau still holds it, or new firmware),
+reboot and run the installer again; nothing else was created. The installer
+then hands the result on: `GPU=<vendor>` to Ollama and ComfyUI, and
+`BACKEND=cuda` or `BACKEND=vulkan` with the render node as `GPU_DEVICES` to
+llama.cpp, unless you set them. A GPU target's `provision-lxc.sh` run by hand
+on a host without a driver points to the same tool.
 
 **Services are created right away,** after the network and storage prompts and
 before anything for the router is built. Each runs its target's community
@@ -85,14 +120,18 @@ After the router is running:
    - Ollama and AirLLM include their guest install.
    - llama.cpp includes it only when `MODEL_ALIAS` plus `MODEL_DOWNLOAD_URL` or
      `MODEL_PATH` are set; otherwise only the CT is made.
-   - Strata, Basalt and Maya generate keys, which are handed to the router with
+   - Strata, Basalt, Maya and Xolotl generate keys, which are handed to the router with
      `set-<kind>-token` on stdin, followed by one `apply`.
 2. The installer waits for Open WebUI and asks once for an admin API key: create
    the admin account in the browser, enable API keys, and create one. It then
-   runs Open Terminal and Hermes against the router CT.
+   runs Open Terminal, Hermes and ComfyUI against the router CT. ComfyUI's
+   community script shows its own menu (choose **Default**) and takes a while.
 
 Target-specific settings (`GPU_DEVICES`, `STRATA_MODEL`, `OLLAMA_PULL_MODELS`,
-`HERMES_MODEL`, …) come from the environment, as each target's README describes.
+`HERMES_MODEL`, `COMFYUI_MODEL_URL`, …) come from the environment, as each target's README describes;
+so do `GPU_GENERATION` and `INSTALL_HOST_DRIVER` for the host driver step, and
+`BACKEND` (llama.cpp: `cuda`, `vulkan` or `cpu`) and `GPU` (Ollama and ComfyUI:
+`nvidia`, `amd`, `intel` or `none`).
 The router's own `CT_ID`, `IP_CIDR`, `CORES`, `ROOTFS_GB` and similar settings
 never reach a target. A failed target leaves the router as it is. The run ends
 with a summary of every target and how to retry it, and exits non-zero if any
@@ -124,7 +163,7 @@ all defaults and skips the prompts):
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
-| Targets | `INSTALL_TARGETS` (e.g. `gitea,ollama,hermes`; pre-fills the menu answer), `INSTALL_GITEA` / `INSTALL_MATTERMOST` (`true` pre-selects that service), `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE` (`<NAME>` is `GITEA`, `MATTERMOST`, `OLLAMA`, `LLAMACPP`, …, `OPEN_TERMINAL`, `HERMES`), `GITEA_COMMUNITY_SCRIPT_URL` / `_SHA256` and the `MATTERMOST_*` equivalents (pin a service's community script), the services' own settings such as `GITEA_SITE_ADMIN` and `MATTERMOST_TEAM` (see their READMEs), `<NAME>_PORT` for Strata/Basalt/Maya (8080), `OPENWEBUI_ADMIN_TOKEN` (skips the admin key prompt), `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
+| Targets | `INSTALL_TARGETS` (e.g. `gitea,ollama,hermes`; pre-fills the menu answer), `INSTALL_GITEA` / `INSTALL_MATTERMOST` (`true` pre-selects that service), `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE` (`<NAME>` is `GITEA`, `MATTERMOST`, `OLLAMA`, `LLAMACPP`, …, `OPEN_TERMINAL`, `HERMES`, `COMFYUI`), `COMFYUI_IMAGE_VARIANT` (`klein-4b` or `klein-9b`) and `HF_TOKEN` (skips the Hugging Face token prompt for `klein-9b`), `GITEA_COMMUNITY_SCRIPT_URL` / `_SHA256` and the `MATTERMOST_*` and `COMFYUI_*` equivalents (pin a target's community script), the services' own settings such as `GITEA_SITE_ADMIN` and `MATTERMOST_TEAM` (see their READMEs), `<NAME>_PORT` for Strata/Basalt/Maya (8080), `OPENWEBUI_ADMIN_TOKEN` (skips the admin key prompt), `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
 
 `NONINTERACTIVE=true` refuses a non-empty `INSTALL_TARGETS` (or `INSTALL_GITEA`
 / `INSTALL_MATTERMOST=true`). The community scripts' menus, GPU selection and
@@ -270,7 +309,7 @@ manage-model-servers set-model large qwen3:32b --apply       # every server in t
 manage-model-servers set-server-model large 10.0.0.54 llama3.3:70b --apply   # one server
 manage-model-servers set-keepalive 2h --apply
 manage-model-servers set-api-key [key|--generate|--off]
-manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya
+manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl
 manage-model-servers set-token | set-webhook [url] | test-alert [message]
 manage-model-servers set-webui-version [version|latest] [--apply]
 manage-model-servers apply [--all] | commit [message]
@@ -292,8 +331,9 @@ manage-model-servers clear-lock [--force]
 Non-Ollama servers are stored with a kind prefix (`maya+http://host:8080`);
 `add` accepts `kind://host` or `--type kind`. A bare address is auto-detected
 without sending a key: Ollama `/api/tags`, then the public `/health` markers of
-Strata, Basalt and Maya, then LM Studio's model API, trying each kind's
-default port.
+Strata, Basalt, Maya and Xolotl, then LM Studio's model API, trying each kind's
+default port. Xolotl runs Strata's server, so its `/health` says `strata`; a
+DeepSeek-V4 model there identifies Xolotl.
 
 | Kind | Default port | Token (in `secrets.env`) | Notes |
 |---|---|---|---|
@@ -302,6 +342,7 @@ default port.
 | Strata | 8080 | `set-strata-token` | Must listen on an address the router can reach (its default is `127.0.0.1`). Can run on 11434: `strata://host:11434`. |
 | Basalt | 8080 | `set-basalt-token` | Model ID is `BASALT_ALIAS` (default `qwen3.8-flash-next`) |
 | Maya | 8080 | `set-maya-token` | Model ID `glm-5.3-flash` |
+| Xolotl | 8080 | `set-xolotl-token` | Model ID `XOLOTL_MODEL_NAME` (default `deepseek-v4.1-flash`, sized 552B) |
 
 Example for a keyed Strata-style server. Set the token first, so the probe can
 authenticate:
@@ -313,14 +354,14 @@ manage-model-servers set-server-model xlarge maya://10.0.0.9 glm-5.3-flash --app
 ```
 
 If an older keyed Strata cannot be identified without a key, add it as
-`strata://host` (that probe uses the key) or with `--no-probe`. Strata, Basalt
-and Maya load models themselves, so no keep-alive is sent. The monitor counts
+`strata://host` (that probe uses the key) or with `--no-probe`. Strata, Basalt,
+Maya and Xolotl load models themselves, so no keep-alive is sent. The monitor counts
 them as down while `/v1/models` is empty, which is how they answer when the
 engine is not running.
 
 ### Model sizes for unsized IDs
 
-Strata, Basalt and Maya report no parameter count. `[model_sizes]` in
+Strata, Basalt, Maya and Xolotl report no parameter count. `[model_sizes]` in
 `router.ini` maps exact model IDs (case-insensitive) to a size:
 
 ```ini
@@ -433,17 +474,18 @@ If the upgraded UI fails its health check, the previous version and
 Each target has `provision-lxc.sh` (run on the PVE host; it creates the CT,
 passes the GPU through and pushes files), `install-target.sh` (run in the CT;
 also does `--upgrade`), tests and a README with the full procedure. Every
-provisioner offers `--dry-run`; the Strata, Basalt and Maya guest installers
-also offer it.
+provisioner offers `--dry-run`; the Strata, Basalt, Maya and Xolotl guest
+installers also offer it.
 
 | Target | Register as | Port | Engine |
 |---|---|---|---|
-| [ollama](targets/ollama/README.md) | plain address | 11434 | Ollama from the PVE community script, run unprivileged with pinned, checksummed upgrades |
-| [llamacpp](targets/llamacpp/README.md) | plain address | 11434 | llama.cpp `llama-server` (one GGUF) behind an Ollama bridge |
+| [ollama](targets/ollama/README.md) | plain address | 11434 | Ollama from the PVE community script, run unprivileged with pinned, checksummed upgrades; NVIDIA (CUDA), AMD Radeon (ROCm) or Intel Arc (Vulkan) |
+| [llamacpp](targets/llamacpp/README.md) | plain address | 11434 | llama.cpp `llama-server` (one GGUF) behind an Ollama bridge; CUDA on NVIDIA, Vulkan on AMD Radeon and Intel Arc (Debian 13), or CPU |
 | [airllm](targets/airllm/README.md) | plain address | 11434 | AirLLM, streaming a model larger than RAM/VRAM from disk; seconds–minutes per token, so give it its own tier |
 | [strata](targets/strata/README.md) | `strata://` | 8080 | Strata (Qwen3.8-Flash-Next) |
 | [basalt](targets/basalt/README.md) | `basalt://` | 8080 | Basalt on a Blackwell GPU, CUDA 13 (13.1+ on Debian 13) |
 | [maya](targets/maya/README.md) | `maya://` | 8080 | Project Maya (GLM-5.3-Flash), CUDA 12.8 default |
+| [xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | Xolotl, Indras Mirror's Strata fork, running DeepSeek-V4.1-Flash (552B MoE) on one 24 GB GPU; downloads ~372 GB of pinned, hash-checked weights, CUDA 13.0 default |
 
 [Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
 are services for the router (configuration repository and alerts). They come
@@ -456,27 +498,42 @@ its model provider, and by default its API server is added to Open WebUI as the
 model `hermes-agent`. Needs a tool-capable model with 64K context. After
 `set-api-key`, run its `provision-lxc.sh --reconfigure`.
 
+[ComfyUI](targets/comfyui/README.md) is Open WebUI's image generation engine,
+not a pool member: chats get an image button, backed by ComfyUI on a GPU in
+its own CT (port 8188). The CT comes from the Proxmox VE community script; the
+target adopts it (unprivileged account, data in `/var/lib/comfyui-target`),
+admits only the router to its unauthenticated port through the CT firewall,
+and sets Open WebUI's image settings (engine, URL, and the selected distilled
+FLUX.2 Klein 4B or 9B workflow). The installer prompts for the variant, and the
+CT install downloads its diffusion model, text encoder and VAE (12.5 or 18.4 GB,
+checksum-verified, resumable), so images work when the install finishes.
+`klein-9b` is gated: the installer also asks for a Hugging Face token whose
+account accepted its license (or takes `HF_TOKEN`). Its `--upgrade` builds a
+pinned, commit-verified release beside the running one.
+
 Upgrades share one contract ([ARCHITECTURE.md §16](ARCHITECTURE.md#16-inference-targets-targets)):
 
-- Sources are fetched and verified before stopping. Strata, Basalt and Maya
-  stop and snapshot the running checkout before building; llama.cpp, AirLLM,
-  Ollama and Open Terminal prepare the new build, venv or release while the
-  old one keeps running, then restart.
+- Sources are fetched and verified before stopping. Strata, Basalt, Maya and
+  Xolotl stop and snapshot the running checkout before building (Xolotl also
+  verifies or finishes its weights download first); llama.cpp, AirLLM,
+  Ollama, Open Terminal and ComfyUI prepare the new build, venv or release
+  while the old one keeps running, then restart.
 - An unchanged, healthy target is left alone ("nothing to do").
 - Success requires the target's own health check.
 - Any failure restores the previous code and configuration, health-checks
   it, and exits non-zero.
-- llama.cpp, AirLLM and Ollama keep a deliberately stopped service stopped.
-- Strata, Basalt and Maya keep an installation's settings on every rerun, with
+- llama.cpp, AirLLM, Ollama and ComfyUI keep a deliberately stopped service
+  stopped.
+- Strata, Basalt, Maya and Xolotl keep an installation's settings on every rerun, with
   or without `--upgrade` (`installed-env`, or `installed-settings` for older
   installs). Non-empty environment values override them; changing Strata's
-  family or Maya's CUDA version also resets the model or nvcc derived from it
+  family or Maya's or Xolotl's CUDA version also resets the model or nvcc derived from it
   unless that is given too. A first install that stops part-way resumes with
   the settings it was started with (`pending-env`). An existing checkout or
   unit with no readable record at all requires every setting explicitly; it
   never receives fresh-install defaults.
 
-Strata, Basalt and Maya snapshot their runnable checkout to
+Strata, Basalt, Maya and Xolotl snapshot their runnable checkout to
 `/var/lib/<target>-target/rollback-runtime.tar` (root-only, may contain
 secrets) before changing it, and delete it once the upgrade or the rollback
 succeeds. Leave disk room for one snapshot during an upgrade; model stores
@@ -527,7 +584,7 @@ curl -s -H "Authorization: Bearer $KEY" http://<ct-ip>:8000/routing/inventory
 | No Mattermost alerts | `journalctl -u ollama-monitor` shows rejected webhooks. Use `set-webhook` and `test-alert`. Alerts fire after 3 failed checks and recover after 2; the startup notice is sent at most hourly. |
 | `apply` failed | The snapshot was restored and the services were restarted on the old files. Read the reported check, then `journalctl -u <unit>`. Snapshots are in `/var/backups/ollama-smart-router/`. |
 | "config is locked" | Another change is running. A hung one: `manage-model-servers clear-lock` shows the holder, and `--force` stops it. Afterwards check `git -C /app/config-repo status` and re-run `apply`. |
-| Target upgrade failed | The installer says whether the previous version is "running again". If not, use `journalctl -u <unit>` in the target CT. Replaced files are kept as `*.prev` (llama.cpp, AirLLM, Ollama); Strata, Basalt and Maya keep their snapshot in `/var/lib/<target>-target/` when the rollback fails. Maya and Basalt: the CT's distro must carry the CUDA release, or the toolkit must already be installed. Debian 13 starts at 13.1 (no V100 support for Maya; set `CUDA_VERSION=13.1` for Basalt). |
+| Target upgrade failed | The installer says whether the previous version is "running again". If not, use `journalctl -u <unit>` in the target CT. Replaced files are kept as `*.prev` (llama.cpp, AirLLM, Ollama); Strata, Basalt, Maya and Xolotl keep their snapshot in `/var/lib/<target>-target/` when the rollback fails. Maya, Basalt and Xolotl: the CT's distro must carry the CUDA release, or the toolkit must already be installed. Debian 13 starts at 13.1 (no V100 support for Maya; set `CUDA_VERSION=13.1` for Basalt). |
 
 ## Development
 
@@ -544,5 +601,5 @@ touches the network, a CT or a GPU. Target end-to-end cases need root and are
 skipped otherwise; `unshare -r bash targets/<t>/test-*.sh` runs them as an
 ordinary user. CI (`.gitea/workflows/tests.yml`, needs an `act_runner`) runs
 the suites, shellcheck and ruff on every push. It uses separate router and
-bridge venvs because they pin different fastapi versions. Two more jobs check
-Strata and Maya at their pinned upstream commits.
+bridge venvs because they pin different fastapi versions. Three more jobs check
+Strata, Maya and Xolotl at their pinned upstream commits.

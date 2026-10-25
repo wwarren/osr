@@ -22,7 +22,14 @@ Settings (environment; all optional):
   OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b'   models to pull once the server is up
   OLLAMA_VERSION=$OLLAMA_DEFAULT_VERSION             release for --upgrade
   OLLAMA_SHA256=<hex>                       also require this archive checksum (--upgrade)
+  OLLAMA_GPU=auto|nvidia|amd|intel|none     the GPU this CT was given (auto: /dev/kfd
+                                            is AMD, an Arc render node Intel)
 Server settings live in /etc/ollama-target/ollama.env (see ollama.env.example).
+
+AMD Radeon: Ollama's ROCm libraries (the release's -rocm archive, checksum-
+verified) are added to the installed release, and every --upgrade installs
+them with it. Intel Arc: Mesa's Vulkan driver (mesa-vulkan-drivers) is
+installed for Ollama's Vulkan backend.
 
 --upgrade verifies the archive against the release's sha256sum.txt, keeps models
 and settings, and puts the previous release back if the server does not answer
@@ -41,6 +48,8 @@ OLLAMA_LIB=${OLLAMA_LIB:-/usr/local/lib/ollama}
 OLLAMA_LINK=${OLLAMA_LINK:-/usr/local/bin/ollama}
 # Where the community install keeps models: as root (HOME=/root), or as the ollama user.
 LEGACY_MODEL_DIRS=${LEGACY_MODEL_DIRS:-/root/.ollama/models /usr/share/ollama/.ollama/models}
+DEV_ROOT=${DEV_ROOT:-/dev}
+DRM_SYSFS=${DRM_SYSFS:-/sys/class/drm}
 RELEASE_BASE=${RELEASE_BASE:-https://github.com/ollama/ollama/releases/download}
 SERVICE=ollama.service
 DROPIN=$TARGET_UNITS/$SERVICE.d/10-ollama-target.conf
@@ -55,32 +64,77 @@ release_archive() {
         *) return 1 ;;
     esac
 }
+# rocm_archive: the release's ROCm libraries for AMD GPUs (amd64 only).
+rocm_archive() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'ollama-linux-amd64-rocm.tar.zst' ;;
+        *) return 1 ;;
+    esac
+}
+# has_rocm_libs DIR: does the release in DIR carry the ROCm libraries?
+has_rocm_libs() { compgen -G "$1/lib/ollama/rocm*" >/dev/null; }
+# gpu_vendor: OLLAMA_GPU, or for auto what this CT was given: /dev/kfd is an
+# AMD GPU, an Intel render node an Arc, /dev/nvidia0 an NVIDIA GPU.
+gpu_vendor() {
+    local node
+    case ${OLLAMA_GPU:-auto} in
+        nvidia|amd|intel|none) printf '%s\n' "$OLLAMA_GPU"; return 0 ;;
+        auto) ;;
+        *) return 1 ;;
+    esac
+    if [[ -e $DEV_ROOT/kfd ]]; then echo amd; return 0; fi
+    for node in "$DRM_SYSFS"/renderD*; do
+        [[ $(cat "$node/device/vendor" 2>/dev/null) == 0x8086 ]] && { echo intel; return 0; }
+    done
+    if [[ -e $DEV_ROOT/nvidia0 ]]; then echo nvidia; else echo none; fi
+}
+# ensure_vulkan_runtime: Mesa's Vulkan driver for Ollama's Vulkan backend (Intel Arc).
+ensure_vulkan_runtime() {
+    local version
+    if ! dpkg-query -W -f='${Status}' mesa-vulkan-drivers 2>/dev/null | grep -q 'ok installed' ||
+            ! dpkg-query -W -f='${Status}' libvulkan1 2>/dev/null | grep -q 'ok installed'; then
+        printf 'Installing Mesa'"'"'s Vulkan driver for the Intel Arc GPU...\n'
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends mesa-vulkan-drivers libvulkan1
+    fi
+    version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers 2>/dev/null || true)
+    if [[ -n $version ]] && dpkg --compare-versions "$version" lt 24.2; then
+        printf 'Note: Mesa %s is older than 24.2, which Arc B-series cards need; run apt full-upgrade in this CT.\n' "$version" >&2
+    fi
+    return 0
+}
 # The checksum listed for archive $2 in sha256sum file $1 ("<hex>  [./]<name>").
 listed_sha256() {
     awk -v name="$2" '{ file = $2; sub(/^\*?(\.\/)?/, "", file) } file == name { print tolower($1); exit }' "$1"
 }
-# Download the release archive for $1 into directory $2 and verify it; prints the path.
+# Download archive $3 (default: the release archive) of release $1 into
+# directory $2 and verify it against the release's sha256sum.txt; prints the
+# path. OLLAMA_SHA256 pins the release archive only.
 fetch_release() {
-    local version=$1 dir=$2 archive expected actual
-    archive=$(release_archive) || die "Unsupported architecture: $(uname -m)"
-    curl -fsSL --retry 3 -o "$dir/sha256sum.txt" "$RELEASE_BASE/$version/sha256sum.txt"
+    local version=$1 dir=$2 archive=${3:-} expected actual
+    [[ -n $archive ]] || archive=$(release_archive) || die "Unsupported architecture: $(uname -m)"
+    [[ -s $dir/sha256sum.txt ]] || curl -fsSL --retry 3 -o "$dir/sha256sum.txt" "$RELEASE_BASE/$version/sha256sum.txt"
     curl -fsSL --retry 3 -o "$dir/$archive" "$RELEASE_BASE/$version/$archive"
     expected=$(listed_sha256 "$dir/sha256sum.txt" "$archive")
     [[ $expected =~ ^[0-9a-f]{64}$ ]] || die "sha256sum.txt of $version does not list $archive."
     actual=$(sha256sum "$dir/$archive" | awk '{ print $1 }')
     [[ $actual == "$expected" ]] || die "Checksum mismatch for $archive: got $actual, the release lists $expected."
-    if [[ -n ${OLLAMA_SHA256:-} ]]; then
+    if [[ -n ${OLLAMA_SHA256:-} && -z ${3:-} ]]; then
         [[ $actual == "${OLLAMA_SHA256,,}" ]] || die "Checksum mismatch for $archive: got $actual, OLLAMA_SHA256 is $OLLAMA_SHA256."
     fi
     printf '%s' "$dir/$archive"
 }
-# Unpack archive $1 into a fresh $2 (bin/ollama + lib/ollama) and check the binary runs.
+# Unpack archive $1 into a fresh $2 (bin/ollama + lib/ollama), then any extra
+# archives (the ROCm libraries) on top, and check the binary runs.
 unpack_release() {
-    local archive=$1 dest=$2
+    local archive=$1 dest=$2 extra
     rm -rf -- "$dest"
     install -d -m 0755 "$dest"
     zstd -dc -- "$archive" | tar -xf - -C "$dest" --no-same-owner
     [[ -x $dest/bin/ollama ]] || die 'The release archive has no bin/ollama.'
+    for extra in "${@:3}"; do
+        zstd -dc -- "$extra" | tar -xf - -C "$dest" --no-same-owner
+    done
     chmod -R u=rwX,go=rX -- "$dest"
     "$dest/bin/ollama" --version >/dev/null 2>&1 || die 'The downloaded ollama binary does not run on this system.'
 }
@@ -167,6 +221,7 @@ valid_version "$OLLAMA_VERSION" || die 'OLLAMA_VERSION must be a release tag suc
 [[ -z ${OLLAMA_SHA256:-} || ${OLLAMA_SHA256} =~ ^[0-9A-Fa-f]{64}$ ]] || die 'OLLAMA_SHA256 must be 64 hex digits.'
 OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-}
 valid_models "$OLLAMA_PULL_MODELS" || die 'OLLAMA_PULL_MODELS is a space-separated list of name[:tag] entries.'
+gpu=$(gpu_vendor) || die 'OLLAMA_GPU must be auto, nvidia, amd, intel or none.'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for file in ollama.env.example ollama-target.conf README.md; do
@@ -178,10 +233,14 @@ if [[ $MODE == upgrade ]]; then
     work=$(mktemp -d "${TMPDIR:-/tmp}/ollama-target.XXXXXX")
     trap 'rm -rf -- "$work"' EXIT
     printf 'Installed Ollama: %s\nRequested: %s\n' "$(installed_version)" "$OLLAMA_VERSION"
+    # GPU selection can change without a release change. Install Intel's loader
+    # before deciding that a same-version upgrade has nothing to do.
+    [[ $gpu != intel ]] || ensure_vulkan_runtime
     # The requested release is already the installed one: nothing to download
     # or restart, unless a running server does not answer as that version.
     # (OLLAMA_SHA256 is checked whenever a release is downloaded.)
-    if [[ $(installed_version) == "${OLLAMA_VERSION#v}" && $(readlink -f -- "$OLLAMA_LINK") == "$(readlink -f -- "$OLLAMA_LIB/bin/ollama")" ]]; then
+    if [[ $(installed_version) == "${OLLAMA_VERSION#v}" && $(readlink -f -- "$OLLAMA_LINK") == "$(readlink -f -- "$OLLAMA_LIB/bin/ollama")" ]] &&
+            { [[ $gpu != amd ]] || has_rocm_libs "$OLLAMA_LIB"; }; then
         if [[ $(systemctl show "$SERVICE" -p ActiveState --value) == inactive ]]; then
             printf 'Ollama %s is already installed; nothing to do (the service stays stopped).\n' "$OLLAMA_VERSION"
             exit 0
@@ -190,9 +249,17 @@ if [[ $MODE == upgrade ]]; then
             exit 0
         fi
         printf 'Ollama %s is installed but the server does not answer as that version; reinstalling it.\n' "$OLLAMA_VERSION"
+    elif [[ $(installed_version) == "${OLLAMA_VERSION#v}" && $gpu == amd ]]; then
+        printf 'Ollama %s is installed without ROCm libraries for the AMD GPU; reinstalling it with them.\n' "$OLLAMA_VERSION"
     fi
     archive=$(fetch_release "$OLLAMA_VERSION" "$work")
-    unpack_release "$archive" "$work/new"
+    extras=()
+    # AMD: the ROCm libraries come with every release (also when the installed one has them).
+    if [[ $gpu == amd ]] || has_rocm_libs "$OLLAMA_LIB"; then
+        rocm=$(rocm_archive) || die "Ollama has no ROCm libraries for $(uname -m)."
+        extras+=("$(fetch_release "$OLLAMA_VERSION" "$work" "$rocm")")
+    fi
+    unpack_release "$archive" "$work/new" "${extras[@]}"
 
     was_active=false
     [[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
@@ -257,9 +324,25 @@ else
     install -o root -g "$TARGET_USER" -m 0640 "$source_dir/ollama.env.example" "$TARGET_ENV"
 fi
 
+# The GPU's runtime: ROCm libraries matching the installed release (AMD), or
+# Mesa's Vulkan driver (Intel Arc). Both are fetched before the service stops.
+rocm_new=''
+if [[ $gpu == amd ]] && ! has_rocm_libs "$OLLAMA_LIB"; then
+    rocm_work=$(mktemp -d "${TMPDIR:-/tmp}/ollama-rocm.XXXXXX")
+    trap 'rm -rf -- "$rocm_work"' EXIT
+    printf 'Adding Ollama'"'"'s ROCm libraries for the AMD GPU (release v%s)...\n' "$(installed_version)"
+    rocm=$(rocm_archive) || die "Ollama has no ROCm libraries for $(uname -m)."
+    rocm_new=$(fetch_release "v$(installed_version)" "$rocm_work" "$rocm")
+fi
+[[ $gpu != intel ]] || ensure_vulkan_runtime
+
 was_active=false
 [[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
 if $was_active; then systemctl stop "$SERVICE"; fi
+if [[ -n $rocm_new ]]; then
+    zstd -dc -- "$rocm_new" | tar -xf - -C "$OLLAMA_LIB" --no-same-owner
+    chmod -R u=rwX,go=rX -- "$OLLAMA_LIB/lib/ollama"
+fi
 adopt_models
 chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_STATE"
 install -d -o root -g root -m 0755 "$(dirname -- "$DROPIN")"
@@ -279,7 +362,7 @@ done
 cat <<DONE
   Settings:  $TARGET_ENV, then: systemctl restart $SERVICE
   Models:    ollama pull <name:tag>   (models live in $TARGET_STATE/models)
-  GPU check: journalctl -u $SERVICE | grep -i -E 'inference compute|cuda'
+  GPU check: journalctl -u $SERVICE | grep -i -E 'inference compute|cuda|rocm|vulkan'   (GPU: $gpu)
   Upgrade:   bash install-target.sh --upgrade   (pinned, with rollback)
   Router:    manage-model-servers add http://<this CT's address>:11434
 DONE

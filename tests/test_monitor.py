@@ -24,7 +24,7 @@ def load_monitor(monkeypatch, **env):
         "OLLAMA_KEEP_ALIVE": "",
     }
     base.update(env)
-    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "BASALT_API_KEY", "MAYA_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
+    for key in ("BACKEND_XLARGE", "OPENWEBUI_HEALTH_URL", "MONITOR_STATE_DIR", "LMSTUDIO_API_TOKEN", "STRATA_API_KEY", "BASALT_API_KEY", "MAYA_API_KEY", "XOLOTL_API_KEY", "MODEL_FAST", "MODEL_MEDIUM",
                 "MODEL_LARGE", "MONITOR_FAIL_THRESHOLD", "MONITOR_RECOVER_THRESHOLD"):
         monkeypatch.delenv(key, raising=False)
     for key, value in base.items():
@@ -334,7 +334,7 @@ def test_maya_health_key_and_keep_alive(monkeypatch):
     assert pinned == [A]
 
 
-@pytest.mark.parametrize("kind", ["strata", "basalt", "maya"])
+@pytest.mark.parametrize("kind", ["strata", "basalt", "maya", "xolotl"])
 def test_openai_host_with_an_empty_model_list_is_down(monkeypatch, kind):
     """Strata-style servers answer /v1/models with 200 and no models while
     their engine is down; the router cannot use them, so neither is the host up."""
@@ -351,6 +351,22 @@ def test_openai_host_with_an_empty_model_list_is_down(monkeypatch, kind):
     assert module.probe(check.url, loaded, check.headers, check.require_models) == (True, "")
     not_json = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text="ok")))
     assert not module.probe(check.url, not_json, check.headers, check.require_models)[0]
+
+
+def test_xolotl_health_key_and_keep_alive(monkeypatch):
+    xolotl = "xolotl+http://10.0.0.12:8080"
+    module = load_monitor(monkeypatch, MODEL_SERVERS=f"{A},{xolotl}",
+                          BACKEND_XLARGE=xolotl, MODEL_FAST="deepseek-v4.1-flash",
+                          STRATA_API_KEY="strata-secret", XOLOTL_API_KEY="xolotl-secret",
+                          OLLAMA_KEEP_ALIVE="2h")
+    check = [c for c in module.build_checks() if c.key == xolotl][0]
+    assert check.url == "http://10.0.0.12:8080/v1/models"
+    assert check.headers == {"Authorization": "Bearer xolotl-secret"}
+    assert "Xolotl host" in check.label
+    pinned = []
+    monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append(url) or True)
+    module.refresh_keep_alive(lambda url: True)
+    assert pinned == [A]
 
 
 def test_empty_model_list_alerts_through_run_cycle(monkeypatch):

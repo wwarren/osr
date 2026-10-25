@@ -130,13 +130,14 @@ _DEFAULTS = {
         "tool_match": "0.3",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
         "strata": "125B",               # Strata's default id: Qwen3.8-Flash-Next
         "qwen3.8-flash-next": "125B",   # Basalt's default alias
         "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
+        "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
     },
 }
 ROUTER_INI = os.getenv(
@@ -305,6 +306,8 @@ SERVER_KINDS = {
                "label": "Basalt", "openai": True},
     "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
              "label": "Maya", "openai": True},
+    "xolotl": {"prefix": "xolotl+", "key_env": "XOLOTL_API_KEY",
+               "label": "Xolotl", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
 # Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
@@ -610,7 +613,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt or Maya model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya or Xolotl model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),

@@ -27,6 +27,7 @@ def load_router(monkeypatch, **env):
         "STRATA_API_KEY": "",
         "BASALT_API_KEY": "",
         "MAYA_API_KEY": "",
+        "XOLOTL_API_KEY": "",
         "LITELLM_BASE_URL": "http://litellm.test",
     }
     base.update(env)
@@ -751,7 +752,7 @@ def test_model_sizes_are_configurable(monkeypatch, tmp_path):
 def test_model_sizes_default_without_a_router_ini(monkeypatch, tmp_path):
     router = load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini"))
     assert router.MODEL_SIZES == {"strata": "125B", "qwen3.8-flash-next": "125B",
-                                  "glm-5.3-flash": "321B"}
+                                  "glm-5.3-flash": "321B", "deepseek-v4.1-flash": "552B"}
 
 
 def test_legacy_per_kind_size_keys_still_apply(monkeypatch, tmp_path):
@@ -763,7 +764,7 @@ def test_legacy_per_kind_size_keys_still_apply(monkeypatch, tmp_path):
     custom.write_text(legacy)
     router = load_router(monkeypatch, ROUTER_INI=str(custom))
     assert router.MODEL_SIZES == {"qwen3.8-flash-next": "125B", "my-basalt": "100B",
-                                  "glm-5.3-flash": "300B"}
+                                  "glm-5.3-flash": "300B", "deepseek-v4.1-flash": "552B"}
 
 
 @pytest.mark.parametrize("port", [8080, 11434])
@@ -842,6 +843,42 @@ def test_maya_discovery_and_dispatch(monkeypatch):
     assert response.headers["x-router-server"] == maya
     assert calls == [("/v1/models", "Bearer maya-secret"),
                      ("/v1/chat/completions", "Bearer maya-secret")]
+
+
+def test_xolotl_discovery_and_dispatch(monkeypatch):
+    """Xolotl serves through Strata's server with its own key; a Strata key
+    configured on the router is never sent to it."""
+    xolotl = "xolotl+http://10.0.0.12:8080"
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, request.headers.get("authorization")))
+        if request.headers.get("authorization") != "Bearer xolotl-secret":
+            return httpx.Response(401)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": [
+                {"id": "deepseek-v4.1-flash", "object": "model", "status": {"value": "loaded"},
+                 "meta": {"n_ctx": 131072}, "architecture": {"input_modalities": ["text"]}}]})
+        if request.url.path == "/v1/chat/completions":
+            return streamed(200, {"model": json.loads(request.content)["model"]})
+        return httpx.Response(404)
+
+    router = load_router(monkeypatch, MODEL_SERVERS=xolotl, STRATA_API_KEY="strata-secret",
+                         XOLOTL_API_KEY="xolotl-secret", ROUTER_API_KEY="client-secret")
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app) as client:
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+        response = client.post("/v1/chat/completions",
+                               headers={"Authorization": "Bearer client-secret"},
+                               json={"model": "deepseek-v4.1-flash", "messages": [user("hi")]})
+    assert router.server_kind(xolotl) == "xolotl"
+    assert router.server_base(xolotl) == "http://10.0.0.12:8080"
+    assert models["deepseek-v4.1-flash"]["params_b"] == 552
+    assert models["deepseek-v4.1-flash"]["loaded"] and not models["deepseek-v4.1-flash"]["is_vision"]
+    assert response.status_code == 200 and response.json()["model"] == "deepseek-v4.1-flash"
+    assert response.headers["x-router-server"] == xolotl
+    assert calls == [("/v1/models", "Bearer xolotl-secret"),
+                     ("/v1/chat/completions", "Bearer xolotl-secret")]
 
 
 # --- named models on unreachable hosts ----------------------------------------

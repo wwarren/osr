@@ -159,7 +159,7 @@ unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL 
 # and restored by re-sourcing the extracted functions at the end.
 _tt="$(mktemp -d)"
 TARGETS_DIR="$_tt/targets"
-for _name in gitea mattermost ollama llamacpp airllm strata basalt maya open-terminal hermes; do
+for _name in gitea mattermost ollama llamacpp airllm strata basalt maya xolotl open-terminal hermes comfyui; do
   mkdir -p "$TARGETS_DIR/$_name"
   # The fake provisioner records what it was given: settings, flags, and
   # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
@@ -171,25 +171,141 @@ printf 'provision %s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(basename "$(dirna
   "${CORES:-}" "${ROOTFS_GB:-}" "${ROUTER_CT_ID:-}" "${OPENWEBUI_PORT:-}" "$token" "$*" >> "$MOCK_LOG"
 [[ -z ${COMMUNITY_SCRIPT_URL:-}${COMMUNITY_SCRIPT_SHA256:-}${MATTERMOST_CHANNEL:-} ]] ||
   printf 'service-env %s|%s|%s\n' "${COMMUNITY_SCRIPT_URL:-}" "${COMMUNITY_SCRIPT_SHA256:-}" "${MATTERMOST_CHANNEL:-}" >> "$MOCK_LOG"
+[[ -z ${COMFYUI_IMAGE_VARIANT:-} ]] || printf 'image-variant %s\n' "$COMFYUI_IMAGE_VARIANT" >> "$MOCK_LOG"
+[[ -z ${GPU:-}${BACKEND:-}${GPU_DEVICES:-} ]] || printf 'gpu-env %s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
+if [[ -n ${HF_TOKEN:-} ]]; then
+  if [[ $HF_TOKEN == "${EXPECT_HF_TOKEN:-unset}" ]]; then echo 'hf-token match'; else echo 'hf-token other'; fi >> "$MOCK_LOG"
+fi
 exit "${FAKE_PROVISION_RC:-0}"
 EOF
 done
 unset _name
 
 describe target_table
-assert_eq "lists the ten targets in menu order" \
-  "gitea mattermost ollama llamacpp airllm strata basalt maya open-terminal hermes" \
+assert_eq "lists the twelve targets in menu order" \
+  "gitea mattermost ollama llamacpp airllm strata basalt maya xolotl open-terminal hermes comfyui" \
   "$(target_table | cut -d'|' -f1 | paste -sd' ')"
 
 describe target_field
 assert_eq "model phase" model "$(target_field strata phase)"
 assert_eq "companion phase" companion "$(target_field hermes phase)"
+assert_eq "ComfyUI is a companion of Open WebUI" companion "$(target_field comfyui phase)"
+assert_eq "and not a model server" "" "$(target_field comfyui entry)"
 assert_eq "service phase" service "$(target_field gitea phase)"
 assert_eq "router entry template" "strata+http://@IP@:@PORT@" "$(target_field strata entry)"
 assert_eq "key kind" basalt "$(target_field basalt key)"
+assert_eq "Xolotl has its own key kind" xolotl "$(target_field xolotl key)"
+assert_eq "Xolotl router entry template" "xolotl+http://@IP@:@PORT@" "$(target_field xolotl entry)"
 assert_eq "no key for Ollama" "" "$(target_field ollama key)"
 assert_fail "an unknown target" target_field nope phase
+assert_eq "Strata needs an NVIDIA GPU" required:nvidia "$(target_field strata gpu)"
+assert_eq "Basalt needs an RTX 50" required:nvidia:rtx50 "$(target_field basalt gpu)"
+assert_eq "Ollama uses any GPU when present" optional:nvidia,amd,intel "$(target_field ollama gpu)"
+assert_eq "Hermes runs without" "" "$(target_field hermes gpu)"
 assert_fail "an unknown field" target_field ollama colour
+
+describe target_gpu_spec
+unset BACKEND GPU_DEVICES GPU
+assert_eq "Xolotl: NVIDIA only" "required|nvidia|" "$(target_gpu_spec xolotl)"
+assert_eq "Basalt: RTX 50 only" "required|nvidia|rtx50" "$(target_gpu_spec basalt)"
+assert_eq "llama.cpp: any vendor by default" "required|nvidia,amd,intel|" "$(target_gpu_spec llamacpp)"
+assert_eq "llama.cpp BACKEND=cuda: NVIDIA" "required|nvidia|" "$(BACKEND=cuda target_gpu_spec llamacpp)"
+assert_eq "llama.cpp BACKEND=vulkan: AMD or Intel" "required|amd,intel|" "$(BACKEND=vulkan target_gpu_spec llamacpp)"
+assert_eq "llama.cpp BACKEND=cpu: none" "||" "$(BACKEND=cpu target_gpu_spec llamacpp)"
+assert_eq "AirLLM with GPU_DEVICES: NVIDIA" "required|nvidia|" "$(GPU_DEVICES=/dev/nvidia0 target_gpu_spec airllm)"
+assert_eq "AirLLM without: none" "||" "$(target_gpu_spec airllm)"
+assert_eq "ComfyUI: any vendor when present" "optional|nvidia,amd,intel|" "$(target_gpu_spec comfyui)"
+assert_eq "ComfyUI GPU=amd: AMD" "optional|amd|" "$(GPU=amd target_gpu_spec comfyui)"
+assert_eq "Ollama GPU=no: none" "||" "$(GPU=no target_gpu_spec ollama)"
+assert_eq "ComfyUI GPU=none: none" "||" "$(GPU=none target_gpu_spec comfyui)"
+assert_eq "Gitea: none" "||" "$(target_gpu_spec gitea)"
+assert_fail "an unknown target" target_gpu_spec nope
+
+describe target_gpu_need
+assert_eq "Xolotl requires the GPU" required "$(target_gpu_need xolotl)"
+assert_eq "the generation limit is not part of the need" required "$(target_gpu_need basalt)"
+assert_eq "ComfyUI uses one when present" optional "$(target_gpu_need comfyui)"
+assert_eq "llama.cpp's default build requires it" required "$(target_gpu_need llamacpp)"
+assert_eq "llama.cpp with BACKEND=cpu does not" "" "$(BACKEND=cpu target_gpu_need llamacpp)"
+assert_eq "AirLLM without GPU_DEVICES does not" "" "$(target_gpu_need airllm)"
+assert_eq "AirLLM with GPU_DEVICES does" required "$(GPU_DEVICES=/dev/nvidia0 target_gpu_need airllm)"
+assert_eq "Gitea never" "" "$(target_gpu_need gitea)"
+assert_fail "an unknown target" target_gpu_need nope
+
+describe prepare_host_gpu
+mkdir -p "$_tt/tools"
+cat > "$_tt/tools/setup-host-gpu.sh" <<'EOF'
+printf 'gpu-tool %s\n' "$*" >> "$MOCK_LOG"
+printf '%s\n' "${FAKE_GPU_OUT:-GPU_STATE=ready}"
+exit "${FAKE_GPU_RC:-0}"
+EOF
+mock_reset_log
+TARGETS="gitea hermes"
+assert_ok "nothing to do without GPU targets" prepare_host_gpu
+assert_eq "and the tool is not run" "" "$(cat "$MOCK_LOG")"
+TARGETS="ollama strata basalt"
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rtx50\nGPU_CUDA_ARCH=120\nGPU_VENDOR=nvidia'
+_out="$(prepare_host_gpu 2>&1)"
+assert_contains "required targets set the need and the shared vendor" \
+  "gpu-tool --need required --vendors nvidia --for strata basalt --allow rtx50:basalt" "$(cat "$MOCK_LOG")"
+assert_contains "reports the GPU" "NVIDIA GPU ready: rtx50 (compute capability 120)" "$_out"
+mock_reset_log
+TARGETS="ollama comfyui"; export FAKE_GPU_OUT=GPU_STATE=absent
+_out="$(prepare_host_gpu 2>&1)"
+assert_contains "optional targets alone, any vendor" "gpu-tool --need optional --vendors nvidia,amd,intel --for ollama comfyui" "$(cat "$MOCK_LOG")"
+assert_contains "go on without a GPU" "No GPU (absent): ollama comfyui will run without one." "$_out"
+mock_reset_log
+TARGETS="llamacpp comfyui"
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rdna3\nGPU_VENDOR=amd\nGPU_GFX=gfx1100\nGPU_RENDER_NODE=/dev/dri/renderD128'
+_out="$(BACKEND=vulkan prepare_host_gpu 2>&1)"
+assert_contains "llama.cpp's Vulkan build narrows the vendors" "--vendors amd,intel --for llamacpp" "$(cat "$MOCK_LOG")"
+assert_contains "an AMD card is reported" "AMD Radeon GPU ready: rdna3 (gfx1100, /dev/dri/renderD128 and /dev/kfd)" "$_out"
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=arc-b\nGPU_VENDOR=intel\nGPU_RENDER_NODE=/dev/dri/renderD129'
+assert_contains "and an Intel Arc" "Intel Arc GPU ready: arc-b (/dev/dri/renderD129)" "$(prepare_host_gpu 2>&1)"
+mock_reset_log
+TARGETS="strata llamacpp"
+BACKEND=vulkan
+assert_fail "targets that cannot share a GPU" prepare_host_gpu
+unset BACKEND
+_out="$(BACKEND=vulkan prepare_host_gpu 2>&1 || true)"
+assert_contains "are named, before the tool runs" "cannot share one GPU: strata (nvidia) llamacpp (amd/intel)" "$_out"
+assert_eq "and nothing ran" "" "$(cat "$MOCK_LOG")"
+TARGETS="xolotl"; export FAKE_GPU_RC=2
+assert_fail "a reboot stops the install" prepare_host_gpu
+assert_contains "and says to rerun" "Reboot this host" "$(prepare_host_gpu 2>&1)"
+FAKE_GPU_RC=1
+assert_fail "a GPU that is not ready stops it" prepare_host_gpu
+assert_contains "naming the targets" "The GPU is not ready for: xolotl" "$(prepare_host_gpu 2>&1)"
+unset FAKE_GPU_RC
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_VENDOR=amd\nGPU_RENDER_NODE=/dev/dri/renderD128'
+TARGETS="ollama"
+prepare_host_gpu >/dev/null 2>&1
+assert_eq "the result is kept for the targets" "ready amd /dev/dri/renderD128" "$HOST_GPU_STATE $HOST_GPU_VENDOR $HOST_GPU_RENDER_NODE"
+unset FAKE_GPU_OUT
+mv "$_tt/tools/setup-host-gpu.sh" "$_tt/tools/gone"
+assert_fail "the tool must be in the checkout" prepare_host_gpu
+mv "$_tt/tools/gone" "$_tt/tools/setup-host-gpu.sh"
+TARGETS=""; unset _out
+mock_reset_log
+
+describe target_gpu_env
+HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+assert_eq "nothing before the GPU step ran" "" "$(target_gpu_env ollama)"
+HOST_GPU_STATE=ready HOST_GPU_VENDOR=amd HOST_GPU_RENDER_NODE=/dev/dri/renderD128
+assert_eq "Ollama gets the vendor" GPU=amd "$(target_gpu_env ollama)"
+assert_eq "so does ComfyUI" GPU=amd "$(target_gpu_env comfyui)"
+assert_eq "unless GPU was set" "" "$(GPU=no target_gpu_env comfyui)"
+assert_eq "llama.cpp gets Vulkan and the render node" $'BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD128' "$(target_gpu_env llamacpp)"
+assert_eq "a preset GPU_DEVICES is kept" "BACKEND=vulkan" "$(GPU_DEVICES=/dev/dri/renderD129 target_gpu_env llamacpp)"
+assert_eq "a preset BACKEND is kept" "" "$(BACKEND=cpu target_gpu_env llamacpp)"
+HOST_GPU_VENDOR=nvidia HOST_GPU_RENDER_NODE=""
+assert_eq "NVIDIA: llama.cpp builds for CUDA" BACKEND=cuda "$(target_gpu_env llamacpp)"
+assert_eq "NVIDIA: ComfyUI" GPU=nvidia "$(target_gpu_env comfyui)"
+HOST_GPU_STATE=declined
+assert_eq "no GPU: Ollama runs on the CPU" GPU=none "$(target_gpu_env ollama)"
+assert_eq "no GPU: llama.cpp keeps its own default" "" "$(target_gpu_env llamacpp)"
+assert_eq "other targets get nothing" "" "$(target_gpu_env strata)"
+HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
 
 describe target_var_prefix
 assert_eq "dashes become underscores" OPEN_TERMINAL "$(target_var_prefix open-terminal)"
@@ -213,14 +329,16 @@ unset MODEL_ALIAS MODEL_DOWNLOAD_URL
 describe target_needs_template
 assert_ok "Strata takes a template" target_needs_template strata
 assert_ok "Maya takes a template" target_needs_template maya
+assert_ok "Xolotl takes a template" target_needs_template xolotl
 assert_fail "llama.cpp prompts for its own" target_needs_template llamacpp
 assert_fail "Hermes uses the router's" target_needs_template hermes
+assert_fail "ComfyUI's community script picks its own" target_needs_template comfyui
 
 describe valid_target_selection
-for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8"; do
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "12" "comfyui" "xolotl"; do
   assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
 done
-for _sel in 0 11 bogus "ollama,bogus"; do
+for _sel in 0 13 bogus "ollama,bogus"; do
   assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
 done
 unset _sel
@@ -241,9 +359,11 @@ INSTALL_TARGETS=bogus
 assert_fail "an invalid preset is refused" prompt_target_selection
 NONINTERACTIVE=false; INSTALL_TARGETS=""
 _out="$(mktemp)"
-prompt_target_selection > "$_out" 2>&1 <<< $'11\n4,hermes\n'
+prompt_target_selection > "$_out" 2>&1 <<< $'13\n4,hermes\n'
 assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
-assert_contains "the menu lists the companions" "10) hermes" "$(cat "$_out")"
+assert_contains "the menu lists the model servers" "9) xolotl" "$(cat "$_out")"
+assert_contains "the menu lists the companions" "11) hermes" "$(cat "$_out")"
+assert_contains "ComfyUI among them" "12) comfyui" "$(cat "$_out")"
 assert_contains "and separates them from the model servers" "Companions:" "$(cat "$_out")"
 assert_contains "the services come first" "Services: created now, before the router" "$(cat "$_out")"
 assert_contains "starting with Gitea" "1) gitea" "$(cat "$_out")"
@@ -345,6 +465,42 @@ assert_eq "a preset CT ID is the default" 930 "$OLLAMA_CT_ID"
 assert_contains "an address outside the gateway's subnet is flagged" "outside 10.9.9.9/24" "$(cat "$_out")"
 TARGETS=""
 assert_ok "nothing selected, nothing asked" prompt_target_settings
+TARGETS=comfyui
+COMFYUI_CT_ID=931; COMFYUI_IP_CIDR=192.0.2.98/24; COMFYUI_STORAGE=router-store
+unset COMFYUI_IMAGE_VARIANT
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n\n'
+assert_eq "ComfyUI defaults to the distilled 4B workflow" klein-4b "$COMFYUI_IMAGE_VARIANT"
+COMFYUI_IMAGE_VARIANT=klein-9b
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n\n'
+assert_eq "a preset 9B workflow is kept" klein-9b "$COMFYUI_IMAGE_VARIANT"
+assert_fail "other model families need their own workflow" valid_comfyui_variant sdxl
+unset COMFYUI_IMAGE_VARIANT
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\nsdxl\nklein-4b\n'
+assert_contains "invalid image model is re-prompted" "Not a valid value: 'sdxl'" "$(cat "$_out")"
+assert_eq "the corrected model is kept" klein-4b "$COMFYUI_IMAGE_VARIANT"
+assert_eq "4B needs no Hugging Face token" "" "${TARGET_HF_TOKEN:-}"
+unset COMFYUI_IMAGE_VARIANT; TARGET_HF_TOKEN=""
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\nklein-9b\nnot-a-token\nhf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5\n'
+assert_eq "9B asks for the Hugging Face token of its gated weights" "hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5" "$TARGET_HF_TOKEN"
+assert_contains "and says where to accept the license" "huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8" "$(cat "$_out")"
+assert_contains "a malformed token is asked for again" "not a Hugging Face access token" "$(cat "$_out")"
+assert_not_contains "the token is not echoed" "hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5" "$(cat "$_out")"
+unset COMFYUI_IMAGE_VARIANT; TARGET_HF_TOKEN=""
+assert_fail "EOF instead of a token stops the prompts" prompt_target_settings <<< $'\n\n\nklein-9b\n'
+TARGET_HF_TOKEN="hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5"; unset COMFYUI_IMAGE_VARIANT
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\nklein-9b\n'
+assert_not_contains "a preset HF_TOKEN is not asked for" "Hugging Face token (hf_" "$(cat "$_out")"
+TARGET_HF_TOKEN=""; unset COMFYUI_IMAGE_VARIANT
+
+describe valid_comfyui_variant
+assert_ok "klein-4b" valid_comfyui_variant klein-4b
+assert_ok "klein-9b" valid_comfyui_variant klein-9b
+assert_fail "anything else" valid_comfyui_variant klein
+
+describe valid_hf_token
+assert_ok "an access token" valid_hf_token "hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5"
+assert_fail "a short one" valid_hf_token hf_abc
+assert_fail "no hf_ prefix" valid_hf_token "$(printf 'x%.0s' {1..34})"
 
 describe target_server_entry
 OLLAMA_IP_CIDR=192.0.2.90/24; STRATA_IP_CIDR=192.0.2.91/24; MAYA_IP_CIDR=192.0.2.92/24
@@ -354,6 +510,9 @@ MAYA_PORT=8123
 assert_eq "honouring <NAME>_PORT" maya+http://192.0.2.92:8123 "$(target_server_entry maya)"
 unset MAYA_PORT
 assert_fail "a companion is not a server" target_server_entry hermes
+XOLOTL_IP_CIDR=192.0.2.93/24
+assert_eq "Xolotl with its kind prefix" xolotl+http://192.0.2.93:8080 "$(target_server_entry xolotl)"
+unset XOLOTL_IP_CIDR
 
 describe preset_target_model_servers
 MODEL_SERVER_COUNT=3; MODEL_SERVER_MAX=20
@@ -392,10 +551,44 @@ assert_not_contains "(no guest install)" "--install-target" "$(mock_calls)"
 MODEL_ALIAS=qwen3:8b MODEL_PATH=/var/lib/llama-target/models/m.gguf run_target_provisioner llamacpp
 assert_contains "with a model it installs" "|no|--install-target" "$(mock_calls)"
 mock_reset_log
+HOST_GPU_STATE=ready HOST_GPU_VENDOR=intel HOST_GPU_RENDER_NODE=/dev/dri/renderD129
+run_target_provisioner llamacpp
+assert_contains "llama.cpp gets the host GPU's Vulkan settings" "gpu-env |vulkan|/dev/dri/renderD129" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner ollama
+assert_contains "Ollama gets the GPU vendor" "gpu-env intel||" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner strata
+assert_not_contains "Strata gets none of it" "gpu-env" "$(mock_calls)"
+HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+mock_reset_log
 run_target_provisioner hermes
 assert_eq "a companion gets the router CT, the router's template and the token" \
   "provision hermes|914|192.0.2.94/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|" "$(mock_calls)"
 assert_not_contains "the token is never an argument" "owui-admin-secret" "$(mock_calls)"
+COMFYUI_CT_ID=917; COMFYUI_IP_CIDR=192.0.2.97/24; COMFYUI_STORAGE=t-store
+COMFYUI_COMMUNITY_SCRIPT_SHA256=def456
+COMFYUI_IMAGE_VARIANT=klein-4b
+mock_reset_log
+run_target_provisioner comfyui
+assert_contains "ComfyUI gets the router CT and the token, and no template" \
+  "provision comfyui|917|192.0.2.97/24|192.0.2.1|t-store|vmbr2||||910|8080|match|" "$(mock_calls)"
+assert_contains "COMFYUI_COMMUNITY_SCRIPT_SHA256 pins its community script" "service-env |def456|" "$(mock_calls)"
+assert_contains "the selected image workflow reaches the ComfyUI provisioner" "image-variant klein-4b" "$(mock_calls)"
+TARGET_HF_TOKEN="hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5"; export EXPECT_HF_TOKEN="hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5"
+mock_reset_log
+run_target_provisioner comfyui
+assert_not_contains "4B gets no Hugging Face token" "hf-token" "$(mock_calls)"
+COMFYUI_IMAGE_VARIANT=klein-9b
+mock_reset_log
+run_target_provisioner comfyui
+assert_contains "9B gets the Hugging Face token, in its environment" "hf-token match" "$(mock_calls)"
+assert_not_contains "never as an argument" "hf_A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5A1b2C3d4E5" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner ollama
+assert_not_contains "no other target gets it" "hf-token" "$(mock_calls)"
+TARGET_HF_TOKEN=""; unset EXPECT_HF_TOKEN; COMFYUI_IMAGE_VARIANT=klein-4b
+unset COMFYUI_COMMUNITY_SCRIPT_SHA256
 export FAKE_PROVISION_RC=3
 assert_fail "a failing provisioner fails" run_target_provisioner ollama
 unset FAKE_PROVISION_RC
@@ -475,6 +668,13 @@ FAKE_NO_KEY=1
 assert_fail "an unreadable key is reported" register_target_key strata
 assert_contains "with the command to run instead" "set-strata-token --apply" "$(register_target_key strata 2>&1)"
 unset FAKE_NO_KEY
+_saved_xolotl_id="${XOLOTL_CT_ID:-}"; XOLOTL_CT_ID=912
+mock_reset_log
+assert_ok "Xolotl's key is handed to the router" register_target_key xolotl
+assert_contains "read from the Xolotl CT's record" "cat /etc/xolotl-target/api-key" "$(mock_calls)"
+assert_contains "with set-xolotl-token, not the Strata command" "manage-model-servers set-xolotl-token" "$(mock_calls)"
+assert_not_contains "never as an argument" "sk-strata-generated" "$(mock_calls)"
+XOLOTL_CT_ID="$_saved_xolotl_id"; unset _saved_xolotl_id
 
 describe wait_for_openwebui
 pct() { echo "pct $*" >> "$MOCK_LOG"; [[ -z ${FAKE_WEBUI_DOWN:-} ]]; }
@@ -538,6 +738,12 @@ mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "services done before the router are not run again" "run ollama" "$(mock_calls)"
 assert_contains "but are in the summary" "ok (created before the router)" "$(cat "$_out")"
+TARGETS="ollama comfyui"; SERVICES_DONE=""
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "ComfyUI is added once Open WebUI is up and the admin key is known" \
+  "$(printf '%s\n' 'run ollama' wait token 'run comfyui')" "$(mock_calls)"
+assert_contains "and is in the summary" "comfyui        CT 917    ok" "$(cat "$_out")"
 assert_eq "and count as success" 0 "$_rc"
 SERVICES_DONE=""
 TARGETS=llamacpp; unset MODEL_ALIAS MODEL_PATH MODEL_DOWNLOAD_URL
@@ -659,6 +865,9 @@ assert_ok   "accepts basalt://host"      valid_ollama_addr basalt://10.0.0.7
 assert_ok   "accepts basalt+http url"    valid_ollama_addr basalt+http://h:8080
 assert_ok   "accepts maya://host"        valid_ollama_addr maya://10.0.0.9
 assert_ok   "accepts maya+http url"      valid_ollama_addr maya+http://h:8080
+assert_ok   "accepts xolotl://host"      valid_ollama_addr xolotl://10.0.0.12
+assert_ok   "accepts xolotl+http url"    valid_ollama_addr xolotl+http://h:8080
+assert_fail "rejects xolotl:// junk"     valid_ollama_addr "xolotl://a b"
 
 describe normalize_ollama_url
 assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
@@ -680,6 +889,11 @@ assert_eq "basalt:// default port"          "basalt+http://h:8080"   "$(normaliz
 assert_eq "basalt+http passes through"      "basalt+http://h:8081"   "$(normalize_ollama_url basalt+http://h:8081/)"
 assert_eq "maya:// default port"            "maya+http://h:8080"     "$(normalize_ollama_url maya://h)"
 assert_eq "maya+http passes through"        "maya+http://h:8081"     "$(normalize_ollama_url maya+http://h:8081/)"
+assert_eq "xolotl:// default port"          "xolotl+http://h:8080"   "$(normalize_ollama_url xolotl://h)"
+assert_eq "xolotl+http passes through"      "xolotl+http://h:8150"   "$(normalize_ollama_url xolotl+http://h:8150/)"
+XOLOTL_PORT=8150
+assert_eq "Xolotl default port can be set"  "xolotl+http://h:8150"   "$(normalize_ollama_url xolotl://h)"
+unset XOLOTL_PORT
 
 describe valid_tier_selection
 MODEL_SERVER_COUNT=3

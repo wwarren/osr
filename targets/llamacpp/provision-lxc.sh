@@ -16,7 +16,8 @@ Usage: GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-
 
 Missing settings are prompted on a terminal: CT ID, template, name, IPv4/CIDR
 or DHCP, bridge/gateway, CPU cores, RAM (MiB), root disk storage ID and size (GiB).
-Choose downloaded Debian 12 templates and active rootdir storage by number.
+Choose downloaded Debian templates (12 for CUDA and CPU builds, 13 for Vulkan)
+and active rootdir storage by number.
 Each template includes its storage ID. Enter m for manual entry; if inventory
 is unavailable, enter the full template volume / storage ID manually.
 Presets supplied through environment variables skip their corresponding prompts.
@@ -26,6 +27,11 @@ For CUDA, an interactive run reads the NVIDIA kernel minor mapping and falls
 back to nvidia-smi; selecting one adds its /dev/nvidia<minor>, control, and UVM
 device paths. GPU_DEVICES overrides that selector and is required for
 noninteractive CUDA provisioning.
+BACKEND=vulkan builds llama.cpp's Vulkan backend for AMD Radeon (RDNA 3/4) and
+Intel Arc (A/B) cards, on a Debian 13 template (Mesa 25, Vulkan 1.4). It passes
+the card's render node: GPU_DEVICES=/dev/dri/renderD128, or chosen from the
+host's render nodes on a terminal. Set the host's driver up first with
+tools/setup-host-gpu.sh (the router installer does, and passes these settings).
 By default only the CT is created and deployment files are copied. No model
 settings are required. For CUDA guests, run the copied NVIDIA 580.173.02 helper
 before choosing the model with install-target.sh in the CT.
@@ -33,7 +39,7 @@ LLAMA_CPP_REF is optional; omitted/empty uses install-target.sh's pinned release
 Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
           CORES=4, MEMORY_MB=16384, SWAP_MB=0, ROOTFS_GB=64, ONBOOT=0,
           SSH_PUBLIC_KEY=<file>, GPU_DEVICES=<space-separated exact /dev paths>,
-          INSTALL_TARGET=0, BACKEND=cuda, BUILD_JOBS=4, GPU_LAYERS=auto,
+          INSTALL_TARGET=0, BACKEND=cuda|vulkan|cpu, BUILD_JOBS=4, GPU_LAYERS=auto,
           CONTEXT_SIZE=8192, PARALLEL_SLOTS=1, THREADS=4, LLAMA_EXTRA_ARGS=,
            MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
            MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
@@ -68,7 +74,14 @@ ipv4() {
     done
 }
 valid_container_id() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 >= 100 )); }
-valid_container_template() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-12-[A-Za-z0-9._-]+\.tar\.(zst|xz|gz)$ ]]; }
+# The Debian release of the template: 12 for CUDA (NVIDIA's repository) and CPU
+# builds, 13 for Vulkan (Mesa 25 and Vulkan 1.4 from Debian itself).
+template_release() { if [[ ${BACKEND:-cuda} == vulkan ]]; then echo 13; else echo 12; fi; }
+valid_container_template() {
+    local release
+    release=$(template_release)
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-${release}-[A-Za-z0-9._-]+\.tar\.(zst|xz|gz)$ ]]
+}
 valid_container_name() { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; }
 valid_container_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_container_bridge() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
@@ -297,7 +310,7 @@ list_nvidia_gpus() {
 prompt_gpu_devices_manual() {
     local value
     while true; do
-        printf 'GPU device paths (space-separated, e.g. /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools): ' >&2
+        printf 'GPU device paths (space-separated, e.g. /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools, or /dev/dri/renderD128): ' >&2
         IFS= read -r value || die 'Input ended while reading GPU_DEVICES.'
         if valid_gpu_device_list "$value"; then
             GPU_DEVICES=$value
@@ -306,9 +319,61 @@ prompt_gpu_devices_manual() {
         printf 'Enter one to 32 absolute /dev device paths without traversal components.\n' >&2
     done
 }
+# list_render_nodes: the host's DRM render nodes as "path<TAB>label", AMD and
+# Intel cards only (vendor and PCI device ID from sysfs).
+list_render_nodes() {
+    local node vendor device name
+    for node in "${DRM_SYSFS:-/sys/class/drm}"/renderD*; do
+        [[ -r $node/device/vendor ]] || continue
+        vendor=$(< "$node/device/vendor"); device=$(cat "$node/device/device" 2>/dev/null || echo unknown)
+        case $vendor in
+            0x1002) name='AMD Radeon' ;;
+            0x8086) name='Intel' ;;
+            *) continue ;;
+        esac
+        printf '/dev/dri/%s\t%s GPU %s (/dev/dri/%s)\n' "${node##*/}" "$name" "$device" "${node##*/}"
+    done
+    return 0
+}
+configure_render_node() {
+    local value i
+    local -a nodes=() labels=()
+    if ! container_prompt_available; then
+        die 'Vulkan requires explicit GPU_DEVICES: the card'"'"'s render node on this host, e.g. /dev/dri/renderD128.'
+    fi
+    while IFS=$'\t' read -r value label; do
+        [[ -n $value ]] || continue
+        nodes+=("$value"); labels+=("$label")
+    done < <(list_render_nodes)
+    if (( ${#nodes[@]} == 0 )); then
+        printf 'No AMD or Intel render node was found; enter the device path manually.\n' >&2
+        prompt_gpu_devices_manual
+        return
+    fi
+    printf '\nGPU render nodes:\n' >&2
+    for i in "${!nodes[@]}"; do printf '  %s) %s\n' "$((i + 1))" "${labels[$i]}" >&2; done
+    printf '  m) Enter device paths manually\n' >&2
+    while true; do
+        printf 'Select the GPU [1-%s or m]: ' "${#nodes[@]}" >&2
+        IFS= read -r value || die 'Input ended while reading GPU_DEVICES.'
+        if [[ $value == m || $value == M ]]; then
+            prompt_gpu_devices_manual
+            return
+        fi
+        if [[ $value =~ ^[1-9][0-9]{0,8}$ ]] && (( value <= ${#nodes[@]} )); then
+            GPU_DEVICES=${nodes[$((value - 1))]}
+            return
+        fi
+        printf 'Choose a listed number or m for manual entry.\n' >&2
+    done
+}
 configure_gpu_devices() {
-    [[ $BACKEND == cuda ]] || return 0
+    [[ $BACKEND != cpu ]] || return 0
     [[ -z ${GPU_DEVICES:-} ]] || return 0
+    if [[ $BACKEND == vulkan ]]; then
+        configure_render_node
+        return
+    fi
     if ! container_prompt_available; then
         die 'CUDA requires explicit GPU_DEVICES; select the GPU and control/UVM device paths on this host.'
     fi
@@ -351,8 +416,13 @@ configure_container() {
         valid_container_id "$next_id" || next_id=''
     fi
     prompt_container_setting CT_ID 'Container ID' "$next_id" valid_container_id 'Enter an unused CT ID from 100 to 999999999.'
-    select_container_setting TEMPLATE 'CT template volume' valid_container_template \
-        'Enter an existing Debian 12 template volume, e.g. local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst.' list_container_templates
+    if [[ $(template_release) == 13 ]]; then
+        select_container_setting TEMPLATE 'CT template volume' valid_container_template \
+            'Enter an existing Debian 13 template volume (Vulkan needs Debian 13), e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst.' list_container_templates
+    else
+        select_container_setting TEMPLATE 'CT template volume' valid_container_template \
+            'Enter an existing Debian 12 template volume, e.g. local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst.' list_container_templates
+    fi
     prompt_container_setting CT_HOSTNAME 'Container name' llama-target valid_container_name 'Enter a DNS hostname label, up to 63 characters.'
     prompt_container_setting IP_CIDR 'IPv4 address/CIDR or dhcp' '' valid_container_ip 'Enter a valid IPv4/CIDR (e.g. 192.168.11.30/24), or dhcp.'
     prompt_container_setting BRIDGE 'Network bridge' vmbr0 valid_container_bridge 'Enter a Proxmox bridge name, e.g. vmbr0.'
@@ -395,6 +465,8 @@ if [[ $INSTALL_TARGET == 1 ]]; then
     [[ -n $MODEL_ALIAS ]] || die 'Explicit guest installation requires MODEL_ALIAS. Set it for a prepared template, or use --create-only and choose the model inside the CT later.'
     [[ -n $MODEL_PATH || -n $MODEL_DOWNLOAD_URL ]] || die 'Explicit guest installation requires MODEL_PATH or MODEL_DOWNLOAD_URL. Set a source for a prepared template, or use --create-only and choose the model inside the CT later.'
 fi
+BACKEND=${BACKEND:-cuda}
+[[ $BACKEND == cpu || $BACKEND == cuda || $BACKEND == vulkan ]] || die 'BACKEND must be cpu, cuda or vulkan.'
 configure_container
 NAMESERVER=${NAMESERVER:-}
 VLAN_TAG=${VLAN_TAG:-}
@@ -402,12 +474,11 @@ SWAP_MB=${SWAP_MB:-0}
 ONBOOT=${ONBOOT:-0}
 SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
 GPU_DEVICES=${GPU_DEVICES:-}
-BACKEND=${BACKEND:-cuda}
 BUILD_JOBS=${BUILD_JOBS:-4}
 CONTEXT_SIZE=${CONTEXT_SIZE:-8192}
 PARALLEL_SLOTS=${PARALLEL_SLOTS:-1}
 THREADS=${THREADS:-4}
-if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
+if [[ $BACKEND != cpu ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
 MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
@@ -416,7 +487,6 @@ CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-native}
 CUDA_COMPILER=${CUDA_COMPILER:-}
 LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
 
-[[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
 configure_gpu_devices
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
 [[ $SWAP_MB =~ ^(0|[1-9][0-9]{0,8})$ ]] || die 'SWAP_MB must be a nonnegative integer.'
@@ -425,7 +495,7 @@ for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$na
 [[ -z $NAMESERVER ]] || ipv4 "$NAMESERVER" || die 'NAMESERVER must be one IPv4 address.'
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi
 [[ -z $SSH_PUBLIC_KEY || ( -f $SSH_PUBLIC_KEY && -s $SSH_PUBLIC_KEY && -r $SSH_PUBLIC_KEY ) ]] || die 'SSH_PUBLIC_KEY must refer to a readable, nonempty public-key file.'
-[[ $BACKEND == cuda || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
+[[ $BACKEND != cpu || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
 if (( INSTALL_TARGET )); then
     if [[ -n $LLAMA_CPP_REF ]]; then
         [[ $LLAMA_CPP_REF =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'LLAMA_CPP_REF must be a release tag or full commit without refs/.'
@@ -469,6 +539,12 @@ devices=()
 if [[ -n $GPU_DEVICES ]]; then read -r -a devices <<< "$GPU_DEVICES"; fi
 if [[ $BACKEND == cuda ]] && (( ${#devices[@]} == 0 )); then
     die 'CUDA requires explicit GPU_DEVICES; select the GPU and control/UVM device paths on this host.'
+fi
+if [[ $BACKEND == vulkan ]]; then
+    (( ${#devices[@]} > 0 )) || die 'Vulkan requires GPU_DEVICES: the card'"'"'s render node, e.g. /dev/dri/renderD128.'
+    for device in "${devices[@]}"; do
+        [[ $device == /dev/dri/renderD* ]] || die "Vulkan passes the card's render node only (/dev/dri/renderD<n>), not $device."
+    done
 fi
 (( ${#devices[@]} <= 32 )) || die 'At most 32 explicit GPU device paths are supported.'
 declare -A seen_devices=()
@@ -535,7 +611,11 @@ else
         printf 'Install the host-matched NVIDIA 580.173.02 user-space libraries inside the CT first:\n'
         printf '  bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc\n'
     fi
-    printf 'Then run this inside the CT to select the model/tag and directory; the CUDA toolkit installs automatically if missing:\n'
+    if [[ $BACKEND == vulkan ]]; then
+        printf 'Then run this inside the CT to select the model/tag and directory; Mesa'"'"'s Vulkan driver and the build tools install automatically:\n'
+    else
+        printf 'Then run this inside the CT to select the model/tag and directory; the CUDA toolkit installs automatically if missing:\n'
+    fi
     printf '  BACKEND=%q ' "$BACKEND"
     if [[ $BACKEND == cuda && -n $CUDA_COMPILER ]]; then printf 'CUDA_COMPILER=%q ' "$CUDA_COMPILER"; fi
     printf 'bash /root/llama-target-deploy/install-target.sh\n'

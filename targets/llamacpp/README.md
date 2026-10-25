@@ -68,6 +68,43 @@ context, and parallel slots against the actual card's available VRAM.
 [NVIDIA compute capabilities](https://developer.nvidia.com/cuda/gpus),
 [llama.cpp CUDA builds](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#cuda)
 
+## AMD Radeon and Intel Arc (Vulkan)
+
+`BACKEND=vulkan` builds llama.cpp's Vulkan backend instead of CUDA, for
+**AMD Radeon RX 7000/9000, Radeon PRO W7000, Radeon AI PRO R9700 (RDNA 3/4)**
+and **Intel Arc A- and B-series** cards.
+
+| | CUDA | Vulkan |
+|---|---|---|
+| Guest | Debian 12 | **Debian 13** (Mesa 25.0, Vulkan 1.4, glslc from Debian) |
+| Host driver | NVIDIA 580.173.02 | the kernel's `amdgpu`, `i915` (Arc A) or `xe` (Arc B) |
+| Passed through | `/dev/nvidia<n>`, `nvidiactl`, `nvidia-uvm(-tools)` | the card's render node, `/dev/dri/renderD<n>` |
+| In the CT | NVIDIA user-space libraries, CUDA 13.0 toolkit | `mesa-vulkan-drivers libvulkan1 libvulkan-dev glslc spirv-headers vulkan-tools` |
+
+Why not ROCm/HIP or SYCL: AMD supports ROCm on Radeon cards only on Ubuntu and
+RHEL, not Debian, and SYCL needs Intel's multi-GB oneAPI toolkit. Vulkan runs
+on both vendors with Debian's own packages; Debian 12's Mesa 22.3 and Vulkan
+1.3 are too old for RDNA 4, Arc B and llama.cpp's shaders, hence Debian 13.
+
+Set the host's driver up first: `bash tools/setup-host-gpu.sh --vendors amd,intel`
+(the router installer does this and passes `BACKEND=vulkan` and
+`GPU_DEVICES=/dev/dri/renderD<n>`). The render node gets gid 993 like the CUDA
+nodes. The installer checks, as `llama-target`, that the node opens and that
+`vulkaninfo` lists a discrete GPU, not only Mesa's CPU renderer, before
+building. `GPU_LAYERS` defaults to `auto`. A backend switch by `--upgrade` stays
+on the CT's Debian release: CPU and Vulkan on Debian 13, CPU and CUDA on 12.
+
+```bash
+CT_ID=251 TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
+STORAGE=local-lvm IP_CIDR=192.0.2.51/24 GATEWAY=192.0.2.1 \
+BACKEND=vulkan GPU_DEVICES=/dev/dri/renderD128 \
+MODEL_ALIAS=qwen3:8b MODEL_DOWNLOAD_URL=https://huggingface.co/<org>/<repo>/resolve/<rev>/<file>.gguf \
+bash provision-lxc.sh --install-target
+```
+
+Without `GPU_DEVICES`, an interactive run lists the host's AMD and Intel render
+nodes to choose from.
+
 ## 1. Create the target LXC on its Proxmox host
 
 Copy this repository onto the **GPU's Proxmox host**. Select an unused CT ID,
@@ -448,9 +485,12 @@ it prints "nothing to do" and leaves everything as it is, including the kept
 1. Rebuilds llama.cpp when the resolved commit or backend differs from
    `build-info.txt` (`FORCE_REBUILD=true` also forces a rebuild). The
    backend comes from `build-info.txt` unless `BACKEND` is set. A backend
-   change also sets `GPU_LAYERS` for the new backend (`auto` for cuda, `0` for
-   cpu), unless `GPU_LAYERS` is given on the command line; a CPU build refuses
-   anything but `0`. Otherwise `GPU_LAYERS` is never rewritten.
+   change also sets `GPU_LAYERS` for the new backend (`auto` for cuda or
+   vulkan, `0` for cpu), unless `GPU_LAYERS` is given on the command line; a
+   CPU build refuses anything but `0`. Otherwise `GPU_LAYERS` is never
+   rewritten. The backend must suit the CT's Debian release (CUDA: 12, Vulkan:
+   13, CPU: either); switching to Vulkan installs its packages and checks the
+   GPU first.
 2. Refreshes `bridge.py`, its venv and both unit files. Updating only the
    bridge therefore needs no llama.cpp change.
 3. Restarts services that were running, and waits up to

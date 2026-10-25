@@ -14,7 +14,7 @@ the system is put together and why.
 
 The router presents a **single OpenAI-compatible endpoint** in front of a pool
 of self-hosted model servers (Ollama, LM Studio, llama.cpp, AirLLM, Strata,
-Basalt, Project Maya) and decides *per request* which model on which host
+Basalt, Project Maya, Xolotl) and decides *per request* which model on which host
 answers. It addresses three problems:
 
 1. **Model sprawl.** Clients should not need to know which host serves what.
@@ -25,8 +25,8 @@ answers. It addresses three problems:
 
 The router CT covers routing, load spreading, health alerting, a chat UI and
 the configuration lifecycle. `targets/` provisions inference servers (§16),
-an Open Terminal companion (§17), a Hermes Agent client (§17.1) and the Gitea
-and Mattermost services (§17.2) in their own LXCs. The router treats an inference target like any other external model
+an Open Terminal companion (§17), a Hermes Agent client (§17.1), the Gitea
+and Mattermost services (§17.2) and a ComfyUI image engine (§17.3) in their own LXCs. The router treats an inference target like any other external model
 host; Hermes consumes the router's public API and is offered in Open WebUI as
 one more model.
 
@@ -57,10 +57,11 @@ flowchart LR
     subgraph pool["Model pool (1-20 hosts)"]
         o1["Ollama / llama.cpp bridge / AirLLM<br/>:11434"]
         o2["LM Studio<br/>:1234"]
-        o3["Strata / Basalt / Maya<br/>:8080"]
+        o3["Strata / Basalt / Maya / Xolotl<br/>:8080"]
     end
     term["Open Terminal LXC<br/>:8000"]
     hermes["Hermes Agent LXC<br/>API server :8642"]
+    comfy["ComfyUI LXC<br/>:8188"]
     gitea["Gitea"]
     mm["Mattermost"]
 
@@ -69,6 +70,7 @@ flowchart LR
     webui -->|OpenAI API| router
     webui -->|terminal tool| term
     webui -->|"OpenAI API (hermes-agent)"| hermes
+    webui -->|"image generation"| comfy
     hermes -->|OpenAI API :8000| router
     router -->|direct dispatch| pool
     router -.->|fallback| litellm
@@ -85,6 +87,7 @@ flowchart LR
 | Mattermost (webhook) | Optional | Alerts logged and retried. `targets/mattermost` can provision one in its own CT from the community script, with its webhook (§17.2) |
 | Open Terminal (`:8000`) | Optional | Terminal tool unavailable; chat unaffected |
 | Hermes API server (`:8642`) | Optional | `hermes-agent` unavailable in Open WebUI; other models unaffected |
+| ComfyUI (`:8188`) | Optional | Image generation in Open WebUI fails; chat unaffected |
 
 > After provisioning, the only runtime dependency is the model pool. Gitea and
 > Mattermost outages cannot stop the service or prevent it booting.
@@ -459,12 +462,14 @@ start. Venvs are built with `umask 022`.
 | 11434 / 1234 / 8080 | Model hosts | outbound | Router, LiteLLM, monitor → pool |
 | 8000 | Open Terminal CT | outbound | Open WebUI → terminal |
 | 8642 | Hermes CT API server | `0.0.0.0` in its CT | Open WebUI → Hermes; Hermes → router :8000 |
+| 8188 | ComfyUI CT | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
 
 With the CT firewall enabled, the installer accepts TCP 22, 8000 and the Open
 WebUI port from `API_ALLOW_CIDR`. SSH is included because enabling the
 firewall sets the input policy to drop. Target CTs are created with
-`firewall=1`. Open Terminal and Hermes admit only the router's address; model
-targets leave the rules to the operator. The Hermes CT also restricts egress by
+`firewall=1`. Open Terminal, Hermes and ComfyUI admit only the router's address
+(ComfyUI also `UI_ALLOW_CIDR`, for its web UI); model targets leave the rules to
+the operator. The Hermes CT also restricts egress by
 default: the router's API, DNS and internet HTTP(S) only (§17.1).
 
 ---
@@ -483,11 +488,12 @@ default: the router's API, DNS and internet HTTP(S) only (§17.1).
 |---|---|---|
 | Gitea deploy token, Mattermost webhook | `/app/router/secrets.env` (0640 root:ollama-router) | Never committed; moved out of `env/router.env` by `commit`/`apply` |
 | `ROUTER_API_KEY` (= Open WebUI `OPENAI_API_KEYS`) | `secrets.env` | Generated on new installs; `set-api-key` |
-| `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
-| Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT | Generated in the CT; never in a unit, log or the router's process list |
+| `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY`, `XOLOTL_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
+| Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT; Xolotl's also in its server config `/etc/xolotl/xolotl-ds41.json` (0640 root:xolotl) | Generated in the CT; never in a unit, log or the router's process list |
 | Open Terminal key | `/etc/open-terminal/api-key`; Open WebUI connection settings | Generated in the terminal CT |
 | Hermes API server key | `/etc/hermes-target/api-key` (0600), `~hermes/.hermes/.env` (0600); Open WebUI connection settings | Generated in the Hermes CT |
 | `ROUTER_API_KEY` in the Hermes CT | `~hermes/.hermes/config.yaml` (`model.api_key`) and `.env` (0600, owned by `hermes`) | Pushed as a 0600 file, never in argv; `--reconfigure` after a rotation |
+| Hugging Face token (ComfyUI `klein-9b` weights) | Not kept: the installer's memory, a 0600 file in the provisioner's stage directory and, during the guest step only, `/root/comfyui-target-deploy/hf-token` (0600) in the ComfyUI CT; removed afterwards, also on failure | Never in argv or the CT's environment; only root reads it, as a curl header file |
 
 | Accepted risk | Mitigation |
 |---|---|
@@ -498,6 +504,8 @@ default: the router's API, DNS and internet HTTP(S) only (§17.1).
 | A Strata-family key is also its admin key (Maya's dashboard) | Restrict the target port to the router CT |
 | Gitea tokens cannot be restricted to one repository | Use a dedicated non-admin account with access only to the config repository; select the token scopes documented in README |
 | LiteLLM has no master key | It listens only on 127.0.0.1; add a master key before exposing it |
+| The gated 9B weights have no reviewed hash (Hugging Face hides it from accounts without access) | Checked against the hash Hugging Face sends for the authenticated request and the pinned size; `COMFYUI_KLEIN_9B_SHA256` pins it |
+| ComfyUI has no authentication (queue, outputs, uploads) | Its CT firewall drops all inbound except :8188 from the router and `UI_ALLOW_CIDR`; the service runs unprivileged and cannot write its code or venv (§17.3) |
 | Hermes users can read the router key and share one agent memory | The agent runs as `hermes`, which owns its configuration. Keep `hermes-agent` admin-only or limited to one group; one Hermes profile per user or group for separation |
 
 ---
@@ -573,6 +581,7 @@ default: the router's API, DNS and internet HTTP(S) only (§17.1).
 | Secrets in `secrets.env` | Committed env | Tokens out of git, still readable by every unit |
 | Targets in their own LXCs | Engines in the router CT | GPU, memory and disk stay off the router; a failed target is just a down host |
 | Hermes as a second Open WebUI connection | Hermes as a model-server kind in the pool | `auto` could route to Hermes, which calls `auto`: a loop. Hermes has no size or capabilities to score |
+| ComfyUI as Open WebUI's image engine | An image route in the router | The router's API is chat-only; Open WebUI already drives ComfyUI's workflow API (queue, WebSocket progress, `/view`) |
 
 ---
 
@@ -608,6 +617,7 @@ URLs; other kinds are identified only by their prefix.
 | Strata | `strata+http://host:8080` | `/v1/models` | `openai/` | `STRATA_API_KEY` |
 | Basalt | `basalt+http://host:8080` | `/v1/models` | `openai/` | `BASALT_API_KEY` |
 | Maya | `maya+http://host:8080` | `/v1/models` | `openai/` | `MAYA_API_KEY` |
+| Xolotl | `xolotl+http://host:8080` | `/v1/models` | `openai/` | `XOLOTL_API_KEY` |
 
 ### 15.1 The kind table
 
@@ -628,19 +638,23 @@ The 0.4+ API gives `params_string`, `capabilities.vision` and
 `lmstudio_loaded_only` excludes cold ones. Keep-alive is not sent, because LM
 Studio uses its own idle TTL.
 
-### 15.3 Strata-style servers (Strata, Basalt, Maya)
+### 15.3 Strata-style servers (Strata, Basalt, Maya, Xolotl)
 
 * **Discovery:** model ID, image support (`input_modalities` or
   `architecture.input_modalities`), residency (`status`), `parameter_size` if
   given.
 * **Sizes:** `[model_sizes]` maps exact IDs (case-insensitive): `strata` and
-  `qwen3.8-flash-next` 125B, `glm-5.3-flash` 321B. A blank value removes an
+  `qwen3.8-flash-next` 125B, `glm-5.3-flash` 321B, `deepseek-v4.1-flash` 552B.
+  A blank value removes an
   entry. The legacy `[discovery] strata_default_params`,
   `basalt_/maya_default_id`/`_params` keys are still read.
 * **Health:** an empty `/v1/models` means the engine is not running, so the
   host counts as down.
 * **Detection without a key:** Strata and Basalt by the `service` field of
-  their public `/health`; Maya by `glm-5.3-flash` plus a `version` field.
+  their public `/health`; Maya by `glm-5.3-flash` plus a `version` field;
+  Xolotl, which runs Strata's own server (`service: strata`), by a model id
+  starting with `deepseek-v4` there. Xolotl has its own kind and key so that a
+  Strata key is never sent to it (or the other way round).
   Strata also has older fingerprints. A keyed server that cannot identify
   itself is added as `kind://host`.
 * **Keep-alive** is never sent.
@@ -652,18 +666,19 @@ Studio uses its own idle TTL.
 Each target is an unprivileged LXC built by `provision-lxc.sh` (on the PVE
 host: validates, creates the CT, passes GPU nodes through, pushes files) and
 `install-target.sh` (in the CT: installs, starts, health-checks; `--upgrade`).
-Every provisioner offers `--dry-run`; the Strata, Basalt and Maya guest
+Every provisioner offers `--dry-run`; the Strata, Basalt, Maya and Xolotl guest
 installers also offer it. Each target has its own README and tests. The router
 sees the result as one more host of the matching kind.
 
 | Target | Kind | Port | Engine and model | Notes |
 |---|---|---|---|---|
-| `llamacpp` | Ollama (bridge) | 11434 | `llama-server`, one GGUF | Debian 12; GPU gid 993 |
+| `llamacpp` | Ollama (bridge) | 11434 | `llama-server`, one GGUF | CUDA on Debian 12, Vulkan (AMD/Intel Arc) on Debian 13; GPU gid 993 |
 | `airllm` | Ollama | 11434 | AirLLM, one HF model streamed from disk | Seconds–minutes per token |
-| `ollama` | Ollama | 11434 | Ollama from the PVE community script | Adopted with a drop-in |
+| `ollama` | Ollama | 11434 | Ollama from the PVE community script | Adopted with a drop-in; NVIDIA, AMD (ROCm) or Intel Arc (Vulkan) |
 | `strata` | `strata` | 8080 | Strata, Qwen3.8-Flash-Next (125B) | Options parsed from `setup.sh --help` |
 | `basalt` | `basalt` | 8080 | Basalt, `.basalt` pack of Qwen3.8-Flash-Next | Blackwell (sm_120), CUDA 13 |
 | `maya` | `maya` | 8080 | Project Maya, GLM-5.3-Flash (321B, 18B active) | CUDA 12.8 default; V100 and newer |
+| `xolotl` | `xolotl` | 8080 | Xolotl (Strata fork), DeepSeek-V4.1-Flash-1017 V4 (552B MoE) | Built from source, CUDA 13.0 default, compute capability 7.5+; ~372 GB of pinned weights |
 
 **Common conventions**
 
@@ -673,7 +688,53 @@ sees the result as one more host of the matching kind.
   llama.cpp) that the account joins. Nodes owned by group root are refused.
 * The bundled NVIDIA user-space helper matches host driver 580.173.02. Use
   `NVIDIA_GUEST_INSTALLER` for another driver.
-* Strata, Basalt and Maya: `lxc.prlimit.memlock: unlimited` and
+* **Host GPU driver.** `tools/setup-host-gpu.sh` makes sure the host has a
+  working GPU driver before any GPU target is created.
+  * *Installer side.* The target table's GPU column is `need:vendors[:gens]`
+    (e.g. `required:nvidia:rtx50` for Basalt, `optional:nvidia,amd,intel` for
+    Ollama and ComfyUI). `target_gpu_spec` refines it from the settings:
+    llama.cpp `BACKEND` (`cuda` → nvidia, `vulkan` → amd,intel, `cpu` → none),
+    AirLLM `GPU_DEVICES`, Ollama/ComfyUI `GPU`. `prepare_host_gpu` intersects
+    the selected targets' vendors (refusing targets that share none), and runs
+    the tool once, right after the target prompts and before any service or
+    router CT, with `--need`, `--vendors`, `--for` and `--allow`. It keeps
+    `GPU_STATE`, `GPU_VENDOR` and `GPU_RENDER_NODE`; `target_gpu_env` turns
+    them into `GPU=<vendor|none>` for Ollama and ComfyUI and `BACKEND` plus the
+    render node as `GPU_DEVICES` for llama.cpp, unless preset.
+  * *Tool side.* A working GPU of an allowed vendor, in preference order, is
+    only reported: NVIDIA when `nvidia-smi -L` lists one; AMD when a known card
+    is bound to `amdgpu` with a render node (from sysfs) and `/dev/kfd`; Intel
+    when an Arc card is bound to `i915` or `xe` with a render node. Otherwise
+    it lists the cards of the allowed vendors (`lspci -Dnnk`; Intel iGPUs and
+    older AMD cards are skipped: AMD and Intel generations match by PCI device
+    ID, 1002:744x-749x RDNA 3, 755x/759x RDNA 4, 8086:56xx Alchemist, e2xx
+    Battlemage), asks the generation (suggested when only one is on the bus),
+    and with consent (or `INSTALL_HOST_DRIVER=yes`) sets it up. NVIDIA:
+    `install_nvidia_580_173_02.sh host --no-reboot` with open kernel modules
+    (its host mode loads `nvidia`/`nvidia_uvm` at boot and creates the
+    `/dev/nvidia*` nodes before `pve-guests.service` via
+    `nvidia-lxc-devices.service`). AMD/Intel: `pve-firmware` when the card's
+    firmware (`amdgpu/gc_11_0_*`, `gc_12_0_*`, `i915/dg2_*`, `xe/bmg_*`) is
+    missing, `modprobe` of `amdgpu`, `i915` (Arc A) or `xe` (Arc B, Linux 6.12+)
+    and the module in `/etc/modules-load.d/gpu-lxc.conf`. A blacklisted module
+    or a `vfio-pci` card is an error for required and `GPU_STATE=absent` for
+    optional targets; nothing is changed. Once the driver has the card, the
+    real card (compute capability, PCI ID) wins over the answer. An NVIDIA card
+    outside RTX 20-50 (V100, A100, H100, GTX 10) or with an unreadable compute
+    capability is reported ready without a generation; only targets with a
+    generation limit (`--allow`, i.e. Basalt) refuse it. Exit 2 (nouveau
+    still holds the card, or the loaded driver could not take it without a
+    restart) stops the installer for a reboot and a rerun; nothing else exists
+    yet. A working driver is never replaced. Strata, Basalt, Maya and Xolotl
+    provisioners run by hand point to the tool when the driver or its nodes
+    are missing.
+  * *Targets.* Ollama passes the vendor's devices through the community script
+    and adds the runtime: the release's checksum-verified ROCm archive for AMD
+    (kept across `--upgrade`), Mesa's Vulkan driver for Intel Arc. llama.cpp's
+    `BACKEND=vulkan` builds `-DGGML_VULKAN=ON` on Debian 13 with the render
+    node at gid 993 and checks for a discrete Vulkan GPU first. ComfyUI's
+    `GPU=amd|intel` was already supported (ROCm or XPU PyTorch).
+* Strata, Basalt, Maya and Xolotl: `lxc.prlimit.memlock: unlimited` and
   `LimitMEMLOCK=infinity`. The API key is generated in the CT and never written
   to the unit. The previous commit is kept under a local ref, so rollback needs
   no network.
@@ -682,10 +743,10 @@ sees the result as one more host of the matching kind.
 `upgrade_contract` checks that no target drops a part):
 
 1. **Prepare first.** Sources are fetched and verified before stopping.
-   Strata, Basalt and Maya stop and snapshot their checkout before setup or
-   compilation. llama.cpp, AirLLM, Ollama and Open Terminal prepare the new
-   build, venv or release while the old one runs, then restart. A failed fetch
-   leaves the service running. Every Strata, Basalt and Maya rerun, with or
+   Strata, Basalt, Maya and Xolotl stop and snapshot their checkout before setup or
+   compilation. llama.cpp, AirLLM, Ollama, Open Terminal and ComfyUI prepare
+   the new build, venv or release while the old one runs, then restart. A failed fetch
+   leaves the service running. Every Strata, Basalt, Maya and Xolotl rerun, with or
    without `--upgrade`, starts from the installation's own settings
    (`installed-env`; for older installs the `installed-settings`
    fingerprint) and applies non-empty environment overrides. An override of
@@ -718,7 +779,8 @@ sees the result as one more host of the matching kind.
    explicitly. Only a fresh install uses the defaults.
 2. **Unchanged means nothing to do.** No reinstall, no restart, and the kept
    `*.prev` stays. "Unchanged" means:
-   * Strata, Basalt, Maya: the same commit, settings fingerprint and unit.
+   * Strata, Basalt, Maya: the same commit, settings fingerprint and unit;
+     Xolotl also the same server config and verified weights.
    * llama.cpp: the same commit, requested ref, backend, `bridge.py`,
      requirements and both units, with no new settings to add
      (`FORCE_REBUILD=true` always rebuilds).
@@ -728,16 +790,18 @@ sees the result as one more host of the matching kind.
      downloading).
    * Open Terminal: the commit and dependency lock hash identify the active
      venv, and `service.env` and the unit would be unchanged.
+   * ComfyUI: the running release was built from the requested commit and the
+     drop-in would be unchanged (`FORCE_REBUILD=true` always rebuilds).
 
    An unchanged target is left alone only while healthy, or while explicitly
-   stopped (`ActiveState=inactive`) for llama.cpp, AirLLM and Ollama. A failed
+   stopped (`ActiveState=inactive`) for llama.cpp, AirLLM, Ollama and ComfyUI. A failed
    or unhealthy unit is re-applied. Strata, Basalt, Maya and Open Terminal also
    bring a stopped service back. AirLLM still needs `ALLOW_INTERRUPT=true`
    while its model loads.
 3. **Success requires the target's own readiness check**, unless an explicitly
    stopped service is kept stopped.
 4. **Rollback restores code and configuration** without network:
-   * Strata, Basalt, Maya stop the service and snapshot the runnable checkout
+   * Strata, Basalt, Maya, Xolotl stop the service and snapshot the runnable checkout
      (venv, build, launcher), its launcher env and unit to
      `/var/lib/<target>-target/` (root-only, 0700) before changing anything.
      Rollback resets to the previous commit and restores that snapshot at the
@@ -757,9 +821,12 @@ sees the result as one more host of the matching kind.
    * Ollama replaces only its release directory (`/usr/local/lib/ollama.prev`).
    * Open Terminal switches the venv symlink back and restores `service.env`
      and the unit, including after failed restarts or settings-only changes.
+   * ComfyUI switches its `current` link back to the previous release (and its
+     drop-in, when the upgrade replaced it); `comfyui.env` and the data are
+     never changed by an upgrade.
 5. **The rollback is health-checked** and reported as "running again" or
    failed too. Either way the run exits non-zero. An explicitly stopped service
-   stays stopped (llama.cpp, AirLLM, Ollama).
+   stays stopped (llama.cpp, AirLLM, Ollama, ComfyUI).
 
 ### 16.1 llama.cpp (`targets/llamacpp/`)
 
@@ -855,6 +922,50 @@ scripts refuse a CUDA release the CT's NVIDIA repository lacks (Debian 13 needs
 * **Health:** `/health` `status=ok` and the model listed in `/v1/models`. One
   sequence at a time by default.
 
+### 16.7 Xolotl (`targets/xolotl/`)
+
+[Xolotl](https://github.com/Indras-Mirror/Xolotl) is a fork of Strata (its
+engine, server and kernels merged at 0.1.44.1) with its own DeepSeek-V4.1-Flash,
+GLM-5.3-Flash and Qwen3.8 engines. The target runs the DeepSeek-V4.1 engine
+(`ds41_generate`) as `xolotl` on 8080; GLM and Qwen are left to Maya and
+Strata.
+
+* **No upstream installer.** Xolotl's `setup.sh` is Strata's and only knows
+  the Qwen families, so the target follows Xolotl's README by hand: a CUDA
+  toolkit (`cuda-toolkit.sh`, 13.0 default, as Maya's), the checkout's pinned
+  `requirements.txt` (CMake and Ninja included) in a venv,
+  `tools/xolotl/fetch-llama.sh` (llama.cpp at Xolotl's pin plus its ggml patch;
+  a tree at another commit is fetched again, because the script keeps any
+  patched tree), and CMake for GPU 0's compute capability
+  (`XOLOTL_CUDA_ARCH=auto`). Before building, `validate_checkout` refuses a
+  commit without the files, CMake options, engine flags and server config keys
+  the target uses.
+* **Weights:** `xolotl-weights.txt` pins every file (repository commit, size,
+  SHA-256 or git blob id): the 163 GB V4 quant in 16 byte-range parts, its rank
+  file, tokenizer and DSpark sidecar, and the two DeepSeek safetensors shards
+  holding the Engram tables (203 GB). Missing files are checked against Hugging
+  Face's `X-Linked-Size`/`X-Linked-Etag` and the free disk space before any
+  download; parts are verified, appended and deleted one at a time; downloads
+  resume; verified files are recorded so reruns neither rehash nor need the
+  network. `engram-index.py` writes the Engram index from the verified shards'
+  headers (upstream's index has no published hash), and the engine reads the
+  tables in place.
+* **Service:** Strata's server through `tools/v41/serve/serve_ds41.py`, from a
+  config in `/etc/xolotl/` (root-owned, readable by the `xolotl` group) that
+  holds the engine arguments, `STRATA_*` settings and the API key. The checkout
+  is read-only for the unit (`ReadWritePaths=/var/lib/xolotl /dev/shm`).
+  `STRATA_ENGRAM_RAWDEV=0`, because an unprivileged CT cannot open the block
+  device under the tables.
+* **Host driver:** the provisioner requires a loaded NVIDIA driver and, without
+  one, points to `tools/setup-host-gpu.sh` (see Host GPU driver above).
+* **Health:** `/health` `loaded=true` with the configured model id, and the id
+  listed in `/v1/models` with the key.
+* **Upgrade:** as Maya, with the weights verified (or completed) while the old
+  service runs, and the server config in the snapshot. CI's `xolotl-upstream`
+  job sends the generated config through the pinned server's own config,
+  argument and environment code and checks the engine flags, settings,
+  `/health` fields and Engram lookup the target relies on.
+
 ---
 
 ## 17. Open Terminal companion (`targets/open-terminal/`)
@@ -949,6 +1060,63 @@ setup:
   locking the server (seconds), the web installer or first-account sign-up is
   open on the CT's address. Create these CTs on a trusted segment.
 
+### 17.3 ComfyUI image generation (`targets/comfyui/`)
+
+Not a model host: Open WebUI's image generation engine. Open WebUI queues
+ComfyUI workflows itself (`POST /prompt`, progress over the `/ws` WebSocket,
+images from `/view`); the router is not involved.
+
+```
+Open WebUI (router CT) -> ComfyUI :8188 (comfyui.service, ComfyUI CT) -> GPU
+```
+
+* **Provisioning.** `provision-lxc.sh` checks the router's Open WebUI and takes
+  the admin key before anything is created, then runs the community script
+  `ct/comfyui.sh` with `var_*` presets (Debian 13; `var_comfyui_gpu_type`
+  answers its GPU menu), optionally pinned by SHA-256. That script installs
+  the latest ComfyUI release, unverified, in `/opt/ComfyUI` with a uv Python
+  3.12 venv and runs it as root on all addresses.
+* **Firewall.** ComfyUI has no authentication, so the CT's firewall file drops
+  all inbound traffic except TCP 8188 from the router's source address
+  (`ip route get` on the router) and `UI_ALLOW_CIDR`, and `net0` gets
+  `firewall=1`. It is written before the guest step; an existing file is never
+  replaced.
+* **Adoption.** `install-target.sh` adds the drop-in
+  `comfyui.service.d/10-comfyui-target.conf`: user `comfyui`, hardened, the
+  release `/opt/comfyui-target/current` points to, and
+  `--base-directory /var/lib/comfyui-target`, so models, custom nodes, inputs,
+  outputs, user settings and the database are the only writable paths. uv
+  installs Python under `/root`, which the service account cannot enter, so
+  the interpreter is copied to `/opt/comfyui-target/python` and the venv
+  repointed (no reinstall). Model files from the community tree are moved,
+  other data copied.
+* **Weights.** The installer prompts for a distilled FLUX.2 Klein 4B or 9B
+  model. `klein-weights.txt` lists each variant's diffusion model, text encoder
+  and VAE with size, SHA-256 and URL. The provisioner checks the URLs (and, for
+  the gated 9B, the Hugging Face token) before creating the CT; the guest
+  install checks free space, downloads with resume and verifies every hash.
+  The gated file's hash comes from Hugging Face's `X-Linked-Etag` unless
+  `COMFYUI_KLEIN_9B_SHA256` pins it. The token travels as an environment
+  variable to the provisioner, as a 0600 file into the CT (removed after the
+  guest step) and as a root-only curl header file; curl runs as root while
+  every file operation in the data directory runs as `comfyui`.
+* **Open WebUI.** The selected variant picks the workflow. `integrate-webui.py` (in the router CT) reads
+  `/api/v1/images/config`, sets engine `comfyui`, the URL and the selected
+  API-format workflow with its node mapping (unless an admin configured a
+  custom one), then writes the whole set back. It verifies the
+  diffusion model, text encoder and VAE through ComfyUI's `/object_info`, and
+  has Open WebUI verify the URL and list the diffusion model. On failure the
+  previous settings are restored. Until all three model assets are present,
+  generation is configured but left off.
+  `--integrate-only` with `auto` keeps the configured Klein workflow, else uses
+  the variant whose files ComfyUI has (4B first).
+* **Upgrades** follow §16: `--upgrade` clones the pinned tag, refuses it unless
+  `HEAD` is the reviewed commit, builds a new venv under
+  `/opt/comfyui-target/releases/` with the current Python and PyTorch build
+  while the old release runs, then switches the `current` link and checks
+  `/system_stats` for the new version. Dependencies other than PyTorch's index
+  are resolved from `requirements.txt` as upstream does (no hash lock).
+
 ---
 
 ## 18. Verification and CI
@@ -961,13 +1129,13 @@ setup:
   The provisioner suites (Hermes, Gitea, Mattermost) stub `id` and need no
   root.
 * `tests/test-repo.sh` checks repository invariants: unit hardening, no secrets
-  in `env/`, UTF-8, embedded copies in sync, Maya's update switch and the
-  upgrade contract.
+  in `env/`, UTF-8, embedded copies in sync, Maya's update switch, Xolotl's
+  pinned weights and the upgrade contract.
 * `.gitea/workflows/tests.yml` runs the suites with `--strict` (so its job
   container must run as root), shellcheck and ruff, with
   separate router and bridge venvs. ShellCheck discovers all repository shell
-  files, including test helpers. The `strata-upstream` and `maya-upstream`
-  jobs fetch one pinned commit each, kept separate so a GitHub outage cannot
+  files, including test helpers. The `strata-upstream`, `maya-upstream` and
+  `xolotl-upstream` jobs fetch one pinned commit each, kept separate so a GitHub outage cannot
   hide the main results.
 
 ---
@@ -995,7 +1163,10 @@ Router CT:
 /etc/motd                         login summary
 ```
 
-Strata-style target CTs (`<name>` = strata, basalt, maya):
+Strata-style target CTs (`<name>` = strata, basalt, maya, xolotl; Xolotl's
+server config, with the key, is `/etc/xolotl/xolotl-ds41.json`, its
+`xolotl.env` holds the port, and `/etc/xolotl-target/verified-weights` records
+the checked weights):
 
 ```
 /opt/<name>/                      upstream checkout, venv, build, launcher
@@ -1007,6 +1178,20 @@ Strata-style target CTs (`<name>` = strata, basalt, maya):
 /etc/<name>-target/pending-env    settings of a first install in progress (removed on success)
 /var/lib/<name>-target/rollback-runtime.tar, rollback.env, rollback.service   pre-upgrade snapshot (0700 dir; only during an upgrade or after a failed rollback)
 /etc/systemd/system/<name>.service
+```
+
+ComfyUI CT:
+
+```
+/opt/ComfyUI/                     community install (the first release; its venv is removed two upgrades later)
+/opt/comfyui-target/current       link to the release comfyui.service runs
+/opt/comfyui-target/releases/     pinned builds: <tag>-<commit>-<time>/ (code, .comfyui-target-commit, venv/)
+/opt/comfyui-target/python/       the Python the venvs run (copied out of /root/.local/share/uv)
+/var/lib/comfyui-target/          models/, custom_nodes/, input/, output/, temp/, user/ (owned by comfyui)
+/etc/comfyui-target/verified-weights   weights already hashed: path, SHA-256, size, mtime
+/etc/comfyui-target/comfyui.env   listen address, port, extra ComfyUI options (0640)
+/etc/comfyui-target.lock          installer lock
+/etc/systemd/system/comfyui.service.d/10-comfyui-target.conf   the drop-in
 ```
 
 Hermes CT:

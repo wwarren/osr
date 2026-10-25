@@ -45,6 +45,7 @@ add_suite() {
 }
 add_suite repo          shell "${HERE}/test-repo.sh"
 add_suite nvidia        shell "${HERE}/test-nvidia.sh"
+add_suite host-gpu      shell "${HERE}/test-host-gpu.sh"
 add_suite update        shell "${HERE}/test-update.sh"
 add_suite remote-update shell "${HERE}/test-remote-update.sh"
 add_suite mattermost    shell "${HERE}/test-mattermost.sh"
@@ -69,6 +70,7 @@ add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTH
 add_suite open-terminal-integration python "${ROOT}/targets/open-terminal/test-integration.py" python3
 add_suite open-terminal-webui-probe python "${ROOT}/targets/open-terminal/test-webui-probe.py" python3
 add_suite hermes-integration        python "${ROOT}/targets/hermes/test-integration.py"        python3
+add_suite comfyui-integration       python "${ROOT}/targets/comfyui/test-integration.py"       python3
 add_suite skip-report               python "${HERE}/test-skip-report.py"                       python3
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'; c_off=$'\033[0m'

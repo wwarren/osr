@@ -120,6 +120,8 @@ assert_ok   "basalt://host"          valid_addr basalt://10.0.0.8
 assert_ok   "basalt+http url"        valid_addr basalt+http://h:8080
 assert_ok   "maya://host"            valid_addr maya://10.0.0.9
 assert_ok   "maya+http url"          valid_addr maya+http://h:8080
+assert_ok   "xolotl://host"          valid_addr xolotl://10.0.0.12
+assert_ok   "xolotl+http url"        valid_addr xolotl+http://h:8080
 
 describe server_kind
 assert_eq "ollama"   "ollama"   "$(server_kind http://h:11434)"
@@ -127,6 +129,7 @@ assert_eq "lmstudio" "lmstudio" "$(server_kind lmstudio+http://h:1234)"
 assert_eq "strata"   "strata"   "$(server_kind strata+http://h:8080)"
 assert_eq "basalt"   "basalt"   "$(server_kind basalt+http://h:8080)"
 assert_eq "maya"     "maya"     "$(server_kind maya+http://h:8080)"
+assert_eq "xolotl"   "xolotl"   "$(server_kind xolotl+http://h:8080)"
 
 describe server_base
 assert_eq "strips the prefix" "http://h:1234" "$(server_base lmstudio+http://h:1234)"
@@ -134,6 +137,7 @@ assert_eq "ollama unchanged"  "http://h:11434" "$(server_base http://h:11434)"
 assert_eq "strata prefix"     "http://h:8080"  "$(server_base strata+http://h:8080)"
 assert_eq "basalt prefix"     "http://h:8080"  "$(server_base basalt+http://h:8080)"
 assert_eq "maya prefix"       "http://h:8080"  "$(server_base maya+http://h:8080)"
+assert_eq "xolotl prefix"     "http://h:8080"  "$(server_base xolotl+http://h:8080)"
 
 describe litellm_provider
 assert_eq "ollama"   "ollama"    "$(litellm_provider http://h:11434)"
@@ -141,6 +145,7 @@ assert_eq "lmstudio" "lm_studio" "$(litellm_provider lmstudio+http://h:1234)"
 assert_eq "strata uses OpenAI" "openai" "$(litellm_provider strata+http://h:8080)"
 assert_eq "basalt uses OpenAI" "openai" "$(litellm_provider basalt+http://h:8080)"
 assert_eq "maya uses OpenAI"   "openai" "$(litellm_provider maya+http://h:8080)"
+assert_eq "xolotl uses OpenAI" "openai" "$(litellm_provider xolotl+http://h:8080)"
 
 describe litellm_api_base
 assert_eq "ollama base as-is"      "http://h:11434"   "$(litellm_api_base http://h:11434)"
@@ -148,6 +153,7 @@ assert_eq "lmstudio OpenAI base"   "http://h:1234/v1" "$(litellm_api_base lmstud
 assert_eq "strata OpenAI base"     "http://h:8080/v1" "$(litellm_api_base strata+http://h:8080)"
 assert_eq "basalt OpenAI base"     "http://h:8080/v1" "$(litellm_api_base basalt+http://h:8080)"
 assert_eq "maya OpenAI base"       "http://h:8080/v1" "$(litellm_api_base maya+http://h:8080)"
+assert_eq "xolotl OpenAI base"     "http://h:8080/v1" "$(litellm_api_base xolotl+http://h:8080)"
 
 describe normalize_addr
 assert_eq "adds scheme+port"   "http://10.0.0.5:11434" "$(normalize_addr 10.0.0.5)"
@@ -166,6 +172,8 @@ assert_eq "basalt:// default port"            "basalt+http://h:8080" "$(normaliz
 assert_eq "basalt+http passes through"        "basalt+http://h:8888" "$(normalize_addr basalt+http://h:8888/)"
 assert_eq "maya:// default port"              "maya+http://h:8080"   "$(normalize_addr maya://h)"
 assert_eq "maya+http passes through"          "maya+http://h:8888"   "$(normalize_addr maya+http://h:8888/)"
+assert_eq "xolotl:// default port"            "xolotl+http://h:8080" "$(normalize_addr xolotl://h)"
+assert_eq "xolotl+http passes through"        "xolotl+http://h:8150" "$(normalize_addr xolotl+http://h:8150/)"
 STRATA_PORT=11434
 assert_eq "Strata default port can be 11434" "strata+http://h:11434" "$(normalize_addr strata://h)"
 unset STRATA_PORT
@@ -411,6 +419,13 @@ server_curl maya+http://h:8080 /v1/models >/dev/null
 assert_contains "Maya uses its own key" "http://h:8080/v1/models" "$(mock_calls)"
 assert_contains "Maya key in header file" "-H @" "$(mock_calls)"
 assert_not_contains "Maya key absent from argv" "maya-tok-123" "$(mock_calls)"
+env_set XOLOTL_API_KEY "xolotl-tok-123"
+env_set STRATA_API_KEY "strata-tok-456"
+mock_reset_log
+server_curl xolotl+http://h:8080 /v1/models >/dev/null
+assert_contains "Xolotl uses its own key" "http://h:8080/v1/models" "$(mock_calls)"
+assert_not_contains "Xolotl key absent from argv" "xolotl-tok-123" "$(mock_calls)"
+assert_eq "Xolotl's key is the one sent" "XOLOTL_API_KEY" "$(kind_field "$(server_kind xolotl+http://h:8080)" key)"
 mock_reset_log
 server_curl http://h:11434 /api/tags >/dev/null
 assert_not_contains "never sent to Ollama" "-H" "$(mock_calls)"
@@ -460,6 +475,24 @@ EOF
 mock_reset_log
 assert_eq "keyed Maya identified from public health" "maya" "$(detect_server_kind http://h:8080)"
 assert_not_contains "Maya detection sends no key" "-H @" "$(mock_calls)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok","max_context":131072,"model":"deepseek-v4.1-flash","api_key":true,"loaded":true,"service":"strata"}';;
+  *) exit 22;;
+esac
+EOF
+mock_reset_log
+assert_eq "keyed Xolotl (Strata's server, a DeepSeek-V4 model) identified from public health" "xolotl" "$(detect_server_kind http://h:8080)"
+assert_not_contains "Xolotl detection sends no key" "-H @" "$(mock_calls)"
+mock_script curl <<'EOF'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok","model":"qwen3.8-flash-next","loaded":true,"service":"strata"}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "Strata with a Qwen model stays Strata" "strata" "$(detect_server_kind http://h:8080)"
 mock_script curl <<'EOF'
 case "$*" in
   *"/v1/status"*) printf '{"loaded":true,"auto_load":true}\n200';;
@@ -535,6 +568,13 @@ case "$*" in
 esac
 EOF
 assert_eq "bare Maya host on default port detected" "maya+http://10.0.0.9:8080" "$(resolve_server 10.0.0.9)"
+mock_script curl <<'EOF'
+case "$*" in
+  *":8080/health"*) printf '{"status":"ok","model":"deepseek-v4.1-flash","loaded":false,"service":"strata"}';;
+  *) exit 22;;
+esac
+EOF
+assert_eq "bare Xolotl host on default port detected" "xolotl+http://10.0.0.12:8080" "$(resolve_server 10.0.0.12)"
 BASALT_PORT=8181
 mock_script curl <<'EOF'
 case "$*" in
@@ -552,6 +592,7 @@ assert_eq "an explicit lmstudio:// needs no probe" "lmstudio+http://10.0.0.9:123
 assert_eq "explicit Strata on port 11434 needs no probe" "strata+http://10.0.0.9:11434" "$(resolve_server strata://10.0.0.9:11434)"
 assert_eq "explicit Basalt on port 11434 needs no probe" "basalt+http://10.0.0.9:11434" "$(resolve_server basalt://10.0.0.9:11434)"
 assert_eq "explicit Maya on port 11434 needs no probe" "maya+http://10.0.0.9:11434" "$(resolve_server maya://10.0.0.9:11434)"
+assert_eq "explicit Xolotl on port 8150 needs no probe" "xolotl+http://10.0.0.12:8150" "$(resolve_server xolotl://10.0.0.12:8150)"
 SERVER_TYPE=lmstudio
 assert_eq "--type lmstudio needs no probe"        "lmstudio+http://10.0.0.9:1234" "$(resolve_server 10.0.0.9)"
 SERVER_TYPE=strata
@@ -689,6 +730,21 @@ env_set MAYA_API_KEY "maya-key"
 regenerate_litellm >/dev/null 2>&1
 assert_file_contains "Maya key reference" "api_key: os.environ/MAYA_API_KEY" "$LITELLM_YAML"
 assert_fail "Maya key never enters YAML" grep -q 'maya-key' "$LITELLM_YAML"
+reset_repo
+
+env_set MODEL_SERVERS "xolotl+http://10.0.0.12:8080"
+env_set BACKEND_XLARGE "xolotl+http://10.0.0.12:8080"
+TIER_MODEL_OVERRIDE[xlarge]="deepseek-v4.1-flash"
+regenerate_litellm >/dev/null 2>&1
+TIER_MODEL_OVERRIDE=()
+assert_file_contains "Xolotl OpenAI provider" "model: openai/deepseek-v4.1-flash" "$LITELLM_YAML"
+assert_file_contains "Xolotl /v1 base" "api_base: http://10.0.0.12:8080/v1" "$LITELLM_YAML"
+env_set XOLOTL_API_KEY "xolotl-key"
+env_set STRATA_API_KEY "strata-key"
+regenerate_litellm >/dev/null 2>&1
+assert_file_contains "Xolotl key reference" "api_key: os.environ/XOLOTL_API_KEY" "$LITELLM_YAML"
+assert_fail "the Strata key is not used for Xolotl" grep -q 'STRATA_API_KEY' "$LITELLM_YAML"
+assert_fail "Xolotl key never enters YAML" grep -q 'xolotl-key' "$LITELLM_YAML"
 reset_repo
 
 describe litellm_fallbacks
@@ -1320,7 +1376,7 @@ assert_eq "--off clears it" "" "$(env_get ROUTER_API_KEY)"
 reset_repo
 
 describe server_kinds
-assert_eq "kinds, in detection order" "lmstudio strata basalt maya" "$(server_kinds | paste -sd' ' -)"
+assert_eq "kinds, in detection order" "lmstudio strata basalt maya xolotl" "$(server_kinds | paste -sd' ' -)"
 
 describe kind_field
 assert_eq "maya key" MAYA_API_KEY "$(kind_field maya key)"
@@ -1342,10 +1398,10 @@ assert_fail "LM Studio is not" is_openai_kind lmstudio
 assert_fail "nor is Ollama" is_openai_kind ollama
 
 describe openai_kinds
-assert_eq "OpenAI-style kinds" "strata basalt maya" "$(openai_kinds | paste -sd' ' -)"
+assert_eq "OpenAI-style kinds" "strata basalt maya xolotl" "$(openai_kinds | paste -sd' ' -)"
 
 describe kind_labels
-assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt or Maya" "$(kind_labels)"
+assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt, Maya or Xolotl" "$(kind_labels)"
 
 describe kind_secret_name
 assert_eq "LM Studio has a token" "LM Studio token" "$(kind_secret_name lmstudio)"
@@ -1353,6 +1409,9 @@ assert_eq "Maya has an API key" "Maya API key" "$(kind_secret_name maya)"
 
 describe token_command_kind
 assert_eq "set-maya-token names maya" maya "$(token_command_kind set-maya-token)"
+assert_eq "set-xolotl-token names xolotl" xolotl "$(token_command_kind set-xolotl-token)"
+assert_eq "xolotl key" XOLOTL_API_KEY "$(kind_field xolotl key)"
+assert_eq "xolotl default port" 8080 "$(kind_field xolotl port)"
 assert_eq "set-lmstudio-token names lmstudio" lmstudio "$(token_command_kind set-lmstudio-token)"
 assert_eq "set-token is not a kind command" "" "$(token_command_kind set-token)"
 assert_eq "set-ollama-token is not a kind command" "" "$(token_command_kind set-ollama-token)"
@@ -1361,8 +1420,8 @@ assert_fail "unknown token commands do not" command_writes set-bogus-token
 
 describe secret_keys
 assert_eq "secrets include every kind's key" \
-  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY" \
-  "$(secret_keys | tail -n 4 | paste -sd' ' -)"
+  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY XOLOTL_API_KEY" \
+  "$(secret_keys | tail -n 5 | paste -sd' ' -)"
 
 describe litellm_provider
 assert_eq "litellm provider for maya" openai "$(litellm_provider maya+http://h:8080)"

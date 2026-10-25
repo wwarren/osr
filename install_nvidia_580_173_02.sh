@@ -14,6 +14,16 @@ DRIVER_SHA256="${DRIVER_SHA256:-}"
 # version mismatch"). FORCE=true overrides.
 FORCE="${FORCE:-false}"
 PROC_DRIVER_VERSION="${PROC_DRIVER_VERSION:-/proc/driver/nvidia/version}"
+PROC_MODULES="${PROC_MODULES:-/proc/modules}"
+# host mode: the kernel module flavour, "open" or "proprietary". Empty keeps
+# the installer's own default. RTX 50 (Blackwell) cards need "open"; Turing
+# (RTX 20) and newer work with it.
+KERNEL_MODULE_TYPE="${KERNEL_MODULE_TYPE:-}"
+# host mode: load the modules and create the /dev/nvidia* nodes at every boot,
+# before Proxmox starts its guests, so containers that pass them through start.
+MODULES_LOAD_CONF="${MODULES_LOAD_CONF:-/etc/modules-load.d/nvidia-lxc.conf}"
+DEVICES_UNIT_DIR="${DEVICES_UNIT_DIR:-/etc/systemd/system}"
+DEVICES_UNIT="nvidia-lxc-devices.service"
 APT_UPDATED=false
 
 usage() {
@@ -30,11 +40,18 @@ Environment:
   DRIVER_SHA256=<hex>  Also require this SHA-256 for the downloaded installer.
   DOWNLOAD_DIR=<dir>   Where the installer is kept (default /root).
   FORCE=true           lxc mode: install even if the host driver version differs.
+  KERNEL_MODULE_TYPE=open|proprietary
+                       host mode: the kernel module flavour (default: the
+                       installer's). RTX 50 (Blackwell) needs open.
 
 Notes:
   - For Proxmox LXC GPU passthrough, run host mode on the Proxmox host first.
   - Run lxc mode inside the container after /dev/nvidia* devices are passed through.
   - Do not run host mode inside an LXC container.
+  - Host mode also loads nvidia and nvidia_uvm at boot and creates the
+    /dev/nvidia* nodes before Proxmox starts its guests (${DEVICES_UNIT}).
+  - With --no-reboot, host mode loads the new driver at once unless nouveau
+    holds the GPU; then a reboot is needed.
   - Re-running with the same version already installed is a no-op.
 EOF
 }
@@ -162,14 +179,80 @@ EOF
   update-initramfs -u
 }
 
+# Is the nouveau driver loaded (holding the GPU until the next boot)?
+nouveau_loaded() {
+  grep -q '^nouveau ' "$PROC_MODULES" 2>/dev/null
+}
+
+# The arguments for the .run installer in host mode, one per line.
+host_installer_args() {
+  printf '%s\n' --silent --dkms --no-questions --ui=none \
+    "--glvnd-egl-config-path=${GLVND_EGL_CONFIG_PATH}"
+  if [[ -n "$KERNEL_MODULE_TYPE" ]]; then
+    printf '%s\n' "--kernel-module-type=${KERNEL_MODULE_TYPE}"
+  fi
+  # nouveau stays loaded until the reboot that its blacklist takes effect on;
+  # build and install the NVIDIA module now so that reboot is the only one.
+  if nouveau_loaded; then
+    printf '%s\n' --no-nouveau-check
+  fi
+}
+
+# Load nvidia and nvidia_uvm at every boot, and create the /dev/nvidia* nodes
+# (nvidia-uvm included, which nothing else creates) before pve-guests.service
+# starts the containers that pass them through. Idempotent.
+setup_lxc_device_nodes() {
+  local unit="${DEVICES_UNIT_DIR}/${DEVICES_UNIT}"
+  log "Loading the NVIDIA modules and creating /dev/nvidia* at boot (${DEVICES_UNIT})"
+  mkdir -p "$(dirname "$MODULES_LOAD_CONF")" "$DEVICES_UNIT_DIR"
+  printf '# Written by %s: the GPU nodes LXC containers pass through.\nnvidia\nnvidia_uvm\n' \
+    "$(basename "$0")" > "$MODULES_LOAD_CONF"
+  cat > "$unit" <<EOF
+[Unit]
+Description=Create the NVIDIA device nodes for LXC GPU passthrough
+After=systemd-modules-load.service
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# /dev/nvidiactl and /dev/nvidia0..N
+ExecStart=/usr/bin/nvidia-smi -L
+# /dev/nvidia-uvm and /dev/nvidia-uvm-tools
+ExecStart=/usr/bin/nvidia-modprobe -c0 -u
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$DEVICES_UNIT"
+}
+
+# Load the driver that was just installed, without a reboot. Fails while
+# nouveau holds the GPU, or when the module does not load.
+activate_host_driver() {
+  nouveau_loaded && return 1
+  modprobe nvidia && modprobe nvidia_uvm && systemctl restart "$DEVICES_UNIT"
+}
+
+validate_kernel_module_type() {
+  case "$KERNEL_MODULE_TYPE" in
+    ""|open|proprietary) ;;
+    *) die "KERNEL_MODULE_TYPE must be open or proprietary, not '${KERNEL_MODULE_TYPE}'." ;;
+  esac
+}
+
 install_host_driver() {
   local no_reboot="${1:-false}"
+  local -a args
 
   if detect_lxc; then
     die "This looks like a container. Use lxc mode inside LXC, not host mode."
   fi
+  validate_kernel_module_type
   if [[ "$(host_driver_version)" == "$DRIVER_VERSION" ]]; then
     log "NVIDIA ${DRIVER_VERSION} is already loaded on this host; nothing to do."
+    setup_lxc_device_nodes
     return 0
   fi
 
@@ -177,21 +260,22 @@ install_host_driver() {
   blacklist_nouveau
   download_driver
 
-  log "Installing NVIDIA ${DRIVER_VERSION} host driver with DKMS"
-  "./${DRIVER_FILE}" \
-    --silent \
-    --dkms \
-    --no-questions \
-    --ui=none \
-    --glvnd-egl-config-path="${GLVND_EGL_CONFIG_PATH}"
+  log "Installing NVIDIA ${DRIVER_VERSION} host driver with DKMS${KERNEL_MODULE_TYPE:+ (${KERNEL_MODULE_TYPE} kernel modules)}"
+  mapfile -t args < <(host_installer_args)
+  "./${DRIVER_FILE}" "${args[@]}"
 
   log "NVIDIA installer completed"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi || true
-  fi
+  setup_lxc_device_nodes
 
   if [[ "${no_reboot}" == "true" ]]; then
-    log "Reboot skipped. Reboot before validating GPU passthrough."
+    if nouveau_loaded; then
+      log "nouveau still holds the GPU: reboot the host to switch to NVIDIA ${DRIVER_VERSION}."
+    elif activate_host_driver; then
+      log "NVIDIA ${DRIVER_VERSION} is loaded."
+      nvidia-smi || true
+    else
+      log "The NVIDIA module did not load now; reboot the host before validating GPU passthrough."
+    fi
   else
     log "Rebooting in 10 seconds. Press Ctrl+C to cancel."
     sleep 10

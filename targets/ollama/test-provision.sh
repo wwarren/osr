@@ -6,7 +6,8 @@ exec </dev/null
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 provision=$script_dir/provision-lxc.sh
 bash_bin=$(command -v bash)
-common=(CT_ID=270 IP_CIDR=192.0.2.70/24 GATEWAY=192.0.2.1 STORAGE=local-lvm NVIDIA_DEVICE=/nonexistent)
+common=(CT_ID=270 IP_CIDR=192.0.2.70/24 GATEWAY=192.0.2.1 STORAGE=local-lvm NVIDIA_DEVICE=/nonexistent
+    KFD_DEVICE=/nonexistent DRM_SYSFS=/nonexistent)
 passed=0
 out=''
 
@@ -38,14 +39,32 @@ lacks 'install_nvidia'; lacks '+ pct exec 270 -- env'
 has 'To adopt it into the target layout'
 
 FLAGS=--install-target ok 'install plan adopts the install and pulls models' OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b'
-has "+ pct exec 270 -- env OLLAMA_PULL_MODELS=qwen3:8b\\ qwen3:14b bash /root/ollama-target-deploy/install-target.sh"
+has "+ pct exec 270 -- env OLLAMA_GPU=none OLLAMA_PULL_MODELS=qwen3:8b\\ qwen3:14b bash /root/ollama-target-deploy/install-target.sh"
 
 FLAGS=--install-target ok 'GPU passthrough adds the NVIDIA helper before adoption' GPU=yes
 has 'var_gpu=yes'
 [[ $out == *'install_nvidia_580_173_02.sh lxc'*'install-target.sh'* ]] || { echo 'FAIL: NVIDIA helper not before adoption' >&2; exit 1; }
 
+has 'OLLAMA_GPU=nvidia'
+
 ok 'GPU=auto follows the host devices' GPU=auto NVIDIA_DEVICE=/dev/null
 has 'var_gpu=yes'
+
+FLAGS=--install-target ok 'an AMD GPU is passed through without the NVIDIA helper' GPU=amd
+has 'var_gpu=yes'; has 'OLLAMA_GPU=amd'; has 'answer AMD'
+lacks 'install_nvidia'
+fake_drm=$(mktemp -d); trap 'rm -rf -- "$fake_drm" "${keyfile:-}"' EXIT
+mkdir -p "$fake_drm/renderD128/device" "$fake_drm/renderD129/device"
+printf '0x8086\n' > "$fake_drm/renderD128/device/vendor"; printf '0xa780\n' > "$fake_drm/renderD128/device/device"
+FLAGS=--install-target ok 'GPU=auto ignores an Intel iGPU' GPU=auto DRM_SYSFS="$fake_drm"
+has 'var_gpu=no'; has 'OLLAMA_GPU=none'
+printf '0x8086\n' > "$fake_drm/renderD129/device/vendor"; printf '0xe20b\n' > "$fake_drm/renderD129/device/device"
+FLAGS=--install-target ok 'GPU=auto finds an Arc B580' GPU=auto DRM_SYSFS="$fake_drm"
+has 'var_gpu=yes'; has 'OLLAMA_GPU=intel'; has 'answer INTEL'
+FLAGS=--install-target ok 'GPU=auto finds an AMD GPU by /dev/kfd' GPU=auto KFD_DEVICE=/dev/null DRM_SYSFS="$fake_drm"
+has 'OLLAMA_GPU=amd'
+ok 'GPU=none (or no) runs on the CPU' GPU=no
+has 'var_gpu=no'; lacks 'answer'
 
 ok 'DHCP drops the gateway' IP_CIDR=dhcp
 has 'var_net=dhcp'; lacks 'var_gateway'
@@ -53,7 +72,7 @@ has 'var_net=dhcp'; lacks 'var_gateway'
 ok 'optional network settings are passed through' NAMESERVER=192.0.2.53 VLAN_TAG=30 BRIDGE=vmbr1
 has 'var_ns=192.0.2.53'; has 'var_vlan=30'; has 'var_brg=vmbr1'
 
-keyfile=$(mktemp); trap 'rm -f -- "$keyfile"' EXIT
+keyfile=$(mktemp)
 echo 'ssh-ed25519 AAAAC3Nz test@host' > "$keyfile"
 ok 'an SSH key is passed as its content' SSH_PUBLIC_KEY="$keyfile"
 has 'var_ssh=yes'; has 'var_ssh_authorized_key=ssh-ed25519\ AAAAC3Nz\ test@host'

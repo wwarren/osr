@@ -49,9 +49,27 @@ with the settings preset as its `var_*` variables (`var_ctid`, `var_cpu`,
 `var_ram`, `var_disk`, `var_net`, `var_gateway`, `var_gpu`, ...). The script
 still shows its menu: choose **Default** to accept the presets. Defaults
 here are larger than the community ones, because models need the room:
-4 cores, **16 GB RAM, 128 GB disk**. `GPU=auto` passes the GPU through when
-the host has `/dev/nvidia0`; when `nvidia-smi` is then missing inside the CT,
-the repository's NVIDIA 580.173.02 user-space helper runs before adoption.
+4 cores, **16 GB RAM, 128 GB disk**.
+
+The GPU: `GPU=auto` picks NVIDIA when the host has `/dev/nvidia0`, else AMD
+when it has `/dev/kfd`, else Intel for an Arc card's render node, else none;
+`GPU=nvidia|amd|intel|none` chooses (`yes` still means NVIDIA, `no` none). The
+community script passes the devices through itself; when the host has more
+than one GPU type it asks which, so answer the vendor the wrapper names. The
+wrapper then checks the CT config and warns if the GPU is missing.
+
+| GPU | Passed through | `install-target.sh` adds |
+|---|---|---|
+| NVIDIA | `/dev/nvidia*` | the repository's NVIDIA 580.173.02 user-space helper, when `nvidia-smi` is missing (before adoption) |
+| AMD Radeon RX 7000/9000, PRO W7000 | `/dev/dri/renderD*`, `/dev/kfd` | Ollama's ROCm libraries for the installed release (`ollama-linux-amd64-rocm.tar.zst`, checksum-verified; they bundle ROCm, so nothing else is installed) |
+| Intel Arc A/B | `/dev/dri/renderD*` | Mesa's Vulkan driver (`mesa-vulkan-drivers libvulkan1`) for Ollama's built-in Vulkan backend; Arc B needs Mesa 24.2+ (Ubuntu 24.04 has 25.0 after `apt upgrade`) |
+
+Set the host's driver up first with `tools/setup-host-gpu.sh --vendors
+nvidia,amd,intel` (the router installer does, and passes `GPU`). Inside the CT,
+`OLLAMA_GPU` (auto: `/dev/kfd` is AMD, an Intel render node is an Arc) tells
+`install-target.sh` which runtime to add. Without exposing VRAM through
+`cap_perfmon` (which the hardened unit does not grant), Ollama's Vulkan backend
+sizes models approximately.
 
 The script comes from the community repo's `main` branch, so it can change
 between runs. The wrapper prints its SHA-256; set `COMMUNITY_SCRIPT_SHA256`
@@ -72,6 +90,10 @@ ollama pull qwen3:8b                           # models land in /var/lib/ollama-
 bash /root/ollama-target-deploy/install-target.sh --upgrade             # pinned release
 OLLAMA_VERSION=v0.35.0 bash /root/ollama-target-deploy/install-target.sh --upgrade
 ```
+
+On an AMD GPU (or whenever the installed release carries ROCm libraries),
+`--upgrade` downloads and verifies the new release's ROCm archive too and
+installs both together, so an upgrade never drops ROCm support.
 
 When the requested version is already installed and the server answers as
 that version (or the service is stopped), `--upgrade` prints "nothing to do"

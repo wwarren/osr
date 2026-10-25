@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Run INSIDE a dedicated Debian 12 inference-target LXC, never on the router or PVE host.
+# Run INSIDE a dedicated Debian inference-target LXC (Debian 12 for CUDA and CPU
+# builds, Debian 13 for Vulkan), never on the router or PVE host.
 set -Eeuo pipefail
 umask 027
 
-# Official release reviewed for Debian 12 / CUDA 13.0 / SM 86, 89 and 120.
+# Official release reviewed for Debian 12 / CUDA 13.0 / SM 86, 89 and 120, and for
+# Debian 13's Vulkan 1.4 / glslc (shaderc 2025.2) on RDNA 3/4 and Arc A/B.
 # https://github.com/ggml-org/llama.cpp/releases/tag/v0.5.0
 # Release commit: 7fe450e19305b828c199d602c23a8337aaa1f03b
 # Keep this fixed until a newer release has been reviewed; never resolve "latest".
@@ -28,7 +30,7 @@ https://huggingface.co/<org>/<repo>/resolve/<revision>/<file>.gguf URL.
 NONINTERACTIVE=true disables prompts and requires MODEL_ALIAS plus a GGUF file
 setting or a valid MODEL_DOWNLOAD_URL.
 Optional: LLAMA_CPP_REF=<release-tag-or-full-commit> ($LLAMA_CPP_DEFAULT_REF),
-          BACKEND=cuda|cpu (cuda), BUILD_JOBS=4, CONTEXT_SIZE=8192,
+          BACKEND=cuda|vulkan|cpu (cuda), BUILD_JOBS=4, CONTEXT_SIZE=8192,
           PARALLEL_SLOTS=1, THREADS=4, GPU_LAYERS=auto (0 for cpu),
           MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
           MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
@@ -45,6 +47,10 @@ Everything replaced is kept as *.prev and restored if the upgrade fails.
 CUDA requires host-matched userspace driver libraries inside the CT, with GPU
 devices passed through. If nvcc is missing, the CUDA 13.0 toolkit is installed
 from NVIDIA's Debian 12 repository. No NVIDIA drivers are installed.
+Vulkan (AMD Radeon RDNA 3/4, Intel Arc A/B) needs Debian 13 and the card's
+render node passed through; Mesa's Vulkan driver, the Vulkan headers and glslc
+come from Debian. A backend switch must stay on its Debian release (CUDA: 12,
+Vulkan: 13, CPU: either).
 Services are enabled but are NOT started by this script.
 USAGE
 }
@@ -384,6 +390,44 @@ build_info() {
     [[ -f $TARGET_ROOT/build-info.txt ]] || return 0
     sed -n "s/^$1=//p" "$TARGET_ROOT/build-info.txt" | head -n1
 }
+# backend_debian_ok BACKEND: does this guest's Debian release suit BACKEND?
+backend_debian_ok() {
+    [[ ${ID:-} == debian ]] || return 1
+    case $1 in
+        cuda) [[ ${VERSION_ID:-} == 12 ]] ;;
+        vulkan) [[ ${VERSION_ID:-} == 13 ]] ;;
+        cpu) [[ ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ]] ;;
+        *) return 1 ;;
+    esac
+}
+require_backend_debian() {
+    backend_debian_ok "$1" && return 0
+    case $1 in
+        cuda) die 'The CUDA 13.0 build targets a Debian 12 guest.' ;;
+        vulkan) die 'The Vulkan build targets a Debian 13 guest (Mesa 25 and Vulkan 1.4); provision a new CT with BACKEND=vulkan.' ;;
+        *) die 'This target runs on a Debian 12 or 13 guest.' ;;
+    esac
+}
+# Mesa's Vulkan driver, the Vulkan loader and headers, glslc and SPIR-V headers.
+readonly VULKAN_PACKAGES='mesa-vulkan-drivers libvulkan1 libvulkan-dev glslc spirv-headers vulkan-tools'
+install_vulkan_packages() {
+    # shellcheck disable=SC2086  # a list of package names
+    apt-get install --no-install-recommends -y $VULKAN_PACKAGES
+}
+# vulkan_gpu_check USER: USER must see a discrete GPU through Vulkan (not only
+# Mesa's CPU renderer), through a render node it can open.
+vulkan_gpu_check() {
+    local node usable=0 summary
+    for node in "${DRI_DIR:-/dev/dri}"/renderD*; do
+        [[ -e $node ]] || continue
+        runuser -u "$1" -- test -r "$node" -a -w "$node" && usable=1
+    done
+    (( usable )) || die "$1 cannot open a GPU render node in ${DRI_DIR:-/dev/dri}; check the CT device (path=/dev/dri/renderD<n>,gid=993,mode=0660)."
+    summary=$(runuser -u "$1" -- vulkaninfo --summary 2>&1) || die "vulkaninfo failed as $1: $summary"
+    [[ $summary == *PHYSICAL_DEVICE_TYPE_DISCRETE_GPU* ]] ||
+        die "Vulkan sees no discrete GPU (only: $(grep -o 'deviceName *= .*' <<< "$summary" | paste -sd, -)). Check the host driver (tools/setup-host-gpu.sh) and the passed-through render node."
+    grep -m1 'deviceName' <<< "$(grep -B4 -A4 DISCRETE_GPU <<< "$summary")" || true
+}
 # Fetch LLAMA_CPP_REF into a fresh clone at $1; print the resolved commit.
 fetch_llama_source() {
     local repo=$1
@@ -412,6 +456,8 @@ build_llama_server() {
     if [[ $BACKEND == cuda ]]; then
         cmake_args+=(-DGGML_CUDA=ON "-DCMAKE_CUDA_COMPILER=$CUDA_COMPILER")
         [[ -z $CUDA_ARCHITECTURES ]] || cmake_args+=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES")
+    elif [[ $BACKEND == vulkan ]]; then
+        cmake_args+=(-DGGML_CUDA=OFF -DGGML_VULKAN=ON)
     else
         cmake_args+=(-DGGML_CUDA=OFF)
     fi
@@ -420,7 +466,7 @@ build_llama_server() {
     install -o root -g root -m 0755 "$repo/build/bin/llama-server" "$dest"
     dependencies=$(ldd "$dest")
     printf '%s\n' "$dependencies"
-    [[ $dependencies != *'not found'* ]] || die 'The built llama-server is missing a shared library. Check CUDA userspace paths/ldconfig inside this CT.'
+    [[ $dependencies != *'not found'* ]] || die 'The built llama-server is missing a shared library. Check CUDA or Vulkan userspace paths/ldconfig inside this CT.'
     "$dest" --version
 }
 # (Re)create the bridge venv and install bridge.py from $1.
@@ -533,7 +579,8 @@ command -v systemd-detect-virt >/dev/null || die 'systemd-detect-virt is require
 [[ $(systemd-detect-virt --container) == lxc ]] || die 'Install only in the dedicated inference-target LXC.'
 # shellcheck disable=SC1090,SC1091
 source "${OS_RELEASE_FILE:-/etc/os-release}"
-[[ ${ID:-} == debian && ${VERSION_ID:-} == 12 ]] || die 'This CUDA 13.0 deployment targets a Debian 12 guest.'
+[[ ${ID:-} == debian && ( ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ) ]] ||
+    die 'This target runs on a Debian 12 guest (CUDA, CPU) or a Debian 13 guest (Vulkan, CPU).'
 [[ ! -d /app/router ]] || die 'The smart-router installation is present. Install this stack in a separate inference-target CT.'
 [[ $(systemctl show ollama-router.service -p LoadState --value) == not-found ]] || die 'The smart-router service is present. Install this stack in a separate inference-target CT.'
 
@@ -555,17 +602,20 @@ if [[ $MODE == upgrade ]]; then
     CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-native}
     CUDA_COMPILER=${CUDA_COMPILER:-}
     FORCE_REBUILD=${FORCE_REBUILD:-false}
-    [[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
+    [[ $BACKEND == cpu || $BACKEND == cuda || $BACKEND == vulkan ]] || die 'BACKEND must be cpu, cuda or vulkan.'
+    require_backend_debian "$BACKEND"
     # A backend switch also switches GPU_LAYERS, which the upgrade otherwise
-    # never rewrites: a CUDA build left at 0 would silently run on the CPU, and
+    # never rewrites: a GPU build left at 0 would silently run on the CPU, and
     # a CPU build requires 0. GPU_LAYERS overrides the new backend's default.
     gpu_layers_new=''
     previous_backend=$(build_info backend)
     if [[ -n $previous_backend && $BACKEND != "$previous_backend" ]]; then
-        if [[ $BACKEND == cuda ]]; then gpu_layers_new=${GPU_LAYERS:-auto}; else gpu_layers_new=${GPU_LAYERS:-0}; fi
-        [[ $gpu_layers_new == auto || $gpu_layers_new == all || $gpu_layers_new =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+        if [[ $BACKEND != cpu && ( $previous_backend == cpu ) ]]; then gpu_layers_new=${GPU_LAYERS:-auto}
+        elif [[ $BACKEND == cpu ]]; then gpu_layers_new=${GPU_LAYERS:-0}
+        else gpu_layers_new=${GPU_LAYERS:-}; fi
+        [[ -z $gpu_layers_new || $gpu_layers_new == auto || $gpu_layers_new == all || $gpu_layers_new =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
             die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
-        [[ $BACKEND == cuda || $gpu_layers_new == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
+        [[ $BACKEND != cpu || $gpu_layers_new == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
     elif [[ -n ${GPU_LAYERS:-} ]]; then
         printf 'Note: GPU_LAYERS is applied by --upgrade only with a BACKEND change; edit %s/llama-server.env instead.\n' "$TARGET_ETC" >&2
     fi
@@ -578,6 +628,10 @@ if [[ $MODE == upgrade ]]; then
     if [[ $BACKEND == cuda ]]; then
         ensure_cuda_compiler
         printf 'Using CUDA compiler: %s\n' "$CUDA_COMPILER"
+    elif [[ $BACKEND == vulkan && $previous_backend != vulkan ]]; then
+        apt-get -o Acquire::Retries=3 update
+        install_vulkan_packages
+        vulkan_gpu_check llama-target
     fi
 
     current_commit=$(build_info resolved_commit)
@@ -681,7 +735,7 @@ BUILD_JOBS=${BUILD_JOBS:-4}
 CONTEXT_SIZE=${CONTEXT_SIZE:-8192}
 PARALLEL_SLOTS=${PARALLEL_SLOTS:-1}
 THREADS=${THREADS:-4}
-if [[ $BACKEND == cuda ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
+if [[ $BACKEND != cpu ]]; then GPU_LAYERS=${GPU_LAYERS:-auto}; else GPU_LAYERS=${GPU_LAYERS:-0}; fi
 MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
@@ -693,8 +747,9 @@ LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
 positive_int() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
 [[ $GPU_LAYERS == auto || $GPU_LAYERS == all || $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
-[[ $BACKEND == cpu || $BACKEND == cuda ]] || die 'BACKEND must be cpu or cuda.'
-[[ $BACKEND == cuda || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
+[[ $BACKEND == cpu || $BACKEND == cuda || $BACKEND == vulkan ]] || die 'BACKEND must be cpu, cuda or vulkan.'
+require_backend_debian "$BACKEND"
+[[ $BACKEND != cpu || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
 [[ $LLAMA_CPP_REF =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Use a release tag or full 40-character commit, without a refs/ prefix.'
 [[ $LLAMA_CPP_REF != HEAD && $LLAMA_CPP_REF != master && $LLAMA_CPP_REF != main ]] || die 'Choose a pinned release tag or commit, not a branch.'
 for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION; do
@@ -727,10 +782,13 @@ fi
 
 apt-get -o Acquire::Retries=3 update
 apt-get install --no-install-recommends -y ca-certificates curl git build-essential cmake ninja-build pkg-config python3 python3-venv libcurl4-openssl-dev libssl-dev
+[[ $BACKEND != vulkan ]] || install_vulkan_packages
 groupadd --system --gid 993 llama-target
 useradd --system --gid llama-target --home-dir /var/lib/llama-target --no-create-home --shell /usr/sbin/nologin llama-target
 if [[ $BACKEND == cuda ]]; then
     runuser -u llama-target -- nvidia-smi -L || die 'The llama-target account cannot access the GPU; check CT device gid=993 and mode=0660.'
+elif [[ $BACKEND == vulkan ]]; then
+    vulkan_gpu_check llama-target
 fi
 install -d -o root -g root -m 0755 /opt/llama-target /opt/llama-target/bin /opt/llama-target/src
 install -d -o root -g llama-target -m 0750 /etc/llama-target

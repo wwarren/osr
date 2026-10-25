@@ -145,6 +145,8 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Where to send a host without an NVIDIA driver (the router installer runs it too).
+gpu_hint=" Without an NVIDIA driver on this host, run: bash ${source_dir%/*/*}/tools/setup-host-gpu.sh"
 for file in install-target.sh strata.service; do
     [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
@@ -162,7 +164,7 @@ for device in "${devices[@]}"; do
     [[ $device =~ ^/dev/nvidia[0-9]+$ ]] && have_gpu=1
     [[ $device == /dev/nvidiactl ]] && have_ctl=1
     [[ $device == /dev/nvidia-uvm ]] && have_uvm=1
-    if (( ! dry_run )); then [[ -c $device ]] || die "GPU device is missing on the PVE host: $device"; fi
+    if (( ! dry_run )); then [[ -c $device ]] || die "GPU device is missing on the PVE host: $device.$gpu_hint"; fi
 done
 (( have_gpu && have_ctl && have_uvm )) || die 'GPU_DEVICES must include /dev/nvidiaN, /dev/nvidiactl, and /dev/nvidia-uvm.'
 
@@ -182,7 +184,10 @@ for i in "${!devices[@]}"; do create+=("--dev$i" "path=${devices[$i]},gid=$GPU_G
 if (( ! dry_run )); then
     [[ $EUID -eq 0 ]] || die 'Run as root on the PVE host.'
     for command_name in pveversion pct pvesh pvesm nvidia-smi; do
-        command -v "$command_name" >/dev/null || die "Missing PVE/driver command: $command_name"
+        if ! command -v "$command_name" >/dev/null; then
+            [[ $command_name == nvidia-smi ]] || die "Missing PVE/driver command: $command_name"
+            die "Missing PVE/driver command: nvidia-smi.$gpu_hint"
+        fi
     done
     [[ $(pveversion) == pve-manager/9.* ]] || die 'This script targets Proxmox VE 9.x.'
     [[ -d /etc/pve/nodes ]] || die '/etc/pve is unavailable.'

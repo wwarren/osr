@@ -131,6 +131,17 @@ assert_file_contains "the Ollama drop-in drops capabilities" "CapabilityBounding
 assert_file_contains "the Ollama drop-in runs unprivileged" "User=ollama" "$dropin"
 assert_ok "the Ollama target starts from the community script" \
   grep -q 'community-scripts/ProxmoxVE/main/ct/ollama.sh' "${ROOT}/targets/ollama/provision-lxc.sh"
+comfy="${ROOT}/targets/comfyui"
+assert_file_contains "the ComfyUI drop-in is ProtectSystem=strict" "ProtectSystem=strict" "${comfy}/comfyui-target.conf"
+assert_file_contains "the ComfyUI drop-in drops capabilities" "CapabilityBoundingSet=" "${comfy}/comfyui-target.conf"
+assert_file_contains "the ComfyUI drop-in runs unprivileged" "User=comfyui" "${comfy}/comfyui-target.conf"
+assert_ok "the ComfyUI drop-in replaces the community unit's root ExecStart" grep -qx 'ExecStart=' "${comfy}/comfyui-target.conf"
+assert_ok "and keeps every writable ComfyUI folder in its state directory" \
+  grep -q -- '--base-directory /var/lib/comfyui-target' "${comfy}/comfyui-target.conf"
+assert_ok "the ComfyUI target starts from the community script" \
+  grep -q 'community-scripts/ProxmoxVE/main/ct/comfyui.sh' "${comfy}/provision-lxc.sh"
+# ComfyUI has no authentication: its CT must drop what the firewall does not admit.
+assert_ok "the ComfyUI target firewalls its port" grep -q 'policy_in: DROP' "${comfy}/provision-lxc.sh"
 airllm="${ROOT}/targets/airllm"
 assert_ok "the AirLLM target installs from a hash lock" grep -q -- '--require-hashes' "${airllm}/install-target.sh"
 assert_fail "the AirLLM requirements are exact pins" grep -Eq '^[A-Za-z].*(>=|~=|<)' "${airllm}/requirements.txt"
@@ -142,7 +153,7 @@ describe upgrade_contract
 # rollback restores configuration as well as code, is health-checked, and
 # says when it failed too. The behaviour itself is exercised by each target's
 # own tests; this keeps a new or edited target from silently dropping a part.
-for name in strata basalt maya; do
+for name in strata basalt maya xolotl; do
   t="${ROOT}/targets/${name}/install-target.sh"
   assert_ok "${name}: stages the settings of a good install" grep -q 'stage_record "\$[A-Z_]*ETC_DIR/installed-env" settings_env' "$t"
   assert_ok "${name}: publishes installed settings durably" grep -q 'publish_record "\$env_temporary" "\$[A-Z_]*ETC_DIR/installed-env"' "$t"
@@ -218,6 +229,23 @@ assert_fail "the unit does not unset it" grep -q '^UnsetEnvironment=.*MAYA_UPDAT
 assert_fail "the generated maya.env cannot override it" grep -q 'MAYA_UPDATE_CHECK' "${maya}/install-target.sh"
 assert_ok "CI checks the update switch against the pinned upstream code" \
   grep -q 'targets/maya/test-pinned-run-script.py' "${ROOT}/.gitea/workflows/tests.yml"
+
+describe xolotl_target
+# The Xolotl target downloads ~372 GB from Hugging Face and serves an API key
+# from a config file: keep its weights pinned and its key out of the unit.
+xolotl="${ROOT}/targets/xolotl"
+assert_ok "every weight URL names a commit of its repository" \
+  awk '!/^#/ && NF && $2 != "join" && $6 !~ /^https:\/\/huggingface\.co\/[^ ]+\/resolve\/[0-9a-f]{40}\// { exit 1 }' "${xolotl}/xolotl-weights.txt"
+assert_ok "every weight has a hash" \
+  awk '!/^#/ && NF && $5 !~ /^(sha256:[0-9a-f]{64}|git:[0-9a-f]{40})$/ { exit 1 }' "${xolotl}/xolotl-weights.txt"
+assert_fail "the unit carries no key" grep -qi 'api.key' <(grep -v '^#' "${xolotl}/xolotl.service")
+assert_ok "the unit leaves the checkout read-only" grep -qx 'ReadWritePaths=/var/lib/xolotl /dev/shm' "${xolotl}/xolotl.service"
+pin="$(< "${xolotl}/upstream-commit.txt")"
+assert_ok "the Xolotl default pin is a full commit" grep -Eq '^[0-9a-f]{40}$' "${xolotl}/upstream-commit.txt"
+assert_ok "the README names the tested pin" grep -q "$pin" "${xolotl}/README.md"
+assert_ok "CI fetches the default pin" grep -q 'targets/xolotl/upstream-commit.txt' "${ROOT}/.gitea/workflows/tests.yml"
+assert_ok "CI checks the target against the pinned upstream code" \
+  grep -q 'targets/xolotl/test-pinned-upstream.py' "${ROOT}/.gitea/workflows/tests.yml"
 
 describe venv_permissions
 # Venvs are built after the secret-bearing tree (umask 077); the service account

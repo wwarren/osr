@@ -226,6 +226,29 @@ empty_inventory_allows_manual_devices() {
     printf 'DEVICES|%s\n' "$GPU_DEVICES"
 }
 
+vulkan_render_nodes() {
+    local drm
+    drm=$(mktemp -d); trap 'rm -rf -- "$drm"' RETURN
+    mkdir -p "$drm/renderD128/device" "$drm/renderD129/device" "$drm/renderD130/device"
+    printf '0x8086\n' > "$drm/renderD128/device/vendor"; printf '0xa780\n' > "$drm/renderD128/device/device"
+    printf '0x1002\n' > "$drm/renderD129/device/vendor"; printf '0x744c\n' > "$drm/renderD129/device/device"
+    printf '0x10de\n' > "$drm/renderD130/device/vendor"; printf '0x2684\n' > "$drm/renderD130/device/device"
+    BACKEND=vulkan GPU_DEVICES='' NONINTERACTIVE=false DRM_SYSFS=$drm
+    container_prompt_available() { return 0; }
+    list_nvidia_gpus() { die 'NVIDIA discovery must not run for Vulkan.'; }
+    configure_gpu_devices
+    printf 'DEVICES|%s\n' "$GPU_DEVICES"
+}
+unattended_vulkan_requires_devices() {
+    BACKEND=vulkan GPU_DEVICES='' NONINTERACTIVE=true
+    container_prompt_available() { return 1; }
+    configure_gpu_devices
+}
+
+check 'Vulkan lists AMD and Intel render nodes (not NVIDIA) and maps the choice' ok 'DEVICES|/dev/dri/renderD129' vulkan_render_nodes <<'INPUT'
+2
+INPUT
+check 'unattended Vulkan requires the render node' fail 'Vulkan requires explicit GPU_DEVICES' unattended_vulkan_requires_devices
 check 'authoritative /proc mapping is preferred without running nvidia-smi' ok $'0\tNVIDIA RTX PRO 2000 Blackwell at 00000000:06:00.0 (/dev/nvidia0)' proc_inventory_is_preferred
 check 'NVIDIA /proc information Device Minor is parsed' ok 'PROC_MINOR|0' proc_information_minor_is_parsed
 check 'nvidia-smi -L plus detailed query maps actual GPU minors without minor_number query' ok $'3\tGPU 1: NVIDIA RTX PRO 4000 Blackwell (/dev/nvidia3)' fallback_inventory_from_smi_l_and_detailed_query

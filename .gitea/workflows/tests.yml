@@ -1,8 +1,9 @@
 # Runs every test suite, shellcheck and ruff on each push and pull request.
 # Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image.
-# The "test" job talks to nothing beyond PyPI. The "strata-upstream" and
-# "maya-upstream" jobs each fetch one pinned commit from GitHub; they are
-# separate jobs so a GitHub outage cannot hide the results of the main suites.
+# The "test" job talks to nothing beyond PyPI. The "strata-upstream",
+# "maya-upstream" and "xolotl-upstream" jobs each fetch one pinned commit from
+# GitHub; they are separate jobs so a GitHub outage cannot hide the results of
+# the main suites.
 name: tests
 
 on:
@@ -99,3 +100,31 @@ jobs:
 
       - name: Pinned upstream check
         run: python targets/maya/test-pinned-run-script.py "$RUNNER_TEMP/maya"
+
+  # Sends the server config targets/xolotl/install-target.sh writes through
+  # Xolotl's real server code at the commit the target is tested against (PIN
+  # in targets/xolotl/test-pinned-upstream.py), and checks the engine flags,
+  # STRATA_* settings, /health contract and Engram index the target relies on.
+  xolotl-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Xolotl commit
+        run: |
+          pin=$(cat targets/xolotl/upstream-commit.txt)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/xolotl"
+          git -C "$RUNNER_TEMP/xolotl" fetch -q --depth 1 https://github.com/Indras-Mirror/Xolotl.git "$pin"
+          git -C "$RUNNER_TEMP/xolotl" checkout -q FETCH_HEAD
+
+      # The server imports Xolotl's own pinned packages (numpy, jinja2, regex, ...).
+      - name: Xolotl's Python packages
+        run: python -m pip install -r "$RUNNER_TEMP/xolotl/requirements.txt"
+
+      - name: Pinned upstream check
+        run: python targets/xolotl/test-pinned-upstream.py "$RUNNER_TEMP/xolotl"

@@ -60,7 +60,11 @@ bin=$tmp_root/bin; mkdir -p "$bin"
 log=$tmp_root/calls.log
 releases=$tmp_root/releases
 stub() { printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n%s\n' "$1" "$log" "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
-for command_name in getent groupadd useradd usermod sleep; do stub "$command_name" 'exit 0'; done
+for command_name in getent groupadd useradd usermod sleep apt-get; do stub "$command_name" 'exit 0'; done
+# dpkg-query: packages listed in FAKE_DPKG are installed, as Mesa FAKE_MESA.
+stub dpkg-query 'pkg="${@: -1}"; [[ " ${FAKE_DPKG:-} " == *" $pkg "* ]] || exit 1
+[[ $* == *Version* ]] && { echo "${FAKE_MESA:-25.0.7-0ubuntu0.24.04.2}"; exit 0; }; echo "install ok installed"'
+stub dpkg 'exit 1'   # dpkg --compare-versions: never older
 stub systemctl 'case "$1" in
     show) if [[ $* == *ActiveState* ]]; then
               if [[ -n ${FAKE_ACTIVE_STATE:-} ]]; then echo "$FAKE_ACTIVE_STATE"
@@ -82,7 +86,9 @@ make_release() {
     else printf '#!/bin/sh\necho "ollama version is %s"\n' "${version#v}" > "$stage/bin/ollama"; fi
     chmod +x "$stage/bin/ollama"; echo "$version" > "$stage/lib/ollama/marker"
     tar -cf "$dir/ollama-linux-amd64.tar.zst" -C "$stage" bin lib
-    (cd "$dir" && sha256sum ollama-linux-amd64.tar.zst | sed 's/  /  .\//' > sha256sum.txt)
+    rm -rf "$stage"; mkdir -p "$stage/lib/ollama/rocm_v7_2"; echo "$version" > "$stage/lib/ollama/rocm_v7_2/marker"
+    tar -cf "$dir/ollama-linux-amd64-rocm.tar.zst" -C "$stage" lib
+    (cd "$dir" && sha256sum ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst | sed 's/  /  .\//' > sha256sum.txt)
 }
 # community_ct: what ct/ollama.sh leaves behind (service as root, models in /root/.ollama).
 community_ct() {
@@ -101,7 +107,8 @@ target() {
         OLLAMA_LINK="$tmp_root/usr/bin/ollama" LEGACY_MODEL_DIRS="$tmp_root/rootmodels $tmp_root/none" \
         RELEASE_BASE=https://github.test/ollama/releases/download SYSTEMD_RUN_DIR="$tmp_root/run" \
         FAKE_SERVED="${FAKE_SERVED-0.30.0}" FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" UPGRADE_HEALTH_TIMEOUT=6 \
-        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
+        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" DEV_ROOT="$tmp_root/dev" DRM_SYSFS="$tmp_root/drm" \
+        FAKE_DPKG="${FAKE_DPKG:-}" \
         "$@" bash "$script_dir/install-target.sh" ${ARGS:-}
 }
 dropin=$tmp_root/units/ollama.service.d/10-ollama-target.conf
@@ -199,6 +206,57 @@ adopted; make_release v0.35.0
 FAKE_ACTIVE_RC=3 upgrade >/dev/null 2>&1 || die 'upgrade of a stopped service failed'
 ! grep -q 'systemctl start' "$log" || die 'a stopped service was started'
 pass 'a stopped service stays stopped'
+
+# GPUs: AMD gets the ROCm libraries of the installed release, Intel Mesa's Vulkan driver.
+community_ct; make_release v0.30.0
+out=$(target OLLAMA_GPU=amd 2>&1) || die "AMD adoption failed: $out"
+[[ $(cat "$tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2/marker") == v0.30.0 ]] || die 'ROCm libraries not added'
+grep -q 'download/v0.30.0/ollama-linux-amd64-rocm.tar.zst' "$log" || die "ROCm archive: $(cat "$log")"
+grep -q 'apt-get' "$log" && die 'AMD installed packages'
+: > "$log"
+out=$(target OLLAMA_GPU=amd 2>&1) || die "AMD re-run failed: $out"
+grep -q 'rocm.tar.zst' "$log" && die 'ROCm downloaded again'
+community_ct; make_release v0.30.0
+echo tampered >> "$releases/v0.30.0/ollama-linux-amd64-rocm.tar.zst"
+out=$(target OLLAMA_GPU=amd 2>&1) && die 'a tampered ROCm archive was installed'
+[[ $out == *'Checksum mismatch for ollama-linux-amd64-rocm.tar.zst'* ]] || die "rocm checksum: $out"
+grep -q 'systemctl stop' "$log" && die 'stopped before the ROCm archive was verified'
+community_ct; mkdir -p "$tmp_root/dev"; : > "$tmp_root/dev/kfd"; make_release v0.30.0
+out=$(target 2>&1) || die "auto AMD adoption failed: $out"
+[[ -d $tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2 && $out == *'(GPU: amd)'* ]] || die 'auto did not find the AMD GPU'
+rm -rf "${tmp_root:?}/dev"
+pass 'AMD: ROCm libraries of the installed release, checksum-verified before anything stops; found by /dev/kfd'
+
+adopted; make_release v0.35.0
+mkdir -p "$tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2"
+out=$(FAKE_SERVED=0.35.0 upgrade 2>&1) || die "AMD upgrade failed: $out"
+[[ $(cat "$tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2/marker") == v0.35.0 ]] || die 'the upgrade dropped the ROCm libraries'
+adopted; make_release v0.35.0
+out=$(FAKE_SERVED=0.35.0 upgrade 2>&1) || die "upgrade failed: $out"
+[[ ! -e $tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2 ]] || die 'ROCm libraries without an AMD GPU'
+pass 'an upgrade keeps the ROCm libraries (new release) where they were installed, and adds none elsewhere'
+
+adopted; make_release v0.35.0
+out=$(ARGS=--upgrade target OLLAMA_VERSION=v0.30.0 OLLAMA_GPU=amd 2>&1) || die "same-version AMD upgrade failed: $out"
+[[ $(cat "$tmp_root/usr/lib/ollama/lib/ollama/rocm_v7_2/marker") == v0.30.0 ]] || die 'same-version AMD upgrade omitted ROCm libraries'
+grep -q 'download/v0.30.0/ollama-linux-amd64-rocm.tar.zst' "$log" || die 'same-version AMD upgrade skipped ROCm archive'
+[[ $out == *'installed without ROCm libraries for the AMD GPU; reinstalling it with them'* ]] || die "same-version AMD reason: $out"
+pass 'same-version upgrade adds ROCm libraries when switching to AMD'
+
+community_ct
+mkdir -p "$tmp_root/drm/renderD128/device"; echo 0x8086 > "$tmp_root/drm/renderD128/device/vendor"
+out=$(target 2>&1) || die "Intel adoption failed: $out"
+grep -q 'apt-get install -y -q --no-install-recommends mesa-vulkan-drivers libvulkan1' "$log" || die "vulkan: $(cat "$log")"
+[[ $out == *'(GPU: intel)'* ]] || die 'auto did not find the Intel GPU'
+: > "$log"
+out=$(ARGS=--upgrade target OLLAMA_VERSION=v0.30.0 OLLAMA_GPU=intel 2>&1) || die "same-version Intel upgrade failed: $out"
+grep -q 'apt-get install -y -q --no-install-recommends mesa-vulkan-drivers libvulkan1' "$log" || die 'same-version Intel upgrade skipped Vulkan runtime'
+: > "$log"
+out=$(FAKE_DPKG='mesa-vulkan-drivers libvulkan1' target 2>&1) || die "Intel re-run: $out"
+grep -q apt-get "$log" && die 'installed Mesa again'
+rm -rf "${tmp_root:?}/drm"
+out=$(target OLLAMA_GPU=radeon 2>&1) && die 'a bad OLLAMA_GPU was accepted'
+pass 'Intel Arc: Mesa'"'"'s Vulkan driver is installed on adopt and same-version upgrade; OLLAMA_GPU is checked'
 
 community_ct
 out=$(upgrade 2>&1) && die 'upgrade before adoption succeeded'

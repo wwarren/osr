@@ -119,7 +119,7 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"
 INSTALL_GITEA="${INSTALL_GITEA:-false}"
 INSTALL_MATTERMOST="${INSTALL_MATTERMOST:-false}"
 # Optional targets from targets/ (the Gitea and Mattermost services, model
-# servers, and the Open Terminal / Hermes companions), each in its own LXC.
+# servers, and the Open Terminal / Hermes / ComfyUI companions), each in its own LXC.
 # Interactive installs ask which to create;
 # names or menu numbers, comma-separated, e.g. INSTALL_TARGETS=ollama,hermes
 # to pre-fill the answer. Unattended installs refuse a non-empty list.
@@ -132,6 +132,10 @@ OPENWEBUI_WAIT_SECONDS="${OPENWEBUI_WAIT_SECONDS:-900}"
 # the environment at once, so no child process sees it.
 TARGET_ADMIN_TOKEN="${OPENWEBUI_ADMIN_TOKEN:-}"
 unset OPENWEBUI_ADMIN_TOKEN
+# Likewise a Hugging Face token for ComfyUI's gated klein-9b weights; only the
+# ComfyUI provisioner gets it, as an environment variable.
+TARGET_HF_TOKEN="${HF_TOKEN:-}"
+unset HF_TOKEN
 # Populated by the prompts: normalised base URLs, and 0-based index lists.
 MODEL_SERVERS=()
 TIER_FAST_IDX=""
@@ -720,6 +724,8 @@ valid_ollama_addr() {
   [[ "$raw" == basalt://* ]] && raw="${raw#basalt://}"
   raw="${raw#maya+}"
   [[ "$raw" == maya://* ]] && raw="${raw#maya://}"
+  raw="${raw#xolotl+}"
+  [[ "$raw" == xolotl://* ]] && raw="${raw#xolotl://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     valid_http_url "$raw"; return $?
   fi
@@ -733,7 +739,7 @@ valid_ollama_addr() {
 }
 # Normalise any accepted form to a base URL with an explicit port.
 # Stored form: http://host:port for Ollama or a kind-prefixed URL for
-# LM Studio, Strata, Basalt and Maya, matching the manager, router and monitor.
+# LM Studio, Strata, Basalt, Maya and Xolotl, matching the manager, router and monitor.
 normalize_ollama_url() {
   local raw="${1%/}" prefix="" port="$OLLAMA_PORT"
   if [[ "$raw" == lmstudio+* ]]; then
@@ -752,6 +758,10 @@ normalize_ollama_url() {
     prefix="maya+"; raw="${raw#maya+}"; port="${MAYA_PORT:-8080}"
   elif [[ "$raw" == maya://* ]]; then
     prefix="maya+"; raw="${raw#maya://}"; port="${MAYA_PORT:-8080}"
+  elif [[ "$raw" == xolotl+* ]]; then
+    prefix="xolotl+"; raw="${raw#xolotl+}"; port="${XOLOTL_PORT:-8080}"
+  elif [[ "$raw" == xolotl://* ]]; then
+    prefix="xolotl+"; raw="${raw#xolotl://}"; port="${XOLOTL_PORT:-8080}"
   fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     printf '%s%s\n' "$prefix" "$raw"
@@ -867,25 +877,30 @@ require_companion_credentials() {
 # so they come last.
 #
 # One line per target: name|phase|label|router entry (@IP@ and @PORT@ filled
-# in)|key kind (Strata-style servers generate an API key the router needs).
+# in)|key kind (Strata-style servers generate an API key the router needs)|
+# GPU as need:vendors[:generations]: need is required, optional (used when
+# present) or empty; vendors are the GPU vendors the engine runs on, in order of
+# preference; generations limit the cards (see target_gpu_spec).
 target_table() {
   printf '%s\n' \
-    'gitea|service|Gitea: the configuration repository (configured for the router)||' \
-    'mattermost|service|Mattermost: health alerts (team, channel and webhook made for you)||' \
-    'ollama|model|Ollama from the PVE community script (GPU passed through when present)|http://@IP@:11434|' \
-    'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (Debian 12)|http://@IP@:11434|' \
-    'airllm|model|AirLLM: one model larger than RAM/VRAM, streamed from disk (slow)|http://@IP@:11434|' \
-    'strata|model|Strata (Qwen3.8-Flash-Next) on an NVIDIA GPU|strata+http://@IP@:@PORT@|strata' \
-    'basalt|model|Basalt on a Blackwell GPU (CUDA 13)|basalt+http://@IP@:@PORT@|basalt' \
-    'maya|model|Project Maya (GLM-5.3-Flash) on an NVIDIA GPU|maya+http://@IP@:@PORT@|maya' \
-    'open-terminal|companion|Open Terminal: a shell tool for Open WebUI||' \
-    'hermes|companion|Hermes Agent: offered in Open WebUI as the model hermes-agent||'
+    'gitea|service|Gitea: the configuration repository (configured for the router)|||' \
+    'mattermost|service|Mattermost: health alerts (team, channel and webhook made for you)|||' \
+    'ollama|model|Ollama from the PVE community script (NVIDIA, AMD or Intel Arc GPU when present)|http://@IP@:11434||optional:nvidia,amd,intel' \
+    'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (CUDA, or Vulkan on AMD/Intel Arc)|http://@IP@:11434||required:nvidia,amd,intel' \
+    'airllm|model|AirLLM: one model larger than RAM/VRAM, streamed from disk (slow)|http://@IP@:11434||:nvidia' \
+    'strata|model|Strata (Qwen3.8-Flash-Next) on an NVIDIA GPU|strata+http://@IP@:@PORT@|strata|required:nvidia' \
+    'basalt|model|Basalt on a Blackwell GPU (CUDA 13)|basalt+http://@IP@:@PORT@|basalt|required:nvidia:rtx50' \
+    'maya|model|Project Maya (GLM-5.3-Flash) on an NVIDIA GPU|maya+http://@IP@:@PORT@|maya|required:nvidia' \
+    'xolotl|model|Xolotl (DeepSeek-V4.1-Flash, 552B) on a 24 GB NVIDIA GPU; ~372 GB download|xolotl+http://@IP@:@PORT@|xolotl|required:nvidia' \
+    'open-terminal|companion|Open Terminal: a shell tool for Open WebUI|||' \
+    'hermes|companion|Hermes Agent: offered in Open WebUI as the model hermes-agent|||' \
+    'comfyui|companion|ComfyUI: image generation for Open WebUI (NVIDIA, AMD or Intel Arc GPU when present)|||optional:nvidia,amd,intel'
 }
-# target_field NAME FIELD: one column of the table (phase, label, entry, key).
+# target_field NAME FIELD: one column of the table (phase, label, entry, key, gpu).
 target_field() {
   local column
   case "$2" in
-    phase) column=2 ;; label) column=3 ;; entry) column=4 ;; key) column=5 ;;
+    phase) column=2 ;; label) column=3 ;; entry) column=4 ;; key) column=5 ;; gpu) column=6 ;;
     *) return 1 ;;
   esac
   target_table | awk -F'|' -v n="$1" -v c="$column" '$1 == n {print $c; found=1} END {exit !found}'
@@ -902,8 +917,132 @@ target_setting() {
 llamacpp_model_given() {
   [[ -n "${MODEL_ALIAS:-}" && ( -n "${MODEL_DOWNLOAD_URL:-}" || -n "${MODEL_PATH:-}" ) ]]
 }
-# Strata, Basalt and Maya take a template; the others choose or prompt for theirs.
-target_needs_template() { [[ "$1" == strata || "$1" == basalt || "$1" == maya ]]; }
+# target_gpu_spec NAME: need|vendors|generations for the target as configured.
+# llama.cpp needs a GPU for its default build: BACKEND=cuda (NVIDIA) or vulkan
+# (AMD, Intel Arc), unset for whichever the host has; BACKEND=cpu does without.
+# AirLLM uses an NVIDIA GPU only when GPU_DEVICES is given. Ollama and ComfyUI
+# follow GPU (nvidia, amd or intel picks one; no or none runs on the CPU).
+target_gpu_spec() {
+  local need vendors gens
+  IFS=: read -r need vendors gens <<< "$(target_field "$1" gpu)" || true
+  target_field "$1" gpu >/dev/null || return 1
+  case "$1" in
+    llamacpp)
+      case "${BACKEND:-}" in
+        '') ;;
+        cuda) vendors=nvidia ;;
+        vulkan) vendors=amd,intel ;;
+        *) need="" ;;
+      esac ;;
+    airllm) [[ -z "${GPU_DEVICES:-}" ]] || need=required ;;
+    ollama|comfyui)
+      case "${GPU:-auto}" in
+        no|none) need="" ;;
+        nvidia|amd|intel) vendors="$GPU" ;;
+      esac ;;
+  esac
+  [[ -n "$need" ]] || vendors="" gens=""
+  printf '%s|%s|%s\n' "$need" "$vendors" "$gens"
+}
+# target_gpu_need NAME: required, optional or nothing.
+target_gpu_need() {
+  local spec
+  spec="$(target_gpu_spec "$1")" || return 1
+  printf '%s\n' "${spec%%|*}"
+}
+
+# The GPU prepare_host_gpu found, for the targets that adapt to it.
+HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+
+# prepare_host_gpu: before anything is created, make sure the selected GPU
+# targets find a working GPU driver on this host. tools/setup-host-gpu.sh
+# reports a working one, or lists the cards, asks for the GPU generation and
+# (with consent) sets up the driver: NVIDIA's from the repository, or the
+# kernel's amdgpu, i915 or xe for AMD Radeon and Intel Arc. All selected
+# targets use one GPU vendor. Targets that need the GPU stop the install
+# without one; those that only use it when present go on without.
+prepare_host_gpu() {
+  local name need vendors gens v kept tool out rc=0 mode state vendor_list="nvidia,amd,intel"
+  local -a required=() optional=() args=() wants=()
+  for name in ${TARGETS:-}; do
+    IFS='|' read -r need vendors gens <<< "$(target_gpu_spec "$name")"
+    case "$need" in
+      required) required+=("$name") ;;
+      optional) optional+=("$name") ;;
+      *) continue ;;
+    esac
+    wants+=("${name} (${vendors//,/\/})")
+    kept=""
+    for v in ${vendor_list//,/ }; do
+      [[ ",$vendors," != *",$v,"* ]] || kept+="${kept:+,}$v"
+    done
+    vendor_list="$kept"
+    [[ -z "$gens" ]] || args+=(--allow "${gens}:${name}")
+  done
+  (( ${#required[@]} + ${#optional[@]} > 0 )) || return 0
+  if [[ -z "$vendor_list" ]]; then
+    echo "The selected targets cannot share one GPU: ${wants[*]}." >&2
+    echo "Deselect one, or set BACKEND (llama.cpp) or GPU (Ollama, ComfyUI) to match. Nothing was created." >&2
+    return 1
+  fi
+  tool="${TARGETS_DIR}/../tools/setup-host-gpu.sh"
+  if [[ ! -r "$tool" ]]; then
+    echo "Missing ${tool}. Run the router installer from the full repository checkout." >&2
+    return 1
+  fi
+  if (( ${#required[@]} )); then mode=required; else mode=optional; fi
+  echo
+  echo "--- GPU for: ${required[*]} ${optional[*]} ---"
+  out="$(bash "$tool" --need "$mode" --vendors "$vendor_list" --for "${required[*]:-${optional[*]}}" "${args[@]}")" || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      echo "Reboot this host, then run the router installer again. The GPU driver is set up;" >&2
+      echo "nothing else was created." >&2
+      return 1 ;;
+    *)
+      echo "The GPU is not ready for: ${required[*]:-${optional[*]}}. Nothing was created;" >&2
+      echo "deselect those targets, or fix the GPU and run the router installer again." >&2
+      return 1 ;;
+  esac
+  state="$(sed -n 's/^GPU_STATE=//p' <<< "$out")"
+  HOST_GPU_STATE="$state"
+  HOST_GPU_VENDOR="$(sed -n 's/^GPU_VENDOR=//p' <<< "$out")"
+  HOST_GPU_RENDER_NODE="$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$out")"
+  if [[ "$state" == ready ]]; then
+    case "$HOST_GPU_VENDOR" in
+      nvidia) echo "NVIDIA GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") (compute capability $(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out"))." ;;
+      amd) echo "AMD Radeon GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") ($(sed -n 's/^GPU_GFX=//p' <<< "$out"), ${HOST_GPU_RENDER_NODE} and /dev/kfd)." ;;
+      *) echo "Intel Arc GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") (${HOST_GPU_RENDER_NODE})." ;;
+    esac
+  else
+    echo "No GPU (${state}): ${optional[*]} will run without one."
+  fi
+}
+
+# target_gpu_env NAME: the GPU settings a target gets from prepare_host_gpu
+# (NAME=value lines), unless they were preset: GPU for Ollama and ComfyUI; for
+# llama.cpp BACKEND (cuda or vulkan) and, for Vulkan, the card's render node.
+target_gpu_env() {
+  [[ -n "${HOST_GPU_STATE:-}" ]] || return 0
+  case "$1" in
+    ollama|comfyui)
+      [[ -z "${GPU:-}" || "${GPU}" == auto ]] || return 0
+      if [[ $HOST_GPU_STATE == ready ]]; then echo "GPU=${HOST_GPU_VENDOR}"; else echo "GPU=none"; fi ;;
+    llamacpp)
+      local backend="${BACKEND:-}"
+      if [[ -z "$backend" && $HOST_GPU_STATE == ready ]]; then
+        case "$HOST_GPU_VENDOR" in nvidia) backend=cuda ;; amd|intel) backend=vulkan ;; esac
+        echo "BACKEND=${backend}"
+      fi
+      if [[ "$backend" == vulkan && -z "${GPU_DEVICES:-}" && -n "${HOST_GPU_RENDER_NODE:-}" ]]; then
+        echo "GPU_DEVICES=${HOST_GPU_RENDER_NODE}"
+      fi ;;
+  esac
+}
+
+# Strata, Basalt, Maya and Xolotl take a template; the others choose or prompt for theirs.
+target_needs_template() { [[ "$1" == strata || "$1" == basalt || "$1" == maya || "$1" == xolotl ]]; }
 
 # A selection is blank, "none", or target names and/or menu numbers separated
 # by commas or spaces.
@@ -969,7 +1108,7 @@ prompt_target_selection() {
     printf '  %d) %-14s %s\n' "$i" "$name" "$label"
     prev_phase="$phase"
   done < <(target_table)
-  echo "Target-specific settings (GPU_DEVICES, STRATA_MODEL, HERMES_MODEL, ...) are read"
+  echo "Target-specific settings (GPU_DEVICES, BACKEND, STRATA_MODEL, HERMES_MODEL, COMFYUI_MODEL_URL, ...) are read"
   echo "from the environment as each target's README describes."
   prompt_until_valid "Targets to create (numbers or names, comma-separated; none)" \
     INSTALL_TARGETS "${INSTALL_TARGETS:-none}" valid_target_selection || return 1
@@ -999,11 +1138,13 @@ valid_target_ip() {
 valid_target_template() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-22\.04|ubuntu-24\.04|debian-12|debian-13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]]
 }
+valid_comfyui_variant() { [[ $1 == klein-4b || $1 == klein-9b ]]; }
+valid_hf_token() { [[ $1 =~ ^hf_[A-Za-z0-9]{30,}$ ]]; }
 
 # default_gpu_target_template: the newest downloaded Ubuntu 24.04, Ubuntu
 # 22.04 or Debian 12 standard template (in that order), else the newest
 # Ubuntu 24.04 template pveam can download into TEMPLATE_STORAGE. (Debian 13
-# needs CUDA 13.1+, which Maya's and Basalt's defaults are not.)
+# needs CUDA 13.1+, which Maya's, Basalt's and Xolotl's defaults are not.)
 default_gpu_target_template() {
   local storage distro ref name
   for distro in ubuntu-24.04 ubuntu-22.04 debian-12; do
@@ -1028,7 +1169,7 @@ ensure_target_template() {
 }
 
 # For each selected target: CT ID, static address and storage (and a template
-# for Strata, Basalt and Maya), asked now so a typo costs a re-prompt. Presets:
+# for Strata, Basalt, Maya and Xolotl), asked now so a typo costs a re-prompt. Presets:
 # <NAME>_CT_ID, <NAME>_IP_CIDR, <NAME>_STORAGE, <NAME>_TEMPLATE.
 prompt_target_settings() {
   local name prefix id_var ip_var storage_var template_var default ip
@@ -1058,6 +1199,26 @@ prompt_target_settings() {
       echo "    WARNING: gateway ${GATEWAY} is outside ${ip}." >&2
     fi
     prompt_until_valid "    Storage" "$storage_var" "${!storage_var:-$STORAGE}" valid_nonempty || return 1
+    if [[ $name == comfyui ]]; then
+      echo "    Image model; the CT install downloads its diffusion model, text encoder and VAE:"
+      echo "      klein-4b  FLUX.2 Klein 4B distilled: Apache 2.0, a 12.5 GB download"
+      echo "      klein-9b  FLUX.2 Klein 9B distilled: FLUX Non-Commercial License, an 18.4 GB"
+      echo "                download; gated, so it needs a Hugging Face token"
+      prompt_until_valid "    Image model" COMFYUI_IMAGE_VARIANT "${COMFYUI_IMAGE_VARIANT:-klein-4b}" \
+        valid_comfyui_variant || return 1
+      if [[ $COMFYUI_IMAGE_VARIANT == klein-9b && -z ${TARGET_HF_TOKEN:-} ]]; then
+        echo "    Accept the license at https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8"
+        echo "    with your Hugging Face account, then create a read token (Settings > Access Tokens)."
+        while true; do
+          if ! read -r -s -p "    Hugging Face token (hf_...): " TARGET_HF_TOKEN; then
+            echo; echo "    No Hugging Face token was entered." >&2; TARGET_HF_TOKEN=""; return 1
+          fi
+          echo
+          valid_hf_token "$TARGET_HF_TOKEN" && break
+          echo "    That is not a Hugging Face access token (hf_...)." >&2
+        done
+      fi
+    fi
     if target_needs_template "$name"; then
       default="${!template_var:-}"
       [[ -n "$default" ]] || default="$(default_gpu_target_template)" || default=""
@@ -1108,7 +1269,7 @@ preset_target_model_servers() {
 # and the like must not reach a target, and the admin token only reaches the
 # companions (as an environment variable, never an argument).
 run_target_provisioner() {
-  local name="$1" phase script id ip storage template
+  local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env
   local -a flags=()
   phase="$(target_field "$name" phase)" || return 1
   script="${TARGETS_DIR}/${name}/provision-lxc.sh"
@@ -1117,6 +1278,9 @@ run_target_provisioner() {
   ip="$(target_setting "$name" IP_CIDR)"
   storage="$(target_setting "$name" STORAGE)"
   template="$(target_setting "$name" TEMPLATE)"
+  image_variant="$(target_setting "$name" IMAGE_VARIANT)"
+  # Only ComfyUI's gated klein-9b weights need the Hugging Face token.
+  if [[ $name == comfyui && $image_variant == klein-9b ]]; then hf_token="${TARGET_HF_TOKEN:-}"; fi
   [[ -n "$id" && -n "$ip" ]] || { echo "${name}: no CT ID or address was chosen." >&2; return 1; }
   case "$name" in
     ollama|airllm) flags=(--install-target) ;;
@@ -1126,13 +1290,15 @@ run_target_provisioner() {
   local script_url script_sha channel="${MATTERMOST_CHANNEL:-ollama-monitor}"
   script_url="$(target_setting "$name" COMMUNITY_SCRIPT_URL)"
   script_sha="$(target_setting "$name" COMMUNITY_SCRIPT_SHA256)"
+  gpu_env="$(target_gpu_env "$name")"
   (
     local router_ct="$CT_ID" gateway="$GATEWAY" bridge="$BRIDGE" nameserver="$NAMESERVER"
     local webui_port="$OPENWEBUI_PORT" admin_token="${TARGET_ADMIN_TOKEN:-}"
     unset CT_ID CT_NAME CT_HOSTNAME IP_CIDR GATEWAY STORAGE BRIDGE NAMESERVER VLAN_TAG \
       CORES MEMORY MEMORY_MB SWAP SWAP_MB ROOTFS_GB ONBOOT TEMPLATE FIREWALL NONINTERACTIVE \
       ROUTER ROUTER_CT_ID ROUTER_SSH_HOST ROUTER_IP ROUTER_URL ROUTER_API_KEY \
-      OPENWEBUI_PORT OPENWEBUI_ADMIN_TOKEN TARGET_ADMIN_TOKEN
+      OPENWEBUI_PORT OPENWEBUI_ADMIN_TOKEN TARGET_ADMIN_TOKEN COMFYUI_IMAGE_VARIANT \
+      HF_TOKEN TARGET_HF_TOKEN
     export CT_ID="$id" IP_CIDR="$ip" GATEWAY="$gateway" STORAGE="$storage" BRIDGE="$bridge"
     [[ -z "$nameserver" ]] || export NAMESERVER="$nameserver"
     [[ -z "$template" ]] || export TEMPLATE="$template"
@@ -1142,6 +1308,12 @@ run_target_provisioner() {
     [[ -z "$script_url" ]] || export COMMUNITY_SCRIPT_URL="$script_url"
     [[ -z "$script_sha" ]] || export COMMUNITY_SCRIPT_SHA256="$script_sha"
     [[ "$name" != mattermost ]] || export MATTERMOST_CHANNEL="$channel"
+    [[ "$name" != comfyui ]] || export COMFYUI_IMAGE_VARIANT="$image_variant"
+    [[ -z "$hf_token" ]] || export HF_TOKEN="$hf_token"
+    local setting
+    while IFS= read -r setting; do
+      [[ -z "$setting" ]] || export "${setting?}"
+    done <<< "$gpu_env"
     if [[ "$phase" == companion ]]; then
       export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
       OPENWEBUI_ADMIN_TOKEN="$admin_token" exec bash "$script" "${flags[@]}"
@@ -1302,6 +1474,7 @@ provision_selected_targets() {
       done
     fi
     TARGET_ADMIN_TOKEN=""
+    TARGET_HF_TOKEN=""
   fi
   echo
   echo "=============================================================================="
@@ -1500,10 +1673,10 @@ prompt_model_servers() {
     # suggesting the previous server's address would let a stray Enter create a
     # duplicate deployment, which silently double-weights that host.
     if [[ -n "$default_addr" ]]; then
-      prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host or maya://host)" raw "$default_addr" valid_ollama_addr
+      prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host or xolotl://host)" raw "$default_addr" valid_ollama_addr
     else
       while true; do
-        read -r -p "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host or maya://host): " raw
+        read -r -p "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host or xolotl://host): " raw
         valid_ollama_addr "$raw" && break
         echo "    Not a valid address — try again." >&2
       done
@@ -2197,6 +2370,9 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 prompt_network_config
 prompt_storage_config
 prompt_target_settings || exit 1
+# The selected GPU targets need the host's NVIDIA driver: installed now, when
+# missing, before anything is created (a reboot then costs nothing but a rerun).
+prepare_host_gpu || exit 1
 # Gitea and Mattermost, if selected, are created now: the prompts below take
 # their URL, token and webhook.
 provision_service_targets || exit 1
@@ -2490,13 +2666,14 @@ _DEFAULTS = {
         "tool_match": "0.3",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
         "strata": "125B",               # Strata's default id: Qwen3.8-Flash-Next
         "qwen3.8-flash-next": "125B",   # Basalt's default alias
         "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
+        "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
     },
 }
 ROUTER_INI = os.getenv(
@@ -2665,6 +2842,8 @@ SERVER_KINDS = {
                "label": "Basalt", "openai": True},
     "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
              "label": "Maya", "openai": True},
+    "xolotl": {"prefix": "xolotl+", "key_env": "XOLOTL_API_KEY",
+               "label": "Xolotl", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
 # Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
@@ -2970,7 +3149,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt or Maya model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya or Xolotl model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -3955,6 +4134,8 @@ SERVER_KINDS = {
                "label": "Basalt", "openai": True},
     "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
              "label": "Maya", "openai": True},
+    "xolotl": {"prefix": "xolotl+", "key_env": "XOLOTL_API_KEY",
+               "label": "Xolotl", "openai": True},
 }
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
              for kind, spec in SERVER_KINDS.items()}
@@ -4531,12 +4712,12 @@ tie_epsilon = 0.05
 # entries are neutral). Small: it breaks near-ties, it does not override fit.
 loaded_bonus = 0.1
 # On a tool request, bonus for a model reported tool-capable over one whose
-# tool support is unknown (Strata/Basalt/Maya, LM Studio's untrained models).
+# tool support is unknown (Strata/Basalt/Maya/Xolotl, LM Studio's untrained models).
 tool_match = 0.3
 
 [model_sizes]
 # Sizes for exact model ids that an OpenAI-compatible server (Strata, Basalt,
-# Maya) lists without a parameter count, so the router can size-band them.
+# Maya, Xolotl) lists without a parameter count, so the router can size-band them.
 # Matching is by the whole id, case-insensitive: variants and aliases (Strata's
 # Coder, a renamed Basalt alias) stay unknown-size unless listed here.
 # Add a line for a custom alias (e.g. the BASALT_ALIAS a target serves);
@@ -4544,6 +4725,7 @@ tool_match = 0.3
 strata = 125B
 qwen3.8-flash-next = 125B
 glm-5.3-flash = 321B
+deepseek-v4.1-flash = 552B
 INIEOF
 
 cat > "${REPO_DIR}/services/ollama-monitor/monitor.ini" <<'INIEOF'
@@ -4554,9 +4736,9 @@ cat > "${REPO_DIR}/services/ollama-monitor/monitor.ini" <<'INIEOF'
 interval_seconds = 15
 timeout_seconds = 5
 # Path appended to each Ollama backend URL for the health probe. LM Studio,
-# Strata, Basalt and Maya are probed on /v1/models with their own keys when
-# set, and are skipped by the keep-alive pinner. Strata, Basalt and Maya count
-# as down while that list is empty (their engine is not running).
+# Strata, Basalt, Maya and Xolotl are probed on /v1/models with their own keys
+# when set, and are skipped by the keep-alive pinner. They count as down while
+# that list is empty (their engine is not running).
 health_path = /api/tags
 
 [alerting]
@@ -4688,8 +4870,8 @@ LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Default ports of the other server kinds are in kind_field (LM Studio 1234,
-# Strata/Basalt/Maya 8080); LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT and
-# MAYA_PORT in the environment override them.
+# Strata/Basalt/Maya/Xolotl 8080); LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT,
+# MAYA_PORT and XOLOTL_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -4737,9 +4919,10 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             LM Studio, Strata, Basalt and Maya are detected automatically,
-                             or use lmstudio://host / strata://host /
-                             basalt://host / maya://host or --type. Detection sends no API key.
+                             LM Studio, Strata, Basalt, Maya and Xolotl are detected
+                             automatically, or use lmstudio://host / strata://host /
+                             basalt://host / maya://host / xolotl://host or --type.
+                             Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
@@ -4774,6 +4957,9 @@ Commands:
   set-maya-token [token|--off]
                              Bearer token for Maya servers with an API key
                              (stored in secrets.env)
+  set-xolotl-token [token|--off]
+                             Bearer token for Xolotl servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on the router
                              API (Open WebUI is given the same key)
@@ -4787,7 +4973,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt|maya> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya|xolotl> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -4830,7 +5016,7 @@ valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
 #   port   -- default port (overridable through the <KIND>_PORT variable)
 #   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
 #             openai provider), 0 for LM Studio (its own API and provider)
-server_kinds() { printf '%s\n' lmstudio strata basalt maya; }
+server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl; }
 kind_field() {
   local spec key label port_var port_default openai value
   case "$1" in
@@ -4838,6 +5024,7 @@ kind_field() {
     strata)   spec='STRATA_API_KEY|Strata|STRATA_PORT|8080|1' ;;
     basalt)   spec='BASALT_API_KEY|Basalt|BASALT_PORT|8080|1' ;;
     maya)     spec='MAYA_API_KEY|Maya|MAYA_PORT|8080|1' ;;
+    xolotl)   spec='XOLOTL_API_KEY|Xolotl|XOLOTL_PORT|8080|1' ;;
     *) return 1 ;;
   esac
   IFS='|' read -r key label port_var port_default openai <<< "$spec"
@@ -4852,7 +5039,7 @@ kind_field() {
 is_server_kind() { [[ -n "$1" ]] && server_kinds | grep -qx -- "$1"; }
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
-# "Ollama, LM Studio, Strata, Basalt or Maya"
+# "Ollama, LM Studio, Strata, Basalt, Maya or Xolotl"
 kind_labels() {
   local out=Ollama k label last=""
   for k in $(server_kinds); do
@@ -4966,6 +5153,11 @@ detect_server_kind() {
   # Both services identify themselves at public /health without credentials.
   if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/health" 2>/dev/null)"; then
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"strata\" ]]; then
+      # Xolotl serves through Strata's server; its DeepSeek-V4 engine (a model
+      # upstream Strata does not run) tells it apart.
+      if [[ "$body" =~ \"model\"[[:space:]]*:[[:space:]]*\"deepseek-v4 ]]; then
+        echo xolotl; return 0
+      fi
       echo strata; return 0
     fi
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"basalt\" ]]; then
@@ -6788,8 +6980,8 @@ cmd_set_api_key() {
 }
 
 # Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
-# LM Studio servers with "Require authentication" on, or Strata, Basalt and
-# Maya servers started with an API key. One token per kind, stored in
+# LM Studio servers with "Require authentication" on, or Strata, Basalt, Maya
+# and Xolotl servers started with an API key. One token per kind, stored in
 # secrets.env (outside the repo) like the other secrets.
 cmd_set_kind_token() {
   local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd

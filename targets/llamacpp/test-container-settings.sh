@@ -80,6 +80,15 @@ inventory_templates() {
     [[ $output != *debian-13* && $output != *ubuntu* && $output != *offline:* ]] || die "Unsupported or inactive template listed: $output"
     printf 'INVENTORY verified\n'
 }
+inventory_templates_vulkan() {
+    local output
+    pvesm() { printf '%s\n' 'Name Type Status Total Used Available %' 'local dir active 100 20 80 20%'; }
+    pveam() { printf '%s\n' 'NAME SIZE' 'local:vztmpl/debian-12-standard_test_amd64.tar.zst 123' 'local:vztmpl/debian-13-standard_test_amd64.tar.zst 456'; }
+    BACKEND=vulkan
+    output=$(list_container_templates)
+    [[ $output == 'local:vztmpl/debian-13-standard_test_amd64.tar.zst' ]] || die "Vulkan must list Debian 13 only: $output"
+    printf 'INVENTORY verified\n'
+}
 inventory_storage() {
     local output
     pvesm() {
@@ -241,6 +250,7 @@ local-lvm
 INPUT
 check 'interactive EOF aborts' fail 'Input ended' interactive </dev/null
 check 'inventory lists only downloaded Debian 12 templates on active storage' ok 'INVENTORY verified' inventory_templates
+check 'BACKEND=vulkan lists only Debian 13 templates' ok 'INVENTORY verified' inventory_templates_vulkan
 check 'storage inventory requests rootdir capability' ok 'INVENTORY verified' inventory_storage
 check 'inventory failure permits manual entry' ok 'INVENTORY verified' inventory_unavailable
 check 'numbered template selector accepts underscore storage ID' ok 'SELECTED|iso_fs:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst' select_template <<'INPUT'

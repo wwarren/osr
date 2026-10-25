@@ -102,6 +102,30 @@ check failure 'invalid GPU layer policy is rejected' install GPU_LAYERS=maximum 
 check failure 'CPU install requires zero GPU layers' install BACKEND=cpu GPU_DEVICES= GPU_LAYERS=auto MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'guest template must match supported OS' create TEMPLATE=local:vztmpl/debian-13-standard_test_amd64.tar.zst
 
+# Vulkan (AMD Radeon, Intel Arc): a Debian 13 template and the card's render node.
+vulkan=(TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst BACKEND=vulkan GPU_DEVICES=/dev/dri/renderD128)
+# shellcheck disable=SC2086  # VFLAGS: zero or more flags
+vplan() { out=$(env -i "PATH=$PATH" "${common[@]}" "${vulkan[@]}" "$@" "$bash_bin" "$provision" --dry-run ${VFLAGS:-} 2>&1); }
+vcheck() { local label=$1; passed=$((passed + 1)); printf 'PASS %s\n' "$label"; }
+VFLAGS=--install-target vplan MODEL_ALIAS=qwen3:8b MODEL_PATH=/var/lib/llama-target/models/m.gguf ||
+    { printf 'FAIL vulkan install plan\n%s\n' "$out" >&2; exit 1; }
+[[ $out == *'+ pct create 250 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst '*'--dev0 path=/dev/dri/renderD128\,gid=993\,mode=0660'* ||
+   $out == *'+ pct create 250 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst '*'--dev0 path=/dev/dri/renderD128,gid=993,mode=0660'* ]] ||
+    { printf 'FAIL vulkan device\n%s\n' "$out" >&2; exit 1; }
+[[ $out == *'BACKEND=vulkan'* && $out == *'GPU_LAYERS=auto'* ]] || { printf 'FAIL vulkan guest env\n%s\n' "$out" >&2; exit 1; }
+[[ $out != *'install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL vulkan ran the NVIDIA helper\n%s\n' "$out" >&2; exit 1; }
+vcheck 'Vulkan: a Debian 13 CT with the render node, GPU layers on, no NVIDIA helper'
+VFLAGS=--create-only vplan || { printf 'FAIL vulkan create-only\n%s\n' "$out" >&2; exit 1; }
+[[ $out == *"Mesa's Vulkan driver and the build tools install automatically"* && $out != *'install_nvidia_580_173_02.sh lxc'* ]] ||
+    { printf 'FAIL vulkan create-only instructions\n%s\n' "$out" >&2; exit 1; }
+vcheck 'Vulkan create-only: instructions without the NVIDIA helper'
+for bad in 'TEMPLATE=local:vztmpl/debian-12-standard_test_amd64.tar.zst|Debian 13' 'GPU_DEVICES=|Vulkan requires explicit GPU_DEVICES' \
+        'GPU_DEVICES=/dev/nvidia0|render node only' 'BACKEND=rocm|BACKEND must be cpu, cuda or vulkan'; do
+    if vplan "${bad%%|*}"; then printf 'FAIL accepted %s\n%s\n' "$bad" "$out" >&2; exit 1; fi
+    [[ $out == *"${bad#*|}"* && $out != *'+ pct create'* ]] || { printf 'FAIL %s\n%s\n' "$bad" "$out" >&2; exit 1; }
+done
+vcheck 'Vulkan refuses a Debian 12 template, a missing or non-render device, and unknown backends'
+
 "$bash_bin" -n "$provision"
 "$bash_bin" -n "$script_dir/install-target.sh"
 "$bash_bin" -n "$nvidia_installer"

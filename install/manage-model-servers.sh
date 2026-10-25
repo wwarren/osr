@@ -35,8 +35,8 @@ LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Default ports of the other server kinds are in kind_field (LM Studio 1234,
-# Strata/Basalt/Maya 8080); LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT and
-# MAYA_PORT in the environment override them.
+# Strata/Basalt/Maya/Xolotl 8080); LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT,
+# MAYA_PORT and XOLOTL_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -84,9 +84,10 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask the router to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             LM Studio, Strata, Basalt and Maya are detected automatically,
-                             or use lmstudio://host / strata://host /
-                             basalt://host / maya://host or --type. Detection sends no API key.
+                             LM Studio, Strata, Basalt, Maya and Xolotl are detected
+                             automatically, or use lmstudio://host / strata://host /
+                             basalt://host / maya://host / xolotl://host or --type.
+                             Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
   set-model <tier> <model>   Set the model for EVERY server in a tier
@@ -121,6 +122,9 @@ Commands:
   set-maya-token [token|--off]
                              Bearer token for Maya servers with an API key
                              (stored in secrets.env)
+  set-xolotl-token [token|--off]
+                             Bearer token for Xolotl servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on the router
                              API (Open WebUI is given the same key)
@@ -134,7 +138,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt|maya> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya|xolotl> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -177,7 +181,7 @@ valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
 #   port   -- default port (overridable through the <KIND>_PORT variable)
 #   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
 #             openai provider), 0 for LM Studio (its own API and provider)
-server_kinds() { printf '%s\n' lmstudio strata basalt maya; }
+server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl; }
 kind_field() {
   local spec key label port_var port_default openai value
   case "$1" in
@@ -185,6 +189,7 @@ kind_field() {
     strata)   spec='STRATA_API_KEY|Strata|STRATA_PORT|8080|1' ;;
     basalt)   spec='BASALT_API_KEY|Basalt|BASALT_PORT|8080|1' ;;
     maya)     spec='MAYA_API_KEY|Maya|MAYA_PORT|8080|1' ;;
+    xolotl)   spec='XOLOTL_API_KEY|Xolotl|XOLOTL_PORT|8080|1' ;;
     *) return 1 ;;
   esac
   IFS='|' read -r key label port_var port_default openai <<< "$spec"
@@ -199,7 +204,7 @@ kind_field() {
 is_server_kind() { [[ -n "$1" ]] && server_kinds | grep -qx -- "$1"; }
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
-# "Ollama, LM Studio, Strata, Basalt or Maya"
+# "Ollama, LM Studio, Strata, Basalt, Maya or Xolotl"
 kind_labels() {
   local out=Ollama k label last=""
   for k in $(server_kinds); do
@@ -313,6 +318,11 @@ detect_server_kind() {
   # Both services identify themselves at public /health without credentials.
   if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/health" 2>/dev/null)"; then
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"strata\" ]]; then
+      # Xolotl serves through Strata's server; its DeepSeek-V4 engine (a model
+      # upstream Strata does not run) tells it apart.
+      if [[ "$body" =~ \"model\"[[:space:]]*:[[:space:]]*\"deepseek-v4 ]]; then
+        echo xolotl; return 0
+      fi
       echo strata; return 0
     fi
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"basalt\" ]]; then
@@ -2135,8 +2145,8 @@ cmd_set_api_key() {
 }
 
 # Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
-# LM Studio servers with "Require authentication" on, or Strata, Basalt and
-# Maya servers started with an API key. One token per kind, stored in
+# LM Studio servers with "Require authentication" on, or Strata, Basalt, Maya
+# and Xolotl servers started with an API key. One token per kind, stored in
 # secrets.env (outside the repo) like the other secrets.
 cmd_set_kind_token() {
   local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd
