@@ -70,6 +70,7 @@ class Upstream:
         self.capabilities = {}  # model name -> list, None (404) or "boom"
         self.tool_less = set()  # models whose chat rejects a tool request
         self.show_calls = []
+        self.show_extra = {}    # model name -> more /api/show fields (model_info, parameters)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         host = f"{request.url.scheme}://{request.url.host}:{request.url.port}"
@@ -108,7 +109,7 @@ class Upstream:
                 return httpx.Response(404, json={"error": "not found"})
             if caps == "boom":
                 raise httpx.ConnectError("refused", request=request)
-            return httpx.Response(200, json={"capabilities": caps})
+            return httpx.Response(200, json={"capabilities": caps, **self.show_extra.get(name, {})})
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"data": [{"id": "fast"}]})
         return httpx.Response(404)
@@ -455,13 +456,22 @@ def test_capabilities_override_a_misleading_name(router):
 
 
 def test_capabilities_are_cached_per_digest(served):
-    router, upstream, client = served
+    import asyncio
+
+    router, upstream, _ = served
     upstream.capabilities["qwen3:14b"] = ["completion", "tools"]
     upstream.show_calls.clear()
     router._CAPABILITIES.clear()
-    client.post("/routing/refresh")
-    client.post("/routing/refresh")
-    assert len(upstream.show_calls) == 2       # once per host, not per poll
+    router._SHOW_TIMES.clear()
+
+    async def probe_twice():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+            raw = upstream.inventory[HOST_A]["models"][0]
+            await router.model_capabilities(http, HOST_A, raw)
+            await router.model_capabilities(http, HOST_A, raw)
+
+    asyncio.run(probe_twice())
+    assert upstream.show_calls == [(HOST_A, "qwen3:14b")]
 
 
 def test_capability_probe_failure_falls_back_and_retries(served):
@@ -976,6 +986,159 @@ def test_lmstudio_trained_flag_means_tools_otherwise_unknown(router):
                for r in raws}
     assert entries["trained"]["tools"] is True
     assert entries["plain"]["tools"] is None
+
+
+def test_show_context_length(router):
+    show = router.show_context_length
+    assert show({"model_info": {"qwen3.context_length": 40960}}) == 40960
+    # A served num_ctx below the model's own limit is what counts.
+    assert show({"model_info": {"llama.context_length": 131072},
+                 "parameters": "stop <eot>\nnum_ctx 8192"}) == 8192
+    assert show({"parameters": "num_ctx 2048\nnum_predict 512"}) == 2048
+    for nothing in ({}, {"model_info": {"llama.context_length": True}},
+                    {"model_info": {"x.context_length": "4096"}, "parameters": "num_ctx big"},
+                    {"model_info": None, "parameters": None}):
+        assert show(nothing) is None
+
+
+def test_discovery_records_context_length(served):
+    router, upstream, client = served
+    router._CAPABILITIES.clear()
+    router._CONTEXTS.clear()
+    upstream.inventory = {HOST_A: tags(("qwen3:14b", "14.8B", "qwen3")),
+                          HOST_B: tags(("airllm-72b", "72B", "qwen2"))}
+    upstream.capabilities.update({"qwen3:14b": ["completion", "tools"], "airllm-72b": ["completion"]})
+    upstream.show_extra.update({
+        "qwen3:14b": {"model_info": {"qwen3.context_length": 40960}},
+        # What AirLLM's /api/show reports for its default window.
+        "airllm-72b": {"model_info": {"qwen2.context_length": 2048},
+                       "parameters": "num_ctx 2048\nnum_predict 512"}})
+    assert client.post("/routing/refresh").status_code == 200
+    inventory = {e["name"]: e for e in client.get("/routing/inventory").json()["models"]}
+    assert inventory["qwen3:14b"]["context_length"] == 40960
+    assert (inventory["airllm-72b"]["context_length"], inventory["airllm-72b"]["tools"]) == (2048, False)
+    # Cached with the capabilities: a second poll still reports it.
+    client.post("/routing/refresh")
+    assert {e["name"]: e["context_length"] for e in router.INVENTORY["models"]}["qwen3:14b"] == 40960
+
+
+def test_context_is_reprobed_after_cache_expiry(served):
+    import asyncio
+
+    router, upstream, client = served
+    router._CAPABILITIES.clear()
+    router._CONTEXTS.clear()
+    router._SHOW_TIMES.clear()
+    upstream.capabilities["qwen3:14b"] = ["completion", "tools"]
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 65536"}
+    client.post("/routing/refresh")
+    assert {e["context_length"] for e in router.INVENTORY["models"]} == {65536}
+
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 8192"}
+    async def fetch():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+            return await router.fetch_server_models(http, HOST_A)
+
+    _, cached, _ = asyncio.run(fetch())
+    assert cached[0]["context_length"] == 65536
+    for key in router._SHOW_TIMES:
+        router._SHOW_TIMES[key] = 0
+    _, refreshed, _ = asyncio.run(fetch())
+    assert refreshed[0]["context_length"] == 8192
+    # A manual refresh should also re-probe before the cache expires.
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 4096"}
+    client.post("/routing/refresh")
+    assert {e["context_length"] for e in router.INVENTORY["models"]} == {4096}
+
+
+def test_a_failed_reprobe_keeps_the_last_good_show_answer(served):
+    """A transient /api/show failure after the cache expired must not turn a
+    model's known capabilities and context into "unknown": tools False would
+    become None, which Hermes's dispatcher accepts."""
+    import asyncio
+
+    router, upstream, client = served
+    router._CAPABILITIES.clear()
+    router._CONTEXTS.clear()
+    router._SHOW_TIMES.clear()
+    # No tools, a vision capability the name alone would not suggest, a small window.
+    upstream.capabilities["qwen3:14b"] = ["completion", "vision"]
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 2048"}
+    client.post("/routing/refresh")
+
+    def entry():
+        found = [e for e in router.INVENTORY["models"] if e["name"] == "qwen3:14b"]
+        assert found
+        return {(e["tools"], e["is_vision"], e["context_length"]) for e in found}
+
+    assert entry() == {(False, True, 2048)}
+
+    upstream.capabilities["qwen3:14b"] = "boom"      # /api/show now fails to connect
+    calls = len(upstream.show_calls)
+    # A forced refresh re-probes, fails, and keeps the last good answer.
+    client.post("/routing/refresh")
+    assert len(upstream.show_calls) > calls
+    assert entry() == {(False, True, 2048)}
+
+    # So does a scheduled poll after the cache expired.
+    for key in router._SHOW_TIMES:
+        router._SHOW_TIMES[key] = 0
+
+    async def fetch():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+            return await router.fetch_server_models(http, HOST_A)
+
+    calls = len(upstream.show_calls)
+    _, entries, _ = asyncio.run(fetch())
+    assert len(upstream.show_calls) > calls
+    assert [(e["tools"], e["is_vision"], e["context_length"]) for e in entries
+            if e["name"] == "qwen3:14b"] == [(False, True, 2048)]
+
+    # The failure is not cached: once /api/show answers again, its answer wins.
+    upstream.capabilities["qwen3:14b"] = ["completion", "tools"]
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 65536"}
+    client.post("/routing/refresh")
+    assert entry() == {(True, False, 65536)}
+
+
+def test_context_length_is_unknown_without_the_probe(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "CAPABILITY_PROBE", False)
+    client.post("/routing/refresh")
+    assert {e["context_length"] for e in router.INVENTORY["models"]} == {None}
+
+
+def test_lmstudio_context_length(router):
+    v1 = {r["name"]: r["context_length"] for r in router._lmstudio_v1_models({"models": [
+        {"key": "loaded", "type": "llm", "max_context_length": 131072,
+         "loaded_instances": [{"id": "a", "config": {"context_length": 8192}}]},
+        {"key": "cold", "type": "llm", "max_context_length": 32768, "loaded_instances": []},
+        {"key": "unknown", "type": "llm"},
+    ]})}
+    assert v1 == {"loaded": 8192, "cold": 32768, "unknown": None}
+    v0 = router._lmstudio_v0_models({"data": [{"id": "m", "type": "llm", "max_context_length": 4096}]})
+    assert v0[0]["context_length"] == 4096
+    entry = router.build_entry("lmstudio+http://h:1234", v0[0], v0[0]["capabilities"])
+    assert entry["context_length"] == 4096
+
+
+def test_openai_kind_context_length(router):
+    import asyncio
+
+    def handler(request):
+        return httpx.Response(200, json={"data": [
+            {"id": "a", "context_length": 65536},
+            {"id": "b", "max_model_len": 32768},
+            {"id": "c", "context_window": False},
+        ]})
+
+    async def fetch():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await router.fetch_openai_models(client, "strata+http://h:8080")
+
+    _, entries, error = asyncio.run(fetch())
+    assert error is None
+    assert {e["name"]: e["context_length"] for e in entries} == {"a": 65536, "b": 32768, "c": None}
 
 
 def test_openai_kind_tool_support_is_unknown(router):

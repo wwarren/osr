@@ -1,9 +1,11 @@
 """Integration checks for Hermes's loopback dispatcher; no real router/GPU."""
 
+import http.client
 import importlib.util
 import json
 import pathlib
 import socket
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -71,13 +73,14 @@ class Router(Quiet):
     inventory = {}
     rankings = []
     requests = []
+    extra_models = ()
 
     def do_GET(self):
         self.requests.append(("GET", self.path, self.headers.get("Authorization")))
         if self.path == "/v1/models":
             self.send_json({"data": [{"id": name} for name in
                                      ("auto", "fast", "medium", "large", "xlarge",
-                                      "tool-model", "other-model")]})
+                                      "tool-model", "other-model", *self.extra_models)]})
         else:
             self.send_json(self.inventory)
 
@@ -106,6 +109,7 @@ class TestDirect(unittest.TestCase):
         Backend.errors = {}
         Backend.stream_gate.clear()
         Router.requests = []
+        Router.extra_models = ()
         hot = f"strata+http://127.0.0.1:{self.hot.server_port}"
         cold = f"strata+http://127.0.0.1:{self.cold.server_port}"
         Router.inventory = {
@@ -260,6 +264,342 @@ class TestDirect(unittest.TestCase):
         attempts.clear()
         self.post({"model": "auto", "messages": [{"role": "user", "content": "Back again"}]})
         self.assertEqual(attempts, [hot], "a server that answered stayed on the skip list")
+
+    def test_pinned_task_falls_back_when_its_server_fails(self):
+        hot, cold = Router.inventory["servers"]
+        first_user = {"role": "user", "content": "Keep working on this task"}
+        self.post({"model": "auto", "messages": [first_user]})
+        dispatcher = direct.Handler.dispatcher
+        real_open = dispatcher.open_backend
+        attempts = []
+
+        def fail_hot(entry, body):
+            attempts.append(entry["server"])
+            if entry["server"] == hot:
+                raise OSError("server is unreachable")
+            return real_open(entry, body)
+
+        later = {"model": "auto", "messages": [first_user,
+                 {"role": "assistant", "content": "step one"},
+                 {"role": "user", "content": "continue"}]}
+        with mock.patch.object(dispatcher, "open_backend", side_effect=fail_hot):
+            _, answer = self.post(later)
+            self.assertEqual(answer["model"], "other-model")
+            self.assertEqual(attempts, [hot, cold])
+            attempts.clear()
+            self.post(later)
+            self.assertEqual(attempts, [cold], "the task was not pinned to the healthy fallback")
+
+    def test_incomplete_backend_stream_is_quarantined(self):
+        hot, cold = Router.inventory["servers"]
+        original = Backend.do_POST
+
+        def drop_stream(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Transfer-Encoding", "chunked")
+            handler.end_headers()
+            handler.wfile.write(b"7\r\npartial\r\n")
+            handler.wfile.flush()
+            handler.close_connection = True  # no terminating chunk
+
+        body = {"model": "auto", "messages": [{"role": "user", "content": "Stream this"}],
+                "stream": True}
+        request = Request(self.base + "/v1/chat/completions",
+                          data=json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"})
+        handler_errors = []
+        with mock.patch.object(Backend, "do_POST", drop_stream), \
+                mock.patch.object(self.proxy, "handle_error",
+                                  side_effect=lambda *args: handler_errors.append(args)):
+            with urlopen(request, timeout=5) as response:
+                # The client must see a broken response, not a short answer.
+                with self.assertRaises(http.client.IncompleteRead) as broken:
+                    response.read()
+                self.assertEqual(broken.exception.partial, b"partial")
+            self.assertFalse(handler_errors, "the incomplete stream escaped the handler")
+            self.assertIn(hot, direct.Handler.dispatcher._failed)
+            attempts = self.spy_backends()
+            _, answer = self.post({"model": "auto", "messages": body["messages"]})
+            self.assertEqual(answer["model"], "other-model")
+            self.assertEqual(attempts, [cold])
+
+    def test_short_backend_body_reaches_the_client_as_incomplete(self):
+        hot, cold = Router.inventory["servers"]
+        original = Backend.do_POST
+
+        def short_body(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", "500")
+            handler.end_headers()
+            handler.wfile.write(b'{"choices": [{"message": {"content": "par')
+            handler.wfile.flush()
+            handler.close_connection = True
+
+        with mock.patch.object(Backend, "do_POST", short_body):
+            with self.assertRaises(http.client.IncompleteRead) as broken:
+                self.post({"model": "tool-model", "messages": []})
+        self.assertTrue(broken.exception.partial.startswith(b'{"choices"'))
+        self.assertIn(hot, direct.Handler.dispatcher._failed)
+
+    def test_eof_delimited_json_must_be_complete(self):
+        hot = Router.inventory["servers"][0]
+        original = Backend.do_POST
+
+        def unframed(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            body = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])))
+            data = (b'{"model":"tool-model","choices":[]}' if body["messages"][0]["content"] == "valid"
+                    else b'{"choices": [{"message": {"content": "par')
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.end_headers()  # no Content-Length or Transfer-Encoding
+            handler.wfile.write(data)
+            handler.wfile.flush()
+            handler.close_connection = True
+
+        with mock.patch.object(Backend, "do_POST", unframed):
+            _, answer = self.post({"model": "tool-model", "messages": [
+                {"role": "user", "content": "valid"}]})
+            self.assertEqual(answer["model"], "tool-model")
+            with self.assertRaises(http.client.IncompleteRead):
+                self.post({"model": "tool-model", "messages": [
+                    {"role": "user", "content": "cut off"}]})
+        self.assertIn(hot, direct.Handler.dispatcher._failed)
+
+    def test_eof_delimited_sse_needs_done(self):
+        hot = Router.inventory["servers"][0]
+        original = Backend.do_POST
+
+        def unframed(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()  # no Content-Length or Transfer-Encoding
+            handler.wfile.write(b'data: {"chunk":1}\n\n')
+            handler.wfile.flush()
+            handler.close_connection = True
+
+        request = Request(self.base + "/v1/chat/completions",
+                          data=json.dumps({"model": "tool-model", "messages": [], "stream": True}).encode(),
+                          headers={"Content-Type": "application/json"})
+        with mock.patch.object(Backend, "do_POST", unframed):
+            with urlopen(request, timeout=5) as response:
+                with self.assertRaises(http.client.IncompleteRead):
+                    response.read()
+        self.assertIn(hot, direct.Handler.dispatcher._failed)
+
+    def test_done_marker_split_across_backend_reads(self):
+        done = direct._SSEDone()
+        done.feed(b'data: {"chunk":1}\n\ndata: [DO')
+        self.assertFalse(done.seen)
+        done.feed(b'NE]\r\n\r\n')
+        self.assertTrue(done.seen)
+
+    def test_done_marker_without_a_line_end_counts_at_eof(self):
+        done = direct._SSEDone()
+        done.feed(b'data: {"chunk":1}\n\ndata: [DONE]')
+        self.assertFalse(done.seen)
+        self.assertTrue(done.finish())
+        cut = direct._SSEDone()
+        cut.feed(b'data: {"chunk":1}\n\ndata: [DO')
+        self.assertFalse(cut.finish(), "a cut-off [DONE] was accepted")
+        long_line = direct._SSEDone()
+        long_line.feed(b"data: " + b"x" * 200)
+        self.assertFalse(long_line.finish())
+
+    def unframed_sse(self, data):
+        """A backend that streams SSE without framing and then closes."""
+        original = Backend.do_POST
+
+        def handler_fn(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(data)
+            handler.wfile.flush()
+            handler.close_connection = True
+        return mock.patch.object(Backend, "do_POST", handler_fn)
+
+    def stream_request(self):
+        return Request(self.base + "/v1/chat/completions",
+                       data=json.dumps({"model": "tool-model", "messages": [], "stream": True}).encode(),
+                       headers={"Content-Type": "application/json"})
+
+    def test_eof_delimited_sse_with_a_final_done_and_no_line_end(self):
+        hot = Router.inventory["servers"][0]
+        with self.unframed_sse(b'data: {"chunk":1}\n\ndata: [DONE]'):
+            with urlopen(self.stream_request(), timeout=5) as response:
+                self.assertTrue(response.read().endswith(b"data: [DONE]"))
+        self.assertNotIn(hot, direct.Handler.dispatcher._failed)
+
+    def test_framed_sse_without_done_is_complete(self):
+        # Chunked encoding marks the end, so [DONE] is not required.
+        hot = Router.inventory["servers"][0]
+        original = Backend.do_POST
+        event = b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+
+        def chunked(handler):
+            if handler.server.server_port != self.hot.server_port:
+                return original(handler)
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Transfer-Encoding", "chunked")
+            handler.end_headers()
+            handler.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(event), event))
+            handler.wfile.flush()
+            handler.close_connection = True
+
+        with mock.patch.object(Backend, "do_POST", chunked):
+            with urlopen(self.stream_request(), timeout=5) as response:
+                self.assertEqual(response.read(), event)
+        self.assertNotIn(hot, direct.Handler.dispatcher._failed)
+
+    def test_complete_responses_are_chunked_and_the_connection_kept(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
+        try:
+            for content in ("one", "two"):
+                connection.request("POST", "/v1/chat/completions",
+                                   json.dumps({"model": "tool-model", "messages": [
+                                       {"role": "user", "content": content}]}),
+                                   {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.getheader("Transfer-Encoding"), "chunked")
+                self.assertEqual(json.loads(response.read())["model"], "tool-model")
+            # An error is answered with Connection: close (the body may be unread).
+            connection.request("POST", "/nowhere", b"{}", {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual((response.status, response.getheader("Connection")), (404, "close"))
+        finally:
+            connection.close()
+
+    def pin(self, server, name, first_user):
+        dispatcher = direct.Handler.dispatcher
+        session = dispatcher.session_key({"messages": [first_user]})
+        dispatcher._sessions[session] = (server, name, direct.time.monotonic())
+
+    def test_pinned_fallback_follows_the_router_ranking(self):
+        hot = Router.inventory["servers"][0]
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead = f"strata+http://127.0.0.1:{probe.getsockname()[1]}"
+        Router.inventory["servers"].append(dead)
+        Router.inventory["server_status"][dead] = {"up": True}
+        # Inventory order puts the small model first; the router ranks big-b first.
+        Router.inventory["models"] = [
+            {"server": dead, "name": "big-a", "loaded": True, "tools": True},
+            {"server": hot, "name": "tiny-1b", "loaded": True, "tools": True},
+            {"server": hot, "name": "big-b", "loaded": False, "tools": True}]
+        Router.rankings = [{"server": dead, "model": "big-a"},
+                           {"server": hot, "model": "big-b"},
+                           {"server": hot, "model": "tiny-1b"}]
+        first_user = {"role": "user", "content": "A long agent task"}
+        self.pin(dead, "big-a", first_user)
+        attempts = self.spy_backends()
+        later = {"model": "auto", "tools": [{"type": "function"}],
+                 "messages": [first_user, {"role": "assistant", "content": "step"},
+                              {"role": "user", "content": "continue"}]}
+        _, answer = self.post(later)
+        self.assertEqual((answer["model"], attempts), ("big-b", [dead, hot]))
+        # The task is now pinned to the fallback, without asking the router.
+        attempts.clear()
+        Router.requests.clear()
+        _, answer = self.post(later)
+        self.assertEqual((answer["model"], attempts), ("big-b", [hot]))
+        self.assertFalse([r for r in Router.requests if r[1] == "/routing/explain"])
+
+    def test_pinned_replica_error_falls_back_instead_of_failing(self):
+        hot, cold = Router.inventory["servers"]
+        first_user = {"role": "user", "content": "Another task"}
+        self.pin(hot, "tool-model", first_user)
+        Backend.errors[self.hot.server_port] = (503, b'{"error": "busy"}')
+        _, answer = self.post({"model": "auto", "messages": [first_user]})
+        self.assertEqual(answer["model"], "other-model")
+        self.assertEqual([req[0] for req in Backend.requests],
+                         [self.hot.server_port, self.cold.server_port])
+
+    def add_unusable(self, name, **fields):
+        """A loaded model on the hot server that the router ranks first."""
+        hot = Router.inventory["servers"][0]
+        Router.inventory["models"].insert(0, {"server": hot, "name": name, "loaded": True,
+                                              "is_embedding": False, **fields})
+        Router.rankings.insert(0, {"server": hot, "model": name})
+        Router.extra_models = (name,)
+
+    def test_a_model_without_tools_is_never_used(self):
+        # AirLLM's shape: no tools. Not even for a request that offers none.
+        self.add_unusable("airllm-72b", tools=False, context_length=2048)
+        attempts = self.spy_backends()
+        _, answer = self.post({"model": "auto", "messages": [{"role": "user", "content": "Summarize"}]})
+        self.assertNotEqual(answer["model"], "airllm-72b")
+        self.assertTrue(attempts)
+        self.assertNotIn("airllm-72b", [m["name"] for m in direct.Handler.dispatcher.candidates(
+            {"model": "auto", "messages": [{"role": "user", "content": "x"}]})])
+
+    def test_a_model_with_too_little_context_is_never_used(self):
+        direct.Handler.dispatcher.min_context = 64000
+        self.add_unusable("small-ctx", tools=True, context_length=8192)
+        names = [m["name"] for m in direct.Handler.dispatcher.candidates(
+            {"model": "auto", "messages": [{"role": "user", "content": "x"}]})]
+        self.assertNotIn("small-ctx", names)
+        # Unknown context (None) and enough context are both usable.
+        self.assertIn("tool-model", names)
+        Router.inventory["models"][0]["context_length"] = 65536
+        direct.Handler.dispatcher._inventory = None
+        self.assertIn("small-ctx", [m["name"] for m in direct.Handler.dispatcher.candidates(
+            {"model": "auto", "messages": [{"role": "user", "content": "y"}]})])
+
+    def test_naming_an_unusable_model_is_refused_not_rerouted(self):
+        self.add_unusable("airllm-72b", tools=False)
+        attempts = self.spy_backends()
+        with self.assertRaises(HTTPError) as refused:
+            self.post({"model": "airllm-72b", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(refused.exception.code, 503)
+        self.assertIn("tool support", json.loads(refused.exception.read())["error"]["message"])
+        refused.exception.close()
+        self.assertEqual(attempts, [])
+
+    def test_model_list_leaves_out_unusable_models(self):
+        self.add_unusable("airllm-72b", tools=False)
+        with urlopen(self.base + "/v1/models", timeout=5) as response:
+            names = {m["id"] for m in json.load(response)["data"]}
+        self.assertNotIn("airllm-72b", names)
+        self.assertIn("tool-model", names)
+
+    def test_main_reads_the_context_floor_from_the_settings(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc, home = pathlib.Path(root, "etc"), pathlib.Path(root, "home")
+            etc.mkdir()
+            home.mkdir()
+            (etc / "settings").write_text("ROUTER_URL=http://r:8000\nHERMES_CONTEXT_LENGTH=65536\n")
+            (home / ".env").write_text("ROUTER_API_KEY=k\n")
+            env = {"HERMES_ETC": str(etc), "HERMES_HOME": str(home)}
+            with mock.patch.dict("os.environ", env), \
+                    mock.patch.object(direct, "ThreadingHTTPServer"), \
+                    mock.patch.object(direct.logging, "basicConfig"):
+                direct.main()
+            self.assertEqual(direct.Handler.dispatcher.min_context, 65536)
+            (etc / "settings").write_text("ROUTER_URL=http://r:8000\nHERMES_CONTEXT_LENGTH=lots\n")
+            with mock.patch.dict("os.environ", env), \
+                    mock.patch.object(direct, "ThreadingHTTPServer"), \
+                    mock.patch.object(direct.logging, "basicConfig"), \
+                    self.assertRaises(SystemExit):
+                direct.main()
 
     def test_connect_timeout_is_short_and_read_timeout_long(self):
         made = []

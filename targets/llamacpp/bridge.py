@@ -47,6 +47,8 @@ class Config:
     quantization: str = ""
     capabilities: tuple = ("completion",)
     timeout: float = 600
+    context_size: int = 0
+    parallel_slots: int = 1
 
     @classmethod
     def from_env(cls):
@@ -59,6 +61,8 @@ class Config:
             os.getenv("MODEL_FAMILY", ""), os.getenv("MODEL_QUANTIZATION", ""),
             tuple(x.strip() for x in os.getenv("MODEL_CAPABILITIES", "completion").split(",") if x.strip()),
             float(os.getenv("REQUEST_TIMEOUT_SECONDS", "600")),
+            int(os.getenv("CONTEXT_SIZE", "0")),
+            int(os.getenv("PARALLEL_SLOTS", "1")),
         )
 
 
@@ -360,7 +364,24 @@ def create_app(config=None, transport=None):
             info["general.parameter_count"] = meta["n_params"]
         if meta.get("n_ctx_train"):
             info[f"{arch}.context_length"] = meta["n_ctx_train"]
-        return {"details": data["details"], "capabilities": list(cfg().capabilities), "model_info": info}
+        # n_ctx_train is the GGUF's trained limit, not the window llama-server
+        # actually allocated. /props reports the active per-slot context.
+        served_context = (max(1, cfg().context_size // max(1, cfg().parallel_slots))
+                          if cfg().context_size > 0 else None)
+        try:
+            props_response = await app.state.client.get(cfg().base_url + "/props", timeout=5)
+            props_response.raise_for_status()
+            props = props_response.json()
+            active = props.get("default_generation_settings", {}).get("n_ctx")
+            if isinstance(active, int) and not isinstance(active, bool) and active > 0:
+                served_context = active
+        except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+            pass  # An installed target still has CONTEXT_SIZE as a fallback.
+        result = {"details": data["details"], "capabilities": list(cfg().capabilities),
+                  "model_info": info}
+        if served_context:
+            result["parameters"] = f"num_ctx {served_context}"
+        return result
 
     @app.get("/v1/models")
     async def models():

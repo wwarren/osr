@@ -149,6 +149,8 @@ Speed decides how to use it:
 | `GET /health` | Diagnostics, always 200: status, device, error. |
 | `POST /api/show`, `GET /api/ps` | Metadata; family from `AIRLLM_MODEL_FAMILY` or the model config. |
 | `POST /api/chat`, `POST /api/generate` | Streaming NDJSON or `"stream": false`. |
+| `POST /v1/chat/completions` | OpenAI chat completions, used by the router's direct dispatch. JSON, or SSE ending with `data: [DONE]` when `"stream": true`. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` and `seed` are honoured; other fields are ignored. Requests offering `tools` or legacy `functions` get 400 "does not support tools" unless their choice is `none`; image parts are dropped with a warning. |
+| `GET /v1/models` | The model once ready; 503 before. |
 | `POST /api/pull` | Starts the background load for the configured model. |
 | `POST /api/embed(dings)`, `/api/create`, `/api/copy`, `/api/push`, `/api/delete` | 501. |
 

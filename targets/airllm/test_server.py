@@ -235,6 +235,142 @@ def test_generate_raw_skips_templating():
     assert model.tokenizer.last_call["text"] == "bare prompt"
 
 
+# --- OpenAI-compatible chat ------------------------------------------------------------
+
+
+def sse(response):
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    return [line[len("data: "):] for line in response.text.splitlines() if line.startswith("data: ")]
+
+
+def test_openai_chat_non_stream_shape_and_usage():
+    server, _ = build()
+    with TestClient(server.app) as client:
+        body = client.post("/v1/chat/completions", json={"model": MODEL, **user("unique-marker")}).json()
+    assert body["object"] == "chat.completion" and body["id"].startswith("chatcmpl-")
+    assert body["model"] == server.cfg.public_name and isinstance(body["created"], int)
+    choice = body["choices"][0]
+    assert choice["message"] == {"role": "assistant", "content": "".join(fakes.FakeModel.REPLY)}
+    assert choice["finish_reason"] == "stop"
+    usage = body["usage"]
+    assert usage["prompt_tokens"] > 0 and usage["completion_tokens"] > 0
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+
+
+def test_openai_chat_stream_ends_with_done():
+    server, _ = build()
+    with TestClient(server.app) as client:
+        events = sse(client.post("/v1/chat/completions", json={"model": MODEL, "stream": True, **user()}))
+    assert events[-1] == "[DONE]"
+    chunks = [json.loads(e) for e in events[:-1]]
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert len({c["id"] for c in chunks}) == 1
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert text == "".join(fakes.FakeModel.REPLY)
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1])
+
+
+def test_openai_max_tokens_reports_length():
+    server, model = build()
+    with TestClient(server.app) as client:
+        body = client.post("/v1/chat/completions", json={**user(), "max_tokens": 2}).json()
+        client.post("/v1/chat/completions", json={**user(), "max_completion_tokens": 3, "max_tokens": 1})
+    assert body["choices"][0]["message"]["content"] == "Hello there"
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert model.calls[1]["max_new_tokens"] == 3
+
+
+def test_openai_sampling_fields_map_onto_generate_kwargs():
+    server, model = build()
+    with TestClient(server.app) as client:
+        client.post("/v1/chat/completions", json={**user(), "temperature": 0.7, "top_p": 0.9,
+                                                  "stop": ["x"], "presence_penalty": 0.1})
+        client.post("/v1/chat/completions", json={**user(), "temperature": 0, "top_p": 0.9})
+    assert model.calls[0]["do_sample"] is True and model.calls[0]["temperature"] == 0.7
+    assert model.calls[0]["top_p"] == 0.9
+    assert model.calls[1]["do_sample"] is False and "top_p" not in model.calls[1]
+
+
+def test_openai_content_parts_and_roles_reach_the_template():
+    server, model = build()
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={"messages": [
+            {"role": "developer", "content": "be nice"},
+            {"role": "user", "content": [{"type": "text", "text": "hi "},
+                                         {"type": "image_url", "image_url": {"url": "data:,"}},
+                                         {"type": "text", "text": "there"}]},
+            {"role": "assistant", "content": None}]})
+    assert response.status_code == 200
+    assert model.tokenizer.last_call["text"] == (
+        "<system>be nice</system><user>hi there</user><assistant></assistant><assistant>")
+
+
+def test_openai_tools_are_refused_without_generating():
+    server, model = build()
+    tools = [{"type": "function", "function": {"name": "noop", "parameters": {"type": "object"}}}]
+    functions = [{"name": "noop", "parameters": {"type": "object"}}]
+    with TestClient(server.app) as client:
+        refused = client.post("/v1/chat/completions", json={**user(), "tools": tools})
+        legacy_refused = client.post("/v1/chat/completions", json={**user(), "functions": functions})
+        allowed = client.post("/v1/chat/completions", json={**user(), "tools": tools, "tool_choice": "none"})
+        legacy_allowed = client.post("/v1/chat/completions", json={**user(), "functions": functions,
+                                                                    "function_call": "none"})
+    assert refused.status_code == 400
+    assert legacy_refused.status_code == 400
+    # The router's and Hermes's tool-rejection checks look for this phrase.
+    assert "does not support tools" in refused.json()["error"]["message"]
+    assert "does not support tools" in legacy_refused.json()["error"]["message"]
+    assert allowed.status_code == legacy_allowed.status_code == 200 and len(model.calls) == 2
+
+
+def test_airllm_digest_changes_with_served_context():
+    first, _ = build(AIRLLM_MAX_SEQ_LEN=2048)
+    second, _ = build(AIRLLM_MAX_SEQ_LEN=8192)
+    assert first.model_entry()["digest"] != second.model_entry()["digest"]
+
+
+def test_openai_bad_requests_and_unknown_models():
+    server, _ = build()
+    with TestClient(server.app) as client:
+        assert client.post("/v1/chat/completions", json={"model": "other", **user()}).status_code == 404
+        assert client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": 5}]}).status_code == 400
+        # A message that is not an object fails request validation (422).
+        assert client.post("/v1/chat/completions", json={"messages": ["hi"]}).status_code == 422
+        assert client.post("/v1/chat/completions", json={"model": f"{MODEL}:latest", **user()}).status_code == 200
+
+
+def test_openai_models_lists_the_served_model_once_ready():
+    server, _ = build()
+    with TestClient(server.app) as client:
+        data = client.get("/v1/models").json()["data"]
+    assert [m["id"] for m in data] == [server.cfg.public_name]
+    loading, _ = build(AIRLLM_EAGER_LOAD="false")
+    with TestClient(loading.app) as client:
+        assert client.get("/v1/models").status_code == 503
+
+
+def test_openai_generation_failure_stream_and_non_stream():
+    server, _ = build(fail_with=RuntimeError("out of memory"))
+    with TestClient(server.app) as client:
+        events = sse(client.post("/v1/chat/completions", json={"stream": True, **user()}))
+        once = client.post("/v1/chat/completions", json=user())
+    # An error event and no [DONE], so a client cannot mistake it for a reply.
+    assert "[DONE]" not in events
+    assert "out of memory" in json.loads(events[-1])["error"]["message"]
+    assert once.status_code == 500 and "out of memory" in once.json()["detail"]
+
+
+def test_openai_chat_503_while_the_model_is_still_loading():
+    server, _ = build(AIRLLM_EAGER_LOAD="false", AIRLLM_LOAD_WAIT=0)
+    server.manager.load = lambda: threading.Event().wait(30)
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json=user())
+    assert response.status_code == 503
+
+
 # --- context window -------------------------------------------------------------------
 
 

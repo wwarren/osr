@@ -409,7 +409,7 @@ after a controlled replacement can avoid a router configuration change.
 | Interface | Behavior |
 |---|---|
 | OpenAI `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | Request and response passthrough, including SSE, to the local server; model alias validated |
-| `/v1/models`, `/api/tags`, `/api/show` | Ready model plus configured metadata/capabilities. An empty or `unknown` `MODEL_PARAMETER_SIZE` is filled in from llama-server's own `n_params`, so the router can size-band the target; `/api/show` also reports parameter count and training context length |
+| `/v1/models`, `/api/tags`, `/api/show` | Ready model plus configured metadata/capabilities. An empty or `unknown` `MODEL_PARAMETER_SIZE` is filled in from llama-server's own `n_params`, so the router can size-band the target; `/api/show` reports the training context length and the active serving context from llama-server's `/props` (falling back to installed `CONTEXT_SIZE` divided among `PARALLEL_SLOTS`) |
 | `/api/ps` (GET) | The resident model while llama-server is ready; an empty list while it loads |
 | `/api/chat` | Text, image messages, tools, structured output, reasoning response fields; streaming SSE converted to NDJSON |
 | `/api/generate` | Prompt uses the model's chat template; `raw:true` uses text completions; streaming and non-streaming |

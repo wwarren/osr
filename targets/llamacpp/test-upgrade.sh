@@ -97,7 +97,7 @@ make_install() {
     printf '#!/bin/sh\necho version old\n' > "$tmp_root/opt/bin/llama-server"; chmod +x "$tmp_root/opt/bin/llama-server"
     echo 'old bridge' > "$tmp_root/opt/bridge.py"; echo 'old venv' > "$tmp_root/opt/venv/marker"
     printf 'requested_ref=v0.4.0\nresolved_commit=%s\nbackend=cpu\n' "${1:-oldcommit}" > "$tmp_root/opt/build-info.txt"
-    printf 'MODEL_PATH=/m.gguf\nMODEL_ALIAS=m:latest\n' > "$tmp_root/etc/llama-server.env"
+    printf 'MODEL_PATH=/m.gguf\nMODEL_ALIAS=m:latest\nCONTEXT_SIZE=8192\nPARALLEL_SLOTS=2\n' > "$tmp_root/etc/llama-server.env"
     printf 'MODEL_ALIAS=m:latest\n' > "$tmp_root/etc/bridge.env"
     echo 'old unit' > "$tmp_root/units/llama-server.service"
     printf 'ID=debian\nVERSION_ID=12\n' > "$tmp_root/os-release"
@@ -122,6 +122,8 @@ out=$(upgrade 2>&1) || die "healthy upgrade failed: $out"
 grep -q '^resolved_commit=newcommit$' "$tmp_root/opt/build-info.txt" || die 'build-info not updated'
 grep -q '^backend=cpu$' "$tmp_root/opt/build-info.txt" || die 'backend not carried over'
 grep -q '^LLAMA_EXTRA_ARGS=$' "$tmp_root/etc/llama-server.env" || die 'LLAMA_EXTRA_ARGS not added'
+grep -q '^CONTEXT_SIZE=8192$' "$tmp_root/etc/bridge.env" || die 'bridge context fallback not added'
+grep -q '^PARALLEL_SLOTS=2$' "$tmp_root/etc/bridge.env" || die 'bridge slot count not added'
 grep -q '^MODEL_PATH=/m.gguf$' "$tmp_root/etc/llama-server.env" || die 'existing settings touched'
 cmp -s "$script_dir/bridge.py" "$tmp_root/opt/bridge.py" || die 'bridge.py not refreshed'
 cmp -s "$script_dir/llama-server.service" "$tmp_root/units/llama-server.service" || die 'unit not refreshed'

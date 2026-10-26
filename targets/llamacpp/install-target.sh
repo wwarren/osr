@@ -719,6 +719,8 @@ if [[ $MODE == upgrade ]]; then
     stash_copy "$TARGET_ETC/llama-server.env"
     stash_copy "$TARGET_ETC/bridge.env"
     ensure_env_key "$TARGET_ETC/llama-server.env" LLAMA_EXTRA_ARGS ''
+    ensure_env_key "$TARGET_ETC/bridge.env" CONTEXT_SIZE "$(env_key_value "$TARGET_ETC/llama-server.env" CONTEXT_SIZE)"
+    ensure_env_key "$TARGET_ETC/bridge.env" PARALLEL_SLOTS "$(env_key_value "$TARGET_ETC/llama-server.env" PARALLEL_SLOTS)"
     if [[ -n $gpu_layers_new ]]; then
         printf 'Backend %s -> %s: setting GPU_LAYERS=%s (was %s).\n' "$previous_backend" "$BACKEND" "$gpu_layers_new" \
             "$(env_key_value "$TARGET_ETC/llama-server.env" GPU_LAYERS)"
@@ -840,6 +842,8 @@ MODEL_PARAMETER_SIZE=$MODEL_PARAMETER_SIZE
 MODEL_FAMILY=$MODEL_FAMILY
 MODEL_QUANTIZATION=$MODEL_QUANTIZATION
 MODEL_CAPABILITIES=$MODEL_CAPABILITIES
+CONTEXT_SIZE=$CONTEXT_SIZE
+PARALLEL_SLOTS=$PARALLEL_SLOTS
 REQUEST_TIMEOUT_SECONDS=600
 BRIDGEENV
 chown root:llama-target /etc/llama-target/*.env

@@ -254,6 +254,7 @@ to lack tools gets `X-Router-Warning: no-tool-model`, or a 400
 | **Unknown size** | `unknown_params` (0.3): usable, never preferred |
 | **Embeddings** | Structurally excluded; naming one on the chat endpoint is a 400 |
 | **Tools** | On a tool request, models known to lack tools are excluded (kept only if nothing else is left); `+tool_match` for a model reported tool-capable over an unknown one. Support is known from Ollama's `/api/show` capabilities (also the llama.cpp bridge's `MODEL_CAPABILITIES` and AirLLM) and LM Studio's `trained_for_tool_use`; Strata-style servers and untrained LM Studio models are unknown. Shown per entry as `tools` in `/routing/inventory` |
+| **Context length** | Not scored. Recorded per entry as `context_length` in `/routing/inventory`: the smaller of `/api/show`'s `<arch>.context_length` and a `num_ctx` parameter (Ollama; the llama.cpp bridge reports llama-server's active per-slot context from `/props`; AirLLM its window). The `/api/show` answer is cached for 60 s (`/routing/refresh` re-probes at once); if a re-probe fails, the last good answer is kept, so a blip never turns known capabilities or context into unknown. A loaded instance's context or `max_context_length` (LM Studio); `context_length`, `max_model_len` or `context_window` when an OpenAI-style server lists one. A ceiling: Ollama may serve less than the model's limit. `null` when unreported. Hermes's dispatcher uses it (§17.1) |
 | **Tie rotation** | Candidates within `tie_epsilon` of the best rotate, spreading load. For a tool request only the same model on several hosts rotates, so an agent loop keeps one model (and its prompt cache) |
 
 Sizes come from `details.parameter_size` (Ollama), `params_string` (LM Studio)
@@ -544,7 +545,8 @@ default: the router's API, registered model server endpoints, DNS and internet H
   orphaned `nvidia-*`/`triton` wheels. If the CPU index is unreachable, it
   falls back to the CUDA build and removes nothing.
 * **Discovery cost:** one model list per host per `refresh_seconds` (plus
-  cached `/api/show` for Ollama), independent of traffic.
+  `/api/show` for Ollama models when its one-minute cache expires or a manual
+  `/routing/refresh` is requested), independent of chat traffic.
 * **Targets:** AirLLM and Maya (by default) serve one sequence at a time,
   which the router cannot see (§14).
 
@@ -601,7 +603,7 @@ default: the router's API, registered model server endpoints, DNS and internet H
 7. **Old secrets remain in git history** (before 2026-09); rotate them.
 
 Next steps: feed observed latency into scoring; track in-flight requests per
-host (e.g. Maya's `/slots`); keep context length in the inventory and exclude
+host (e.g. Maya's `/slots`); use the inventory's `context_length` to exclude
 models too small for the prompt; add hosts through an endpoint.
 
 ---
@@ -878,10 +880,14 @@ twice (download plus shards). Code is in `/opt/airllm-target` (hash-locked
 venv), settings in `/etc/airllm-target/airllm.env` (0640, holds `HF_TOKEN`),
 data in `/var/lib/airllm-target`. `/api/tags` and `/healthz` answer 503 until
 the model is loaded. A failed load exits; systemd retries three times, then
-leaves the unit failed. `/api/chat` and `/api/generate` handle one generation
-at a time within `AIRLLM_MAX_SEQ_LEN` (the oldest tokens are dropped), with no
-tools, images or embeddings. Give it its own tier, never a fallback chain, and
-mind LiteLLM's 600 s timeout.
+leaves the unit failed. `/api/chat`, `/api/generate` and the OpenAI-style
+`/v1/chat/completions` (the router's direct dispatch path; SSE ends with
+`[DONE]`) handle one generation at a time within `AIRLLM_MAX_SEQ_LEN` (the
+oldest tokens are dropped), with no images or embeddings. Tools are not
+supported: `/v1/chat/completions` refuses a request that offers them with
+400 "does not support tools", so the router fails forward. Give it its own
+tier, never a fallback chain, and mind LiteLLM's 600 s timeout. Hermes never
+uses it (§17.1).
 
 ### 16.3 Ollama (`targets/ollama/`)
 
@@ -1005,7 +1011,11 @@ Not a model host. A separate Debian LXC runs
 [Hermes Agent](https://hermes-agent.nousresearch.com/), installed by the
 official `install.sh` as the unprivileged `hermes` account (optionally pinned
 by commit and installer SHA-256). Its custom provider is a loopback dispatcher
-at `127.0.0.1:8765/v1`. The router supplies discovery and ranking only.
+at `127.0.0.1:8765/v1`. The router supplies discovery and ranking only. The
+dispatcher never uses a model the inventory reports without tools, or with a
+`context_length` below `HERMES_CONTEXT_LENGTH`, for any request: Hermes is a
+tool agent, and a smaller window would silently drop the start of the task.
+This keeps AirLLM away from Hermes. A request naming such a model gets a 503.
 
 ```
 Open WebUI -> Hermes API server :8642 -> local dispatcher :8765 -> model server
@@ -1033,7 +1043,10 @@ Open WebUI -> Hermes API server :8642 -> local dispatcher :8765 -> model server
   what the dispatcher connects to; a URL without a port uses 80 or 443. The
   dispatcher connects with a 5 s timeout and skips an unreachable server for
   60 s, so a server that is not admitted yet costs one short wait, not every
-  request. The API, router and
+  request. A task pinned to a model whose servers all fail is ranked afresh
+  by the router. The dispatcher relays responses chunked (HTTP/1.1) and ends a
+  response the backend broke off without the final chunk, so Hermes sees an
+  error, not a short answer. The API, router and
   model rules carry a rule comment, which Proxmox keeps through GUI edits.
   `--reconfigure` rewrites only those rules,
   in two steps: before the guest step it adds the new rules next to the old

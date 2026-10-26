@@ -404,6 +404,27 @@ class BridgeTests(unittest.TestCase):
         # Cached after the first success: /v1/models is asked once.
         self.assertEqual(sum(r.url.path == "/v1/models" for r in self.requests), 1)
 
+    def test_show_reports_active_context_and_falls_back_to_installed_context(self):
+        self.config = Config("http://llama.invalid:8081", ALIAS, family="qwen2",
+                             context_size=8192, parallel_slots=2)
+        active = {"n_ctx": 3072}
+
+        def answer(request):
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"meta": {"n_ctx_train": 131072}}]})
+            if request.url.path == "/props":
+                return httpx.Response(200, json={"default_generation_settings": active})
+            return httpx.Response(404)
+
+        self.response = answer
+        with self.client() as client:
+            show = client.post("/api/show", json={"model": ALIAS}).json()
+            self.assertEqual(show["model_info"]["qwen2.context_length"], 131072)
+            self.assertEqual(show["parameters"], "num_ctx 3072")
+            active.clear()
+            show = client.post("/api/show", json={"model": ALIAS}).json()
+            self.assertEqual(show["parameters"], "num_ctx 4096")
+
     def test_parameter_size_lookup_failure_is_harmless(self):
         self.config = Config("http://llama.invalid:8081", ALIAS, parameter_size="")
         self.response = httpx.Response(500, text="nope")

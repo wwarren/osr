@@ -322,7 +322,7 @@ Every response carries `X-Router-Model`, `-Server`, `-Class`, `-Mode` and
 `-Candidates`. For inspection:
 
 ```
-GET  /routing/inventory   what each host serves, up/down, last error
+GET  /routing/inventory   what each host serves (tools, context_length, ...), up/down, last error
 POST /routing/refresh     re-poll now
 POST /routing/explain     {"prompt": "..."} -> decision and scored candidates
 GET  /healthz             liveness (no key needed)

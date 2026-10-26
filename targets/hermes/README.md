@@ -107,8 +107,8 @@ Finally, `integrate-webui.py` runs in the router CT:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `HERMES_MODEL` | `auto` | A model ID from the router's `/v1/models`. With `auto`, the dispatcher uses `/routing/explain`, prefers models reported loaded, and pins an agent task to one model name. Name a model for a fixed choice. |
-| `HERMES_CONTEXT_LENGTH` | `65536` | Context the model's host serves; at least 64000. |
+| `HERMES_MODEL` | `auto` | A model ID from the router's `/v1/models`. With `auto`, the dispatcher uses `/routing/explain`, prefers models reported loaded, and keeps an agent task on one model while a server for it works. If every server for that model fails, the pin is dropped and the router ranks afresh, so the task moves to the best healthy model, and stays there. Name a model for a fixed choice. |
+| `HERMES_CONTEXT_LENGTH` | `65536` | Context the model's host serves; at least 64000. The dispatcher never uses a model the router reports with less (`context_length` in `/routing/inventory`), nor one reported without tool support, for any request. AirLLM is excluded on both counts. |
 | `HERMES_CHANNEL` | `stable` | Upstream update channel (`stable` or `main`). |
 | `HERMES_COMMIT` | — | Pin the Hermes checkout to a commit. A changed pin is applied on the next run. The installer reports the installed commit so you can pin it. |
 | `HERMES_INSTALLER_SHA256` | — | Refuse an `install.sh` with another SHA-256. Every run prints the downloaded installer's checksum. |
@@ -176,9 +176,13 @@ All other outbound traffic is dropped, including private (RFC 1918), CGNAT
 and link-local addresses. A newly added model server, or a host name whose
 address changed, needs `--reconfigure` to be admitted; model additions on an
 already admitted host are discovered automatically. Until then the dispatcher
-skips it: a server it cannot connect to within 5 seconds is left out of
-candidate lists for 60 seconds, then tried again (unless it is the only
-candidate left). `EGRESS=open`
+skips it: a server it cannot connect to within 5 seconds, or that drops a
+response while streaming, is left out of candidate lists for 60 seconds, then
+tried again (unless every candidate is skipped). A response the backend breaks
+off reaches Hermes as an incomplete chunked response, which its HTTP client
+reports as an error. For backends whose response ends only when the connection
+closes, the dispatcher requires complete JSON or an SSE `[DONE]` event before
+finishing the chunked response. `EGRESS=open`
 allows all outbound traffic, for example when packages must come through a LAN
 proxy.
 
@@ -231,6 +235,7 @@ or set the new commit, when you upgrade.
 |---|---|
 | "rejected the API key … --reconfigure" | The router key was rotated. Run `provision-lxc.sh --reconfigure`. |
 | `model server … is unreachable; skipping it` in `journalctl -u hermes-direct` | The CT cannot connect to that server: not yet admitted (run `--reconfigure` after adding a server or changing its DNS), down, or blocked by the model host's own firewall. |
+| 503 "No available chat model with tool support and at least … tokens of context" | Every candidate is unusable for Hermes. Check `tools` and `context_length` per model in `/routing/inventory`: raise the model's context on its host (Ollama `num_ctx`, llama.cpp `CONTEXT_SIZE`), or add `tools` to llama.cpp's `MODEL_CAPABILITIES`. |
 | "Direct model-server chat probe failed" | Check `/routing/inventory`, backend keys, and direct access from the Hermes CT to the model host. Ollama reports `tools` per model; llama.cpp needs `MODEL_CAPABILITIES=…,tools`. |
 | The agent forgets its instructions or tools mid-task | The host's context is smaller than `HERMES_CONTEXT_LENGTH`. Raise it on the host (see above). |
 | Open WebUI lists no `hermes-agent` | `systemctl status hermes-gateway` in the CT, then `--integrate-only`. With the firewall on, the router's address needs TCP 8642. |

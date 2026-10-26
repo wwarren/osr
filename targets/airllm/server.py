@@ -21,6 +21,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -165,7 +166,9 @@ def model_entry() -> Dict[str, Any]:
         "model": cfg.public_name,
         "modified_at": now_iso(),
         "size": 0,
-        "digest": fake_digest(cfg.model_id),
+        # Discovery caches /api/show by digest. Include the served window so
+        # changing MAX_SEQ_LEN re-probes context even with the same weights.
+        "digest": fake_digest(f"{cfg.model_id}:{cfg.max_seq_len}"),
         "details": model_details(),
     }
 
@@ -559,6 +562,24 @@ class ChatRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
 
 
+class OpenAIChatRequest(BaseModel):
+    """The subset of OpenAI's chat completion request this target serves.
+    Unknown fields (stop, presence_penalty, ...) are accepted and ignored."""
+
+    model: Optional[str] = None
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    stream: bool = False
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    seed: Optional[int] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    functions: Optional[List[Dict[str, Any]]] = None
+    function_call: Optional[Any] = None
+
+
 class ShowRequest(BaseModel):
     model: Optional[str] = None
     name: Optional[str] = None
@@ -836,6 +857,133 @@ async def chat(req: ChatRequest, request: Request):
     packet = chat_final(gen.timing, gen.done_reason)
     packet["message"] = {"role": "assistant", "content": text}
     return packet
+
+
+# --- OpenAI-compatible chat (the router's direct dispatch path) -----------------------
+
+
+def openai_messages(raw: List[Dict[str, Any]]) -> Tuple[List[ChatMessage], bool]:
+    """OpenAI messages -> ChatMessages, and whether any carried an image.
+    Content may be a string or a list of parts; only text parts are used."""
+    messages, images = [], False
+    for item in raw:
+        content = item.get("content")
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(str(part.get("text") or ""))
+                elif isinstance(part, dict) and part.get("type") in ("image_url", "input_image"):
+                    images = True
+            content = "".join(texts)
+        elif content is not None and not isinstance(content, str):
+            raise HTTPException(status_code=400, detail="message content must be a string or a list of parts")
+        role = str(item.get("role") or "user")
+        messages.append(ChatMessage(role="system" if role == "developer" else role, content=content or ""))
+    return messages, images
+
+
+def openai_options(req: OpenAIChatRequest) -> Dict[str, Any]:
+    """OpenAI sampling fields as the Ollama options resolve_options reads."""
+    options: Dict[str, Any] = {}
+    limit = req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens
+    if limit is not None:
+        options["num_predict"] = limit
+    for key in ("temperature", "top_p", "seed"):
+        value = getattr(req, key)
+        if value is not None:
+            options[key] = value
+    return options
+
+
+def openai_error(status: int, message: str, kind: str = "invalid_request_error") -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": {"message": message, "type": kind}})
+
+
+def finish_reason(done_reason: str) -> str:
+    return "length" if done_reason == "length" else "stop"
+
+
+def sse_stream(request: Request, gen: Generation, completion_id: str, created: int) -> StreamingResponse:
+    """Drain a Generation as OpenAI chat.completion.chunk events, ending with
+    data: [DONE]. A failed generation ends with an error event and no [DONE]."""
+
+    def event(delta: Dict[str, Any], reason: Optional[str] = None) -> str:
+        chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                 "model": cfg.public_name,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+        return "data: " + json.dumps(chunk) + "\n\n"
+
+    async def body() -> AsyncIterator[str]:
+        finished = False
+        try:
+            yield event({"role": "assistant", "content": ""})
+            while True:
+                item = await _next_item(gen)
+                if item is None:
+                    if await request.is_disconnected():
+                        return
+                    continue
+                if item is _SENTINEL:
+                    break
+                yield event({"content": item})
+                if await request.is_disconnected():
+                    return
+            if gen.error is not None:
+                error = {"message": f"{type(gen.error).__name__}: {gen.error}", "type": "server_error"}
+                yield "data: " + json.dumps({"error": error}) + "\n\n"
+            else:
+                yield event({}, finish_reason(gen.done_reason))
+                yield "data: [DONE]\n\n"
+            finished = True
+        finally:
+            if not finished:
+                log.info("stream ended early; cancelling generation")
+                gen.cancel.set()
+
+    return StreamingResponse(body(), media_type="text/event-stream")
+
+
+@app.get("/v1/models")
+async def openai_models():
+    if not manager.ready:
+        return not_ready_response()
+    return {"object": "list", "data": [{"id": cfg.public_name, "object": "model",
+                                        "created": 0, "owned_by": "airllm"}]}
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat(req: OpenAIChatRequest, request: Request):
+    """OpenAI chat completions, for the router's direct dispatch. Tool calling
+    is refused with a 400 rather than ignored: a caller that offers tools must
+    learn that this model cannot use them (the router then tries another)."""
+    assert_known_model(req.model)
+    if ((req.tools and req.tool_choice != "none")
+            or (req.functions and req.function_call != "none")):
+        return openai_error(400, f"model {cfg.public_name!r} does not support tools")
+    messages, images = openai_messages(req.messages)
+    warn_unsupported(images)
+    max_new_tokens, gen_options, seed = resolve_options(openai_options(req))
+    created = int(time.time())
+    completion_id = "chatcmpl-" + uuid.uuid4().hex
+
+    def start() -> Generation:
+        manager.require()
+        return manager.submit(manager.build_prompt(messages), max_new_tokens, gen_options, seed)
+
+    gen = await run_blocking(start)
+    if req.stream:
+        return sse_stream(request, gen, completion_id, created)
+    text = await collect(request, gen)
+    timing = gen.timing
+    return {
+        "id": completion_id, "object": "chat.completion", "created": created,
+        "model": cfg.public_name,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                     "finish_reason": finish_reason(gen.done_reason)}],
+        "usage": {"prompt_tokens": timing.prompt_tokens, "completion_tokens": timing.eval_tokens,
+                  "total_tokens": timing.prompt_tokens + timing.eval_tokens},
+    }
 
 
 @app.post("/api/generate")

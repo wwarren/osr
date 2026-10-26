@@ -3097,6 +3097,10 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         "is_vision": is_vision,
         "is_embedding": is_embedding,
         "tools": tools,
+        # The largest context the server reports for this model (tokens), or
+        # None when it reports none. A ceiling, not a guarantee: Ollama, for
+        # one, may serve less than the model's own limit unless num_ctx says.
+        "context_length": positive_int(raw.get("context_length")),
         # True/False when the server reports residency; None otherwise.
         "loaded": raw.get("loaded"),
         "kind": server_kind(server),
@@ -3106,31 +3110,85 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
 # (server, model name, digest) -> capability list, or None when the server
 # does not report one. Keyed by digest so a re-pulled model is re-probed.
 _CAPABILITIES = {}
+# The same key -> context length from the same /api/show answer, or None.
+_CONTEXTS = {}
+# Runtime settings can change without changing a model digest (for example a
+# llama.cpp context size). Cached probes expire after one minute.
+SHOW_CACHE_SECONDS = 60
+_SHOW_TIMES = {}
+
+
+def positive_int(value):
+    """value if it is a positive int (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def show_context_length(show: dict):
+    """The context Ollama's /api/show says a model is served with, or None.
+    model_info's "<arch>.context_length" is the model's own limit; a num_ctx
+    parameter (a Modelfile's, or AirLLM's window) is what the server uses.
+    The smaller known value wins."""
+    values = []
+    info = show.get("model_info")
+    if isinstance(info, dict):
+        values += [positive_int(v) for k, v in info.items()
+                   if isinstance(k, str) and k.endswith(".context_length")]
+    parameters = show.get("parameters")
+    if isinstance(parameters, str):
+        for line in parameters.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+                values.append(positive_int(int(parts[1])))
+    values = [v for v in values if v]
+    return min(values) if values else None
+
+
+def _show_key(server: str, raw: dict) -> tuple:
+    name = raw.get("name") or raw.get("model") or ""
+    return (server, name, raw.get("digest") or raw.get("modified_at") or "")
 
 
 async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
-                             limit: asyncio.Semaphore = None):
-    """Ollama's capability list for one model via POST /api/show, cached."""
+                             limit: asyncio.Semaphore = None, force: bool = False):
+    """Ollama's capability list for one model via POST /api/show, cached.
+    The context length from the same answer is cached in _CONTEXTS."""
     name = raw.get("name") or raw.get("model") or ""
-    key = (server, name, raw.get("digest") or raw.get("modified_at") or "")
-    if key in _CAPABILITIES:
+    key = _show_key(server, raw)
+    if (not force and key in _CAPABILITIES and key in _SHOW_TIMES
+            and time.monotonic() - _SHOW_TIMES[key] < SHOW_CACHE_SECONDS):
         return _CAPABILITIES[key]
-    caps = None
+    caps = context = None
     try:
         async with (limit or asyncio.Semaphore(1)):
             response = await client.post(f"{server}/api/show", json={"model": name},
                                          timeout=DISCOVERY_TIMEOUT)
         if response.status_code == 200:
-            found = response.json().get("capabilities")
-            if isinstance(found, list):
-                caps = [str(c) for c in found]
+            payload = response.json()
+            if isinstance(payload, dict):
+                found = payload.get("capabilities")
+                if isinstance(found, list):
+                    caps = [str(c) for c in found]
+                context = show_context_length(payload)
         # Only a definite answer is cached; a transient failure is retried
         # on the next poll.
         if response.status_code in (200, 400, 404, 405, 501):
+            _CONTEXTS[key] = context
             _CAPABILITIES[key] = caps
+            _SHOW_TIMES[key] = time.monotonic()
     except (httpx.HTTPError, ValueError, AttributeError):
         pass
-    return caps
+    return _CAPABILITIES.get(key, caps)
+
+
+def lmstudio_context(model: dict):
+    """LM Studio's context for a model: the smallest loaded instance's
+    configured context_length, else max_context_length; None if neither."""
+    loaded = []
+    for instance in model.get("loaded_instances") or []:
+        config = instance.get("config") if isinstance(instance, dict) else None
+        if isinstance(config, dict) and positive_int(config.get("context_length")):
+            loaded.append(config["context_length"])
+    return min(loaded) if loaded else positive_int(model.get("max_context_length"))
 
 
 def _lmstudio_v1_models(payload: dict) -> list:
@@ -3158,6 +3216,7 @@ def _lmstudio_v1_models(payload: dict) -> list:
             "capabilities": caps,
             "tools": True if trained else None,
             "loaded": bool(m.get("loaded_instances")),
+            "context_length": lmstudio_context(m),
         })
     return out
 
@@ -3177,6 +3236,7 @@ def _lmstudio_v0_models(payload: dict) -> list:
                         "quantization_level": m.get("quantization") or ""},
             "capabilities": caps,
             "loaded": m.get("state") == "loaded",
+            "context_length": positive_int(m.get("max_context_length")),
         })
     return out
 
@@ -3241,7 +3301,12 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
                 size = MODEL_SIZES.get(str(model["id"]).lower())
             raw = {"name": model["id"], "capabilities": caps,
                    "details": {"parameter_size": size},
-                   "loaded": state == "loaded" if state is not None else None}
+                   "loaded": state == "loaded" if state is not None else None,
+                   # Field names used by OpenAI-style servers (vLLM-style
+                   # max_model_len included); none of them is required.
+                   "context_length": next(filter(None, (
+                       positive_int(model.get(k)) for k in
+                       ("context_length", "max_model_len", "context_window"))), None)}
             entries.append(build_entry(server, raw, caps))
         return server, entries, None
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
@@ -3251,7 +3316,8 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
 fetch_strata_models = fetch_openai_models  # preserve the existing callable
 
 
-async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
+async def fetch_server_models(client: httpx.AsyncClient, server: str,
+                              force_probe: bool = False) -> tuple:
     if server_kind(server) == "lmstudio":
         return await fetch_lmstudio_models(client, server)
     if server_kind(server) in OPENAI_KINDS:
@@ -3281,15 +3347,17 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
         pass
     if CAPABILITY_PROBE:
         limit = asyncio.Semaphore(8)   # per poll, so no cross-event-loop state
-        caps = await asyncio.gather(*[model_capabilities(client, server, m, limit)
+        caps = await asyncio.gather(*[model_capabilities(client, server, m, limit, force_probe)
                                       for m in raws])
+        for raw in raws:
+            raw["context_length"] = _CONTEXTS.get(_show_key(server, raw))
     else:
         caps = [None] * len(raws)
     entries = [build_entry(server, m, c) for m, c in zip(raws, caps, strict=True)]
     return server, [e for e in entries if e["name"]], None
 
 
-async def refresh_inventory() -> dict:
+async def refresh_inventory(force_probe: bool = False) -> dict:
     """Poll every target for the models it is currently serving."""
     global INVENTORY
     if not SERVERS:
@@ -3297,7 +3365,7 @@ async def refresh_inventory() -> dict:
                      "errors": {"config": "no servers configured"}}
         return INVENTORY
     results = await asyncio.gather(
-        *[fetch_server_models(http_client(), s) for s in SERVERS],
+        *[fetch_server_models(http_client(), s, force_probe) for s in SERVERS],
         return_exceptions=True,
     )
     models, servers, errors = [], {}, {}
@@ -3884,7 +3952,7 @@ async def routing_inventory():
 
 @app.post("/routing/refresh")
 async def routing_refresh():
-    await refresh_inventory()
+    await refresh_inventory(force_probe=True)
     return await routing_inventory()
 
 
