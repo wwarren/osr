@@ -16,8 +16,8 @@ Usage: CT_ID=282 ROUTER=280 TEMPLATE=local:vztmpl/debian-13-standard_..._amd64.t
        bash targets/hermes/provision-lxc.sh [--dry-run] [--reconfigure | --integrate-only]
 
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Hermes Agent with
-its official installer, configures the router as its model provider (with the
-router's ROUTER_API_KEY), and adds Hermes to the router's Open WebUI as the
+its official installer, configures a CT-local dispatcher to discover models
+from the router and call their servers directly, and adds Hermes to Open WebUI as the
 model "hermes-agent". It asks for an Open WebUI admin API key or session JWT
 unless OPENWEBUI_ADMIN_TOKEN is set (or OPENWEBUI=false).
 
@@ -39,14 +39,16 @@ Router:   ROUTER_URL (default http://<router address>:<router port>),
 Open WebUI: OPENWEBUI=true (false: CLI only, no API server), OPENWEBUI_PORT
           (read from the router), TASK_MODEL=fast (router model for Open WebUI
           titles and tags; blank leaves the setting alone).
-Network:  EGRESS=restricted (outbound only to the router, DNS and HTTP(S) on
-          the internet; private ranges dropped) or open.
+Network:  EGRESS=restricted (outbound to router, registered model servers,
+          DNS and internet HTTP(S); other private destinations dropped) or open.
+          Model server host names are resolved inside the Hermes CT; a URL
+          without a port means port 80 (http) or 443 (https).
 CT:       BRIDGE=vmbr0, CT_HOSTNAME=hermes-agent, CORES=2, MEMORY_MB=4096,
           SWAP_MB=1024, ROOTFS_GB=32, ONBOOT=1, NAMESERVER, VLAN_TAG.
 
 --dry-run         print the plan without touching Proxmox or the router.
 --reconfigure     an existing Hermes CT (CT_ID): push the current router key,
-                  installer and unit, rerun the installer with these settings,
+                  installer, dispatcher and units, rerun with these settings,
                   update its API firewall rule, then register it again. Use
                   after set-api-key on the router.
 --integrate-only  register an existing Hermes CT's API server in Open WebUI.
@@ -106,16 +108,20 @@ remote_command() {
 url_host() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest%:*}"; }
 url_port() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest##*:}"; }
 
-# The two rules this target owns carry a rule comment, which Proxmox keeps when
+# The rules this target owns carry a rule comment, which Proxmox keeps when
 # the firewall is edited in its GUI or API (comment-only lines are dropped).
 FW_TAG='ollama-smart-router hermes'
 
 # hermes_fw_rules ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT RESTRICTED: the
 # owned rules. Inbound: only the router, to the API server (an empty API_PORT
-# admits nothing). With restricted egress (true), outbound to the router's API.
+# admits nothing). Restricted egress also admits inventory model hosts.
 hermes_fw_rules() {
+  local rule
   [[ -z $2 ]] || printf 'IN ACCEPT -source %s/32 -p tcp -dport %s -log nolog # %s-api\n' "$1" "$2" "$FW_TAG"
   [[ $5 != true ]] || printf 'OUT ACCEPT -dest %s/32 -p tcp -dport %s -log nolog # %s-router\n' "$3" "$4" "$FW_TAG"
+  if [[ $5 == true ]]; then
+    for rule in "${model_rules[@]-}"; do [[ -z $rule ]] || printf '%s\n' "$rule"; done
+  fi
 }
 
 # firewall_config EGRESS ROUTER_IP ROUTER_DEST ROUTER_PORT API_PORT: the CT's
@@ -158,7 +164,7 @@ hermes_fw_update() {
   local begin='# BEGIN ollama-smart-router Hermes API' end='# END ollama-smart-router Hermes API'
   local in_re='^IN ACCEPT -source [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
   local out_re='^OUT ACCEPT -dest [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
-  local mark_re=" # ${FW_TAG}-(api|router)\$"
+  local mark_re=" # ${FW_TAG}-(api|router|model)\$"
   local -a lines=() rest=() old=() rules=()
   local -A owned=()
   local rule_re='^(IN|OUT) '
@@ -187,7 +193,9 @@ hermes_fw_update() {
       owned[$i]=1; [[ ! $line =~ $rule_re ]] || old+=("$line"); continue
     fi
     if [[ $line =~ $mark_re ]]; then
-      owned[$i]=1; old+=("$line"); marked=$((marked + 1)); continue
+      owned[$i]=1; old+=("$line")
+      [[ $line == *" # ${FW_TAG}-model" ]] || marked=$((marked + 1))
+      continue
     fi
     [[ -z ${line//[[:space:]]/} || $line == \#* ]] || rest+=("$i")
   done
@@ -227,8 +235,11 @@ hermes_fw_update() {
   mapfile -t rules < <(hermes_fw_rules "$router_ip" "$api_port" "$router_dest" "$router_port" "$restricted")
   if [[ $keep == keep ]]; then
     for line in "${old[@]}"; do
+      local old_tag=${line##* # ${FW_TAG}-}
       line=${line%% \#*}
-      if [[ $line == IN\ * ]]; then rule="$line # ${FW_TAG}-api"; else rule="$line # ${FW_TAG}-router"; fi
+      if [[ $line == IN\ * ]]; then rule="$line # ${FW_TAG}-api"
+      elif [[ $old_tag == model ]]; then rule="$line # ${FW_TAG}-model"
+      else rule="$line # ${FW_TAG}-router"; fi
       have=0
       for idx in "${rules[@]}"; do [[ $idx != "$rule" ]] || have=1; done
       (( have )) || rules+=("$rule")
@@ -252,9 +263,74 @@ hermes_fw_update() {
 write_if_changed() {
   [[ "$(cat -- "$1")" == "$2" ]] || printf '%s\n' "$2" > "$1"
 }
+# inventory_endpoints FILE: one host and port per registered model server. A
+# URL without a port uses its scheme's default (80 for http, 443 for https).
+# Validation is deliberately strict: the firewall only admits exact endpoints.
+inventory_endpoints() {
+  python3 - "$1" <<'PY'
+import json, sys
+from urllib.parse import urlsplit
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if not data.get("enabled") or not isinstance(data.get("servers"), list):
+    raise SystemExit("Router discovery is disabled; enable [discovery] before installing Hermes")
+seen = set()
+for item in data["servers"]:
+    if not isinstance(item, str):
+        raise SystemExit("Invalid model server in router inventory")
+    url = item.split("+", 1)[-1]
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+        if port is None:
+            port = {"http": 80, "https": 443}[parsed.scheme]
+    except (KeyError, ValueError):
+        port = None
+    if parsed.scheme not in ("http", "https") or not port or not parsed.hostname \
+            or parsed.username or parsed.password \
+            or parsed.query or parsed.fragment:
+        raise SystemExit("Invalid model server URL in router inventory: " + item)
+    pair = (parsed.hostname, port)
+    if pair not in seen:
+        seen.add(pair)
+        print(*pair)
+PY
+}
 # End provision helpers. --------------------------------------------------------
 
 positive() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
+
+# model_rules_for ips|all: the egress rules for model_endpoints. A host name is
+# resolved INSIDE the Hermes CT, by the same resolver (glibc getaddrinfo) its
+# dispatcher connects with, so the rules admit the addresses the dispatcher
+# will actually use; every IPv4 address is admitted. "ips" leaves host names
+# out, for a CT that is not running yet.
+model_rules_for() {
+  local pass=$1 entry host port addr
+  local -a addrs
+  local -A seen=()
+  model_rules=()
+  for entry in "${model_endpoints[@]}"; do
+    read -r host port <<< "$entry"
+    [[ -n $host ]] || continue
+    if ipv4 "$host" || (( dry_run )); then
+      addrs=("$host")
+    elif [[ $pass == ips ]]; then
+      continue
+    else
+      mapfile -t addrs < <(pct exec "$CT_ID" -- getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+      if (( ${#addrs[@]} == 0 )); then
+        note "Warning: CT $CT_ID cannot resolve model server $host, so it is not admitted; Hermes skips it. Fix the CT's DNS, then rerun --reconfigure."
+        continue
+      fi
+    fi
+    for addr in "${addrs[@]}"; do
+      ipv4 "$addr" || (( dry_run )) || continue
+      [[ -z ${seen[$addr:$port]:-} ]] || continue
+      seen[$addr:$port]=1
+      model_rules+=("OUT ACCEPT -dest $addr/32 -p tcp -dport $port -log nolog # ${FW_TAG}-model")
+    done
+  done
+}
 run() {
   printf '+'; printf ' %q' "$@"; printf '\n'
   if (( ! dry_run )); then "$@"; fi
@@ -392,6 +468,7 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Open WebUI is checked with the Open Terminal target's probe (same router).
 verify_webui=$source_dir/../open-terminal/verify-webui.py
 for file in "$source_dir/install-target.sh" "$source_dir/hermes-gateway.service" \
+            "$source_dir/direct-dispatch.py" "$source_dir/hermes-direct.service" \
             "$source_dir/integrate-webui.py" "$verify_webui"; do
   [[ -r $file ]] || die "Deployment file is missing: $file"
 done
@@ -444,7 +521,7 @@ cleanup() {
   if [[ $router_kind == ssh ]] && (( ! dry_run )); then
     ssh "${ssh_opts[@]}" -O exit "$ssh_dest" >/dev/null 2>&1 || true
   fi
-  rm -f -- "$stage/admin-token" "$stage/router-api-key" "$stage/hermes-api-key" "$stage/router-auth" 2>/dev/null || true
+  rm -f -- "$stage/admin-token" "$stage/router-api-key" "$stage/backend-keys" "$stage/hermes-api-key" "$stage/router-auth" 2>/dev/null || true
   rm -rf -- "$stage" 2>/dev/null || true
   if (( rc != 0 && ! dry_run )); then
     printf 'Setup stopped. CT %s, if created, is retained: fix the error and re-run with --reconfigure.\n' "$CT_ID" >&2
@@ -456,7 +533,7 @@ trap cleanup EXIT
 if (( ! dry_run )); then
   # id, not $EUID, so the tests can run the whole flow without root.
   [[ $(id -u) == 0 ]] || die 'Run as root on the Proxmox host.'
-  for command_name in pveversion pct pvesh pvesm curl; do
+  for command_name in pveversion pct pvesh pvesm curl python3; do
     command -v "$command_name" >/dev/null || die "Missing command: $command_name"
   done
   [[ -d $PVE_ETC/nodes ]] || die 'Proxmox cluster filesystem is unavailable.'
@@ -473,6 +550,8 @@ if (( ! dry_run )); then
   # Straight into a 0600 file: the key never passes through argv or a variable.
   router_exec awk -F= '$1=="ROUTER_API_KEY" {sub(/^[^=]*=/,""); print; exit}' /app/router/secrets.env \
     > "$stage/router-api-key" 2>/dev/null || : > "$stage/router-api-key"
+  router_exec awk -F= '$1 ~ /^(LMSTUDIO_API_TOKEN|STRATA_API_KEY|BASALT_API_KEY|MAYA_API_KEY|XOLOTL_API_KEY)$/ {print}' /app/router/secrets.env \
+    > "$stage/backend-keys" 2>/dev/null || : > "$stage/backend-keys"
   if [[ -s $stage/router-api-key ]]; then
     note "Read ROUTER_API_KEY from ${router_label}."
   else
@@ -497,6 +576,7 @@ else
   router_port=8000
   OPENWEBUI_PORT=${OPENWEBUI_PORT:-8080}
   printf '+ read ROUTER_API_KEY from /app/router/secrets.env on %s into a 0600 file\n' "$router_label"
+  printf '+ read model-server keys from /app/router/secrets.env on %s into a 0600 file\n' "$router_label"
 fi
 
 # --- the Hermes CT's address, and the router's address as seen from it ----------
@@ -545,6 +625,7 @@ fi
 # The router's API must answer with this key before a CT is made for it.
 if (( dry_run )); then
   printf '+ verify %s/v1/models answers with the router key\n' "$ROUTER_URL"
+  printf '+ discover model-server endpoints from %s/routing/inventory for firewall rules\n' "$ROUTER_URL"
 elif [[ $mode != integrate ]]; then
   : > "$stage/router-auth"
   if [[ -s $stage/router-api-key ]]; then
@@ -556,6 +637,27 @@ elif [[ $mode != integrate ]]; then
     401|403) die "The router at $ROUTER_URL rejected the key from ${router_label}'s secrets.env (HTTP $status)." ;;
     *) die "The router at $ROUTER_URL did not answer /v1/models from this host (HTTP ${status:-none}). Check ROUTER_URL and the router CT's firewall (API_ALLOW_CIDR must include $HERMES_IP)." ;;
   esac
+fi
+
+model_rules=()
+model_endpoints=()
+model_egress=$EGRESS
+if [[ $mode == reconfigure && -f $firewall_file ]] &&
+   grep -Eq '^policy_out:[[:space:]]*DROP[[:space:]]*$' "$firewall_file"; then
+  model_egress=restricted
+fi
+if [[ $mode != integrate && $model_egress == restricted ]]; then
+  if (( ! dry_run )); then
+    status=$(curl --silent --show-error --max-time 15 -o "$stage/inventory" -w '%{http_code}' \
+      -H "@$stage/router-auth" "$ROUTER_URL/routing/inventory" || true)
+    [[ $status == 200 ]] || die "Could not read router model inventory (HTTP ${status:-none})."
+    endpoints=$(inventory_endpoints "$stage/inventory") || die 'Could not parse router model inventory.'
+    mapfile -t model_endpoints <<< "$endpoints"
+  else
+    model_endpoints=('<inventory-model-server> <port>')
+  fi
+  # An existing CT resolves model server host names now; a new one once it runs.
+  if [[ $mode == create ]]; then model_rules_for ips; else model_rules_for all; fi
 fi
 
 admin_token=''
@@ -611,6 +713,16 @@ if [[ $mode == create ]]; then
   else
     printf '+ wait for systemd, a default route and DNS in CT %s\n' "$CT_ID"
   fi
+  # Model servers given by host name: admitted now that the CT can resolve them.
+  if (( ${#model_endpoints[@]} )); then
+    if (( dry_run )); then
+      printf '+ resolve model server host names inside CT %s and admit their addresses in %s\n' "$CT_ID" "$firewall_file"
+    else
+      model_rules_for all
+      write_if_changed "$firewall_file" "$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port")" ||
+        die "Could not write $firewall_file."
+    fi
+  fi
 fi
 
 # --reconfigure: the CT's owned firewall rules follow the new settings (router
@@ -640,6 +752,9 @@ if [[ $mode != integrate ]]; then
   run pct exec "$CT_ID" -- install -d -m 0700 "$deploy"
   run pct push "$CT_ID" "$source_dir/install-target.sh" "$deploy/install-target.sh" --perms 0755
   run pct push "$CT_ID" "$source_dir/hermes-gateway.service" "$deploy/hermes-gateway.service" --perms 0644
+  run pct push "$CT_ID" "$source_dir/direct-dispatch.py" "$deploy/direct-dispatch.py" --perms 0644
+  run pct push "$CT_ID" "$source_dir/hermes-direct.service" "$deploy/hermes-direct.service" --perms 0644
+  run pct push "$CT_ID" "$stage/backend-keys" "$deploy/backend-keys" --perms 0600
   if (( dry_run )) || [[ -s $stage/router-api-key ]]; then
     run pct push "$CT_ID" "$stage/router-api-key" "$deploy/router-api-key" --perms 0600
   fi
@@ -687,7 +802,7 @@ if [[ $OPENWEBUI == true ]]; then
   (( dry_run )) && router_stage=''
 fi
 
-printf 'Hermes CT %s uses %s/v1 (model %s).\n' "$CT_ID" "$ROUTER_URL" "$HERMES_MODEL"
+printf 'Hermes CT %s discovers via %s and dispatches model %s directly.\n' "$CT_ID" "$ROUTER_URL" "$HERMES_MODEL"
 if [[ $OPENWEBUI == true ]]; then
   printf 'Open WebUI: choose "%s" in the model list. Check its visibility under Admin Settings > Models before sharing it:\n' "$HERMES_API_MODEL_NAME"
   printf 'whoever can chat with it runs tools as the hermes account in CT %s and shares one Hermes memory.\n' "$CT_ID"

@@ -19,7 +19,7 @@ SPEC = importlib.util.spec_from_file_location("comfyui_integrate_webui", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-# The shape of GET /api/v1/images/config in Open WebUI 0.11.0 (ImagesConfig).
+# The shape of GET /api/v1/images/config in Open WebUI 0.11.0-0.12.4 (ImagesConfig).
 FRESH = {
     "ENABLE_IMAGE_GENERATION": False, "ENABLE_IMAGE_PROMPT_GENERATION": True,
     "IMAGE_GENERATION_ENGINE": "openai", "IMAGE_GENERATION_MODEL": "", "IMAGE_SIZE": "512x512", "IMAGE_STEPS": 50,
@@ -46,8 +46,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     missing_node = None
     is_comfyui = True
     reachable = True          # can "Open WebUI's backend" reach ComfyUI?
+    legacy_verify = False     # Open WebUI before 0.11.4: GET .../config/url/verify
     models_override = None
     updates = []
+    verified = []
 
     def log_message(self, *_args):
         pass
@@ -93,13 +95,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/api/v1/images/config":
             self.reply(200, cls.config)
-        elif self.path == "/api/v1/images/config/url/verify":
+        elif self.path == "/api/v1/images/config/url/verify" and cls.legacy_verify:
+            cls.verified.append("legacy")
             if cls.reachable and cls.config.get("COMFYUI_BASE_URL") == self.comfy_url():
                 self.reply(200, True)
             else:
                 self.reply(400, {"detail": "Invalid URL"})
         elif self.path == "/api/v1/images/models":
-            # Open WebUI 0.11.0 reads UNETLoader's combo options at index 0.
+            # Open WebUI 0.11.0-0.12.4 reads UNETLoader's combo options at index 0.
             # Its model picker cannot read ComfyUI's newer COMBO format.
             if cls.models_override is not None:
                 models = cls.models_override
@@ -124,6 +127,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cls.updates.append(copy.deepcopy(body))
             cls.config = body
             self.reply(200, body)
+        elif self.path == "/api/v1/images/verify" and not cls.legacy_verify:
+            # Open WebUI 0.11.4+: ConnectionVerificationForm {engine, url, key}.
+            if not isinstance(body.get("engine"), str) or not isinstance(body.get("url"), str):
+                self.reply(422, {"detail": "engine and url are required"})
+                return
+            cls.verified.append(body)
+            if body["engine"] == "comfyui" and body["url"] == self.comfy_url() and cls.reachable:
+                self.reply(200, True)
+            else:
+                self.reply(400, {"detail": "Invalid URL"})
         else:
             self.reply(404, {"detail": "Not Found"})
 
@@ -138,8 +151,10 @@ class IntegrationTest(unittest.TestCase):
         Handler.missing_node = None
         Handler.is_comfyui = True
         Handler.reachable = True
+        Handler.legacy_verify = False
         Handler.models_override = None
         Handler.updates = []
+        Handler.verified = []
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -324,6 +339,25 @@ class IntegrationTest(unittest.TestCase):
             self.run_script()
         self.assertEqual(Handler.config, before)
         self.assertEqual(len(Handler.updates), 2)
+
+    def test_open_webui_verifies_the_comfyui_url_it_is_given(self):
+        self.run_script()
+        self.assertEqual(Handler.verified, [{"engine": "comfyui", "url": f"{self.base}/comfy",
+                                             "key": None}])
+
+    def test_an_open_webui_before_0_11_4_uses_the_old_verify_endpoint(self):
+        Handler.legacy_verify = True
+        self.run_script()
+        self.assertEqual(Handler.verified, ["legacy"])
+        self.assertTrue(Handler.config["ENABLE_IMAGE_GENERATION"])
+
+    def test_an_unreachable_comfyui_on_an_old_open_webui_restores_the_previous_settings(self):
+        Handler.legacy_verify = True
+        Handler.reachable = False
+        before = copy.deepcopy(Handler.config)
+        with self.assertRaisesRegex(RuntimeError, "Invalid URL.*previous image settings were restored"):
+            self.run_script()
+        self.assertEqual(Handler.config, before)
 
     def test_a_diffusion_model_open_webui_does_not_list_restores_the_previous_settings(self):
         Handler.models_override = ["other.safetensors"]

@@ -4,8 +4,9 @@ Hermes is an **agent client** of the router, not a model-serving inference
 target. This target creates a dedicated unprivileged Debian LXC and installs
 [Hermes Agent](https://hermes-agent.nousresearch.com/) with the [official POSIX
 installer](https://hermes-agent.nousresearch.com/install.sh). Hermes's custom
-OpenAI-compatible provider is set to the router's `http://<router>:8000/v1`,
-authenticated with the router's `ROUTER_API_KEY`.
+OpenAI-compatible provider points at `127.0.0.1:8765/v1` inside the CT. The
+local dispatcher reads the router's inventory and task ranking with
+`ROUTER_API_KEY`, then sends chat requests straight to the chosen model server.
 
 By default Hermes's **API server** also runs in the CT (`hermes-gateway.service`,
 TCP 8642). It is registered in the router's Open WebUI as a second OpenAI
@@ -13,7 +14,8 @@ connection, so `hermes-agent` appears in the model list next to the router's
 models. The request path is:
 
 ```
-browser -> Open WebUI :8080 -> Hermes API server :8642 (Hermes CT) -> router :8000/v1 -> model pool
+browser -> Open WebUI :8080 -> Hermes API server :8642 -> local dispatcher :8765 -> model server
+                                                       \-> router :8000 (inventory and ranking only)
 ```
 
 The agent's tools (terminal, files, web) run as the unprivileged `hermes`
@@ -24,6 +26,9 @@ account inside the Hermes CT.
 - **The router is installed** and its API port (8000) is reachable from the
   Proxmox host and from the new CT's address. With the router CT's firewall
   on, `API_ALLOW_CIDR` must include the Hermes CT.
+- **The model server ports accept the Hermes CT's address.** The Hermes CT
+  firewall permits outbound traffic to discovered servers, but a model host's
+  own firewall may still allow only the router. Admit the Hermes CT there too.
 - **An Open WebUI admin API key or JWT**, as for Open Terminal: Settings →
   Account (enable API keys in Admin Settings → Authentication first). The
   script prompts for it without echo; for unattended runs set
@@ -31,6 +36,8 @@ account inside the Hermes CT.
   deleted from temporary files after use. Not needed with `OPENWEBUI=false`.
 - **A tool-capable model with at least 64K context.** Hermes needs 64,000
   tokens of context for agent work with tools.
+  Every model the dispatcher may select needs this context; the router's
+  inventory does not report configured context length.
   - The pool's defaults are smaller: the Ollama target ships
     `OLLAMA_CONTEXT_LENGTH=8192`, and llama.cpp `CONTEXT_SIZE=8192` is split
     across `PARALLEL_SLOTS`.
@@ -62,21 +69,30 @@ a router LXC/VM that root can log in to over SSH (as for Open Terminal).
 
 Before creating anything, the provisioner:
 
-1. Reads `ROUTER_API_KEY` from the router's `/app/router/secrets.env` into a
-   0600 file. The key never appears in a command line.
+1. Reads `ROUTER_API_KEY` and model server keys from the router's
+   `/app/router/secrets.env` into 0600 files. Keys never appear in a command
+   line. Rerun `--reconfigure` after rotating a backend key.
 2. Detects the address the router uses to reach the new CT. The default
    `ROUTER_URL` is `http://<that address>:<router port>`.
-3. Checks that `ROUTER_URL/v1/models` accepts the key.
+3. Checks that `ROUTER_URL/v1/models` accepts the key, then reads
+   `/routing/inventory` to admit the registered model server IPs and ports
+   through the CT firewall. A server URL without a port means port 80 (http)
+   or 443 (https).
 4. Checks Open WebUI's health and asks for the admin token.
 
-It then creates the CT and its firewall, and pushes `install-target.sh`,
-`hermes-gateway.service` and the router key. The guest installer then:
+It then creates the CT and its firewall. Once the CT is running, it resolves
+model servers given by host name inside the CT, with the resolver the
+dispatcher uses, and admits every IPv4 address returned. It then pushes the
+installer, dispatcher, systemd units and keys. The guest installer then:
 
-1. Sends one test chat request that offers a tool. This proves the key, tool
-   support and inference before anything is installed.
-2. Installs Hermes as the `hermes` account.
-3. Configures the provider: `model.provider custom`, `model.base_url`,
-   `model.default`, `model.context_length` and `model.api_key`.
+1. Checks the router's advertised models and installs Hermes as the `hermes`
+   account.
+2. Configures the provider: `model.provider custom`, `model.base_url` at the
+   loopback dispatcher, `model.default`, `model.context_length` and a local
+   placeholder `model.api_key`.
+3. Starts `hermes-direct.service` and sends one chat request with a tool
+   through it to a model server. This checks the direct path before the
+   gateway is exposed.
 4. Generates the API server key in `/etc/hermes-target/api-key` (0600) and
    writes the `API_SERVER_*` settings to `~/.hermes/.env`.
 5. Starts `hermes-gateway.service` and waits for `/health` and `/v1/models`.
@@ -91,7 +107,7 @@ Finally, `integrate-webui.py` runs in the router CT:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `HERMES_MODEL` | `auto` | A model ID from the router's `/v1/models`. With `auto`, the router keeps a tool request on a tool-capable model of at least `tools_min_class` (default `large`), and keeps one agent loop on one model. Name a model for a fixed choice. |
+| `HERMES_MODEL` | `auto` | A model ID from the router's `/v1/models`. With `auto`, the dispatcher uses `/routing/explain`, prefers models reported loaded, and pins an agent task to one model name. Name a model for a fixed choice. |
 | `HERMES_CONTEXT_LENGTH` | `65536` | Context the model's host serves; at least 64000. |
 | `HERMES_CHANNEL` | `stable` | Upstream update channel (`stable` or `main`). |
 | `HERMES_COMMIT` | — | Pin the Hermes checkout to a commit. A changed pin is applied on the next run. The installer reports the installed commit so you can pin it. |
@@ -108,13 +124,13 @@ Finally, `integrate-webui.py` runs in the router CT:
 | Run | Does |
 |---|---|
 | default | Creates a new CT. A failed run leaves the CT for inspection; fix the error and use `--reconfigure`. |
-| `--reconfigure` | An existing Hermes CT. Pushes the router's **current** key, the installer and the unit, reruns the guest installer with the given settings, updates the CT's Hermes firewall rules (see [Network](#network)), then registers it again. Use it after `manage-model-servers set-api-key`, or to change model, context, port, `OPENWEBUI` or the router's address. |
+| `--reconfigure` | An existing Hermes CT. Pushes the router's **current** and backend keys, installer, dispatcher and units; updates the CT's Hermes firewall rules from the current inventory; then registers it again. Use it after a key rotation, adding a model server, or changing model, context, port, `OPENWEBUI` or router address. |
 | `--integrate-only` | Registers an existing CT's API server in Open WebUI again, for example after resetting `webui.db`. |
 
 Rerunning the guest installer with unchanged settings says "nothing to do".
-It compares a settings record that includes a hash of the router key, so a
-rotated key counts as a change. A failure while configuring restores the
-previous `config.yaml`, `.env` and unit, and health-checks the previous API
+It compares a settings record that includes hashes of the router and backend
+keys, so a rotated key counts as a change. A failure while configuring restores
+the previous `config.yaml`, `.env` and units, and health-checks the previous API
 server: it reports "running again" or "did not become healthy either".
 
 ## Open WebUI
@@ -126,7 +142,7 @@ progress and keepalives, so long tool runs do not time out.
 - **Who can use it.** Check the model's visibility under Admin Settings →
   Models before sharing it. Anyone who can chat with `hermes-agent` runs tools
   as `hermes` in this CT. They also share one Hermes profile: its memory,
-  skills and the router key in its configuration. For separate users, run one
+  skills and the router and backend keys in its configuration. For separate users, run one
   Hermes profile per user or group, each with its own `API_SERVER_PORT`, key
   and Open WebUI connection.
 - **Task model.** Titles, tags and follow-ups go to `TASK_MODEL`. If that
@@ -147,21 +163,29 @@ only to the API server port. Inbound SSH is not admitted; use
 
 With `EGRESS=restricted` (default), outbound traffic is allowed, in this order:
 
-1. The router's API, from `ROUTER_URL`.
-2. DNS.
-3. HTTP(S) to the internet, for packages, `hermes update`, and Hermes's web
+1. The router's API, from `ROUTER_URL`, for inventory and ranking.
+2. The model server IPs and TCP ports registered in router inventory when the
+   CT was provisioned or last reconfigured. Host names are resolved inside the
+   Hermes CT, so the rules match the addresses the dispatcher connects to; a
+   name the CT cannot resolve is reported and left out.
+3. DNS.
+4. HTTP(S) to the internet, for packages, `hermes update`, and Hermes's web
    tools.
 
 All other outbound traffic is dropped, including private (RFC 1918), CGNAT
-and link-local addresses. An agent with a shell therefore cannot reach the
-model hosts directly, Open Terminal, or other LAN services. `EGRESS=open`
+and link-local addresses. A newly added model server, or a host name whose
+address changed, needs `--reconfigure` to be admitted; model additions on an
+already admitted host are discovered automatically. Until then the dispatcher
+skips it: a server it cannot connect to within 5 seconds is left out of
+candidate lists for 60 seconds, then tried again (unless it is the only
+candidate left). `EGRESS=open`
 allows all outbound traffic, for example when packages must come through a LAN
 proxy.
 
-**What `--reconfigure` changes.** Two rules belong to this target: the inbound
-API rule and the outbound router rule. They carry the rule comment
-`ollama-smart-router hermes-api` / `hermes-router`, which Proxmox keeps when
-you edit the firewall in its GUI. `--reconfigure` replaces only those two,
+**What `--reconfigure` changes.** The inbound API rule, outbound router rule
+and outbound model rules belong to this target. They carry rule comments
+`ollama-smart-router hermes-api`, `hermes-router` and `hermes-model`, which Proxmox keeps when
+you edit the firewall in its GUI. `--reconfigure` replaces only those rules,
 puts them first in `[RULES]` so they match first, and leaves every other line
 as it is.
 - **Order.** Before anything in the CT changes, the new rules are added next
@@ -206,7 +230,8 @@ or set the new commit, when you upgrade.
 | Symptom | Cause / fix |
 |---|---|
 | "rejected the API key … --reconfigure" | The router key was rotated. Run `provision-lxc.sh --reconfigure`. |
-| "test chat request with a tool failed … does not support tools" | No tool-capable model was chosen. Name one in `HERMES_MODEL`, or check `/routing/inventory`: Ollama reports `tools` per model; llama.cpp needs `MODEL_CAPABILITIES=…,tools`. |
+| `model server … is unreachable; skipping it` in `journalctl -u hermes-direct` | The CT cannot connect to that server: not yet admitted (run `--reconfigure` after adding a server or changing its DNS), down, or blocked by the model host's own firewall. |
+| "Direct model-server chat probe failed" | Check `/routing/inventory`, backend keys, and direct access from the Hermes CT to the model host. Ollama reports `tools` per model; llama.cpp needs `MODEL_CAPABILITIES=…,tools`. |
 | The agent forgets its instructions or tools mid-task | The host's context is smaller than `HERMES_CONTEXT_LENGTH`. Raise it on the host (see above). |
 | Open WebUI lists no `hermes-agent` | `systemctl status hermes-gateway` in the CT, then `--integrate-only`. With the firewall on, the router's address needs TCP 8642. |
 | Chats are slow to get a title | Check that the Task Model (External) is a router model, not `hermes-agent`. |

@@ -70,6 +70,7 @@ add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTH
 add_suite open-terminal-integration python "${ROOT}/targets/open-terminal/test-integration.py" python3
 add_suite open-terminal-webui-probe python "${ROOT}/targets/open-terminal/test-webui-probe.py" python3
 add_suite hermes-integration        python "${ROOT}/targets/hermes/test-integration.py"        python3
+add_suite hermes-direct-dispatch    python "${ROOT}/targets/hermes/test-direct-dispatch.py"    python3
 add_suite comfyui-integration       python "${ROOT}/targets/comfyui/test-integration.py"       python3
 add_suite skip-report               python "${HERE}/test-skip-report.py"                       python3
 

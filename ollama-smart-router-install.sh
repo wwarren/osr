@@ -63,7 +63,7 @@ OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 # Python >=3.11,<3.13, which is why a dedicated 3.12 interpreter is provisioned.
 # Change it later on a running container with:
 #   manage-model-servers set-webui-version <version|latest> --apply
-OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.11.0}"
+OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.12.4}"
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-ant-hp-nfs-backups}"
@@ -3097,8 +3097,7 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         "is_vision": is_vision,
         "is_embedding": is_embedding,
         "tools": tools,
-        # True/False when the server reports residency (LM Studio); None
-        # when it does not (Ollama loads on demand and is not asked).
+        # True/False when the server reports residency; None otherwise.
         "loaded": raw.get("loaded"),
         "kind": server_kind(server),
     }
@@ -3264,6 +3263,22 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
     except Exception as exc:  # noqa: BLE001 - any failure means "server is down"
         return server, None, f"{type(exc).__name__}: {exc}"
     raws = [m for m in (payload.get("models") or []) if isinstance(m, dict)]
+    # Ollama's /api/tags lists installed models; /api/ps reports the ones
+    # resident in memory right now. Older bridges may lack /api/ps, in which
+    # case residency remains unknown rather than marking everything cold.
+    try:
+        running = await client.get(f"{server}/api/ps", timeout=DISCOVERY_TIMEOUT)
+        running.raise_for_status()
+        running_models = [m for m in running.json().get("models", []) if isinstance(m, dict)]
+        loaded = {name for m in running_models for name in (m.get("name"), m.get("model"))
+                  if isinstance(name, str)}
+        loaded.update(f"{name}:latest" for name in tuple(loaded) if ":" not in name)
+        loaded_digests = {m["digest"] for m in running_models if m.get("digest")}
+        for raw in raws:
+            raw["loaded"] = ((raw.get("name") or raw.get("model")) in loaded
+                             or bool(raw.get("digest") and raw["digest"] in loaded_digests))
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        pass
     if CAPABILITY_PROBE:
         limit = asyncio.Semaphore(8)   # per poll, so no cross-event-loop state
         caps = await asyncio.gather(*[model_capabilities(client, server, m, limit)
@@ -3884,6 +3899,9 @@ async def routing_explain(request: Request):
     if not messages and isinstance(body.get("prompt"), str):
         messages = [{"role": "user", "content": body["prompt"]}]
     need = apply_tool_needs(classify_request(messages or []), body)
+    requested = str(body.get("model") or "").strip()
+    if requested in TIER_NAMES:
+        need = dict(need, **{"class": TIER_NAMES[requested]})
     candidates = rank_candidates(need)
     return JSONResponse({
         "request": need,
@@ -5187,9 +5205,11 @@ valid_addr() {
 
 # Canonical form of an address: http://host:port for Ollama, or a kind prefix
 # plus http://host:port for the OpenAI-compatible servers. $2 (or SERVER_TYPE)
-# may force the kind; the default port follows it.
+# may force the kind; the default port follows it. A full http(s):// URL
+# without a port gets its scheme's default (80 or 443), written out so the
+# router, the monitor and the Hermes firewall all see the same endpoint.
 normalize_addr() {
-  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base k
+  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base k rest hostport
   for k in $(server_kinds); do
     if [[ "$raw" == "$k"+* ]]; then kind="$k"; raw="${raw#"$k"+}"; break; fi
     if [[ "$raw" == "$k"://* ]]; then kind="$k"; raw="${raw#"$k"://}"; break; fi
@@ -5197,6 +5217,12 @@ normalize_addr() {
   if is_server_kind "$kind"; then port="$(kind_field "$kind" port)"; else port="$OLLAMA_PORT"; fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     base="$raw"
+    rest="${raw#*://}"
+    hostport="${rest%%/*}"
+    if [[ "$hostport" != *:* || "$hostport" == *\] ]]; then
+      if [[ "$raw" == https://* ]]; then k=443; else k=80; fi
+      base="${raw%%://*}://${hostport}:${k}${rest:${#hostport}}"
+    fi
   elif [[ "$raw" == *:* ]]; then
     base="http://${raw}"
   else
@@ -5268,6 +5294,9 @@ detect_server_kind() {
 # the normalized form when nothing matches.
 configured_entry() {
   local url alt k
+  # Stored exactly as typed: an http(s) URL without a port, saved before
+  # normalize_addr wrote the default port out, is still found.
+  get_servers | contains_line "${1%/}" && { printf '%s\n' "${1%/}"; return 0; }
   url="$(normalize_addr "$1")"
   get_servers | contains_line "$url" && { printf '%s\n' "$url"; return 0; }
   for k in lmstudio ollama $(openai_kinds); do

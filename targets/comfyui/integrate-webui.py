@@ -66,6 +66,14 @@ KLEIN_NODES = [
 ]
 
 
+class HTTPStatusError(RuntimeError):
+    """An HTTP error response; .code is the status."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
 def request(url, token=None, data=None, expect=dict):
     headers = {"Accept": "application/json"}
     if token:
@@ -79,12 +87,29 @@ def request(url, token=None, data=None, expect=dict):
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", "replace")
         exc.close()
-        raise RuntimeError(f"{url}: HTTP {exc.code}: {detail}") from exc
+        raise HTTPStatusError(f"{url}: HTTP {exc.code}: {detail}", exc.code) from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{url}: response is not JSON") from exc
     if expect is not None and not isinstance(body, expect):
         raise RuntimeError(f"{url}: unexpected {type(body).__name__} response")
     return body
+
+
+def verify_comfyui(base, token, comfyui, key=None):
+    """Have Open WebUI check its connection to ComfyUI.
+
+    Open WebUI 0.11.4 replaced GET /api/v1/images/config/url/verify (which
+    checks the saved URL) with POST /api/v1/images/verify (which checks the
+    URL and key it is given); routers still on an older release get the
+    old endpoint.
+    """
+    try:
+        return request(f"{base}/verify", token,
+                       {"engine": "comfyui", "url": comfyui, "key": key or None}, expect=None)
+    except HTTPStatusError as exc:
+        if exc.code not in (404, 405):
+            raise
+    return request(f"{base}/config/url/verify", token, expect=None)
 
 
 def combo_options(spec):
@@ -190,7 +215,7 @@ def main(argv=None):
     original = request(f"{base}/config", admin_token)
     if "COMFYUI_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
         raise RuntimeError("This Open WebUI's image settings API is not supported "
-                           "(no COMFYUI_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.11.0)")
+                           "(no COMFYUI_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.12.4)")
     custom = not is_default_workflow(original.get("COMFYUI_WORKFLOW"))
     variant = args.variant
     if variant == "auto":
@@ -229,8 +254,8 @@ def main(argv=None):
 
     request(f"{base}/config/update", admin_token, new)
     try:
-        # Open WebUI's backend checks the saved URL itself (GET <url>/object_info).
-        if request(f"{base}/config/url/verify", admin_token, expect=None) is not True:
+        # Open WebUI's backend checks the URL itself (GET <url>/object_info).
+        if verify_comfyui(base, admin_token, comfyui, new.get("COMFYUI_API_KEY")) is not True:
             raise RuntimeError("Open WebUI did not verify the ComfyUI URL")
         if ready and not custom:
             listed = request(f"{base}/models", admin_token, expect=list)

@@ -23,7 +23,7 @@ bash -n "$script" || fail 'shell syntax'
 out=$(ROUTER_URL=http://192.168.11.80:8000 bash "$script" --dry-run) || fail 'dry run'
 [[ $out == *'provider=custom'* && $out == *'model=auto'* && $out == *'--non-interactive'* ]] ||
   fail "dry run omitted the installer or router configuration: $out"
-[[ $out == *'api_key=<router key>'* && $out == *'with the router API key'* ]] || fail 'dry run omitted the router key'
+[[ $out == *'api_key=<local placeholder>'* && $out == *'with the router API key'* ]] || fail 'dry run omitted credential separation'
 [[ $out == *'--channel stable'* && $out == *'offering a tool'* ]] || fail 'dry run omitted the channel or chat probe'
 [[ $out == *'no API server'* ]] || fail 'dry run without HERMES_API_SERVER'
 out=$(ROUTER_URL=http://r:8000 HERMES_API_SERVER=true HERMES_COMMIT="$(printf 'a%.0s' {1..40})" \
@@ -69,6 +69,7 @@ pass 'the .env editor sets, removes and keeps lines, and only drops the old no-k
 ROUTER_URL=http://r:8000 HERMES_MODEL=auto HERMES_CONTEXT_LENGTH=65536 HERMES_CHANNEL=stable HERMES_COMMIT=
 # shellcheck disable=SC2034
 HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent unit_sha256=u
+backend_keys_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
 record=$(settings_record)
 [[ $record == *"ROUTER_KEY_SHA256=$router_key_sha256"* && $record != *sk-secret-key* ]] ||
@@ -109,10 +110,11 @@ stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
 # install: drop -o/-g (the hermes account does not exist here).
 stub install 'a=(); while (( $# )); do case $1 in -o|-g) shift 2;; *) a+=("$1"); shift;; esac; done; exec /usr/bin/install "${a[@]}"'
 stub git '[[ $1 == -C && $3 == rev-parse ]] || exit 1; cat "$2/.commit" 2>/dev/null || exit 128'
-stub systemctl 'case $1 in
-  is-active) [[ -e $FAKE_STATE/active ]] ;;
-  restart) touch "$FAKE_STATE/active" ;;
-  disable) [[ $2 != --now ]] || rm -f "$FAKE_STATE/active" ;;
+stub systemctl 'unit=${*: -1}; file=$FAKE_STATE/active; [[ $unit != hermes-direct.service ]] || file=$FAKE_STATE/direct-active
+case $1 in
+  is-active) [[ -e $file ]] ;;
+  restart) touch "$file" ;;
+  disable) [[ $2 != --now ]] || rm -f "$file" ;;
 esac; exit 0'
 # The upstream installer: logs its arguments, writes the launcher and a checkout.
 cat > "$tmp_root/upstream-install.sh" <<'UP'
@@ -203,6 +205,17 @@ if url.startswith(router):
         reply(200, {"choices": [{"message": {"role": "assistant", "content": "ready"}}]})
 if url.startswith("http://127.0.0.1:"):
     port = url.split(":")[2].split("/")[0]
+    if port == "8765":
+        if not os.path.exists(os.path.join(state, "direct-active")): refused()
+        if url.endswith("/healthz"): reply(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            reply(200, {"object": "list", "data": [{"id": "auto"}, {"id": "qwen3:32b"}]})
+        if url.endswith("/v1/chat/completions"):
+            with open(os.path.join(state, "probe.json"), "w") as f: f.write(data or "")
+            status = int(os.environ.get("FAKE_CHAT_STATUS", "200"))
+            if status != 200:
+                reply(status, {"error": {"message": os.environ.get("FAKE_CHAT_ERROR", "boom")}})
+            reply(200, {"choices": [{"message": {"role": "assistant", "content": "ready"}}]})
     if not os.path.exists(os.path.join(state, "active")): refused()
     if port != env_file("API_SERVER_PORT") or port == os.environ.get("FAKE_BAD_PORT"): refused()
     if url.endswith("/health"):
@@ -227,6 +240,7 @@ reset_tree() {
   rm -rf -- "${deploy:?}" "${tmp_root:?}/home" "${tmp_root:?}/etc" "${units:?}" "${state:?}"/* "${log:?}"
   mkdir -p "$deploy" "$units" "$tmp_root/etc"
   cp "$script" "$here/hermes-gateway.service" "$deploy/"
+  cp "$here/direct-dispatch.py" "$here/hermes-direct.service" "$deploy/"
   : > "$log"
 }
 router_key=sk-router-0123456789abcdef
@@ -234,6 +248,7 @@ push_key() { printf '%s\n' "${1:-$router_key}" > "$deploy/router-api-key"; chmod
 # guest [VAR=value ...]: run the deployed installer in the fake tree.
 guest() {
   env PATH="$bin:$PATH" HERMES_USER_HOME="$home" HERMES_ETC="$etc" UNIT_DIR="$units" \
+    DIRECT_LIB="$tmp_root/hermes-direct.py" \
     LOCK_FILE="$tmp_root/etc/hermes-target.lock" HEALTH_TIMEOUT=2 \
     FAKE_INSTALLER="$tmp_root/upstream-install.sh" FAKE_ROUTER_KEY="$router_key" \
     ROUTER_URL=http://192.168.11.80:8000 HERMES_API_SERVER=true "$@" \
@@ -247,9 +262,9 @@ out=$(guest) || fail "fresh install: $out"
 grep -q 'upstream-install --non-interactive --skip-browser --skip-computer-use --channel stable' "$log" ||
   fail 'upstream installer flags'
 config=$home/.hermes/config.kv
-[[ $(kv model.provider "$config") == custom && $(kv model.base_url "$config") == http://192.168.11.80:8000/v1 ]] ||
+[[ $(kv model.provider "$config") == custom && $(kv model.base_url "$config") == http://127.0.0.1:8765/v1 ]] ||
   fail "provider config: $(cat "$config")"
-[[ $(kv model.api_key "$config") == "$router_key" ]] || fail 'model.api_key is not the router key'
+[[ $(kv model.api_key "$config") == no-key ]] || fail 'model.api_key is not the local placeholder'
 [[ $(kv model.context_length "$config") == 65536 && $(kv model.default "$config") == auto ]] || fail 'model and context'
 env_file=$home/.hermes/.env
 [[ $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] || fail 'ROUTER_API_KEY not kept for reruns'
@@ -258,14 +273,14 @@ env_file=$home/.hermes/.env
 [[ $(kv API_SERVER_KEY "$env_file") == "$(< "$etc/api-key")" && $(wc -c < "$etc/api-key") -ge 64 ]] || fail 'API key'
 [[ $(stat -c %a "$env_file") == 600 && $(stat -c %a "$etc/api-key") == 600 ]] || fail 'secret file modes'
 [[ ! -e $deploy/router-api-key ]] || fail 'the pushed router key was not removed'
-[[ -f $units/hermes-gateway.service && -e $state/active ]] || fail 'gateway unit not installed and started'
+[[ -f $units/hermes-gateway.service && -e $state/active && -e $state/direct-active ]] || fail 'gateway or direct unit not started'
 grep -q "ROUTER_KEY_SHA256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)" "$etc/settings" || fail 'settings key hash'
 grep -q "$router_key" "$etc/settings" && fail 'the settings record holds the router key'
 grep '^curl ' "$log" | grep -q "$router_key" && fail 'the router key was passed to curl in argv'
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["tools"]' "$state/probe.json" ||
   fail 'the chat probe did not offer a tool'
 [[ $out == *'Pin this version with HERMES_COMMIT=cafe'* ]] || fail 'the installed commit is not reported'
-pass 'fresh install: router key as model.api_key, API server, unit started, key file removed, key never in curl argv'
+pass 'fresh install: local provider, separate router key, API server, direct unit, key file removed'
 
 # 2. Unchanged: nothing to do.
 : > "$log"
@@ -279,7 +294,7 @@ old_api_key=$(< "$etc/api-key")
 router_key=sk-router-rotated-999999
 push_key
 out=$(guest) || fail "rotation: $out"
-[[ $(kv model.api_key "$config") == "$router_key" && $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] ||
+[[ $(kv model.api_key "$config") == no-key && $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] ||
   fail 'the rotated key was not applied'
 [[ $(< "$etc/api-key") == "$old_api_key" ]] || fail 'the API server key changed on a router key rotation'
 grep -q '^upstream-install' "$log" && fail 'a key rotation reinstalled Hermes'
@@ -299,18 +314,17 @@ out=$(guest) && fail 'a missing key was accepted'
 grep -q '^apt-get install -y --no-install-recommends ca-certificates curl git' "$log" && fail 'packages installed before the probe'
 pass 'a router that needs a key and gets none is reported before anything is installed'
 
-# 6. The tool probe fails: nothing is installed, the error names tools.
+# 6. The direct tool probe fails: configuration is rolled back.
 reset_tree; push_key
 out=$(guest FAKE_CHAT_STATUS=400 FAKE_CHAT_ERROR='registry.ollama.ai/library/gemma3:12b does not support tools') &&
   fail 'a failed tool probe was accepted'
-[[ $out == *'does not support tools'*'tool-capable model'*'Nothing was changed'* ]] || fail "probe message: $out"
-[[ ! -e $home/.hermes/config.kv ]] || fail 'configuration written after a failed probe'
-grep -q '^upstream-install' "$log" && fail 'Hermes installed after a failed probe'
+[[ $out == *'Direct model-server chat probe failed'*'does not support tools'* ]] || fail "probe message: $out"
+[[ ! -e $etc/settings ]] || fail 'settings kept after a failed probe'
 [[ -e $deploy/router-api-key ]] || fail 'the key file must stay for a retry'
 rm -f "$state/probe.json"
 out=$(guest FAKE_CHAT_STATUS=400 HERMES_SKIP_CHAT_PROBE=true) || fail "skip probe: $out"
 [[ ! -e $state/probe.json ]] || fail 'HERMES_SKIP_CHAT_PROBE still sent a chat request'
-pass 'a failed tool-call probe stops the install with a tool hint; it can be skipped explicitly'
+pass 'a failed direct tool-call probe rolls back the settings; it can be skipped explicitly'
 
 # 7. Unknown model, unreachable router.
 reset_tree; push_key
@@ -361,7 +375,7 @@ pass 'a failing configuration command restores config.yaml, .env and the unit'
 
 # 11. Switching the API server off removes the unit and the API settings.
 out=$(guest HERMES_API_SERVER=false) || fail "API server off: $out"
-[[ ! -e $units/hermes-gateway.service && ! -e $state/active ]] || fail 'the unit was not removed'
+[[ ! -e $units/hermes-gateway.service && ! -e $state/active && -e $state/direct-active ]] || fail 'the gateway was not removed or the dispatcher stopped'
 grep -q '^API_SERVER_' "$env_file" && fail 'API server settings left in .env'
 [[ $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] || fail 'ROUTER_API_KEY lost'
 pass 'HERMES_API_SERVER=false stops and removes the gateway and its settings'
@@ -374,8 +388,8 @@ printf 'OPENAI_API_KEY=no-key\n' >> "$env_file"
 push_key
 out=$(guest HERMES_API_SERVER=false) || fail "migration: $out"
 grep -q '^OPENAI_API_KEY=' "$env_file" && fail 'the old no-key placeholder was kept'
-[[ $(kv model.api_key "$config") == "$router_key" ]] || fail 'migration did not set model.api_key'
-pass 'an install from the first version gets the router key and loses the no-key placeholder'
+[[ $(kv model.api_key "$config") == no-key ]] || fail 'migration did not set local model.api_key'
+pass 'an install from the first version uses the local dispatcher and removes the old placeholder'
 
 # 13. Pins: the commit is passed, a changed pin re-runs the installer, and an
 # installer whose SHA-256 differs is refused.

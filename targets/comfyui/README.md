@@ -170,7 +170,9 @@ image setting is kept:
   1024x1024 and 4 steps for the distilled model).
 
 Then it asks Open WebUI's backend to verify the URL
-(`/api/v1/images/config/url/verify`) and to list the diffusion models. That proves
+(`POST /api/v1/images/verify` from Open WebUI 0.11.4, falling back to
+`/api/v1/images/config/url/verify` on older releases) and to list the
+diffusion models. That proves
 the router CT can reach ComfyUI through the firewall. On failure the previous
 image settings are restored and the run fails.
 
@@ -181,8 +183,8 @@ ComfyUI, choose the selected **distilled** diffusion model, set four steps and
 CFG 1, then use **Export (API)**. In Open WebUI's Admin Settings
 > Images, upload the exported JSON and map prompt, model, width, height,
 steps, batch size, and seed to the corresponding node inputs. This becomes a
-custom workflow, so future integration runs preserve it. Open WebUI 0.11.0
-expects ComfyUI's legacy model-list format; the integration checks its model
+custom workflow, so future integration runs preserve it. Open WebUI (0.11.0
+through the pinned 0.12.4) expects ComfyUI's legacy model-list format; the integration checks its model
 picker and restores the previous settings if the selected model does not
 appear.
 

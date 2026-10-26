@@ -43,6 +43,16 @@ fw=$(firewall_config open 192.0.2.80 192.0.2.80 8000 '')
 [[ $fw == *'policy_out: ACCEPT'* && $fw != *'IN ACCEPT'* && $fw != *'OUT '* ]] || fail "open egress, no API: $fw"
 pass 'helpers: router kind, route source, URL parts, and firewall rules in first-match order'
 
+inv=$tmp_root/inventory.json
+printf '{"enabled":true,"servers":["http://plain.lan","maya+https://secure.lan/","strata+http://10.0.0.5:8080","http://10.0.0.5:8080"]}\n' > "$inv"
+[[ $(inventory_endpoints "$inv") == $'plain.lan 80\nsecure.lan 443\n10.0.0.5 8080' ]] ||
+  fail "inventory endpoints: $(inventory_endpoints "$inv" 2>&1)"
+for bad in http://h:0 http://h:99999 ftp://h:21 http://user@h:80 'http://h:80?x=1'; do
+  printf '{"enabled":true,"servers":["%s"]}\n' "$bad" > "$inv"
+  if inventory_endpoints "$inv" >/dev/null 2>&1; then fail "inventory endpoint accepted: $bad"; fi
+done
+pass 'inventory endpoints: a URL without a port uses 80 (http) or 443 (https); bad URLs are refused'
+
 # Reconfigure rewrites only this target's rules (marked with a rule comment, or
 # in the layout earlier versions wrote) and keeps every other line.
 fwfile=$tmp_root/legacy.fw
@@ -201,6 +211,7 @@ has 'HERMES_API_SERVER=true'
 has 'ROUTER_URL=http://\<router-source-ip\>:8000'
 has 'integrate-webui.py --webui-url http://127.0.0.1:8080 --hermes-url http://192.0.2.82:8642/v1'
 has '--task-model fast'
+has '+ resolve model server host names inside CT 282 and admit their addresses'
 pass 'the default plan reads the router key, firewalls the API to the router, installs and registers Hermes'
 
 plan OPENWEBUI=false
@@ -259,6 +270,7 @@ case $cmd in
     if [[ $id == 280 ]]; then
       case $all in
         'test -f /app/router/router.py') exit 0 ;;
+        awk*LMSTUDIO_API_TOKEN*secrets.env) printf 'STRATA_API_KEY=sk-backend-secret\n' ;;
         awk*secrets.env) [[ -n ${FAKE_NO_ROUTER_KEY:-} ]] || printf '%s\n' "$FAKE_ROUTER_KEY" ;;
         *ROUTER_PORT*) echo 8000 ;;
         *PORT=*openwebui*) echo 8080 ;;
@@ -284,6 +296,18 @@ case $cmd in
             "$(cat "$FAKE_DIR/ct$id/api-state")" "$(cat "$FAKE_DIR/ct$id/api-port")" ;;
         'test -s /etc/hermes-target/api-key') [[ -e $FAKE_DIR/ct$id/api-server ]] ;;
         sh\ -c\ *ip\ -4\ -o\ addr*) echo 192.0.2.82 ;;
+        getent\ ahostsv4\ *)
+          # The CT's own resolver: FAKE_CT_DNS='name=ip,ip;name=ip'.
+          [[ -e $FAKE_DIR/ct$id ]] || exit 2
+          name=${all#getent ahostsv4 }; found=2
+          IFS=';' read -r -a pairs <<< "${FAKE_CT_DNS:-}"
+          for pair in "${pairs[@]}"; do
+            [[ ${pair%%=*} == "$name" ]] || continue
+            IFS=',' read -r -a addrs <<< "${pair#*=}"
+            for a in "${addrs[@]}"; do printf '%s STREAM %s\n%s DGRAM\n%s RAW\n' "$a" "$name" "$a" "$a"; done
+            found=0
+          done
+          exit "$found" ;;
         sh\ -c\ test\ -d\ /run/systemd/system*) exit 0 ;;
         'install -d -m 0700 /root/hermes-deploy') : ;;
         env\ *install-target.sh) touch "$FAKE_DIR/ct$id/installed"
@@ -311,6 +335,8 @@ echo "pvesm $*" >> "$FAKE_LOG"
 case $1 in path) echo "$FAKE_DIR/template" ;; status) printf 'Name Type Status\nlocal-lvm lvmthin active\n' ;; esac
 EOF
 printf '#!/usr/bin/env bash\necho pve-manager/9\n' > "$bin/pveversion"
+# The HOST's resolver gives other answers: model server names must not use it.
+printf '#!/usr/bin/env bash\necho "getent $*" >> "$FAKE_LOG"\necho "198.51.100.99 STREAM $3"\n' > "$bin/getent"
 # id: root unless FAKE_UID says otherwise, so these runs need no real root.
 printf '#!/usr/bin/env bash\n[[ $1 == -u ]] && echo "${FAKE_UID:-0}"\n' > "$bin/id"
 mkdir -p "$fake/net/lo"
@@ -318,12 +344,27 @@ mkdir -p "$fake/net/lo"
 cat > "$bin/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >> "$FAKE_LOG"
-hdr=''
-while (( $# )); do [[ $1 == -H && $2 == @* ]] && hdr=$(cat "${2#@}"); shift; done
+hdr='' out='' url=''
+while (( $# )); do
+  if [[ $1 == -H && $2 == @* ]]; then hdr=$(cat "${2#@}"); shift 2
+  elif [[ $1 == -o ]]; then out=$2; shift 2
+  elif [[ $1 == http* ]]; then url=$1; shift
+  else shift; fi
+done
 [[ -n ${FAKE_ROUTER_REJECTS:-} ]] && { printf 401; exit 0; }
-[[ $hdr == "Authorization: Bearer $FAKE_ROUTER_KEY" || -n ${FAKE_NO_ROUTER_KEY:-} ]] && printf 200 || printf 401
+if [[ $hdr == "Authorization: Bearer $FAKE_ROUTER_KEY" || -n ${FAKE_NO_ROUTER_KEY:-} ]]; then
+  if [[ $url == */routing/inventory ]]; then
+    servers=${FAKE_INVENTORY_SERVERS:-strata+http://${FAKE_MODEL_SERVER:-192.0.2.71}:8080}
+    json=$(printf '"%s",' ${servers//,/ })
+    printf '{"enabled":true,"servers":[%s],"models":[]}\n' "${json%,}" > "$out"
+  fi
+  printf 200
+else printf 401; fi
 EOF
 chmod +x "$bin"/*
+python_cmd=${PYTHON_FOR_TEST:-$(command -v python3)}
+printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$python_cmd" > "$bin/python3"
+chmod +x "$bin/python3"
 touch "$fake/template"
 
 real() {
@@ -339,12 +380,14 @@ stages_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-setup.*' | wc -
 reset_fake
 out=$(real) || fail "full run: $out"
 [[ $(cat "$fake/pushed-282-router-api-key") == "$router_key" ]] || fail 'the router key was not pushed to the CT'
+[[ $(cat "$fake/pushed-282-backend-keys") == 'STRATA_API_KEY=sk-backend-secret' ]] || fail 'the backend key was not pushed to the CT'
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 grep -q 'install-target.sh' "$log" && grep -q 'HERMES_API_SERVER=true' "$log" || fail 'guest installer not run with the API server'
 grep -q 'ROUTER_URL=http://192.0.2.80:8000' "$log" || fail 'ROUTER_URL not derived from the router address'
 fwfile=$fake/pve/firewall/282.fw
 grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
 grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" || fail 'router egress rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fwfile" || fail 'model egress rule'
 grep -q -- '--hermes-url http://192.0.2.82:8642/v1' "$log" || fail 'integration URL'
 grep -q 'rm -rf -- /root/hermes-integration.AbC123' "$log" || fail 'the router staging directory was not removed'
 [[ $out == *'Open WebUI connection 1 added'* && $out == *'hermes-agent'* ]] || fail "summary: $out"
@@ -379,6 +422,12 @@ out=$(real --reconfigure) || fail "reconfigure: $out"
 grep -q 'pct create' "$log" && fail '--reconfigure created a CT'
 [[ $(cat "$fake/pushed-282-router-api-key") == "$router_key" ]] || fail '--reconfigure did not push the current key'
 grep -q 'integrate-webui.py' "$log" || fail '--reconfigure did not register again'
+: > "$log"
+out=$(real --reconfigure FAKE_MODEL_SERVER=192.0.2.72) || fail "changed model server: $out"
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fake/pve/firewall/282.fw" || fail 'new model server not admitted'
+grep -q '192.0.2.71/32.*hermes-model' "$fake/pve/firewall/282.fw" && fail 'old model server still admitted'
+: > "$log"
+out=$(real --reconfigure) || fail "restore model server: $out"
 : > "$log"
 out=$(real --integrate-only) || fail "integrate-only: $out"
 grep -q 'install-target.sh' "$log" && fail '--integrate-only ran the installer'
@@ -455,6 +504,7 @@ pass 'a legacy CLI-only CT keeps an unmarked custom inbound rule and stops befor
 # from the CT's /etc/hermes-target/settings.
 reset_fake
 out=$(real HERMES_API_PORT=8643) || fail "API server on 8643: $out"
+sed -i '/hermes-model/d' "$fwfile"
 sed -i 's/ # ollama-smart-router hermes-[a-z]*$//' "$fwfile"
 grep -q 'ollama-smart-router' "$fwfile" && fail 'test setup: the legacy layout still has comments'
 : > "$log"
@@ -466,6 +516,33 @@ grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-
 [[ $(grep -c '^IN ' "$fwfile") == 1 && $(grep -c 'dport 8000 ' "$fwfile") == 1 ]] || fail "legacy rules duplicated: $(cat "$fwfile")"
 grep -q 'integrate-webui.py' "$log" || fail 'the upgraded CT was not registered again'
 pass 'a CT from the previous version with its API server on 8643 is upgraded: both rules adopted and marked'
+
+# Model servers by host name, and URLs without a port.
+reset_fake
+servers=strata+http://models.lan:8080,http://plain.lan,maya+https://secure.lan,http://192.0.2.75,http://nowhere.lan:11434
+dns='FAKE_CT_DNS=models.lan=192.0.2.73,192.0.2.74;plain.lan=192.0.2.76;secure.lan=192.0.2.77'
+out=$(real FAKE_INVENTORY_SERVERS=$servers "$dns") || fail "model servers by name: $out"
+fwfile=$fake/pve/firewall/282.fw
+for want in 192.0.2.73/32:8080 192.0.2.74/32:8080 192.0.2.76/32:80 192.0.2.77/32:443 192.0.2.75/32:80; do
+  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # ollama-smart-router hermes-model"
+  grep -qxF "$rule" "$fwfile" || fail "missing $rule: $(cat "$fwfile")"
+  grep -qxF "$rule" "$fake/fw-at-guest" || fail "not admitted before the guest step: $rule"
+done
+[[ $(grep -c 'hermes-model' "$fwfile") == 5 ]] || fail "model rule count: $(cat "$fwfile")"
+grep -q '198.51.100.99' "$fwfile" && fail 'a model server was resolved on the Proxmox host'
+grep -q '^getent ' "$log" && fail "the host resolver was used: $(grep '^getent ' "$log")"
+start=$(grep -n 'pct start 282' "$log" | cut -d: -f1); lookup=$(grep -n 'getent ahostsv4 models.lan' "$log" | head -n1 | cut -d: -f1)
+[[ -n $start && -n $lookup ]] && (( lookup > start )) || fail 'names were not resolved inside the running CT'
+[[ $out == *'cannot resolve model server nowhere.lan'* ]] || fail "unresolvable name not reported: $out"
+: > "$log"
+out=$(real --reconfigure FAKE_INVENTORY_SERVERS=$servers 'FAKE_CT_DNS=models.lan=192.0.2.79;plain.lan=192.0.2.76;secure.lan=192.0.2.77') ||
+  fail "reconfigure after a DNS change: $out"
+grep -qxF 'OUT ACCEPT -dest 192.0.2.79/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fwfile" ||
+  fail "new address not admitted: $(cat "$fwfile")"
+grep -q -e '192.0.2.73/32' -e '192.0.2.74/32' "$fwfile" && fail "old addresses still admitted: $(cat "$fwfile")"
+grep -qxF 'OUT ACCEPT -dest 192.0.2.76/32 -p tcp -dport 80 -log nolog # ollama-smart-router hermes-model' "$fwfile" ||
+  fail 'an unchanged name lost its rule'
+pass 'model server names are resolved inside the CT (every address), ports default to 80/443, and --reconfigure follows DNS changes'
 
 reset_fake
 out=$(real FAKE_UID=1000) && fail 'a run without root was accepted'

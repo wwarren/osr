@@ -497,8 +497,7 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         "is_vision": is_vision,
         "is_embedding": is_embedding,
         "tools": tools,
-        # True/False when the server reports residency (LM Studio); None
-        # when it does not (Ollama loads on demand and is not asked).
+        # True/False when the server reports residency; None otherwise.
         "loaded": raw.get("loaded"),
         "kind": server_kind(server),
     }
@@ -664,6 +663,22 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str) -> tuple:
     except Exception as exc:  # noqa: BLE001 - any failure means "server is down"
         return server, None, f"{type(exc).__name__}: {exc}"
     raws = [m for m in (payload.get("models") or []) if isinstance(m, dict)]
+    # Ollama's /api/tags lists installed models; /api/ps reports the ones
+    # resident in memory right now. Older bridges may lack /api/ps, in which
+    # case residency remains unknown rather than marking everything cold.
+    try:
+        running = await client.get(f"{server}/api/ps", timeout=DISCOVERY_TIMEOUT)
+        running.raise_for_status()
+        running_models = [m for m in running.json().get("models", []) if isinstance(m, dict)]
+        loaded = {name for m in running_models for name in (m.get("name"), m.get("model"))
+                  if isinstance(name, str)}
+        loaded.update(f"{name}:latest" for name in tuple(loaded) if ":" not in name)
+        loaded_digests = {m["digest"] for m in running_models if m.get("digest")}
+        for raw in raws:
+            raw["loaded"] = ((raw.get("name") or raw.get("model")) in loaded
+                             or bool(raw.get("digest") and raw["digest"] in loaded_digests))
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        pass
     if CAPABILITY_PROBE:
         limit = asyncio.Semaphore(8)   # per poll, so no cross-event-loop state
         caps = await asyncio.gather(*[model_capabilities(client, server, m, limit)
@@ -1284,6 +1299,9 @@ async def routing_explain(request: Request):
     if not messages and isinstance(body.get("prompt"), str):
         messages = [{"role": "user", "content": body["prompt"]}]
     need = apply_tool_needs(classify_request(messages or []), body)
+    requested = str(body.get("model") or "").strip()
+    if requested in TIER_NAMES:
+        need = dict(need, **{"class": TIER_NAMES[requested]})
     candidates = rank_candidates(need)
     return JSONResponse({
         "request": need,

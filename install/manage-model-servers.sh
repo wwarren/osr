@@ -288,9 +288,11 @@ valid_addr() {
 
 # Canonical form of an address: http://host:port for Ollama, or a kind prefix
 # plus http://host:port for the OpenAI-compatible servers. $2 (or SERVER_TYPE)
-# may force the kind; the default port follows it.
+# may force the kind; the default port follows it. A full http(s):// URL
+# without a port gets its scheme's default (80 or 443), written out so the
+# router, the monitor and the Hermes firewall all see the same endpoint.
 normalize_addr() {
-  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base k
+  local raw="${1%/}" kind="${2:-$SERVER_TYPE}" port base k rest hostport
   for k in $(server_kinds); do
     if [[ "$raw" == "$k"+* ]]; then kind="$k"; raw="${raw#"$k"+}"; break; fi
     if [[ "$raw" == "$k"://* ]]; then kind="$k"; raw="${raw#"$k"://}"; break; fi
@@ -298,6 +300,12 @@ normalize_addr() {
   if is_server_kind "$kind"; then port="$(kind_field "$kind" port)"; else port="$OLLAMA_PORT"; fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     base="$raw"
+    rest="${raw#*://}"
+    hostport="${rest%%/*}"
+    if [[ "$hostport" != *:* || "$hostport" == *\] ]]; then
+      if [[ "$raw" == https://* ]]; then k=443; else k=80; fi
+      base="${raw%%://*}://${hostport}:${k}${rest:${#hostport}}"
+    fi
   elif [[ "$raw" == *:* ]]; then
     base="http://${raw}"
   else
@@ -369,6 +377,9 @@ detect_server_kind() {
 # the normalized form when nothing matches.
 configured_entry() {
   local url alt k
+  # Stored exactly as typed: an http(s) URL without a port, saved before
+  # normalize_addr wrote the default port out, is still found.
+  get_servers | contains_line "${1%/}" && { printf '%s\n' "${1%/}"; return 0; }
   url="$(normalize_addr "$1")"
   get_servers | contains_line "$url" && { printf '%s\n' "$url"; return 0; }
   for k in lmstudio ollama $(openai_kinds); do

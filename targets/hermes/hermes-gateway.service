@@ -1,8 +1,9 @@
 [Unit]
 Description=Hermes Agent gateway (OpenAI-compatible API server for Open WebUI)
 Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server
-After=network-online.target
+After=network-online.target hermes-direct.service
 Wants=network-online.target
+Requires=hermes-direct.service
 
 [Service]
 Type=simple

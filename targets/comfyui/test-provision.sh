@@ -170,7 +170,7 @@ stub pct 'case "$*" in
     "status 286") [[ -n ${FAKE_NO_CT:-} ]] && exit 2; echo "status: running" ;;
     "exec 280 -- systemctl is-active --quiet open-webui.service") exit "${FAKE_WEBUI_DOWN:-0}" ;;
     "exec 280 -- sh -c sed"*) echo 8080 ;;
-    "exec 280 -- python3 -c "*) echo 0.11.0 ;;
+    "exec 280 -- python3 -c "*) echo 0.12.4 ;;
     "exec 280 -- ip -4 route get "*) echo "192.0.2.86 dev eth0 src 192.0.2.80 uid 0" ;;
     "exec 280 -- mktemp "*) echo /root/comfyui-integration.AbC123 ;;
     "exec 280 -- python3 /root/comfyui-integration.AbC123/integrate-webui.py "*) exit "${FAKE_INTEGRATE_RC:-0}" ;;

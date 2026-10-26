@@ -205,7 +205,7 @@ all defaults and skips the prompts):
 |---|---|
 | CT | `CT_ID`, `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 is enough with CPU-only torch) |
 | Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it, or 8000/8080 may be dropped) |
-| Open WebUI | `OPENWEBUI_VERSION` (0.11.0), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
+| Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
@@ -516,6 +516,16 @@ checked against PyPI and against the venv's Python before the pin is written.
 If the upgraded UI fails its health check, the previous version and
 `webui.db` are restored.
 
+New installs get Open WebUI 0.12.4. To bring an existing router up to it, run
+`manage-model-servers set-webui-version 0.12.4 --apply`. Open WebUI 0.11.1,
+0.12.0 and 0.12.1 migrate the database, so an older version cannot open it
+afterwards. `apply` copies `webui.db` into its snapshot under
+`/var/backups/ollama-smart-router/<timestamp>/openwebui-data/` before
+upgrading; only the last `APPLY_BACKUP_KEEP` (5) snapshots are kept, so copy
+that directory elsewhere if you may want to roll back later. Re-run a ComfyUI
+router's `targets/comfyui/integrate-webui.py` only if its image settings need
+to change: it handles both the 0.11.4+ connection check and the older one.
+
 ### Inference targets
 
 Each target has `provision-lxc.sh` (run on the PVE host; it creates the CT,
@@ -540,10 +550,11 @@ from the Proxmox VE community scripts and are set up for the router by their
 `install-target.sh`.
 
 [Hermes Agent](targets/hermes/README.md) is an agent client, not a pool
-member. Its own CT uses the router's `:8000/v1` API (with `ROUTER_API_KEY`) as
-its model provider, and by default its API server is added to Open WebUI as the
+member. Its CT discovers model servers and task ranking from the router, then
+sends inference directly to the selected server. By default its API server is added to Open WebUI as the
 model `hermes-agent`. Needs a tool-capable model with 64K context. After
-`set-api-key`, run its `provision-lxc.sh --reconfigure`.
+`set-api-key`, a backend key rotation or a new model server, run its
+`provision-lxc.sh --reconfigure`.
 
 [ComfyUI](targets/comfyui/README.md) is Open WebUI's image generation engine,
 not a pool member: chats get an image button, backed by ComfyUI on a GPU in

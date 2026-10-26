@@ -159,6 +159,12 @@ describe normalize_addr
 assert_eq "adds scheme+port"   "http://10.0.0.5:11434" "$(normalize_addr 10.0.0.5)"
 assert_eq "keeps explicit port" "http://10.0.0.5:9999" "$(normalize_addr 10.0.0.5:9999)"
 assert_eq "strips trailing /"   "http://h:1"           "$(normalize_addr http://h:1/)"
+assert_eq "http:// without a port gets 80"   "http://h:80"            "$(normalize_addr http://h)"
+assert_eq "https:// without a port gets 443" "https://h:443"          "$(normalize_addr https://h/)"
+assert_eq "a kind keeps the scheme default"  "strata+https://h:443"   "$(normalize_addr strata+https://h)"
+assert_eq "the port goes before a path"      "http://h:80/ollama"     "$(normalize_addr http://h/ollama)"
+assert_eq "an IPv6 literal gets a port too"  "http://[fd00::5]:80"    "$(normalize_addr 'http://[fd00::5]')"
+assert_eq "an explicit https port is kept"   "https://h:8443"         "$(normalize_addr https://h:8443)"
 assert_eq "matches the installer normalisation" \
   "http://ollama1.lan:11434" "$(normalize_addr ollama1.lan)"
 
@@ -609,6 +615,10 @@ assert_eq "finds the Strata entry without the prefix"    "strata+http://10.0.0.8
 assert_eq "finds the Basalt entry without the prefix"    "basalt+http://10.0.0.7:8080"  "$(configured_entry 10.0.0.7:8080)"
 assert_eq "finds an Ollama entry"                         "http://10.0.0.51:11434"       "$(configured_entry 10.0.0.51)"
 assert_eq "unknown -> normalized form"                    "http://10.0.0.99:11434"       "$(configured_entry 10.0.0.99)"
+env_set MODEL_SERVERS "http://old.lan,strata+https://older.lan"
+assert_eq "finds a stored URL without a port"            "http://old.lan"               "$(configured_entry http://old.lan/)"
+assert_eq "and one with a kind prefix"                   "strata+https://older.lan"     "$(configured_entry strata+https://older.lan)"
+assert_eq "a new URL without a port gets 80"             "http://new.lan:80"            "$(configured_entry http://new.lan)"
 reset_repo
 
 describe model_present_on

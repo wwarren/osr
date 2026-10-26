@@ -71,7 +71,8 @@ flowchart LR
     webui -->|terminal tool| term
     webui -->|"OpenAI API (hermes-agent)"| hermes
     webui -->|"image generation"| comfy
-    hermes -->|OpenAI API :8000| router
+    hermes -.->|inventory and ranking :8000| router
+    hermes -->|direct inference| pool
     router -->|direct dispatch| pool
     router -.->|fallback| litellm
     litellm --> pool
@@ -92,8 +93,8 @@ flowchart LR
 > After provisioning, the only runtime dependency is the model pool. Gitea and
 > Mattermost outages cannot stop the service or prevent it booting.
 
-Hermes is an optional agent client. It calls the router's OpenAI-compatible
-`/v1` API with the router key; it is not part of the model pool (§17.1).
+Hermes is an optional agent client. It reads router inventory and ranking with
+the router key, then calls model servers directly (§17.1).
 
 ---
 
@@ -461,7 +462,7 @@ start. Venvs are built with `umask 022`.
 | 4000 | LiteLLM | `127.0.0.1` | CT-local only |
 | 11434 / 1234 / 8080 | Model hosts | outbound | Router, LiteLLM, monitor → pool |
 | 8000 | Open Terminal CT | outbound | Open WebUI → terminal |
-| 8642 | Hermes CT API server | `0.0.0.0` in its CT | Open WebUI → Hermes; Hermes → router :8000 |
+| 8642 / 8765 | Hermes CT API / local dispatcher | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI → Hermes; dispatcher → router metadata and model servers |
 | 8188 | ComfyUI CT | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
 
 With the CT firewall enabled, the installer accepts TCP 22, 8000 and the Open
@@ -470,7 +471,7 @@ firewall sets the input policy to drop. Target CTs are created with
 `firewall=1`. Open Terminal, Hermes and ComfyUI admit only the router's address
 (ComfyUI also `UI_ALLOW_CIDR`, for its web UI); model targets leave the rules to
 the operator. The Hermes CT also restricts egress by
-default: the router's API, DNS and internet HTTP(S) only (§17.1).
+default: the router's API, registered model server endpoints, DNS and internet HTTP(S) (§17.1).
 
 ---
 
@@ -492,7 +493,7 @@ default: the router's API, DNS and internet HTTP(S) only (§17.1).
 | Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT; Xolotl's also in its server config `/etc/xolotl/xolotl-ds41.json` (0640 root:xolotl) | Generated in the CT; never in a unit, log or the router's process list |
 | Open Terminal key | `/etc/open-terminal/api-key`; Open WebUI connection settings | Generated in the terminal CT |
 | Hermes API server key | `/etc/hermes-target/api-key` (0600), `~hermes/.hermes/.env` (0600); Open WebUI connection settings | Generated in the Hermes CT |
-| `ROUTER_API_KEY` in the Hermes CT | `~hermes/.hermes/config.yaml` (`model.api_key`) and `.env` (0600, owned by `hermes`) | Pushed as a 0600 file, never in argv; `--reconfigure` after a rotation |
+| Router and backend keys in the Hermes CT | `~hermes/.hermes/.env` (0600) for the router key; `/etc/hermes-target/backend-keys` (0640) for backend keys | Pushed as 0600 files, never in argv; `--reconfigure` after a rotation |
 | Hugging Face token (ComfyUI `klein-9b` weights) | Not kept: the installer's memory, a 0600 file in the provisioner's stage directory and, during the guest step only, `/root/comfyui-target-deploy/hf-token` (0600) in the ComfyUI CT; removed afterwards, also on failure | Never in argv or the CT's environment; only root reads it, as a curl header file |
 
 | Accepted risk | Mitigation |
@@ -506,7 +507,7 @@ default: the router's API, DNS and internet HTTP(S) only (§17.1).
 | LiteLLM has no master key | It listens only on 127.0.0.1; add a master key before exposing it |
 | The gated 9B weights have no reviewed hash (Hugging Face hides it from accounts without access) | Checked against the hash Hugging Face sends for the authenticated request and the pinned size; `COMFYUI_KLEIN_9B_SHA256` pins it |
 | ComfyUI has no authentication (queue, outputs, uploads) | Its CT firewall drops all inbound except :8188 from the router and `UI_ALLOW_CIDR`; the service runs unprivileged and cannot write its code or venv (§17.3) |
-| Hermes users can read the router key and share one agent memory | The agent runs as `hermes`, which owns its configuration. Keep `hermes-agent` admin-only or limited to one group; one Hermes profile per user or group for separation |
+| Hermes users can read router and backend keys and share one agent memory | The agent runs as `hermes`, which owns its configuration. Keep `hermes-agent` admin-only or limited to one group; one Hermes profile per user or group for separation |
 
 ---
 
@@ -1003,20 +1004,21 @@ firewall on, only the router CT may reach TCP 8000.
 Not a model host. A separate Debian LXC runs
 [Hermes Agent](https://hermes-agent.nousresearch.com/), installed by the
 official `install.sh` as the unprivileged `hermes` account (optionally pinned
-by commit and installer SHA-256). Its custom provider is the router's `/v1`
-with `ROUTER_API_KEY` as `model.api_key`.
+by commit and installer SHA-256). Its custom provider is a loopback dispatcher
+at `127.0.0.1:8765/v1`. The router supplies discovery and ranking only.
 
 ```
-Open WebUI -> Hermes API server :8642 (hermes-gateway.service) -> router :8000/v1 -> pool
+Open WebUI -> Hermes API server :8642 -> local dispatcher :8765 -> model server
+                                            \-> router :8000 (metadata only)
 ```
 
 * **Provisioning.**
-  * The provisioner reads the router key from `secrets.env` into a 0600
-    file, detects the router's address for the new CT, and checks that the
-    router accepts the key before `pct create`.
-  * The guest installer sends one chat request that offers a tool, so the key,
-    tool support and inference are proven before Hermes is installed.
-  * A settings record (with a hash of the router key) makes an unchanged
+  * The provisioner reads router and backend keys from `secrets.env` into
+    0600 files, detects the router and registered model server endpoints, and
+    checks the router key before `pct create`.
+  * The guest installer probes a tool request through its local dispatcher to
+    a model server before exposing the API gateway.
+  * A settings record (with hashes of the keys) makes an unchanged
     rerun a no-op. A failure restores `config.yaml`, `.env` and the unit, and
     health-checks the previous gateway.
 * **Open WebUI.** `integrate-webui.py` adds an OpenAI connection through the
@@ -1025,10 +1027,15 @@ Open WebUI -> Hermes API server :8642 (hermes-gateway.service) -> router :8000/v
   also points the external task model at a router model, so titles and tags
   do not start agent runs.
 * **Network.** Inbound, only the router's address may reach TCP 8642. Egress
-  (`EGRESS=restricted`) allows the router's API, DNS and HTTP(S) to
-  non-private addresses, so the agent's shell cannot reach the model hosts or
-  other LAN services. The API and router rules carry a rule comment, which
-  Proxmox keeps through GUI edits. `--reconfigure` rewrites only those two,
+  (`EGRESS=restricted`) allows the router's API, registered model server IPs
+  and ports, DNS and HTTP(S) to non-private addresses. Model server host names
+  are resolved inside the Hermes CT (every IPv4 address), so the rules match
+  what the dispatcher connects to; a URL without a port uses 80 or 443. The
+  dispatcher connects with a 5 s timeout and skips an unreachable server for
+  60 s, so a server that is not admitted yet costs one short wait, not every
+  request. The API, router and
+  model rules carry a rule comment, which Proxmox keeps through GUI edits.
+  `--reconfigure` rewrites only those rules,
   in two steps: before the guest step it adds the new rules next to the old
   ones (so a moved router is reachable and a failure changes nothing that
   worked), and after it removes the old ones. A file in which they cannot be
@@ -1036,7 +1043,7 @@ Open WebUI -> Hermes API server :8642 (hermes-gateway.service) -> router :8000/v
   missing.
 * **Upgrades.** Hermes's code is upgraded by its own `hermes update`, so the
   §16 upgrade contract does not apply. `--reconfigure` re-pushes the current
-  router key and settings.
+  router and backend keys, dispatcher and settings.
 * **Why not a pool member.** `auto` could select Hermes, which itself calls
   `auto`: a loop. Hermes also has no size, residency or capabilities for the
   scorer.
@@ -1215,9 +1222,12 @@ Hermes CT:
 /home/hermes/.hermes/             Hermes checkout (hermes-agent/), config.yaml, .env (0600), memory, skills
 /home/hermes/.local/bin/hermes    launcher
 /etc/hermes-target/api-key        API server key (0600)
-/etc/hermes-target/settings       settings of the last good run (router key as a hash)
+/etc/hermes-target/backend-keys   model server credentials (0640)
+/etc/hermes-target/settings       settings of the last good run (key hashes)
 /etc/hermes-target.lock           installer lock
 /etc/systemd/system/hermes-gateway.service   API server (only with Open WebUI integration)
+/etc/systemd/system/hermes-direct.service    direct dispatcher (loopback)
+/usr/local/lib/hermes-direct.py              dispatcher code
 ```
 
 ## Appendix B — Configuration surface

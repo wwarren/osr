@@ -36,7 +36,7 @@ class ProbeTests(unittest.TestCase):
         self.calls = []
         self.responses = {
             "/health": Response({"status": True}),
-            "/api/version": Response({"version": "0.11.0"}),
+            "/api/version": Response({"version": "0.12.4"}),
         }
 
         def open_request(request, timeout):
@@ -51,7 +51,7 @@ class ProbeTests(unittest.TestCase):
         self.addCleanup(self.patcher.stop)
 
     def test_healthy_webui(self):
-        self.assertEqual(verify_webui.probe(8000), "0.11.0")
+        self.assertEqual(verify_webui.probe(8000), "0.12.4")
         self.assertEqual(
             self.calls,
             [

@@ -6,7 +6,7 @@ The Open WebUI connection is **admin-only** by default. All users granted access
 
 ## Prerequisites
 
-- A running `ollama-smart-router` Open WebUI, installed by this repository, with the Open Terminal integration (the currently pinned WebUI `0.11.0` has it). It can be a CT on the Proxmox node where you run this script, or any LXC or VM that `root` on this node can log in to over SSH. That includes a router on another node, a VM, or one installed long before this terminal.
+- A running `ollama-smart-router` Open WebUI, installed by this repository, with the Open Terminal integration (the currently pinned WebUI `0.12.4` has it). It can be a CT on the Proxmox node where you run this script, or any LXC or VM that `root` on this node can log in to over SSH. That includes a router on another node, a VM, or one installed long before this terminal.
 - Root access on the Proxmox node that will host the terminal CT, and a free CT ID there.
 - A downloaded Debian 12 or 13 amd64 LXC template (`pveam list <template-storage>`), active storage that supports `rootdir`, and an unused static IPv4 address reachable from the router CT.
 - An **Open WebUI admin API key** from Settings → Account (enable API keys in Admin Settings → Authentication first), or an admin session JWT. The script prompts for it without echoing. For unattended use, set `OPENWEBUI_ADMIN_TOKEN`; it is removed from the environment immediately, so child processes never see it. The script uses the admin API so that other terminal connections are preserved when this one is added. The credential is deleted from temporary files after the call.

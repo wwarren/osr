@@ -63,6 +63,7 @@ class Upstream:
             HOST_A: tags(("qwen3:14b", "14.8B", "qwen3")),
             HOST_B: tags(("qwen3:14b", "14.8B", "qwen3")),
         }
+        self.running = {}       # host -> names returned by /api/ps; absent = unsupported
         self.chat = {}          # host -> status code or "connect" / "timeout"
         self.chat_errors = {}   # host -> custom error body
         self.calls = []
@@ -78,6 +79,11 @@ class Upstream:
             if host in self.inventory:
                 return httpx.Response(200, json=self.inventory[host])
             raise httpx.ConnectError("refused", request=request)
+        if request.url.path == "/api/ps":
+            if host in self.running:
+                return httpx.Response(200, json={"models": [{"name": name}
+                                                            for name in self.running[host]]})
+            return httpx.Response(404)
         if request.url.path == "/v1/chat/completions":
             behaviour = self.chat.get(host, 200)
             if behaviour == "connect":
@@ -477,6 +483,20 @@ def test_capability_probe_can_be_disabled(served, monkeypatch):
     upstream.show_calls.clear()
     client.post("/routing/refresh")
     assert upstream.show_calls == []
+
+
+def test_ollama_residency_comes_from_running_models(served):
+    router, upstream, client = served
+    upstream.inventory[HOST_A] = tags(("hot:8b", "8B", "qwen"),
+                                      ("cold:8b", "8B", "qwen"))
+    upstream.running[HOST_A] = ["hot:8b"]
+    client.post("/routing/refresh")
+    entries = {m["name"]: m for m in router.INVENTORY["models"] if m["server"] == HOST_A}
+    assert entries["hot:8b"]["loaded"] is True
+    assert entries["cold:8b"]["loaded"] is False
+    # A bridge without /api/ps stays unknown, so it remains eligible.
+    assert all(m["loaded"] is None for m in router.INVENTORY["models"]
+               if m["server"] == HOST_B)
 
 
 # --- regex keywords -------------------------------------------------------------------
@@ -1002,6 +1022,13 @@ def test_tool_request_is_raised_to_tools_min_class(served):
     assert tooled["request"]["class"] == router.TOOLS_MIN_CLASS == "large"
     assert tooled["request"]["tools"] is True
     assert chat(client, tools=TOOLS).headers["x-router-class"] == "large"
+
+
+def test_explain_honours_requested_tier_alias(served):
+    router, _, client = served
+    result = client.post("/routing/explain", json={
+        "model": router.TIER_XLARGE, "messages": [user("hi")]}).json()
+    assert result["request"]["class"] == "xlarge"
 
 
 def test_tool_floor_never_lowers_a_class(router):
