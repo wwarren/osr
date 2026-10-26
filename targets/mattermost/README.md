@@ -2,7 +2,8 @@
 
 Mattermost receives the router's **health alerts**. The `ollama-monitor`
 service posts host and service state changes to an incoming webhook (see the
-main README). This target creates a separate Ubuntu 24.04 LXC with the
+main README). This target creates a separate Ubuntu 26.04 LXC (`MATTERMOST_CT_VERSION=24.04`
+or `22.04` for an older one; Mattermost publishes for Ubuntu only) with the
 [Proxmox VE community script](https://community-scripts.org/scripts/mattermost)
 (`ct/mattermost.sh`; PostgreSQL 16, Mattermost from its apt repository, port
 8065). It then does the first-run setup inside the CT without the browser,

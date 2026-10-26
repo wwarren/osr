@@ -32,7 +32,7 @@ has() { [[ $out == *"$1"* ]] || { printf 'FAIL: plan lacks %s\n%s\n' "$1" "$out"
 lacks() { [[ $out != *"$1"* ]] || { printf 'FAIL: plan contains %s\n%s\n' "$1" "$out" >&2; exit 1; }; }
 
 ok 'the community script runs with this target'"'"'s presets'
-has '+ env var_ctid=270 var_hostname=ollama var_cpu=4 var_ram=16384 var_disk=128 var_unprivileged=1 var_nesting=1 var_gpu=no var_brg=vmbr0 var_net=192.0.2.70/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
+has '+ env var_ctid=270 var_hostname=ollama var_cpu=4 var_ram=16384 var_disk=128 var_unprivileged=1 var_nesting=1 var_gpu=no var_brg=vmbr0 var_os=debian var_version=13 var_net=192.0.2.70/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
 has 'https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/ollama.sh'
 has 'install-target.sh'; has 'ollama-target.conf'
 lacks 'install_nvidia'; lacks '+ pct exec 270 -- env'
@@ -66,6 +66,9 @@ has 'OLLAMA_GPU=amd'
 ok 'GPU=none (or no) runs on the CPU' GPU=no
 has 'var_gpu=no'; lacks 'answer'
 
+ok 'another supported distribution is passed to the community script' OLLAMA_CT_OS=ubuntu OLLAMA_CT_VERSION=26.04
+has 'var_os=ubuntu var_version=26.04'
+
 ok 'DHCP drops the gateway' IP_CIDR=dhcp
 has 'var_net=dhcp'; lacks 'var_gateway'
 
@@ -85,6 +88,8 @@ fails 'too small a disk is refused' 'ROOTFS_GB must be at least' ROOTFS_GB=16
 fails 'a bad address is refused' 'IP_CIDR' IP_CIDR=192.0.2.300/24
 fails 'a bad CT ID is refused' 'CT_ID' CT_ID=12
 fails 'an unknown GPU mode is refused' 'GPU must be' GPU=maybe
+fails 'an unsupported distribution is refused' 'OLLAMA_CT_OS/OLLAMA_CT_VERSION' OLLAMA_CT_OS=ubuntu OLLAMA_CT_VERSION=25.10
+fails 'Debian 11 is refused' 'OLLAMA_CT_OS/OLLAMA_CT_VERSION' OLLAMA_CT_VERSION=11
 fails 'a bad model list is refused' 'OLLAMA_PULL_MODELS' OLLAMA_PULL_MODELS='qwen3;reboot'
 fails 'a non-https script URL is refused' 'COMMUNITY_SCRIPT_URL' COMMUNITY_SCRIPT_URL=http://example/ollama.sh
 fails 'a malformed script checksum is refused' 'COMMUNITY_SCRIPT_SHA256' COMMUNITY_SCRIPT_SHA256=abc

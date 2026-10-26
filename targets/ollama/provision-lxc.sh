@@ -22,7 +22,7 @@ OLLAMA_PULL_MODELS.
 
 The community script still shows its own menu; pick "Default" (or "My
 Defaults") to accept the presets below. Its settings you do not preset keep
-the community defaults (Ubuntu 24.04, unprivileged, nesting).
+the community defaults (unprivileged, nesting).
 
 Settings (environment; all optional):
   CT_ID=<next free>  CT_HOSTNAME=ollama  CORES=4  MEMORY_MB=16384  ROOTFS_GB=128
@@ -32,6 +32,10 @@ Settings (environment; all optional):
                       when /dev/kfd exists, else intel for an Arc card's render
                       node, else none (yes means nvidia, no means none)
   OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b'
+  OLLAMA_CT_OS=debian  OLLAMA_CT_VERSION=13   the CT's distribution: debian 12|13 or
+                      ubuntu 22.04|24.04|26.04 (the community script's own
+                      installer handles Debian 13; Ollama's release bundles its
+                      runtimes, so the distribution only supplies Mesa for Arc)
   COMMUNITY_SCRIPT_URL=<url>      default: the ProxmoxVE main-branch ct/ollama.sh
   COMMUNITY_SCRIPT_SHA256=<hex>   refuse to run a script with any other checksum
 When the CT sees an NVIDIA GPU but nvidia-smi is missing inside it, the
@@ -71,7 +75,8 @@ community_vars() {
     local passthrough=yes
     [[ $gpu != none ]] || passthrough=no
     printf '%s\n' "var_ctid=$CT_ID" "var_hostname=$CT_HOSTNAME" "var_cpu=$CORES" "var_ram=$MEMORY_MB" \
-        "var_disk=$ROOTFS_GB" "var_unprivileged=1" "var_nesting=1" "var_gpu=$passthrough" "var_brg=$BRIDGE"
+        "var_disk=$ROOTFS_GB" "var_unprivileged=1" "var_nesting=1" "var_gpu=$passthrough" "var_brg=$BRIDGE" \
+        "var_os=$OLLAMA_CT_OS" "var_version=$OLLAMA_CT_VERSION"
     [[ -z $IP_CIDR ]] || printf '%s\n' "var_net=$IP_CIDR"
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
@@ -110,6 +115,8 @@ gpu_vendor() {
         *) return 1 ;;
     esac
 }
+# valid_ct_os OS VERSION: a distribution the community script and this target support.
+valid_ct_os() { [[ $1 == debian && $2 =~ ^(12|13)$ || $1 == ubuntu && $2 =~ ^(22\.04|24\.04|26\.04)$ ]]; }
 # End container configuration helpers.
 
 dry_run=0
@@ -141,6 +148,8 @@ GPU=${GPU:-auto}
 OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-}
 COMMUNITY_SCRIPT_URL=${COMMUNITY_SCRIPT_URL:-$COMMUNITY_SCRIPT_DEFAULT_URL}
 COMMUNITY_SCRIPT_SHA256=${COMMUNITY_SCRIPT_SHA256:-}
+OLLAMA_CT_OS=${OLLAMA_CT_OS:-debian}
+OLLAMA_CT_VERSION=${OLLAMA_CT_VERSION:-13}
 
 if [[ -z $CT_ID ]]; then
     (( dry_run )) || CT_ID=$(pvesh get /cluster/nextid 2>/dev/null || true)
@@ -161,6 +170,8 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 valid_models "$OLLAMA_PULL_MODELS" || die 'OLLAMA_PULL_MODELS is a space-separated list of name[:tag] entries.'
 [[ $COMMUNITY_SCRIPT_URL =~ ^https://[A-Za-z0-9./_-]+\.sh$ ]] || die 'COMMUNITY_SCRIPT_URL must be an https URL of a .sh file.'
 [[ -z $COMMUNITY_SCRIPT_SHA256 || $COMMUNITY_SCRIPT_SHA256 =~ ^[0-9A-Fa-f]{64}$ ]] || die 'COMMUNITY_SCRIPT_SHA256 must be 64 hex digits.'
+valid_ct_os "$OLLAMA_CT_OS" "$OLLAMA_CT_VERSION" ||
+    die 'OLLAMA_CT_OS/OLLAMA_CT_VERSION must be debian 12|13 or ubuntu 22.04|24.04|26.04.'
 gpu=$(gpu_vendor "$GPU") || die 'GPU must be auto, nvidia, amd, intel or none (yes means nvidia, no means none).'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

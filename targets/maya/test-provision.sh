@@ -78,6 +78,10 @@ plan TEMPLATE=local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst
 has 'CUDA 12.8 is available for debian12'
 plan TEMPLATE=local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
 has 'CUDA 12.8 is available for ubuntu2204'
+reject 'cannot be installed in a ubuntu2604 CT' TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+plan TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst MAYA_CUDA_VERSION=13.3
+has 'CUDA 13.3 is available for ubuntu2604'
+has '--ostype ubuntu'
 
 plan GPU_GID=1000
 has 'path=/dev/nvidia0\,gid=1000\,mode=0660'

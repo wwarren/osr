@@ -173,6 +173,8 @@ printf 'provision %s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(basename "$(dirna
   printf 'service-env %s|%s|%s\n' "${COMMUNITY_SCRIPT_URL:-}" "${COMMUNITY_SCRIPT_SHA256:-}" "${MATTERMOST_CHANNEL:-}" >> "$MOCK_LOG"
 [[ -z ${COMFYUI_IMAGE_VARIANT:-} ]] || printf 'image-variant %s\n' "$COMFYUI_IMAGE_VARIANT" >> "$MOCK_LOG"
 [[ -z ${GPU:-}${BACKEND:-}${GPU_DEVICES:-} ]] || printf 'gpu-env %s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
+[[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-} ]] ||
+  printf 'cuda-env %s|%s|%s\n' "${CUDA_VERSION:-}" "${MAYA_CUDA_VERSION:-}" "${XOLOTL_CUDA_VERSION:-}" >> "$MOCK_LOG"
 if [[ -n ${HF_TOKEN:-} ]]; then
   if [[ $HF_TOKEN == "${EXPECT_HF_TOKEN:-unset}" ]]; then echo 'hf-token match'; else echo 'hf-token other'; fi >> "$MOCK_LOG"
 fi
@@ -402,9 +404,41 @@ assert_fail "no prefix" valid_target_ip 192.0.2.91
 
 describe valid_target_template
 assert_ok "Ubuntu 24.04" valid_target_template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_ok "Ubuntu 26.04" valid_target_template local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
 assert_ok "Debian 12" valid_target_template nfs:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst
+assert_ok "Debian 13" valid_target_template nfs:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
 assert_fail "another distro" valid_target_template local:vztmpl/alpine-3.20-default_20240908_amd64.tar.xz
 assert_fail "no storage" valid_target_template vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+
+describe valid_strata_template
+assert_ok "Strata on Debian 13" valid_strata_template local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+assert_ok "Strata on Ubuntu 24.04" valid_strata_template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_fail "not Ubuntu 26.04 (upstream setup lacks it)" valid_strata_template local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+assert_fail "nor another distro" valid_strata_template local:vztmpl/alpine-3.20-default_20240908_amd64.tar.xz
+
+describe host_gpu_cuda_arch
+HOST_GPU_CUDA_ARCH=120
+assert_eq "the GPU step's result first" 120 "$(host_gpu_cuda_arch)"
+HOST_GPU_CUDA_ARCH=""
+nvidia-smi() { echo "${FAKE_CAP:-8.9}"; }
+assert_eq "else nvidia-smi's compute capability" 89 "$(host_gpu_cuda_arch)"
+assert_eq "an unreadable one is empty" "" "$(FAKE_CAP='[N/A]' host_gpu_cuda_arch)"
+unset -f nvidia-smi
+
+describe gpu_target_template_order
+assert_eq "Strata: Debian 13 first, never Ubuntu 26.04" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order strata)"
+assert_eq "Xolotl: Debian 13, then Ubuntu 26.04" "debian-13 ubuntu-26.04 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order xolotl)"
+assert_eq "Maya on an RTX card: Debian 13 first" "debian-13 ubuntu-26.04 ubuntu-24.04 ubuntu-22.04 debian-12" "$(HOST_GPU_CUDA_ARCH=89 gpu_target_template_order maya)"
+assert_eq "Maya on a V100: only CUDA 12 distributions" "ubuntu-24.04 ubuntu-22.04 debian-12" "$(HOST_GPU_CUDA_ARCH=70 gpu_target_template_order maya)"
+
+describe target_cuda_env
+assert_eq "Basalt on Ubuntu 26.04 uses CUDA 13.3" CUDA_VERSION=13.3 "$(target_cuda_env basalt local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst)"
+assert_eq "Maya on Debian 13 uses CUDA 13.1" MAYA_CUDA_VERSION=13.1 "$(target_cuda_env maya local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst)"
+assert_eq "Xolotl on Ubuntu 26.04 uses CUDA 13.3" XOLOTL_CUDA_VERSION=13.3 "$(target_cuda_env xolotl local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst)"
+assert_eq "Ubuntu 24.04 keeps its CUDA default" "" "$(target_cuda_env basalt local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst)"
+MAYA_CUDA_VERSION=13.4
+assert_eq "an explicit CUDA choice is kept" "" "$(target_cuda_env maya local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst)"
+unset MAYA_CUDA_VERSION
 
 describe default_gpu_target_template
 template_storages() { printf '%s\n' local nfs; }
@@ -419,17 +453,35 @@ pveam() {
     "list local") printf '%s\n' "$_pveam_list_local" ;;
     "list nfs") printf '%s\n' "$_pveam_list_nfs" ;;
     "available --section") printf '%s\n' "system ubuntu-22.04-standard_22.04-1_amd64.tar.zst" \
-                                       "system ubuntu-24.04-standard_24.04-2_amd64.tar.zst" ;;
+                                       "system ubuntu-24.04-standard_24.04-2_amd64.tar.zst" \
+                                       "system debian-13-standard_13.1-2_amd64.tar.zst" \
+                                       "system ubuntu-26.04-standard_26.04-1_amd64.tar.zst" ;;
     download*) return "${FAKE_DOWNLOAD_RC:-0}" ;;
   esac
 }
-assert_eq "prefers the newest downloaded Ubuntu 24.04, on any storage" \
-  nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template)"
+assert_eq "without Debian 13 or Ubuntu 26.04: the newest downloaded Ubuntu 24.04, on any storage" \
+  nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template xolotl)"
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst 120MB
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB
+local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst 150MB'
+assert_eq "Debian 13 is preferred" local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$(default_gpu_target_template xolotl)"
+assert_eq "Maya on a V100 keeps a CUDA 12 distribution" \
+  nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(HOST_GPU_CUDA_ARCH=70 default_gpu_target_template maya)"
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst 120MB
+local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst 150MB'
+assert_eq "then Ubuntu 26.04" local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst "$(default_gpu_target_template basalt)"
+assert_eq "but not for Strata" nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template strata)"
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst 120MB'
 _pveam_list_nfs='NAME SIZE'
-assert_eq "then Debian 12" local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst "$(default_gpu_target_template)"
+assert_eq "then Debian 12" local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst "$(default_gpu_target_template xolotl)"
 _pveam_list_local='NAME SIZE'; TEMPLATE_STORAGE=local
-assert_eq "else one to download into TEMPLATE_STORAGE" \
-  local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(default_gpu_target_template)"
+assert_eq "else a Debian 13 one to download into TEMPLATE_STORAGE" \
+  local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$(default_gpu_target_template xolotl)"
+assert_eq "an Ubuntu 24.04 one for Maya on a V100" \
+  local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(HOST_GPU_CUDA_ARCH=70 default_gpu_target_template maya)"
 
 describe ensure_target_template
 _pveam_list_local='NAME SIZE
@@ -544,6 +596,16 @@ mock_reset_log
 run_target_provisioner strata
 assert_eq "a GPU target gets its template; the router's CORES/ROOTFS_GB and the token do not leak" \
   "provision strata|912|192.0.2.91/24|192.0.2.1|gpu-store|vmbr2|local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst|||||no|" "$(mock_calls)"
+MAYA_CT_ID=918; MAYA_IP_CIDR=192.0.2.98/24; MAYA_STORAGE=gpu-store
+MAYA_TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+mock_reset_log
+run_target_provisioner maya
+assert_contains "Ubuntu 26.04's CUDA version reaches Maya" "cuda-env |13.3|" "$(mock_calls)"
+MAYA_TEMPLATE=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+mock_reset_log
+run_target_provisioner maya
+assert_contains "Debian 13's CUDA version reaches Maya" "cuda-env |13.1|" "$(mock_calls)"
+unset MAYA_CT_ID MAYA_IP_CIDR MAYA_STORAGE MAYA_TEMPLATE
 mock_reset_log
 run_target_provisioner llamacpp
 assert_contains "llama.cpp without a model only gets its CT" "|no|" "$(mock_calls)"

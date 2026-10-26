@@ -54,9 +54,12 @@ NVMe drive: about 26 tok/s decode and 290-400 tok/s prefill.
   `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`. A host without an
   NVIDIA driver gets one from `tools/setup-host-gpu.sh` (see
   [Hosts without an NVIDIA driver](#hosts-without-an-nvidia-driver)).
-- **Templates:** Ubuntu 22.04/24.04 or Debian 12/13 amd64 (Ubuntu 24.04 is the
-  default the router installer picks). Debian 13's NVIDIA repository starts at
-  CUDA 13.1: set `XOLOTL_CUDA_VERSION=13.1` there.
+- **Templates:** Debian 12/13 or Ubuntu 22.04/24.04/26.04 amd64 (the router
+  installer picks Debian 13, then Ubuntu 26.04). Debian 13's NVIDIA repository
+  starts at CUDA 13.1; Ubuntu 26.04's starts at CUDA 13.3. Set
+  `XOLOTL_CUDA_VERSION=13.1` or `13.3`, respectively, when provisioning by
+  hand. The router installer selects those releases automatically unless
+  `XOLOTL_CUDA_VERSION` is explicitly set.
 
 The first install downloads the weights (hours, depending on the connection)
 and then loads the model; plan for both.

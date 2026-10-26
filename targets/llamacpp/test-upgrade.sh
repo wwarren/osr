@@ -294,9 +294,13 @@ out=$(BACKEND=vulkan upgrade 2>&1) && die 'Vulkan on Debian 12 was accepted'
 [[ $out == *'The Vulkan build targets a Debian 13 guest'* ]] || die "debian 12 vulkan: $out"
 make_install
 printf 'ID=debian\nVERSION_ID=13\n' > "$tmp_root/os-release"
-out=$(BACKEND=cuda CUDA_COMPILER=$tmp_root/nvcc upgrade 2>&1) && die 'CUDA on Debian 13 was accepted'
-[[ $out == *'The CUDA 13.0 build targets a Debian 12 guest'* ]] || die "debian 13 cuda: $out"
-grep -qE 'cmake|systemctl (stop|restart)' "$log" && die 'a refused backend touched the target'
-pass 'Vulkan needs a discrete GPU through a render node, and Debian 13; CUDA stays on Debian 12'
+out=$(BACKEND=cuda CUDA_COMPILER=$tmp_root/nvcc upgrade 2>&1) || die "cpu->cuda on Debian 13 failed: $out"
+grep -q 'cmake .*-DGGML_CUDA=ON' "$log" || die "Debian 13 CUDA build flags: $(grep cmake "$log")"
+grep -q '^backend=cuda$' "$tmp_root/opt/build-info.txt" || die 'cuda backend not recorded on Debian 13'
+make_install
+printf 'ID=debian\nVERSION_ID=11\n' > "$tmp_root/os-release"
+out=$(BACKEND=cuda CUDA_COMPILER=$tmp_root/nvcc upgrade 2>&1) && die 'Debian 11 was accepted'
+grep -qE 'cmake|systemctl (stop|restart)' "$log" && die 'a refused guest touched the target'
+pass 'Vulkan needs a discrete GPU through a render node, and Debian 13; CUDA runs on Debian 12 or 13'
 
 printf '%s upgrade cases passed. No system files, builds or services were touched.\n' "$passed"

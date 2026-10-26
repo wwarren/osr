@@ -57,8 +57,55 @@ For each selected target, it asks up front, with the other settings:
 - a static IP/CIDR (the router needs a fixed address);
 - a storage (default: the router's);
 - for Strata, Basalt, Maya and Xolotl, a template. The default is the newest
-  downloaded Ubuntu 24.04, Ubuntu 22.04 or Debian 12 standard template;
-  otherwise an Ubuntu 24.04 template that is downloaded when needed.
+  downloaded Debian 13 template, then Ubuntu 26.04 (not for Strata), Ubuntu
+  24.04, Ubuntu 22.04 and Debian 12; with none downloaded, a Debian 13 template
+  is downloaded. Maya on a card CUDA 13 cannot build for (compute capability
+  below 7.5, e.g. a V100) defaults to Ubuntu 24.04 instead. Basalt, Maya and
+  Xolotl get CUDA 13.1 on Debian 13 and 13.3 on Ubuntu 26.04 (the first
+  releases those NVIDIA repositories carry) unless you set their CUDA version.
+
+### LXC distribution support
+
+Debian 13 and Ubuntu 26.04 are preferred wherever the target's upstream
+supports them; the older releases stay available where it does not.
+
+| LXC | Default | Also supported |
+|---|---|---|
+| Router, Gitea, ComfyUI | Debian 13 | |
+| Open Terminal, Hermes Agent | Debian 13 (the router's template) | Debian 12 |
+| Ollama (community script) | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 (`OLLAMA_CT_OS`, `OLLAMA_CT_VERSION`) |
+| Mattermost (community script) | Ubuntu 26.04 | Ubuntu 22.04, 24.04 (`MATTERMOST_CT_VERSION`); Mattermost publishes for Ubuntu only |
+| AirLLM | chosen at its prompt | Debian 12 or 13; Ubuntu 24.04 or 26.04 (Python 3.11+) |
+| llama.cpp | Debian 13 listed first | CUDA or CPU: Debian 12 or 13; Vulkan: Debian 13 |
+| Basalt, Maya, Xolotl | Debian 13 | Ubuntu 26.04, 24.04, 22.04; Debian 12 |
+| Strata | Debian 13 | Ubuntu 24.04, 22.04; Debian 12 (not 26.04: its setup installs CUDA only on these) |
+
+What each release brings in:
+
+| | Debian 12 | Debian 13 | Ubuntu 22.04 | Ubuntu 24.04 | Ubuntu 26.04 |
+|---|---|---|---|---|---|
+| Python (venvs) | 3.11 | 3.13 | 3.10 | 3.12 | 3.14 |
+| GCC (nvcc's host compiler) | 12 | 14 | 11 | 13 | 15 |
+| First CUDA in NVIDIA's repository | 12.3 | **13.1** | 11.7 | 12.5 | **13.3** |
+| Default CUDA: Basalt and Xolotl / Maya | 13.0 / 12.8 | 13.1 / 13.1 | 13.0 / 12.8 | 13.0 / 12.8 | 13.3 / 13.3 |
+| CUDA used by llama.cpp | 13.0 | 13.1 | | | |
+
+Every pinned Python requirement has wheels for these Pythons: Basalt's,
+Xolotl's and Strata's for 3.10 through 3.14, AirLLM's hash lock for 3.11
+through 3.14 (it requires 3.11, so no Ubuntu 22.04); Maya installs current
+releases.
+Strata's ready-made engine loads CUDA 13.0 from NVIDIA's pip packages, so it
+needs no toolkit. The host keeps the bundled NVIDIA 580.173.02 driver, and the
+CT's user-space libraries must match it on every release. CUDA 13.1 and 13.3
+run on it under NVIDIA's
+[minor version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html):
+the engines are built for the card's own architecture, as that requires, but
+a feature that needs a newer driver can still fail
+(`cudaErrorCallRequiresNewerDriver`). CUDA 13.3 is the release NVIDIA pairs
+with the 610 driver, which is why Debian 13 (13.1) is the default. CUDA 13
+cannot build for a V100; use Ubuntu 22.04/24.04 or Debian 12 for Maya on that
+card. Ubuntu 26.04 needs Proxmox's ubuntu-26.04 template (`pveam update`, then
+`pveam available`) and a current `pve-container`.
 
 **The host's GPU driver comes next,** when GPU targets are selected. All the
 selected targets share one GPU vendor:

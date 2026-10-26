@@ -49,6 +49,10 @@ has 'CUDA 13.1 is available for debian13'
 has 'CUDA_VERSION=13.1'
 plan TEMPLATE=local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst
 has 'CUDA 13.0 is available for debian12'
+reject 'cannot be installed in a ubuntu2604 CT' TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+plan TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst CUDA_VERSION=13.3
+has 'CUDA 13.3 is available for ubuntu2604'
+has '--ostype ubuntu'
 reject 'Duplicate GPU device' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia0'
 reject 'does not pass through /dev/nvidia1' BASALT_GPUS=0,1
 plan BASALT_GPUS=0,1 GPU_DEVICES='/dev/nvidia0 /dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm'

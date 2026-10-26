@@ -100,7 +100,8 @@ check failure 'guest install rejects a noncanonical Hugging Face host' install M
 check failure 'guest install rejects an unpinned build ref' install LLAMA_CPP_REF=main MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'invalid GPU layer policy is rejected' install GPU_LAYERS=maximum MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'CPU install requires zero GPU layers' install BACKEND=cpu GPU_DEVICES= GPU_LAYERS=auto MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
-check failure 'guest template must match supported OS' create TEMPLATE=local:vztmpl/debian-13-standard_test_amd64.tar.zst
+check failure 'guest template must match supported OS' create TEMPLATE=local:vztmpl/ubuntu-24.04-standard_test_amd64.tar.zst
+check success 'CUDA on a Debian 13 template' create TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
 
 # Vulkan (AMD Radeon, Intel Arc): a Debian 13 template and the card's render node.
 vulkan=(TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst BACKEND=vulkan GPU_DEVICES=/dev/dri/renderD128)

@@ -11,7 +11,7 @@ fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$1"; }
 check() { env -i "PATH=$PATH" "CUDA_DIST=$1" "CUDA_VERSION=$2" bash "$toolkit" --check-repo 2>&1; }
 
-for case in ubuntu2404:13.0 ubuntu2204:13.0 debian12:13.0 debian12:13.1 debian13:13.1 debian13:13.4; do
+for case in ubuntu2404:13.0 ubuntu2204:13.0 ubuntu2604:13.3 ubuntu2604:13.4 debian12:13.0 debian12:13.1 debian13:13.1 debian13:13.4; do
     out=$(check "${case%%:*}" "${case#*:}") || fail "$case refused: $out"
     [[ $out == *"is available for ${case%%:*}"* ]] || fail "$case: $out"
 done
@@ -20,6 +20,10 @@ pass 'CUDA 13.x is accepted where NVIDIA publishes it (Debian 13 from 13.1)'
 out=$(check debian13 13.0) && fail 'debian13 with CUDA 13.0 accepted'
 [[ $out == *'debian13 repository starts at CUDA 13.1'* && $out == *'CUDA_VERSION=13.1'* ]] || fail "debian13 message: $out"
 pass 'Debian 13 with the default CUDA 13.0 is refused, naming the release to use'
+
+out=$(check ubuntu2604 13.0) && fail 'ubuntu2604 with CUDA 13.0 accepted'
+[[ $out == *'ubuntu2604 repository starts at CUDA 13.3'* && $out == *'CUDA_VERSION=13.3'* ]] || fail "ubuntu2604 message: $out"
+pass 'Ubuntu 26.04 requires CUDA 13.3 or later'
 
 out=$(check debian14 13.0) || fail "an unknown distro was refused by the table: $out"
 [[ $out == *'not a distro this script has checked'* ]] || fail "unknown distro note: $out"

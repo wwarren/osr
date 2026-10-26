@@ -17,7 +17,7 @@ Usage: bash targets/mattermost/provision-lxc.sh [--dry-run] [--create-only | --r
 Runs the community script
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/mattermost.sh)"
 with the settings below preset as its var_* variables. It creates an
-unprivileged Ubuntu 24.04 CT with PostgreSQL 16 and Mattermost from
+unprivileged Ubuntu 26.04 CT with PostgreSQL 16 and Mattermost from
 Mattermost's apt repository, serving http://<CT address>:8065. This script
 waits for the server to answer, then runs install-target.sh in the CT: the
 administrator MATTERMOST_ADMIN_USER (password in
@@ -35,6 +35,8 @@ Settings (environment; all optional):
   MATTERMOST_CHANNEL=ollama-monitor   the alert channel (its URL name)
   MATTERMOST_TEAM=ollama  MATTERMOST_ADMIN_USER=mmadmin  MATTERMOST_ADMIN_EMAIL
   READY_TIMEOUT=120                   seconds to wait for Mattermost to answer
+  MATTERMOST_CT_VERSION=26.04         the CT's Ubuntu release: 22.04, 24.04 or 26.04
+                                      (Mattermost's apt repository is Ubuntu-only)
   COMMUNITY_SCRIPT_URL=<url>          default: the ProxmoxVE main-branch ct/mattermost.sh
   COMMUNITY_SCRIPT_SHA256=<hex>       refuse to run a script with any other checksum
 The checksum pins ct/mattermost.sh only: that script downloads the shared
@@ -70,7 +72,8 @@ valid_container_ip() {
 # The community script's var_* presets for these settings, one NAME=value per line.
 community_vars() {
     printf '%s\n' "var_ctid=$CT_ID" "var_hostname=$CT_HOSTNAME" "var_cpu=$CORES" "var_ram=$MEMORY_MB" \
-        "var_disk=$ROOTFS_GB" "var_unprivileged=1" "var_nesting=1" "var_gpu=no" "var_brg=$BRIDGE"
+        "var_disk=$ROOTFS_GB" "var_unprivileged=1" "var_nesting=1" "var_gpu=no" "var_brg=$BRIDGE" \
+        "var_os=ubuntu" "var_version=$MATTERMOST_CT_VERSION"
     [[ -z $IP_CIDR ]] || printf '%s\n' "var_net=$IP_CIDR"
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
@@ -113,6 +116,7 @@ MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-ollama-monitor}
 READY_TIMEOUT=${READY_TIMEOUT:-120}
 COMMUNITY_SCRIPT_URL=${COMMUNITY_SCRIPT_URL:-$COMMUNITY_SCRIPT_DEFAULT_URL}
 COMMUNITY_SCRIPT_SHA256=${COMMUNITY_SCRIPT_SHA256:-}
+MATTERMOST_CT_VERSION=${MATTERMOST_CT_VERSION:-26.04}
 # Host paths, overridable for the tests only.
 PVE_NODES_DIR=${PVE_NODES_DIR:-/etc/pve/nodes}
 SYS_NET_DIR=${SYS_NET_DIR:-/sys/class/net}
@@ -137,6 +141,9 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $MATTERMOST_CHANNEL =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die 'MATTERMOST_CHANNEL must be a channel name (lowercase letters, digits, - and _).'
 [[ $COMMUNITY_SCRIPT_URL =~ ^https://[A-Za-z0-9./_-]+\.sh$ ]] || die 'COMMUNITY_SCRIPT_URL must be an https URL of a .sh file.'
 [[ -z $COMMUNITY_SCRIPT_SHA256 || $COMMUNITY_SCRIPT_SHA256 =~ ^[0-9A-Fa-f]{64}$ ]] || die 'COMMUNITY_SCRIPT_SHA256 must be 64 hex digits.'
+# Mattermost's repo-setup.sh accepts focal, jammy, noble and resolute only.
+[[ $MATTERMOST_CT_VERSION =~ ^(22\.04|24\.04|26\.04)$ ]] ||
+    die 'MATTERMOST_CT_VERSION must be 22.04, 24.04 or 26.04 (Mattermost publishes for Ubuntu only).'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deploy=/root/mattermost-target-deploy

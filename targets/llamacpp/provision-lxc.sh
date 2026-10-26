@@ -16,8 +16,8 @@ Usage: GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-
 
 Missing settings are prompted on a terminal: CT ID, template, name, IPv4/CIDR
 or DHCP, bridge/gateway, CPU cores, RAM (MiB), root disk storage ID and size (GiB).
-Choose downloaded Debian templates (12 for CUDA and CPU builds, 13 for Vulkan)
-and active rootdir storage by number.
+Choose downloaded Debian templates (12 or 13 for CUDA and CPU builds, 13 for
+Vulkan; Debian 13 is listed first) and active rootdir storage by number.
 Each template includes its storage ID. Enter m for manual entry; if inventory
 is unavailable, enter the full template volume / storage ID manually.
 Presets supplied through environment variables skip their corresponding prompts.
@@ -49,7 +49,7 @@ Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
 --create-only explicitly skips the guest installer (the default), overriding
 INSTALL_TARGET=1 or --install-target. Prepare host-matched NVIDIA userspace
 libraries in the CT, then run install-target.sh there; it installs the CUDA
-13.0 toolkit when nvcc is missing.
+toolkit when nvcc is missing (CUDA 13.0 on Debian 12, 13.1 on Debian 13).
 --install-target (or INSTALL_TARGET=1) runs the NVIDIA 580.173.02 LXC user-space
 installer first for CUDA guests, then runs the guest installer. It requires
 explicit MODEL_ALIAS=<name[:tag]> (a bare name gets :latest) plus either
@@ -74,9 +74,10 @@ ipv4() {
     done
 }
 valid_container_id() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 >= 100 )); }
-# The Debian release of the template: 12 for CUDA (NVIDIA's repository) and CPU
-# builds, 13 for Vulkan (Mesa 25 and Vulkan 1.4 from Debian itself).
-template_release() { if [[ ${BACKEND:-cuda} == vulkan ]]; then echo 13; else echo 12; fi; }
+# The Debian releases of the template: 12 or 13 for CUDA (NVIDIA's repository:
+# 13.0 on 12, 13.1 on 13) and CPU builds, 13 for Vulkan (Mesa 25 and Vulkan 1.4
+# from Debian itself).
+template_release() { if [[ ${BACKEND:-cuda} == vulkan ]]; then echo 13; else echo '(12|13)'; fi; }
 valid_container_template() {
     local release
     release=$(template_release)
@@ -133,12 +134,13 @@ prompt_container_setting() {
 list_container_templates() {
     local storage type status rest volume
     command -v pvesm >/dev/null && command -v pveam >/dev/null || return 0
+    # Newest Debian release first (Debian 13 before 12).
     while read -r storage type status rest; do
         [[ $status == active ]] || continue
         while read -r volume rest; do
             if valid_container_template "$volume"; then printf '%s\n' "$volume"; fi
         done < <(pveam list "$storage" 2>/dev/null || true)
-    done < <(pvesm status --content vztmpl 2>/dev/null || true)
+    done < <(pvesm status --content vztmpl 2>/dev/null || true) | sort -t/ -k2 -r -V
     return 0
 }
 list_container_storage() {
@@ -421,7 +423,7 @@ configure_container() {
             'Enter an existing Debian 13 template volume (Vulkan needs Debian 13), e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst.' list_container_templates
     else
         select_container_setting TEMPLATE 'CT template volume' valid_container_template \
-            'Enter an existing Debian 12 template volume, e.g. local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst.' list_container_templates
+            'Enter an existing Debian 13 or 12 template volume, e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst.' list_container_templates
     fi
     prompt_container_setting CT_HOSTNAME 'Container name' llama-target valid_container_name 'Enter a DNS hostname label, up to 63 characters.'
     prompt_container_setting IP_CIDR 'IPv4 address/CIDR or dhcp' '' valid_container_ip 'Enter a valid IPv4/CIDR (e.g. 192.168.11.30/24), or dhcp.'

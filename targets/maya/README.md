@@ -25,6 +25,7 @@ not every repository carries every release:
 | Template | CUDA releases in NVIDIA's repository | Maya default (12.8) |
 |---|---|---|
 | Ubuntu 24.04 | 12.5 and later | yes |
+| Ubuntu 26.04 | 13.3 and later | **no**: set `MAYA_CUDA_VERSION=13.3` or later (no V100) |
 | Ubuntu 22.04 | 11.7 and later | yes |
 | Debian 12 | 12.3 and later | yes |
 | Debian 13 | 13.1 and later | **no**: set `MAYA_CUDA_VERSION=13.1` or later (no V100) |
@@ -32,8 +33,11 @@ not every repository carries every release:
 `provision-lxc.sh` and `install-target.sh` refuse a combination the repository
 cannot provide before anything is created or changed. A toolkit of exactly
 `MAYA_CUDA_VERSION` already installed at `MAYA_NVCC` (from a runfile, say) is
-accepted whatever the repository carries. For a V100, use an Ubuntu or Debian
-12 template.
+accepted whatever the repository carries. For a V100, use an Ubuntu 22.04/24.04
+or Debian 12 template. The router installer picks Debian 13 (then Ubuntu
+26.04) and selects CUDA 13.1 or 13.3 for them unless `MAYA_CUDA_VERSION` is
+explicitly set; when the host's GPU 0 is older than compute capability 7.5 it
+picks Ubuntu 24.04 instead, so Maya keeps its CUDA 12.8 default.
 
 ## Install
 

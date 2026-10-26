@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run INSIDE a dedicated Debian inference-target LXC (Debian 12 for CUDA and CPU
-# builds, Debian 13 for Vulkan), never on the router or PVE host.
+# Run INSIDE a dedicated Debian inference-target LXC (Debian 12 or 13 for CUDA
+# and CPU builds, Debian 13 for Vulkan), never on the router or PVE host.
 set -Eeuo pipefail
 umask 027
 
-# Official release reviewed for Debian 12 / CUDA 13.0 / SM 86, 89 and 120, and for
-# Debian 13's Vulkan 1.4 / glslc (shaderc 2025.2) on RDNA 3/4 and Arc A/B.
+# Official release reviewed for CUDA 13.0 (Debian 12) and 13.1 (Debian 13, whose
+# NVIDIA repository starts there) / SM 86, 89 and 120, and for Debian 13's
+# Vulkan 1.4 / glslc (shaderc 2025.2) on RDNA 3/4 and Arc A/B.
 # https://github.com/ggml-org/llama.cpp/releases/tag/v0.5.0
 # Release commit: 7fe450e19305b828c199d602c23a8337aaa1f03b
 # Keep this fixed until a newer release has been reviewed; never resolve "latest".
@@ -45,12 +46,13 @@ units, restarts services that were running and waits for them to be healthy.
 Everything replaced is kept as *.prev and restored if the upgrade fails.
 
 CUDA requires host-matched userspace driver libraries inside the CT, with GPU
-devices passed through. If nvcc is missing, the CUDA 13.0 toolkit is installed
-from NVIDIA's Debian 12 repository. No NVIDIA drivers are installed.
+devices passed through. If nvcc is missing, the CUDA toolkit is installed from
+NVIDIA's repository for the guest: 13.0 on Debian 12, 13.1 on Debian 13 (that
+repository starts at 13.1). No NVIDIA drivers are installed.
 Vulkan (AMD Radeon RDNA 3/4, Intel Arc A/B) needs Debian 13 and the card's
 render node passed through; Mesa's Vulkan driver, the Vulkan headers and glslc
-come from Debian. A backend switch must stay on its Debian release (CUDA: 12,
-Vulkan: 13, CPU: either).
+come from Debian. A backend switch must stay on its Debian release (Vulkan: 13;
+CUDA and CPU: either).
 Services are enabled but are NOT started by this script.
 USAGE
 }
@@ -303,13 +305,17 @@ download_requested_gguf() {
 }
 
 # CUDA compiler discovery helpers (no filesystem mutations).
+# The CUDA release for this guest: NVIDIA's Debian 13 repository starts at
+# 13.1; Debian 12 keeps the reviewed 13.0.
+cuda_release() { if [[ ${VERSION_ID:-12} == 13 ]]; then echo 13.1; else echo 13.0; fi; }
+cuda_repo_dist() { if [[ ${VERSION_ID:-12} == 13 ]]; then echo debian13; else echo debian12; fi; }
 cuda_compiler_candidates() {
     local candidate
     candidate=$(command -v nvcc 2>/dev/null || true)
     [[ $candidate == /* ]] && printf '%s\n' "$candidate"
     for candidate in \
         /usr/local/cuda/bin/nvcc \
-        /usr/local/cuda-13.0/bin/nvcc \
+        "/usr/local/cuda-$(cuda_release)/bin/nvcc" \
         /usr/bin/nvcc \
         /usr/local/cuda-*/bin/nvcc; do
         [[ -e $candidate || -L $candidate ]] || continue
@@ -323,19 +329,21 @@ cuda_compiler_missing() {
     else
         printf 'No executable CUDA compiler (nvcc) was found inside this target CT.\n' >&2
     fi
-    cat >&2 <<'GUIDANCE'
+    local release dist
+    release=$(cuda_release); dist=$(cuda_repo_dist)
+    cat >&2 <<GUIDANCE
 The NVIDIA LXC user-space driver helper does not install the CUDA toolkit.
-Install the toolkit inside this Debian 12 target, then rerun the installer:
+Install the toolkit inside this target, then rerun the installer:
   apt-get update
   apt-get install -y ca-certificates wget
-  wget -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  wget -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/$dist/x86_64/cuda-keyring_1.1-1_all.deb
   dpkg -i /tmp/cuda-keyring.deb
   apt-get update
-  apt-get install --no-install-recommends -y cuda-toolkit-13-0
-  /usr/local/cuda-13.0/bin/nvcc --version
+  apt-get install --no-install-recommends -y cuda-toolkit-${release/./-}
+  /usr/local/cuda-$release/bin/nvcc --version
 Then unset CUDA_COMPILER and run install-target.sh again; it will discover nvcc.
 GUIDANCE
-    die 'CUDA toolkit 13.0 is required for BACKEND=cuda.'
+    die "CUDA toolkit $release is required for BACKEND=cuda."
 }
 resolve_cuda_compiler() {
     local requested=${CUDA_COMPILER:-} candidate resolved=''
@@ -354,23 +362,25 @@ resolve_cuda_compiler() {
     fi
     CUDA_COMPILER=$resolved
 }
-install_cuda_toolkit_13_0() {
-    local keyring_url=https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
-    printf 'CUDA compiler was not found; installing the CUDA 13.0 toolkit inside this target CT.\n'
+install_cuda_toolkit() {
+    local release dist keyring_url
+    release=$(cuda_release); dist=$(cuda_repo_dist)
+    keyring_url=https://developer.download.nvidia.com/compute/cuda/repos/$dist/x86_64/cuda-keyring_1.1-1_all.deb
+    printf 'CUDA compiler was not found; installing the CUDA %s toolkit inside this target CT.\n' "$release"
     apt-get update
     apt-get install -y ca-certificates wget
     wget --https-only -O /tmp/cuda-keyring.deb "$keyring_url"
     dpkg -i /tmp/cuda-keyring.deb
     apt-get update
-    apt-get install --no-install-recommends -y cuda-toolkit-13-0
-    /usr/local/cuda-13.0/bin/nvcc --version
+    apt-get install --no-install-recommends -y "cuda-toolkit-${release/./-}"
+    "/usr/local/cuda-$release/bin/nvcc" --version
 }
 ensure_cuda_compiler() {
     local requested=${CUDA_COMPILER:-}
     if resolve_cuda_compiler; then
         return 0
     fi
-    install_cuda_toolkit_13_0
+    install_cuda_toolkit
     resolve_cuda_compiler || cuda_compiler_missing "$requested"
 }
 # End CUDA compiler discovery helpers.
@@ -394,7 +404,7 @@ build_info() {
 backend_debian_ok() {
     [[ ${ID:-} == debian ]] || return 1
     case $1 in
-        cuda) [[ ${VERSION_ID:-} == 12 ]] ;;
+        cuda) [[ ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ]] ;;
         vulkan) [[ ${VERSION_ID:-} == 13 ]] ;;
         cpu) [[ ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ]] ;;
         *) return 1 ;;
@@ -403,7 +413,7 @@ backend_debian_ok() {
 require_backend_debian() {
     backend_debian_ok "$1" && return 0
     case $1 in
-        cuda) die 'The CUDA 13.0 build targets a Debian 12 guest.' ;;
+        cuda) die 'The CUDA build targets a Debian 12 or 13 guest.' ;;
         vulkan) die 'The Vulkan build targets a Debian 13 guest (Mesa 25 and Vulkan 1.4); provision a new CT with BACKEND=vulkan.' ;;
         *) die 'This target runs on a Debian 12 or 13 guest.' ;;
     esac
@@ -580,7 +590,7 @@ command -v systemd-detect-virt >/dev/null || die 'systemd-detect-virt is require
 # shellcheck disable=SC1090,SC1091
 source "${OS_RELEASE_FILE:-/etc/os-release}"
 [[ ${ID:-} == debian && ( ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ) ]] ||
-    die 'This target runs on a Debian 12 guest (CUDA, CPU) or a Debian 13 guest (Vulkan, CPU).'
+    die 'This target runs on a Debian 12 guest (CUDA, CPU) or a Debian 13 guest (CUDA, Vulkan, CPU).'
 [[ ! -d /app/router ]] || die 'The smart-router installation is present. Install this stack in a separate inference-target CT.'
 [[ $(systemctl show ollama-router.service -p LoadState --value) == not-found ]] || die 'The smart-router service is present. Install this stack in a separate inference-target CT.'
 

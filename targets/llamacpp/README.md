@@ -43,15 +43,18 @@ hosts a pool of inference processes. [Olla supported translations](https://thush
 ## NVIDIA baseline
 
 Host: **PVE 9.2**, with the existing working NVIDIA kernel driver.
-Guest: **Debian 12 amd64**, unprivileged LXC, native systemd services.
-Build: CUDA toolkit **13.0**, plus guest NVIDIA user-space libraries matching
+Guest: **Debian 13 or 12 amd64**, unprivileged LXC, native systemd services.
+Build: CUDA toolkit **13.1** on Debian 13 (NVIDIA's Debian 13 repository starts
+there) or **13.0** on Debian 12, plus guest NVIDIA user-space libraries matching
 the host driver. The repository's `install_nvidia_580_173_02.sh lxc` mode can be
 reused when the host actually runs **580.173.02**. It does not install the CUDA
 compiler. Do not run its `host` mode inside the guest.
 
-Debian 12 is deliberately independent of the host OS: NVIDIA's CUDA 13.0
-support table lists Debian 12. Driver branch 580 meets CUDA 13.x's documented
-minimum; using toolkit 13.0 also avoids requiring features from later drivers.
+The guest release is independent of the host OS: NVIDIA's CUDA 13.0 support
+table lists Debian 12, and 13.1's lists Debian 13. Driver branch 580 meets CUDA
+13.x's documented minimum (13.1 runs on it under minor-version compatibility,
+because the build targets the card's own architecture); toolkit 13.0 on Debian
+12 avoids even that.
 [CUDA 13.0 Linux support](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-installation-guide-linux/index.html),
 [driver compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
 
@@ -76,7 +79,7 @@ and **Intel Arc A- and B-series** cards.
 
 | | CUDA | Vulkan |
 |---|---|---|
-| Guest | Debian 12 | **Debian 13** (Mesa 25.0, Vulkan 1.4, glslc from Debian) |
+| Guest | Debian 13 or 12 | **Debian 13** (Mesa 25.0, Vulkan 1.4, glslc from Debian) |
 | Host driver | NVIDIA 580.173.02 | the kernel's `amdgpu`, `i915` (Arc A) or `xe` (Arc B) |
 | Passed through | `/dev/nvidia<n>`, `nvidiactl`, `nvidia-uvm(-tools)` | the card's render node, `/dev/dri/renderD<n>` |
 | In the CT | NVIDIA user-space libraries, CUDA 13.0 toolkit | `mesa-vulkan-drivers libvulkan1 libvulkan-dev glslc spirv-headers vulkan-tools` |
@@ -108,7 +111,7 @@ nodes to choose from.
 ## 1. Create the target LXC on its Proxmox host
 
 Copy this repository onto the **GPU's Proxmox host**. Select an unused CT ID,
-an existing downloaded Debian 12 amd64 template volume, rootdir storage,
+an existing downloaded Debian 13 (or 12) amd64 template volume, rootdir storage,
 bridge, and a free target IP. Check `pveam list local`, `pvesm status`, and
 `nvidia-smi -L` first.
 
@@ -133,7 +136,7 @@ bash targets/llamacpp/provision-lxc.sh
 The script prompts for the **CT template, name, IPv4/CIDR (or `dhcp`), CPU
 cores, RAM in MiB, root disk storage ID, and disk size in GiB**. It also asks
 for the CT ID, network bridge, and an optional static gateway. The next free
-cluster ID is suggested when available. Downloaded Debian 12 templates and
+cluster ID is suggested when available. Downloaded Debian 13 and 12 templates (13 first) and
 active storage that supports container root disks appear in numbered selectors.
 Choose a number, paste an exact listed ID, or enter `m` to provide a manual
 value. CUDA runs also present a numbered NVIDIA GPU selector. Templates are not
@@ -206,27 +209,32 @@ pct enter "$CT_ID"
 ```
 
 The remaining commands in this section run **inside the target LXC**. For a
-fresh Debian 12 guest, install NVIDIA's toolkit-only package; the `cuda` and
+fresh guest, install NVIDIA's toolkit-only package; the `cuda` and
 `cuda-runtime` meta-packages also bring drivers and should not replace the
 host-matched user-space installation.
 
 ```bash
+# Debian 13: debian13 and 13-1 / cuda-13.1 (its repository starts at 13.1)
+# Debian 12: debian12 and 13-0 / cuda-13.0
 apt-get update
 apt-get install -y ca-certificates wget
 wget -O /tmp/cuda-keyring.deb \
-  https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+  https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
 dpkg -i /tmp/cuda-keyring.deb
 apt-get update
-apt-get install --no-install-recommends -y cuda-toolkit-13-0
+apt-get install --no-install-recommends -y cuda-toolkit-13-1
 nvidia-smi
-/usr/local/cuda-13.0/bin/nvcc --version
+/usr/local/cuda-13.1/bin/nvcc --version
 ```
+
+`install-target.sh` does this itself when no `nvcc` is found, picking the
+repository and release from the guest's Debian version.
 
 The package repository and versioned toolkit-only convention follow the
 [NVIDIA installation guide](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-installation-guide-linux/index.html#debian).
-The NVIDIA LXC user-space helper does not install `nvcc`; `cuda-toolkit-13-0`
-does. The target installer first discovers an executable compiler from `PATH`,
-`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.0/bin/nvcc`, or another
+The NVIDIA LXC user-space helper does not install `nvcc`; `cuda-toolkit-13-1`
+(or `-13-0`) does. The target installer first discovers an executable compiler from `PATH`,
+`/usr/local/cuda/bin/nvcc`, `/usr/local/cuda-13.1/bin/nvcc` (`13.0` on Debian 12), or another
 versioned `/usr/local/cuda-*` directory. When none exists, it automatically
 runs the toolkit-only installation sequence above and then verifies `nvcc`.
 Leave `CUDA_COMPILER` unset unless you need to select a specific installed
@@ -249,7 +257,7 @@ GPU access and compatible user-space libraries on the new host.
 Still inside the target LXC, the installer defaults to the official **llama.cpp
 v0.5.0** release (release commit
 `7fe450e19305b828c199d602c23a8337aaa1f03b`). No version selection is required.
-This is a fixed, source-reviewed baseline for the Debian 12 / CUDA 13.0 setup
+This is a fixed, source-reviewed baseline for the Debian 12 / CUDA 13.0 and Debian 13 / CUDA 13.1 setups
 and the adapter's API; compatibility with your exact GGUF still needs the live
 checks below. The installer builds locally with your CUDA toolkit, explicitly
 includes the OpenSSL development dependency, and disables the separate app/UI

@@ -952,7 +952,7 @@ target_gpu_need() {
 }
 
 # The GPU prepare_host_gpu found, for the targets that adapt to it.
-HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE="" HOST_GPU_CUDA_ARCH=""
 
 # prepare_host_gpu: before anything is created, make sure the selected GPU
 # targets find a working GPU driver on this host. tools/setup-host-gpu.sh
@@ -1009,6 +1009,7 @@ prepare_host_gpu() {
   HOST_GPU_STATE="$state"
   HOST_GPU_VENDOR="$(sed -n 's/^GPU_VENDOR=//p' <<< "$out")"
   HOST_GPU_RENDER_NODE="$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$out")"
+  HOST_GPU_CUDA_ARCH="$(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out")"
   if [[ "$state" == ready ]]; then
     case "$HOST_GPU_VENDOR" in
       nvidia) echo "NVIDIA GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") (compute capability $(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out"))." ;;
@@ -1043,6 +1044,26 @@ target_gpu_env() {
 
 # Strata, Basalt, Maya and Xolotl take a template; the others choose or prompt for theirs.
 target_needs_template() { [[ "$1" == strata || "$1" == basalt || "$1" == maya || "$1" == xolotl ]]; }
+
+# The newer NVIDIA repositories do not carry the targets' CUDA defaults.
+# Keep an explicit user choice, including an unavailable one (the target's
+# preflight explains that error before it creates a CT).
+target_cuda_env() {
+  local name=$1 template=$2 key release
+  case "$name" in
+    basalt) key=CUDA_VERSION ;;
+    maya) key=MAYA_CUDA_VERSION ;;
+    xolotl) key=XOLOTL_CUDA_VERSION ;;
+    *) return 0 ;;
+  esac
+  [[ -z ${!key:-} ]] || return 0
+  case "$template" in
+    *:vztmpl/ubuntu-26.04-*) release=13.3 ;;
+    *:vztmpl/debian-13-*) release=13.1 ;;
+    *) return 0 ;;
+  esac
+  printf '%s=%s\n' "$key" "$release"
+}
 
 # A selection is blank, "none", or target names and/or menu numbers separated
 # by commas or spaces.
@@ -1136,18 +1157,54 @@ valid_target_ip() {
   [[ " ${TARGET_RESERVED_IPS:-} " != *" ${1%/*} "* ]] || { echo "    ${1%/*} is already used by this install." >&2; return 1; }
 }
 valid_target_template() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-22\.04|ubuntu-24\.04|debian-12|debian-13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-22\.04|ubuntu-24\.04|ubuntu-26\.04|debian-12|debian-13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]]
+}
+valid_strata_template() {
+  valid_target_template "$1" && [[ "$1" != *:vztmpl/ubuntu-26.04-* ]]
 }
 valid_comfyui_variant() { [[ $1 == klein-4b || $1 == klein-9b ]]; }
 valid_hf_token() { [[ $1 =~ ^hf_[A-Za-z0-9]{30,}$ ]]; }
 
-# default_gpu_target_template: the newest downloaded Ubuntu 24.04, Ubuntu
-# 22.04 or Debian 12 standard template (in that order), else the newest
-# Ubuntu 24.04 template pveam can download into TEMPLATE_STORAGE. (Debian 13
-# needs CUDA 13.1+, which Maya's, Basalt's and Xolotl's defaults are not.)
+# host_gpu_cuda_arch: GPU 0's compute capability (86), from the GPU step or,
+# before it has run (the template prompts come first), from nvidia-smi.
+host_gpu_cuda_arch() {
+  local cap
+  if [[ -n ${HOST_GPU_CUDA_ARCH:-} ]]; then printf '%s\n' "$HOST_GPU_CUDA_ARCH"; return 0; fi
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  [[ $cap =~ ^([0-9]+)\.([0-9])$ ]] && printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  return 0
+}
+# gpu_target_template_order NAME: the template distributions to prefer for a
+# GPU target. Debian 13 first: its NVIDIA repository starts at CUDA 13.1, the
+# release nearest the host's 580 driver (Ubuntu 26.04's starts at 13.3, which
+# NVIDIA pairs with the 610 driver and which runs on 580 only under minor-version
+# compatibility). Ubuntu 26.04 is next for Basalt, Maya and Xolotl; Strata's
+# upstream setup does not support it. Maya on a card CUDA 13 cannot build for
+# (compute capability below 7.5, e.g. a V100) needs CUDA 12.x, which only the
+# Ubuntu 24.04/22.04 and Debian 12 repositories carry.
+gpu_target_template_order() {
+  case "$1" in
+    strata) echo debian-13 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
+    maya)
+      local arch
+      arch="$(host_gpu_cuda_arch)"
+      if [[ $arch =~ ^[0-9]+$ ]] && (( arch < 75 )); then
+        echo ubuntu-24.04 ubuntu-22.04 debian-12
+      else
+        echo debian-13 ubuntu-26.04 ubuntu-24.04 ubuntu-22.04 debian-12
+      fi ;;
+    *) echo debian-13 ubuntu-26.04 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
+  esac
+}
+# default_gpu_target_template NAME: the newest downloaded template of the first
+# distribution in NAME's order that has one, else the newest template of the
+# first distribution pveam can download into TEMPLATE_STORAGE.
 default_gpu_target_template() {
-  local storage distro ref name
-  for distro in ubuntu-24.04 ubuntu-22.04 debian-12; do
+  local storage distro ref name order first
+  order="$(gpu_target_template_order "${1:-}")"
+  first="${order%% *}"
+  for distro in $order; do
     while IFS= read -r storage; do
       ref="$(pveam list "$storage" 2>/dev/null |
         awk -v p="^${storage}:vztmpl/${distro}-standard_" '$1 ~ p && $1 ~ /_amd64\.tar\.(zst|gz|xz)$/ {print $1}' |
@@ -1156,7 +1213,7 @@ default_gpu_target_template() {
     done < <(template_storages)
   done
   name="$(pveam available --section system 2>/dev/null |
-    awk '$2 ~ /^ubuntu-24\.04-standard_.*_amd64\.tar\.(zst|gz|xz)$/ {print $2}' | sort -V | tail -n 1)"
+    awk -v p="^${first}-standard_" '$2 ~ p && $2 ~ /_amd64\.tar\.(zst|gz|xz)$/ {print $2}' | sort -V | tail -n 1)"
   [[ -n "$name" ]] || return 1
   printf '%s:vztmpl/%s\n' "$TEMPLATE_STORAGE" "$name"
 }
@@ -1221,9 +1278,14 @@ prompt_target_settings() {
     fi
     if target_needs_template "$name"; then
       default="${!template_var:-}"
-      [[ -n "$default" ]] || default="$(default_gpu_target_template)" || default=""
-      prompt_until_valid "    Template (Ubuntu 22.04/24.04 or Debian 12/13; downloaded if missing)" \
-        "$template_var" "$default" valid_target_template || return 1
+      [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
+      if [[ $name == strata ]]; then
+        prompt_until_valid "    Template (Ubuntu 22.04/24.04 or Debian 12/13; downloaded if missing)" \
+          "$template_var" "$default" valid_strata_template || return 1
+      else
+        prompt_until_valid "    Template (Ubuntu 22.04/24.04/26.04 or Debian 12/13; downloaded if missing; Ubuntu 26.04 needs CUDA 13.3+)" \
+          "$template_var" "$default" valid_target_template || return 1
+      fi
     fi
   done
 }
@@ -1269,7 +1331,7 @@ preset_target_model_servers() {
 # and the like must not reach a target, and the admin token only reaches the
 # companions (as an environment variable, never an argument).
 run_target_provisioner() {
-  local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env
+  local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env cuda_env
   local -a flags=()
   phase="$(target_field "$name" phase)" || return 1
   script="${TARGETS_DIR}/${name}/provision-lxc.sh"
@@ -1291,6 +1353,7 @@ run_target_provisioner() {
   script_url="$(target_setting "$name" COMMUNITY_SCRIPT_URL)"
   script_sha="$(target_setting "$name" COMMUNITY_SCRIPT_SHA256)"
   gpu_env="$(target_gpu_env "$name")"
+  cuda_env="$(target_cuda_env "$name" "$template")"
   (
     local router_ct="$CT_ID" gateway="$GATEWAY" bridge="$BRIDGE" nameserver="$NAMESERVER"
     local webui_port="$OPENWEBUI_PORT" admin_token="${TARGET_ADMIN_TOKEN:-}"
@@ -1314,6 +1377,7 @@ run_target_provisioner() {
     while IFS= read -r setting; do
       [[ -z "$setting" ]] || export "${setting?}"
     done <<< "$gpu_env"
+    [[ -z "$cuda_env" ]] || export "${cuda_env?}"
     if [[ "$phase" == companion ]]; then
       export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
       OPENWEBUI_ADMIN_TOKEN="$admin_token" exec bash "$script" "${flags[@]}"

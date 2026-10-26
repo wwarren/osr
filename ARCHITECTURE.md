@@ -672,7 +672,7 @@ sees the result as one more host of the matching kind.
 
 | Target | Kind | Port | Engine and model | Notes |
 |---|---|---|---|---|
-| `llamacpp` | Ollama (bridge) | 11434 | `llama-server`, one GGUF | CUDA on Debian 12, Vulkan (AMD/Intel Arc) on Debian 13; GPU gid 993 |
+| `llamacpp` | Ollama (bridge) | 11434 | `llama-server`, one GGUF | CUDA 13.0 on Debian 12 or 13.1 on Debian 13, Vulkan (AMD/Intel Arc) on Debian 13; GPU gid 993 |
 | `airllm` | Ollama | 11434 | AirLLM, one HF model streamed from disk | Seconds–minutes per token |
 | `ollama` | Ollama | 11434 | Ollama from the PVE community script | Adopted with a drop-in; NVIDIA, AMD (ROCm) or Intel Arc (Vulkan) |
 | `strata` | `strata` | 8080 | Strata, Qwen3.8-Flash-Next (125B) | Options parsed from `setup.sh --help` |
@@ -688,6 +688,21 @@ sees the result as one more host of the matching kind.
   llama.cpp) that the account joins. Nodes owned by group root are refused.
 * The bundled NVIDIA user-space helper matches host driver 580.173.02. Use
   `NVIDIA_GUEST_INSTALLER` for another driver.
+* **Distributions.** Debian 13 and Ubuntu 26.04 are preferred where the
+  target's upstream supports them. The router installer's
+  `gpu_target_template_order` defaults Strata, Basalt, Maya and Xolotl to
+  Debian 13 (CUDA 13.1, the first release in that NVIDIA repository and the
+  nearest to the 580 driver), then Ubuntu 26.04 (13.3; not Strata, whose
+  setup installs CUDA only on Ubuntu 22.04/24.04 and Debian 12/13), then the
+  older releases. Maya on a pre-Turing card (compute capability below 7.5,
+  read from the GPU step or `nvidia-smi`) defaults to Ubuntu 24.04, because
+  CUDA 13 cannot build for it. `target_cuda_env` passes the matching CUDA
+  release unless one is set. Ollama's community CT defaults to Debian 13
+  (`OLLAMA_CT_OS`/`OLLAMA_CT_VERSION`), Mattermost's to Ubuntu 26.04
+  (`MATTERMOST_CT_VERSION`; Mattermost is Ubuntu-only), llama.cpp lists Debian
+  13 first and installs CUDA 13.1 there (13.0 on Debian 12). CUDA 13.1/13.3 on
+  the 580 driver relies on minor-version compatibility: the engines are built
+  for the card's architecture (no runtime PTX JIT).
 * **Host GPU driver.** `tools/setup-host-gpu.sh` makes sure the host has a
   working GPU driver before any GPU target is created.
   * *Installer side.* The target table's GPU column is `need:vendors[:gens]`

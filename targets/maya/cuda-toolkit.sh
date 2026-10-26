@@ -79,6 +79,7 @@ repo_minimum() {
     case $1 in
         ubuntu2204) echo 11.7 ;;
         ubuntu2404) echo 12.5 ;;
+        ubuntu2604) echo 13.3 ;;
         debian12) echo 12.3 ;;
         debian13) echo 13.1 ;;
         *) echo '' ;;

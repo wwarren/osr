@@ -12,16 +12,18 @@ installer supplies a newer CMake in its virtual environment when the system
 version is too old.
 
 The toolkit comes from NVIDIA's apt repository for the CT's distribution.
-Ubuntu 22.04/24.04 and Debian 12 carry the default CUDA 13.0; **Debian 13
-starts at 13.1**, so use `CUDA_VERSION=13.1` (or later) with a Debian 13
-template. `provision-lxc.sh` and `install-target.sh` refuse a combination the
+Ubuntu 22.04/24.04 and Debian 12 carry the default CUDA 13.0. **Debian 13
+starts at 13.1** (`CUDA_VERSION=13.1` or later); **Ubuntu 26.04 starts at
+13.3** (`CUDA_VERSION=13.3` or later). The router installer picks a Debian 13
+template first, then Ubuntu 26.04, and selects these versions automatically
+for them unless `CUDA_VERSION` is explicitly set. `provision-lxc.sh` and `install-target.sh` refuse a combination the
 repository cannot provide before anything is created or changed, unless a
 toolkit that meets `CUDA_VERSION` is already installed in the CT.
 
 ## Before running
 
 Run on the Proxmox GPU host as root. The host needs Proxmox VE 9, an unused CT
-ID, a downloaded Ubuntu 22.04/24.04 or Debian 12/13 amd64 LXC template,
+ID, a downloaded Ubuntu 22.04/24.04/26.04 or Debian 12/13 amd64 LXC template,
 rootdir storage, network access, and `/dev/nvidia0`, `/dev/nvidiactl` and
 `/dev/nvidia-uvm`. The bundled NVIDIA guest helper matches host driver
 580.173.02. For a different host driver, supply a matching

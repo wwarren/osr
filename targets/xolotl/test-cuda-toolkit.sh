@@ -12,7 +12,7 @@ pass() { passed=$((passed + 1)); printf 'PASS %s\n' "$1"; }
 check() { env -i "PATH=$PATH" "CUDA_DIST=$1" "CUDA_VERSION=$2" "CUDA_HOME_DIR=/nonexistent" bash "$toolkit" --check-repo 2>&1; }
 
 for case in ubuntu2404:12.8 ubuntu2404:12.9 ubuntu2204:12.8 debian12:12.8 debian12:13.0 \
-            debian13:13.1 debian13:13.4 ubuntu2404:13.0; do
+            debian13:13.1 debian13:13.4 ubuntu2404:13.0 ubuntu2604:13.3 ubuntu2604:13.4; do
     out=$(check "${case%%:*}" "${case#*:}") || fail "$case refused: $out"
     [[ $out == *"is available for ${case%%:*}"* ]] || fail "$case: $out"
 done
@@ -24,6 +24,10 @@ for case in debian13:12.8 debian13:12.9 debian13:13.0; do
     [[ $out == *'XOLOTL_CUDA_VERSION=13.1 or later'* && $out == *'Ubuntu 24.04'* ]] || fail "$case advice: $out"
 done
 pass 'Debian 13 with CUDA 12.x or 13.0 is refused, with the setting to change and the alternatives'
+
+out=$(check ubuntu2604 13.0) && fail 'ubuntu2604 with CUDA 13.0 accepted'
+[[ $out == *'ubuntu2604 repository starts at CUDA 13.3'* && $out == *'XOLOTL_CUDA_VERSION=13.3'* ]] || fail "ubuntu2604 message: $out"
+pass 'Ubuntu 26.04 requires CUDA 13.3 or later'
 
 out=$(check debian14 12.8) || fail "an unknown distro was refused by the table: $out"
 [[ $out == *'not a distro this script has checked'* ]] || fail "unknown distro note: $out"

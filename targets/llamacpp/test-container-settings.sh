@@ -76,8 +76,9 @@ inventory_templates() {
         esac
     }
     output=$(list_container_templates)
-    [[ $output == *'local:vztmpl/debian-12-standard_test_amd64.tar.zst'* ]] || die "Missing downloaded template: $output"
-    [[ $output != *debian-13* && $output != *ubuntu* && $output != *offline:* ]] || die "Unsupported or inactive template listed: $output"
+    [[ $output == $'local:vztmpl/debian-13-standard_test_amd64.tar.zst\nlocal:vztmpl/debian-12-standard_test_amd64.tar.zst' ]] ||
+        die "Expected Debian 13, then Debian 12: $output"
+    [[ $output != *ubuntu* && $output != *offline:* ]] || die "Unsupported or inactive template listed: $output"
     printf 'INVENTORY verified\n'
 }
 inventory_templates_vulkan() {
@@ -181,7 +182,8 @@ check 'fractional CPU rejected' fail 'CORES' presets NONINTERACTIVE=true CORES=1
 check 'RAM below minimum rejected' fail 'MEMORY_MB' presets NONINTERACTIVE=true MEMORY_MB=1023
 check 'zero disk size rejected' fail 'ROOTFS_GB' presets NONINTERACTIVE=true ROOTFS_GB=0
 check 'invalid preset fails without prompt' fail 'CORES' interactive_presets CT_HOSTNAME=llama-target BRIDGE=vmbr0 CORES=invalid MEMORY_MB=16384 ROOTFS_GB=64 </dev/null
-check 'unsupported template rejected' fail 'TEMPLATE' presets NONINTERACTIVE=true TEMPLATE=local:vztmpl/debian-13-standard_test_amd64.tar.zst
+check 'unsupported template rejected' fail 'TEMPLATE' presets NONINTERACTIVE=true TEMPLATE=local:vztmpl/ubuntu-24.04-standard_test_amd64.tar.zst
+check 'Debian 11 rejected' fail 'TEMPLATE' presets NONINTERACTIVE=true TEMPLATE=local:vztmpl/debian-11-standard_test_amd64.tar.zst
 check 'storage path rejected' fail 'STORAGE' presets NONINTERACTIVE=true STORAGE=/var/lib/vz
 check 'hostname with whitespace rejected' fail 'CT_HOSTNAME' presets NONINTERACTIVE=true 'CT_HOSTNAME=gpu target'
 check 'bridge with whitespace rejected' fail 'BRIDGE' presets NONINTERACTIVE=true 'BRIDGE=vm br0'
@@ -229,7 +231,7 @@ INPUT
 check 'interactive invalid values re-prompt' ok 'SETTINGS|250|local:vztmpl/debian-12-standard_test_amd64.tar.zst|gpu-target|192.0.2.50/24|vmbr0|192.0.2.1|8|32768|local-lvm|128' interactive <<'INPUT'
 99
 250
-local:vztmpl/debian-13-standard_test_amd64.tar.zst
+local:vztmpl/ubuntu-24.04-standard_test_amd64.tar.zst
 local:vztmpl/debian-12-standard_test_amd64.tar.zst
 bad name
 gpu-target

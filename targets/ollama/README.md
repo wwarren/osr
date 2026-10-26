@@ -49,7 +49,11 @@ with the settings preset as its `var_*` variables (`var_ctid`, `var_cpu`,
 `var_ram`, `var_disk`, `var_net`, `var_gateway`, `var_gpu`, ...). The script
 still shows its menu: choose **Default** to accept the presets. Defaults
 here are larger than the community ones, because models need the room:
-4 cores, **16 GB RAM, 128 GB disk**.
+4 cores, **16 GB RAM, 128 GB disk**, and a **Debian 13** CT (`var_os`/
+`var_version`; the community script's installer handles Debian 13 itself).
+`OLLAMA_CT_OS=ubuntu OLLAMA_CT_VERSION=26.04` (or 24.04, 22.04; Debian 12)
+picks another distribution; Ollama's releases bundle their CUDA and ROCm
+runtimes, so the distribution only supplies Mesa for Intel Arc.
 
 The GPU: `GPU=auto` picks NVIDIA when the host has `/dev/nvidia0`, else AMD
 when it has `/dev/kfd`, else Intel for an Arc card's render node, else none;
@@ -62,7 +66,7 @@ wrapper then checks the CT config and warns if the GPU is missing.
 |---|---|---|
 | NVIDIA | `/dev/nvidia*` | the repository's NVIDIA 580.173.02 user-space helper, when `nvidia-smi` is missing (before adoption) |
 | AMD Radeon RX 7000/9000, PRO W7000 | `/dev/dri/renderD*`, `/dev/kfd` | Ollama's ROCm libraries for the installed release (`ollama-linux-amd64-rocm.tar.zst`, checksum-verified; they bundle ROCm, so nothing else is installed) |
-| Intel Arc A/B | `/dev/dri/renderD*` | Mesa's Vulkan driver (`mesa-vulkan-drivers libvulkan1`) for Ollama's built-in Vulkan backend; Arc B needs Mesa 24.2+ (Ubuntu 24.04 has 25.0 after `apt upgrade`) |
+| Intel Arc A/B | `/dev/dri/renderD*` | Mesa's Vulkan driver (`mesa-vulkan-drivers libvulkan1`) for Ollama's built-in Vulkan backend; Arc B needs Mesa 24.2+ (Debian 13 has 25.0, Ubuntu 24.04 25.0 after `apt upgrade`, Ubuntu 26.04 26.0) |
 
 Set the host's driver up first with `tools/setup-host-gpu.sh --vendors
 nvidia,amd,intel` (the router installer does, and passes `GPU`). Inside the CT,
