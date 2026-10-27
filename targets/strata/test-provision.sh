@@ -7,6 +7,8 @@ provision=$here/provision-lxc.sh
 guest=$here/install-target.sh
 common=(CT_ID=280 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
         STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1)
+pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' "$here/test-pinned-run-script.py")
+[[ $pin =~ ^[0-9a-f]{40}$ ]] || { echo 'FAIL missing Strata test pin' >&2; exit 1; }
 passed=0
 
 has() { [[ $output == *"$1"* ]] || { printf 'FAIL missing %s\n%s\n' "$1" "$output" >&2; exit 1; }; }
@@ -40,8 +42,15 @@ has 'STRATA_READY_TIMEOUT=900'
 has 'nvidia-guest-install.sh lxc'
 has 'bash /root/strata-target-deploy/install-target.sh'
 has 'STRATA_PORT=8080'
-has 'STRATA_COMMIT='
+has "STRATA_COMMIT=$pin"
 lacks 'https://github.com/Niko1221/Strata.git'  # cloning happens inside the CT
+
+plan STRATA_REF=v0.1.40
+has 'STRATA_REF=v0.1.40'
+has 'STRATA_COMMIT='
+plan STRATA_COMMIT=
+has 'STRATA_REF=main'
+has 'STRATA_COMMIT='
 
 plan STRATA_PORT=11434 IP_CIDR=dhcp GATEWAY= STRATA_MODEL=IQ3_S
 has 'STRATA_PORT=11434'
@@ -71,7 +80,7 @@ plan GPU_DEVICES='/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-to
 has '--dev3 path=/dev/nvidia-uvm-tools'
 
 output=$(env -i "PATH=$PATH" bash "$guest" --dry-run 2>&1)
-has 'git fetch --depth 1 https://github.com/Niko1221/Strata.git main into /opt/strata (as strata)'
+has "git fetch --depth 1 https://github.com/Niko1221/Strata.git $pin into /opt/strata (as strata)"
 has 'setup.sh --help: keep only the options this checkout supports'
 has '--setup --no-start --yes'
 has '--host 0.0.0.0 --port 8080'
@@ -95,7 +104,7 @@ rerun_plan() {
         UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1
 }
 output=$(rerun_plan)
-has 'git fetch --depth 1 https://github.com/Niko1221/Strata.git main (before anything is stopped'
+has "git fetch --depth 1 https://github.com/Niko1221/Strata.git $pin (before anything is stopped"
 has 'nothing to do'
 has 'record the current commit; systemctl stop strata.service'
 has 'previous commit locally (no network)'
@@ -114,6 +123,10 @@ passed=$((passed + 1))
 output=$(env -i "PATH=$PATH" STRATA_PORT=11434 STRATA_REF=v0.1.40 bash "$guest" --dry-run 2>&1)
 has 'Strata.git v0.1.40 into'
 has '--port 11434'
+passed=$((passed + 1))
+
+output=$(env -i "PATH=$PATH" STRATA_COMMIT= bash "$guest" --dry-run 2>&1)
+has 'Strata.git main into'
 passed=$((passed + 1))
 
 commit=0123456789abcdef0123456789abcdef01234567

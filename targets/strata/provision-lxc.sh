@@ -28,7 +28,8 @@ Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           GPU_GID=44 (the CT group given the GPU nodes; 44 is "video"),
           NVIDIA_DRIVER_VERSION=580.173.02,
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
-          STRATA_REF=main, STRATA_COMMIT=<optional full SHA-1 pin>,
+          STRATA_COMMIT=a0116b2782a5b82622358c04a06496485d12b2d6 (tested default),
+          STRATA_REF=<branch or tag> (explicitly follow it when no commit is set),
           STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (or swift, coder,
           unsloth: whatever the checkout's setup.sh offers),
           STRATA_CONTEXT=32768,
@@ -37,8 +38,8 @@ Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
 
 Strata's setup.sh options vary between releases; the guest installer reads
 setup.sh --help and stops with an explanation when a required one (--host,
---api-key, --no-start, ...) is missing. With no STRATA_COMMIT, installation
-fetches the latest commit on STRATA_REF (main by default).
+--api-key, --no-start, ...) is missing. Explicit STRATA_REF or an empty
+STRATA_COMMIT follows a branch tip (main if no ref is set).
 
 The new CT is retained if a later step fails so setup can be inspected and
 resumed. No existing CT, router, host driver, or host network setting is changed.
@@ -101,8 +102,15 @@ fi
 # the nodes must not be root's group inside the CT.
 GPU_GID=${GPU_GID:-44}
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-580.173.02}
+# Pin an unconfigured install to the source used by the upstream regression
+# test. An explicit ref, or an explicitly empty commit, opts into branch tips.
+STRATA_DEFAULT_COMMIT=a0116b2782a5b82622358c04a06496485d12b2d6
+if [[ ! ${STRATA_COMMIT+x} && ! ${STRATA_REF+x} ]]; then
+    STRATA_COMMIT=$STRATA_DEFAULT_COMMIT
+else
+    STRATA_COMMIT=${STRATA_COMMIT:-}
+fi
 STRATA_REF=${STRATA_REF:-main}
-STRATA_COMMIT=${STRATA_COMMIT:-}
 STRATA_FAMILY=${STRATA_FAMILY:-qwen}
 # Default model per family (upstream offers IQ1_M only for coder and the
 # UD-* packs only for unsloth).

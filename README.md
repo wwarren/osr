@@ -18,240 +18,147 @@ four hardened systemd services as the `ollama-router` user:
 | Health monitor | `ollama-monitor.service` | — | Probes hosts and local services, alerts to Mattermost, keeps models loaded |
 
 Normal request path: **client or Open WebUI → router :8000 → model host**.
-LiteLLM is used only when discovery is off or no host answers.
+LiteLLM handles static tiers when discovery is off or the inventory is empty.
 
-The model pool can mix Ollama, LM Studio, Strata, Basalt, Project Maya and
-Xolotl servers. `targets/` provisions such servers in their own CTs (see
-[Inference targets](#inference-targets)), plus optional
-[Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
-service LXCs and [Open Terminal](targets/open-terminal/README.md),
-[Hermes Agent](targets/hermes/README.md) and [ComfyUI](targets/comfyui/README.md)
-(image generation) companion LXCs.
+The pool can mix Ollama, LM Studio, llama.cpp, AirLLM, Strata, Basalt, Maya
+and Xolotl. Optional service and companion CTs are listed under
+[Inference targets](#inference-targets).
 
 ## Install
 
-Gitea keeps the router's configuration history, and Mattermost receives its
-health alerts. Both are optional. If you do not run them yet, the installer can
-create each one in its own LXC at the start of the install, already set up for
-the router. You can also create them first with
-[`targets/gitea`](targets/gitea/README.md) and
-[`targets/mattermost`](targets/mattermost/README.md).
-
-Run as root on the Proxmox host:
+From a full repository checkout, run as root on the Proxmox host:
 
 ```bash
 bash ollama-smart-router-install.sh
 ```
 
-It first asks which [targets](#inference-targets) to create alongside the
-router, from a numbered menu:
-- the services `gitea` and `mattermost`;
-- the model servers `ollama`, `llamacpp`, `airllm`, `strata`, `basalt`,
-  `maya` and `xolotl`;
-- the companions `open-terminal`, `hermes` and `comfyui`.
+The installer asks which targets to create: Gitea and Mattermost services;
+Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya and Xolotl model servers; and
+Open Terminal, Hermes and ComfyUI companions. Enter comma-separated names or
+menu numbers, or press Enter for none. Gitea stores configuration history and
+Mattermost receives alerts; both are optional and can also be installed
+separately from [targets/gitea](targets/gitea/README.md) and
+[targets/mattermost](targets/mattermost/README.md).
 
-Answer with numbers or names, comma-separated, or Enter for none.
+For each selected target, provide a unique CT ID, static IP/CIDR and storage.
+Strata, Basalt, Maya and Xolotl also ask for a template. The installer then
+checks the host GPU, creates selected service CTs, verifies the Gitea token,
+creates the router CT, provisions model targets, and finally connects selected
+companions to Open WebUI. Choose **Default** in the Gitea, Mattermost and
+ComfyUI community-script menus. Open WebUI companions require an admin API key:
+create the first admin account in the browser, enable API keys and create one
+when prompted. A failed service stops the install before the router is built;
+a failed model or companion target leaves the router running and is listed with
+retry instructions at the end.
 
-For each selected target, it asks up front, with the other settings:
-- a CT ID (the next free one after the router's);
-- a static IP/CIDR (the router needs a fixed address);
-- a storage (default: the router's);
-- for Strata, Basalt, Maya and Xolotl, a template. The default is the newest
-  downloaded Debian 13 template, then Ubuntu 26.04 (not for Strata), Ubuntu
-  24.04, Ubuntu 22.04 and Debian 12; with none downloaded, a Debian 13 template
-  is downloaded. Maya on a card CUDA 13 cannot build for (compute capability
-  below 7.5, e.g. a V100) defaults to Ubuntu 24.04 instead. Basalt, Maya and
-  Xolotl get CUDA 13.1 on Debian 13 and 13.3 on Ubuntu 26.04 (the first
-  releases those NVIDIA repositories carry) unless you set their CUDA version.
+Ollama and AirLLM install their engines during provisioning. The llama.cpp
+target creates only a CT unless `MODEL_ALIAS` and either `MODEL_DOWNLOAD_URL`
+or `MODEL_PATH` are set; see its [README](targets/llamacpp/README.md).
+Generated Gitea and Mattermost admin passwords are in
+`/etc/<service>-target/admin-password` inside their respective CTs.
 
 ### LXC distribution support
 
-Debian 13 and Ubuntu 26.04 are preferred wherever the target's upstream
-supports them; the older releases stay available where it does not.
-
-| LXC | Default | Also supported |
+| LXC | Default | Other supported releases |
 |---|---|---|
-| Router, Gitea, ComfyUI | Debian 13 | |
-| Open Terminal, Hermes Agent | Debian 13 (the router's template) | Debian 12 |
-| Ollama (community script) | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 (`OLLAMA_CT_OS`, `OLLAMA_CT_VERSION`) |
-| Mattermost (community script) | Ubuntu 26.04 | Ubuntu 22.04, 24.04 (`MATTERMOST_CT_VERSION`); Mattermost publishes for Ubuntu only |
-| AirLLM | chosen at its prompt | Debian 12 or 13; Ubuntu 24.04 or 26.04 (Python 3.11+) |
-| llama.cpp | Debian 13 listed first | CUDA or CPU: Debian 12 or 13; Vulkan: Debian 13 |
-| Basalt, Maya, Xolotl | Debian 13 | Ubuntu 26.04, 24.04, 22.04; Debian 12 |
-| Strata | Debian 13 | Ubuntu 24.04, 22.04; Debian 12 (not 26.04: its setup installs CUDA only on these) |
+| Router, Gitea, ComfyUI | Debian 13 | — |
+| Open Terminal, Hermes | Debian 13 | Debian 12 |
+| Ollama | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 (`OLLAMA_CT_OS`, `OLLAMA_CT_VERSION`) |
+| Mattermost | Ubuntu 26.04 | Ubuntu 22.04, 24.04 (`MATTERMOST_CT_VERSION`); Ubuntu only |
+| AirLLM | chosen at prompt | Debian 12/13; Ubuntu 24.04/26.04 (Python 3.11+) |
+| llama.cpp | Debian 13 listed first | Debian 12/13 for CUDA or CPU; Debian 13 for Vulkan |
+| Basalt, Maya, Xolotl | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 |
+| Strata | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (no Ubuntu 26.04) |
 
-What each release brings in:
+The template prompt prefers a downloaded Debian 13 template, then supported
+Ubuntu and Debian releases; it downloads Debian 13 if needed. Maya on a GPU
+with compute capability below 7.5 (such as V100) defaults to Ubuntu 24.04:
+CUDA 13 cannot build for that card. Debian 13's NVIDIA repository starts at
+CUDA 13.1 and Ubuntu 26.04's at 13.3; Basalt, Maya and Xolotl use those
+versions unless overridden. The CT's NVIDIA user-space libraries must match
+the host's 580.173.02 driver. Ubuntu 26.04 needs an available Proxmox template
+(`pveam update`, `pveam available`) and a current `pve-container`. See each
+target README for Python, CUDA and GPU requirements.
 
-| | Debian 12 | Debian 13 | Ubuntu 22.04 | Ubuntu 24.04 | Ubuntu 26.04 |
-|---|---|---|---|---|---|
-| Python (venvs) | 3.11 | 3.13 | 3.10 | 3.12 | 3.14 |
-| GCC (nvcc's host compiler) | 12 | 14 | 11 | 13 | 15 |
-| First CUDA in NVIDIA's repository | 12.3 | **13.1** | 11.7 | 12.5 | **13.3** |
-| Default CUDA: Basalt and Xolotl / Maya | 13.0 / 12.8 | 13.1 / 13.1 | 13.0 / 12.8 | 13.0 / 12.8 | 13.3 / 13.3 |
-| CUDA used by llama.cpp | 13.0 | 13.1 | | | |
+### Host GPU
 
-Every pinned Python requirement has wheels for these Pythons: Basalt's,
-Xolotl's and Strata's for 3.10 through 3.14, AirLLM's hash lock for 3.11
-through 3.14 (it requires 3.11, so no Ubuntu 22.04); Maya installs current
-releases.
-Strata's ready-made engine loads CUDA 13.0 from NVIDIA's pip packages, so it
-needs no toolkit. The host keeps the bundled NVIDIA 580.173.02 driver, and the
-CT's user-space libraries must match it on every release. CUDA 13.1 and 13.3
-run on it under NVIDIA's
-[minor version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html):
-the engines are built for the card's own architecture, as that requires, but
-a feature that needs a newer driver can still fail
-(`cudaErrorCallRequiresNewerDriver`). CUDA 13.3 is the release NVIDIA pairs
-with the 610 driver, which is why Debian 13 (13.1) is the default. CUDA 13
-cannot build for a V100; use Ubuntu 22.04/24.04 or Debian 12 for Maya on that
-card. Ubuntu 26.04 needs Proxmox's ubuntu-26.04 template (`pveam update`, then
-`pveam available`) and a current `pve-container`.
+All selected GPU targets must support the same GPU vendor:
 
-**The host's GPU driver comes next,** when GPU targets are selected. All the
-selected targets share one GPU vendor:
-
-| Target | GPU |
+| Target | Requirement |
 |---|---|
-| Strata, Maya, Xolotl | NVIDIA, required |
-| Basalt | NVIDIA RTX 50, required |
-| llama.cpp | required unless `BACKEND=cpu`: NVIDIA (CUDA) or AMD Radeon / Intel Arc (Vulkan, on a Debian 13 CT) |
-| AirLLM | NVIDIA, only when `GPU_DEVICES` is set |
-| Ollama, ComfyUI | NVIDIA, AMD Radeon or Intel Arc, used when present |
+| Strata, Maya, Xolotl | NVIDIA required |
+| Basalt | NVIDIA Blackwell (sm_120: RTX 50 or RTX PRO Blackwell) required |
+| llama.cpp | NVIDIA CUDA or AMD/Intel Vulkan; `BACKEND=cpu` needs no GPU |
+| AirLLM | NVIDIA when `GPU_DEVICES` is set |
+| Ollama, ComfyUI | NVIDIA, AMD or Intel if present; otherwise CPU |
 
-If a suitable GPU already works (`nvidia-smi` lists one, or an AMD/Intel card is
-bound to its driver with its render node), the installer just reports it.
-Otherwise [`tools/setup-host-gpu.sh`](tools/setup-host-gpu.sh) lists the cards on
-the PCI bus and asks which generation the card is, suggesting it from the
-card's ID: `rtx20`-`rtx50` (GeForce RTX 20-50), `rdna3` (Radeon RX 7000, PRO
-W7000), `rdna4` (Radeon RX 9000, AI PRO R9700), `arc-a` or `arc-b` (Intel Arc
-A/B). Once you agree, it sets the driver up: for NVIDIA it installs the
-repository's NVIDIA 580.173.02 driver (open kernel modules, DKMS, loaded at
-every boot with the `/dev/nvidia*` nodes the CTs pass through); for AMD and
-Intel, whose drivers are part of the Proxmox kernel, it installs `pve-firmware`
-when the card's firmware is missing and loads `amdgpu`, `i915` or `xe` now and
-at every boot (Arc B needs Linux 6.12+). A driver blacklisted in
-`/etc/modprobe.d` (often for VM passthrough) or a card bound to `vfio-pci` is
-reported, not changed. Unattended: `GPU_GENERATION=rtx40` (or `7900`, `9070`,
-`A770`, `B580`) `INSTALL_HOST_DRIVER=yes`. Without a GPU, targets that need one
-stop the install before anything is created, and Ollama and ComfyUI go on
-CPU-only. If the card needs a reboot (nouveau still holds it, or new firmware),
-reboot and run the installer again; nothing else was created. The installer
-then hands the result on: `GPU=<vendor>` to Ollama and ComfyUI, and
-`BACKEND=cuda` or `BACKEND=vulkan` with the render node as `GPU_DEVICES` to
-llama.cpp, unless you set them. A GPU target's `provision-lxc.sh` run by hand
-on a host without a driver points to the same tool.
+Before creating CTs, the installer checks for a working host driver. If one
+is missing, [tools/setup-host-gpu.sh](tools/setup-host-gpu.sh) identifies the
+card and offers to install it: NVIDIA 580.173.02, or the Proxmox kernel driver
+and missing firmware for AMD/Intel. It reports blacklisted or `vfio-pci`-bound
+cards without changing them. For unattended driver setup, set
+`GPU_GENERATION` (for example `rtx40`, `7900`, `9070`, `A770`, `B580`) and
+`INSTALL_HOST_DRIVER=yes`. A required GPU missing or needing a reboot stops
+the install before any CT is created; reboot and rerun when asked. The detected
+vendor is passed to Ollama/ComfyUI as `GPU` and to llama.cpp as `BACKEND` and
+`GPU_DEVICES`, unless you set them explicitly. Intel Arc B needs a Proxmox
+kernel with Linux 6.12 or newer.
 
-**Services are created right away,** after the network and storage prompts and
-before anything for the router is built. Each runs its target's community
-script (choose **Default** in its menu), then is set up inside its CT without
-the browser:
-- **Gitea:** a locked `app.ini` with registration off, an administrator, and a
-  non-admin router account with a scoped token.
-- **Mattermost:** an administrator, the `ollama` team, the `ollama-monitor`
-  channel and an incoming webhook.
+### Router settings
 
-The installer then reads Gitea's URL, router account and token, and
-Mattermost's webhook URL, from the CTs. They become the defaults of the Gitea
-and Mattermost prompts, which still verify them. The administrator passwords
-stay in each CT, in `/etc/<service>-target/admin-password`. A service that
-fails stops the install before the router is built; its CT is kept for
-`--reconfigure`.
+The router prompts for its root password, network, storage and size; Gitea
+URL, account, repository and token; Mattermost webhook (blank disables
+alerts); and 1–20 model servers, tiers and model tags. Selected model targets
+fill the first server slots. Increase the count to include existing servers.
+Inputs are validated before `pct create`; a failed router build removes its
+half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 
-The selected model targets become servers 1…n of the model-server prompt, so
-they get tiers like any other server. Raise the count to keep existing servers
-too.
-
-After the router is running:
-1. Each model target's `provision-lxc.sh` runs in turn, with its own CT
-   settings:
-   - Ollama and AirLLM include their guest install.
-   - llama.cpp includes it only when `MODEL_ALIAS` plus `MODEL_DOWNLOAD_URL` or
-     `MODEL_PATH` are set; otherwise only the CT is made.
-   - Strata, Basalt, Maya and Xolotl generate keys, which are handed to the router with
-     `set-<kind>-token` on stdin, followed by one `apply`.
-2. The installer waits for Open WebUI and asks once for an admin API key: create
-   the admin account in the browser, enable API keys, and create one. It then
-   runs Open Terminal, Hermes and ComfyUI against the router CT. ComfyUI's
-   community script shows its own menu (choose **Default**) and takes a while.
-
-Target-specific settings (`GPU_DEVICES`, `STRATA_MODEL`, `OLLAMA_PULL_MODELS`,
-`HERMES_MODEL`, `COMFYUI_MODEL_URL`, …) come from the environment, as each target's README describes;
-so do `GPU_GENERATION` and `INSTALL_HOST_DRIVER` for the host driver step, and
-`BACKEND` (llama.cpp: `cuda`, `vulkan` or `cpu`) and `GPU` (Ollama and ComfyUI:
-`nvidia`, `amd`, `intel` or `none`).
-The router's own `CT_ID`, `IP_CIDR`, `CORES`, `ROOTFS_GB` and similar settings
-never reach a target. A failed target leaves the router as it is. The run ends
-with a summary of every target and how to retry it, and exits non-zero if any
-target failed. The router monitor reports each configured but absent model host
-as down after three failed checks and posts one down alert for it, retried
-every cycle until Mattermost accepts it. Once the host is ready, two passing
-checks send a recovery notice. (Both counts are defaults, set in
-`monitor.ini` `[alerting]`.)
-
-The monitor's startup notice is limited to one per hour; that limit does not
-delay host alerts.
-
-It then prompts for the CT root password, network (bridge, IP/CIDR, gateway, DNS),
-rootfs size and storage, Gitea URL/user/repo/token, Mattermost webhook
-(blank disables alerts), and the model servers (1–20), their tiers and the
-model tag per tier. Every prompt has a default and re-prompts on bad input.
-Everything is validated before `pct create`, and a failed run destroys the
-half-built CT.
-
-Settings can be preset as environment variables (`NONINTERACTIVE=true` takes
-all defaults and skips the prompts):
+Settings can be preset as environment variables:
 
 | Area | Variables (default) |
 |---|---|
-| CT | `CT_ID`, `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 is enough with CPU-only torch) |
-| Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it, or 8000/8080 may be dropped) |
+| CT | `CT_ID`, `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 with CPU-only torch) |
+| Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it when enabling the firewall or 8000/8080 may be dropped) |
 | Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
-| Targets | `INSTALL_TARGETS` (e.g. `gitea,ollama,hermes`; pre-fills the menu answer), `INSTALL_GITEA` / `INSTALL_MATTERMOST` (`true` pre-selects that service), `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE` (`<NAME>` is `GITEA`, `MATTERMOST`, `OLLAMA`, `LLAMACPP`, …, `OPEN_TERMINAL`, `HERMES`, `COMFYUI`), `COMFYUI_IMAGE_VARIANT` (`klein-4b` or `klein-9b`) and `HF_TOKEN` (skips the Hugging Face token prompt for `klein-9b`), `GITEA_COMMUNITY_SCRIPT_URL` / `_SHA256` and the `MATTERMOST_*` and `COMFYUI_*` equivalents (pin a target's community script), the services' own settings such as `GITEA_SITE_ADMIN` and `MATTERMOST_TEAM` (see their READMEs), `<NAME>_PORT` for Strata/Basalt/Maya (8080), `OPENWEBUI_ADMIN_TOKEN` (skips the admin key prompt), `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
+| Targets | `INSTALL_TARGETS` (comma-separated, pre-fills menu), `INSTALL_GITEA` / `INSTALL_MATTERMOST` (pre-select), `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `COMFYUI_IMAGE_VARIANT` (`klein-4b` or `klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR`; see target READMEs for engine options, script pins and ports |
 
-`NONINTERACTIVE=true` refuses a non-empty `INSTALL_TARGETS` (or `INSTALL_GITEA`
-/ `INSTALL_MATTERMOST=true`). The community scripts' menus, GPU selection and
-the Open WebUI admin key need a person. Install the router unattended instead,
-then run each target's `provision-lxc.sh` afterwards. A target's CT settings
-(`<NAME>_CT_ID`, …) are separate from the router's `CT_ID`, `IP_CIDR` and
-`STORAGE`; every target shares the router's bridge and gateway. Targets need
-the full repository checkout.
+`NONINTERACTIVE=true` accepts router defaults without prompts but refuses
+selected targets: community-script menus, GPU selection and the Open WebUI
+admin key require interaction. Install the router unattended, then run each
+target's `provision-lxc.sh` from the full checkout. Target CT variables are
+separate from the router's `CT_ID`, `IP_CIDR` and `STORAGE`; targets share its
+bridge and gateway. Target-specific options (`GPU_DEVICES`, `BACKEND`,
+`OLLAMA_PULL_MODELS`, `HERMES_MODEL`, `COMFYUI_MODEL_URL`, etc.) are documented
+in their READMEs.
 
-**Model servers.** An address can be `10.0.0.5`, `host:port`, a URL, or
-`kind://host` for a non-Ollama server (e.g. `strata://10.0.0.8`). Only
-servers 1–3 have default addresses. `MODEL_LARGE` defaults to the inherited
-`qwen3.8:27b`, so change it to a model you have pulled. By default the servers
-are split into four contiguous groups, with the remainder going to `xlarge`.
-Below four servers, the upper tiers share the last host:
+Model server addresses may be IPs, `host:port`, URLs, or `kind://host` for
+non-Ollama servers. Only servers 1–3 have default addresses. Set `MODEL_LARGE`
+to a model actually present on your host (its inherited default is
+`qwen3.8:27b`). Hosts are divided among four tiers; with fewer than four
+hosts, upper tiers share the last host. Override assignments with
+`TIER_<tier>_SERVERS`.
 
-| Servers | fast | medium | large | xlarge |
-|---|---|---|---|---|
-| 1 | 1 | 1 | 1 | 1 |
-| 2 | 1 | 2 | 2 | 2 |
-| 3 | 1 | 2 | 3 | 3 |
-| 5 | 1 | 2 | 3 | 4,5 |
-| 8 | 1,2 | 3,4 | 5,6 | 7,8 |
+For Gitea, use the final URL scheme, address and port (`:3000` for the
+community CT, HTTPS 443 for TurnKey); an HTTP-to-HTTPS redirect can lose the
+token. A dedicated non-admin account needs `read:user` and
+`write:repository` for an existing repo, or `write:user` and
+`write:repository` to create one under its account. Set `GITEA_REPO_OWNER`
+if repository lookup is ambiguous; a repo under another owner must already
+exist. Without a usable token, installation continues in local mode without
+version control. For self-signed TLS, verification defaults off; install the
+CA and change `GITEA_VERIFY_TLS` in `prompt_gitea_credentials` to enable it.
+Protect tokens on untrusted networks with a TLS reverse proxy.
 
-**Gitea.** Use the server's actual scheme, address and port. The community
-installer below serves on `http://<ct-ip>:3000`; the TurnKey appliance serves
-on HTTPS port 443. If your server redirects HTTP to HTTPS, use its final HTTPS
-URL directly so the token is not dropped on the redirect. TLS verification
-is off by default for self-signed certificates. To turn it on, install the CA
-and change
-`GITEA_VERIFY_TLS=false` in `prompt_gitea_credentials`. The token is checked
-before anything is built, with up to 3 tries. If the token belongs to another
-account, its owner becomes the repo owner. The repo is `GITEA_REPO_NAME`, and
-its owner is resolved in this order: `GITEA_REPO_OWNER`, then the token owner,
-then an exact-name search across repos the token can see. The repo is created
-under the token owner only when none matches; a missing repo under any other
-`GITEA_REPO_OWNER` stops the check, so create that one in Gitea first. If several matches are ambiguous, the installer stops
-and you set `GITEA_REPO_OWNER`. With no usable token, the install continues in
-**local mode**: the same config is applied, but without version control. The
-installer's access-test commit is deleted again once it succeeds; remove
-markers left by older runs with `git rm -r provisioning-tests`.
+With a usable Gitea token, the installer tests write access by committing
+`provisioning-tests/<timestamp>.md`, then attempts to delete it in a second
+commit. The history retains a "Provisioning test commit" and a "Remove
+provisioning test marker" commit even when the file is gone. If cleanup fails
+or an older installer left markers, remove them from the config checkout with
+`git rm -r provisioning-tests` and commit.
 
 **After install**
 
@@ -260,84 +167,92 @@ http://<ct-ip>:8000/v1      OpenAI-compatible API (Bearer ROUTER_API_KEY)
 http://<ct-ip>:8080         Open WebUI: the first visitor creates the admin account
 ```
 
-**Gitea and Mattermost on their own.** `targets/gitea/provision-lxc.sh` and
-`targets/mattermost/provision-lxc.sh` create the same service CTs for an
-existing router, and print where their URL, token or webhook are. See
-[targets/gitea](targets/gitea/README.md) and
-[targets/mattermost](targets/mattermost/README.md).
-- `--create-only` keeps the earlier behaviour: the community script, then the
-  browser setup steps. `tools/install-gitea.sh` and
-  `tools/install-mattermost.sh` still do exactly that.
-- `--reconfigure` repairs the setup of an existing CT.
-- **A Gitea you already run.** Give the router a dedicated non-admin account
-  and its token. Reusing an existing repository needs the `read:user` and
-  `write:repository` scopes; creating it under that account needs `write:user`
-  and `write:repository`. Tokens cannot be limited to one repository, so limit
-  the account's access instead (a collaborator with Write access).
-- **Plain HTTP.** Gitea answers on `http://<ip>:3000`, so its token travels
-  unencrypted. Put a TLS reverse proxy in front of it on an untrusted network.
+The generated API key is in `/app/router/secrets.env` inside the router CT.
 
-The first Open WebUI start downloads an embedding model and is slow
-(`TimeoutStartSec=600`). `/etc/motd` summarises ports, tiers and paths. The
-runtime file layout is in [ARCHITECTURE.md, Appendix A](ARCHITECTURE.md#appendix-a--runtime-file-layout).
+**Gitea and Mattermost on their own.** Run
+`targets/gitea/provision-lxc.sh` or `targets/mattermost/provision-lxc.sh` for
+an existing router. `--reconfigure` repairs an existing CT; `--create-only`
+(also used by `tools/install-*.sh`) leaves browser setup to you. See their
+READMEs for credentials and retry steps.
+
+Open WebUI's first start downloads an embedding model and can take up to ten
+minutes. `/etc/motd` lists ports, tiers and paths; the full runtime layout is
+in [ARCHITECTURE.md, Appendix A](ARCHITECTURE.md#appendix-a--runtime-file-layout).
+
+## Inference targets
+
+Each target has a host-side `provision-lxc.sh`, guest-side
+`install-target.sh` (also `--upgrade`) and a README with requirements, settings
+and recovery steps. Provisioners support `--dry-run`.
+
+| Target | Register as | Port | Key requirement |
+|---|---|---|---|
+| [Ollama](targets/ollama/README.md) | plain address | 11434 | NVIDIA, AMD, Intel or CPU |
+| [llama.cpp](targets/llamacpp/README.md) | plain address | 11434 | GGUF; CUDA, Vulkan or CPU |
+| [AirLLM](targets/airllm/README.md) | plain address | 11434 | Large disk; slow inference, so give it its own tier |
+| [Strata](targets/strata/README.md) | `strata://` | 8080 | NVIDIA |
+| [Basalt](targets/basalt/README.md) | `basalt://` | 8080 | Blackwell GPU (sm_120) and CUDA 13 |
+| [Maya](targets/maya/README.md) | `maya://` | 8080 | NVIDIA; CUDA version must suit CT and card |
+| [Xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | NVIDIA; ~372 GB of pinned weights |
+
+[Gitea](targets/gitea/README.md) and
+[Mattermost](targets/mattermost/README.md) provide config history and alerts.
+[Open Terminal](targets/open-terminal/README.md) adds a terminal tool.
+[Hermes](targets/hermes/README.md) is an agent client, registered in Open
+WebUI as `hermes-agent`, not a pool model; it needs a tool-capable model with
+at least 64K context. Re-run its provisioner with `--reconfigure` after a
+router or backend key rotation or a new model host.
+[ComfyUI](targets/comfyui/README.md) adds image generation to Open WebUI on
+port 8188. Select distilled FLUX.2 Klein 4B or 9B; 9B needs a Hugging Face
+token for an account that accepted the license.
 
 ## How routing works
 
-The router polls every host in `MODEL_SERVERS` every `refresh_seconds` (60)
-through that host's own API and keeps a live inventory. Each request is
-classified `fast` / `medium` / `large` / `xlarge` (from the newest user
-message's length and keywords, plus whether it contains code or an image).
-Every `(host, model)` pair is then scored:
+The router polls configured hosts every 60 seconds and inventories their
+models. It classifies the newest user message as `fast`, `medium`, `large` or
+`xlarge`, then scores each available host/model pair by size, code or vision
+fit, tool support and residency. Close scores rotate across hosts. A named
+model is used if available; `auto` and tier aliases ask the router to choose.
+Embedding-only models are excluded from chat.
 
-- **Size band** — `0:9`, `9:20`, `20:70`, `70:999` billion parameters
-  (ceilings exclusive). Out-of-band models score lower but are not excluded.
-  When nothing is in band, the closest model wins.
-- **Specialisation** — code requests prefer code models, and image requests
-  prefer vision models (Ollama's `/api/show` capabilities first, names as a
-  fallback).
-- **Tools** — a request that offers tools (agents such as Hermes, Open WebUI
-  function calling) skips models whose server reports no tool support
-  (Ollama's `tools` capability; the llama.cpp bridge needs `tools` in
-  `MODEL_CAPABILITIES`). It is raised to at least the `large` class
-  (`[classification] tools_min_class`), and stays on one model across an agent
-  loop. A model that answers 400 "does not support tools" (or similar
-  wording) is skipped and the next candidate tried. Any other 400, such as a
-  malformed `tools` schema, goes back to the client unchanged.
-- **Never embeddings** — naming an embedding-only model on
-  `/v1/chat/completions` returns 400 `embedding_model_not_chat`.
-- **Load spreading** — near-ties rotate across hosts.
-- **Fail-forward** — a connect error, timeout, 404 or 5xx moves on to the
-  next candidate, until the response starts streaming. A host that refuses a
-  connection is marked down until its next good poll.
+Connect errors, timeouts, 404s and 5xx responses try the next candidate until
+streaming starts. A tool-support rejection also tries the next candidate;
+other 400s go back to the client. If discovery is off or inventory empty,
+LiteLLM handles the request by static tier (`X-Router-Mode: litellm`).
+`X-Router-Model`, `-Server`, `-Class`, `-Mode`, `-Candidates` and optional
+`-Warning` response headers explain the choice. Use:
 
-A model named in the request is honoured if a host that has it is up.
-Otherwise the request is routed by content with
-`X-Router-Warning: model-unavailable`. `auto` and the tier aliases mean
-"decide for me"; a tier alias pins the size class. An image request with no
-vision model is routed with `X-Router-Warning: no-vision-model`, or rejected
-if `vision_strict = true`. A tool request with no tool-capable model gets
-`X-Router-Warning: no-tool-model`, or a 400 with `tools_strict = true`.
-
-Every response carries `X-Router-Model`, `-Server`, `-Class`, `-Mode` and
-`-Candidates`. For inspection:
-
-```
-GET  /routing/inventory   what each host serves (tools, context_length, ...), up/down, last error
-POST /routing/refresh     re-poll now
-POST /routing/explain     {"prompt": "..."} -> decision and scored candidates
-GET  /healthz             liveness (no key needed)
+```text
+GET  /routing/inventory   host models, capabilities and errors
+POST /routing/refresh     poll now
+POST /routing/explain     {"prompt": "..."} -> scored candidates
+GET  /healthz             unauthenticated liveness
 ```
 
-Thresholds, keywords (JSON arrays; `"re:..."` for regexes), weights, bands,
-timeouts and model sizes all live in `services/ollama-router/router.ini`, so
-routing changes by commit. If discovery is disabled or the inventory is empty,
-the router hands the request to LiteLLM by tier (`X-Router-Mode: litellm`).
+Tune thresholds, keywords, weights, timeouts and model sizes in
+`services/ollama-router/router.ini`. See [ARCHITECTURE.md](ARCHITECTURE.md#5-request-routing)
+for the decision and failover rules.
 
-**API key.** New installs generate `ROUTER_API_KEY`. For an older install, run
-`manage-model-servers set-api-key --apply`, then paste the printed key into
-Open WebUI under **Admin Settings > Connections > OpenAI**, because Open WebUI
-reads `OPENAI_API_KEYS` only on its first start. The client's key is never
-forwarded to model hosts.
+The router reads `ROUTER_HOST` and `ROUTER_PORT` from its environment (default
+`0.0.0.0:8000`); the installer sets neither. To change its binding, set the
+needed variables in `env/router.env`, then update `OPENAI_API_BASE_URLS` in
+`env/openwebui.env`, `ollama-router` in `monitor.ini [local_services]`, the CT
+firewall and client URLs. On an existing Open WebUI, check its saved OpenAI
+connection under **Admin Settings > Connections** too. Management health
+checks use a separate `ROUTER_URL`
+defaulting to `http://127.0.0.1:8000`; set it to the new reachable base URL
+when running `apply`, `discover` or the updater inside the CT. The host-side
+management and update wrappers do not forward that override. Reconfigure
+Hermes if it uses the old router URL. Hermes's `--reconfigure` derives
+`ROUTER_URL` again from the router's IP and `ROUTER_PORT` in
+`/app/router/.env` unless you pass `ROUTER_URL` on that run; it does not
+remember one given at install, so pass a custom URL (a DNS name or proxy)
+again each time.
+With no API key on a non-loopback address, the router logs a warning at start-up.
+
+New installs generate `ROUTER_API_KEY`;
+for an older install, run `manage-model-servers set-api-key --apply` and enter
+the printed key in Open WebUI **Admin Settings > Connections > OpenAI**.
 
 ## Managing model servers
 
@@ -386,7 +301,7 @@ DeepSeek-V4 model there identifies Xolotl.
 |---|---|---|---|
 | Ollama (also llama.cpp bridge, AirLLM) | 11434 | — | Keep-alive pinned by the monitor |
 | LM Studio | 1234 | `set-lmstudio-token` | Resident models are preferred; `lmstudio_loaded_only = true` never triggers a just-in-time load. Model names differ (`qwen/qwen3-14b`). Set LM Studio's own idle TTL. |
-| Strata | 8080 | `set-strata-token` | Must listen on an address the router can reach (its default is `127.0.0.1`). Can run on 11434: `strata://host:11434`. |
+| Strata | 8080 | `set-strata-token` | Must listen on an address the router can reach (see below). Can run on 11434: `strata://host:11434`. |
 | Basalt | 8080 | `set-basalt-token` | Model ID is `BASALT_ALIAS` (default `qwen3.8-flash-next`) |
 | Maya | 8080 | `set-maya-token` | Model ID `glm-5.3-flash` |
 | Xolotl | 8080 | `set-xolotl-token` | Model ID `XOLOTL_MODEL_NAME` (default `deepseek-v4.1-flash`, sized 552B) |
@@ -399,6 +314,15 @@ manage-model-servers set-maya-token --apply
 manage-model-servers add maya://10.0.0.9 --tier xlarge --apply
 manage-model-servers set-server-model xlarge maya://10.0.0.9 glm-5.3-flash --apply
 ```
+
+A Strata you run yourself, rather than the [Strata target](targets/strata/README.md),
+binds to `127.0.0.1` by default and is unreachable from the router. Run its
+setup (`./setup.sh` on Linux, `START-HERE.bat` on Windows) with `--host` set to
+a reachable address, `--port 11434` if you want that port, and `--api-key` to
+require a key; see [Strata's setup options at the tested commit](https://github.com/Niko1221/Strata/blob/a0116b2782a5b82622358c04a06496485d12b2d6/docs/INSTALL.md#options-without-questions).
+For the newer Strata launcher on `main`, use `strata launch --access lan`
+instead of `--host`; it [creates a key by default](https://github.com/Niko1221/Strata/blob/main/docs/TERMINAL_LAUNCH.md)
+(`--no-api-key` skips it).
 
 If an older keyed Strata cannot be identified without a key, add it as
 `strata://host` (that probe uses the key) or with `--no-probe`. Strata, Basalt,
@@ -416,6 +340,7 @@ Strata, Basalt, Maya and Xolotl report no parameter count. `[model_sizes]` in
 strata = 125B
 qwen3.8-flash-next = 125B
 glm-5.3-flash = 321B
+deepseek-v4.1-flash = 552B
 ```
 
 Add a line for a custom alias; a blank value removes a built-in entry. A size
@@ -430,7 +355,8 @@ endpoint ignores `keep_alive`. Set `OLLAMA_KEEP_ALIVE` (at install, or
 
 - LiteLLM sends `keep_alive` on its native-API calls.
 - The monitor calls each up Ollama host's native `/api/chat` with an empty
-  message every 240 s (`monitor.ini [keep_alive] refresh_seconds`), keeping
+  message every 240 s (`monitor.ini [keep_alive] refresh_seconds`, or
+  `KEEP_ALIVE_REFRESH_SECONDS` in its environment), keeping
   each tier's model loaded.
 
 Blank (the default) sends nothing and leaves each server's own setting in
@@ -445,6 +371,8 @@ to start. To change config on a running CT:
 cd /app/config-repo && git pull
 manage-model-servers apply          # or --all to restart every service
 ```
+
+In local mode, edit `/app/config-repo` directly and skip `git pull`.
 
 `apply`:
 
@@ -473,7 +401,11 @@ before 2026-09 still contain the old deploy token, so rotate it in Gitea.
 **Config lock.** `update-router.sh` and every writing command take
 `/run/lock/ollama-smart-router-config.lock`. A second change fails at once;
 `CONFIG_LOCK_WAIT=<seconds>` makes it wait instead. The lock dies with its
-process, so a crash never leaves it held.
+process, so a crash never leaves it held. For a hung holder,
+`clear-lock --force` asks for confirmation, then sends SIGTERM and SIGKILL
+after `LOCK_KILL_WAIT` (10) seconds if needed. `--yes` skips the prompt;
+without a terminal, the prompt cancels. A change stopped midway can leave
+the config repo or services half-updated.
 
 ## Updating
 
@@ -526,76 +458,13 @@ that directory elsewhere if you may want to roll back later. Re-run a ComfyUI
 router's `targets/comfyui/integrate-webui.py` only if its image settings need
 to change: it handles both the 0.11.4+ connection check and the older one.
 
-### Inference targets
+### Targets
 
-Each target has `provision-lxc.sh` (run on the PVE host; it creates the CT,
-passes the GPU through and pushes files), `install-target.sh` (run in the CT;
-also does `--upgrade`), tests and a README with the full procedure. Every
-provisioner offers `--dry-run`; the Strata, Basalt, Maya and Xolotl guest
-installers also offer it.
-
-| Target | Register as | Port | Engine |
-|---|---|---|---|
-| [ollama](targets/ollama/README.md) | plain address | 11434 | Ollama from the PVE community script, run unprivileged with pinned, checksummed upgrades; NVIDIA (CUDA), AMD Radeon (ROCm) or Intel Arc (Vulkan) |
-| [llamacpp](targets/llamacpp/README.md) | plain address | 11434 | llama.cpp `llama-server` (one GGUF) behind an Ollama bridge; CUDA on NVIDIA, Vulkan on AMD Radeon and Intel Arc (Debian 13), or CPU |
-| [airllm](targets/airllm/README.md) | plain address | 11434 | AirLLM, streaming a model larger than RAM/VRAM from disk; seconds–minutes per token, so give it its own tier |
-| [strata](targets/strata/README.md) | `strata://` | 8080 | Strata (Qwen3.8-Flash-Next) |
-| [basalt](targets/basalt/README.md) | `basalt://` | 8080 | Basalt on a Blackwell GPU, CUDA 13 (13.1+ on Debian 13) |
-| [maya](targets/maya/README.md) | `maya://` | 8080 | Project Maya (GLM-5.3-Flash), CUDA 12.8 default |
-| [xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | Xolotl, Indras Mirror's Strata fork, running DeepSeek-V4.1-Flash (552B MoE) on one 24 GB GPU; downloads ~372 GB of pinned, hash-checked weights, CUDA 13.0 default |
-
-[Gitea](targets/gitea/README.md) and [Mattermost](targets/mattermost/README.md)
-are services for the router (configuration repository and alerts). They come
-from the Proxmox VE community scripts and are set up for the router by their
-`install-target.sh`.
-
-[Hermes Agent](targets/hermes/README.md) is an agent client, not a pool
-member. Its CT discovers model servers and task ranking from the router, then
-sends inference directly to the selected server. By default its API server is added to Open WebUI as the
-model `hermes-agent`. Needs a tool-capable model with 64K context. After
-`set-api-key`, a backend key rotation or a new model server, run its
-`provision-lxc.sh --reconfigure`.
-
-[ComfyUI](targets/comfyui/README.md) is Open WebUI's image generation engine,
-not a pool member: chats get an image button, backed by ComfyUI on a GPU in
-its own CT (port 8188). The CT comes from the Proxmox VE community script; the
-target adopts it (unprivileged account, data in `/var/lib/comfyui-target`),
-admits only the router to its unauthenticated port through the CT firewall,
-and sets Open WebUI's image settings (engine, URL, and the selected distilled
-FLUX.2 Klein 4B or 9B workflow). The installer prompts for the variant, and the
-CT install downloads its diffusion model, text encoder and VAE (12.5 or 18.4 GB,
-checksum-verified, resumable), so images work when the install finishes.
-`klein-9b` is gated: the installer also asks for a Hugging Face token whose
-account accepted its license (or takes `HF_TOKEN`). Its `--upgrade` builds a
-pinned, commit-verified release beside the running one.
-
-Upgrades share one contract ([ARCHITECTURE.md §16](ARCHITECTURE.md#16-inference-targets-targets)):
-
-- Sources are fetched and verified before stopping. Strata, Basalt, Maya and
-  Xolotl stop and snapshot the running checkout before building (Xolotl also
-  verifies or finishes its weights download first); llama.cpp, AirLLM,
-  Ollama, Open Terminal and ComfyUI prepare the new build, venv or release
-  while the old one keeps running, then restart.
-- An unchanged, healthy target is left alone ("nothing to do").
-- Success requires the target's own health check.
-- Any failure restores the previous code and configuration, health-checks
-  it, and exits non-zero.
-- llama.cpp, AirLLM, Ollama and ComfyUI keep a deliberately stopped service
-  stopped.
-- Strata, Basalt, Maya and Xolotl keep an installation's settings on every rerun, with
-  or without `--upgrade` (`installed-env`, or `installed-settings` for older
-  installs). Non-empty environment values override them; changing Strata's
-  family or Maya's or Xolotl's CUDA version also resets the model or nvcc derived from it
-  unless that is given too. A first install that stops part-way resumes with
-  the settings it was started with (`pending-env`). An existing checkout or
-  unit with no readable record at all requires every setting explicitly; it
-  never receives fresh-install defaults.
-
-Strata, Basalt, Maya and Xolotl snapshot their runnable checkout to
-`/var/lib/<target>-target/rollback-runtime.tar` (root-only, may contain
-secrets) before changing it, and delete it once the upgrade or the rollback
-succeeds. Leave disk room for one snapshot during an upgrade; model stores
-outside `/opt/<target>` are not copied.
+Target upgrades check readiness and restore the prior code and settings on
+failure. Strata, Basalt, Maya and Xolotl need disk for one runtime snapshot;
+their existing installation settings carry forward unless explicitly
+overridden. See the target README and [architecture upgrade contract](ARCHITECTURE.md#16-inference-targets-targets)
+before upgrading.
 
 ### Old tier names
 
@@ -618,19 +487,21 @@ built-in defaults.
 
 ## Troubleshooting
 
-Start with the services' logs and the router's view of the pool:
+Start with the services' logs and the router's view of the pool, inside the
+router CT (`pct enter <CT_ID>`):
 
 ```bash
+KEY=$(sed -n 's/^ROUTER_API_KEY=//p' /app/router/secrets.env)
 systemctl status open-webui ollama-router litellm-proxy ollama-monitor
-journalctl -u ollama-router -f        # every routing decision is logged
 manage-model-servers status           # configured hosts + live probe
-curl -s -H "Authorization: Bearer $KEY" http://<ct-ip>:8000/routing/inventory
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8000/routing/inventory
+journalctl -u ollama-router -f        # every routing decision is logged (Ctrl-C to stop)
 ```
 
 | Symptom | Cause / fix |
 |---|---|
 | Installer: no storage found | The storage does not declare `rootdir`. Run `pvesm set <storage> --content rootdir,images`. Storages too small for `ROOTFS_GB` are listed but cannot be selected. |
-| Installer: Gitea 401 or TLS error | Use `https://` without a port. The installer prints a specific diagnosis (DNS, refused, TLS, 401). A wrong token re-prompts; after 3 tries it falls back to local mode. |
+| Installer: Gitea 401 or TLS error | Use the final URL (community CT: `http://<ip>:3000`; TurnKey: HTTPS 443), avoiding redirects. The installer diagnoses DNS, connection, TLS and token errors. After 3 bad tokens it falls back to local mode. |
 | `open-webui==… (from versions: none)` | Open WebUI needs Python 3.11–3.12. The installer provisions 3.12 (system package, otherwise `uv` into `/opt/python`, which needs PyPI/GitHub). If neither is reachable, install 3.12 manually and re-run. |
 | Open WebUI venv ~7.5 GB | `TORCH_CPU_ONLY=false`, or `download.pytorch.org` was unreachable. `apply` installs CPU torch and purges `nvidia-*`/`triton` wheels. |
 | Open WebUI shows no models / 401 | The router key changed. Paste it into Admin Settings > Connections > OpenAI. |
@@ -646,18 +517,15 @@ curl -s -H "Authorization: Bearer $KEY" http://<ct-ip>:8000/routing/inventory
 
 ## Development
 
-The files under `services/`, `install/` and `targets/` are the source of
-truth. The installer embeds copies of `services/` and `install/`: after editing, run
-`tools/sync-embedded.py --write`, or `tests/test-repo.sh` fails.
-`install/manage-model-servers.sh` is the only real management tool; the
-repo-root `manage-model-servers.sh` just runs it.
+`services/`, `install/` and `targets/` are the sources. After editing embedded
+`services/` or `install/` files, run `tools/sync-embedded.py --write`.
+`bash tests/run-tests.sh` runs the shell and pytest suites; use `--list` or a
+suite name to narrow it. Some target tests require root and skip otherwise;
+CI runs them with `--strict`. See [tests/README.md](tests/README.md) for the
+test and CI details.
 
-`bash tests/run-tests.sh` runs every suite: shell, pytest, the targets' stubbed
-installs, and a coverage gate requiring a test for every installer and manager
-function. Use `bash tests/run-tests.sh <suite>` or `--list` to pick one. Nothing
-touches the network, a CT or a GPU. Target end-to-end cases need root and are
-skipped otherwise; `unshare -r bash targets/<t>/test-*.sh` runs them as an
-ordinary user. CI (`.gitea/workflows/tests.yml`, needs an `act_runner`) runs
-the suites, shellcheck and ruff on every push. It uses separate router and
-bridge venvs because they pin different fastapi versions. Three more jobs check
-Strata, Maya and Xolotl at their pinned upstream commits.
+To run CI (`.gitea/workflows/tests.yml`) in Gitea, enable Actions on the
+repository and register an `act_runner` with an ubuntu-latest style image.
+Configure its job containers to run as root, because
+`--strict` fails on skipped root-only tests. The `strata-upstream`,
+`maya-upstream` and `xolotl-upstream` jobs also need access to GitHub.

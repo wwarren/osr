@@ -2,7 +2,7 @@
 # Runs inside the dedicated Strata LXC after matching NVIDIA userspace is ready.
 #
 #   bash install-target.sh             install or update Strata and start it
-#   bash install-target.sh --upgrade   move to STRATA_COMMIT or the tip of STRATA_REF;
+#   bash install-target.sh --upgrade   move to STRATA_COMMIT or an explicit STRATA_REF;
 #                                      roll back to the previous commit on failure
 #   bash install-target.sh --dry-run   print the plan; change nothing
 #
@@ -35,9 +35,10 @@ usage() {
 Usage: bash install-target.sh [--dry-run] [--upgrade]
 Installs Strata from https://github.com/Niko1221/Strata.git as the "strata"
 service account, sets up the model with upstream setup.sh, and starts the
-hardened strata systemd service. Re-running fetches STRATA_COMMIT or the
-latest STRATA_REF (main by default) before stopping anything: when the commit,
-settings and unit are unchanged and Strata is healthy it does nothing;
+hardened strata systemd service. Re-running fetches the tested default commit,
+an explicit STRATA_COMMIT or the tip of an explicit STRATA_REF before stopping
+anything. When the commit, settings and unit are unchanged and Strata is healthy
+it does nothing;
 otherwise it upgrades with rollback to the previous commit on failure.
 
 --upgrade moves an existing install to STRATA_COMMIT (or the current tip of
@@ -49,7 +50,9 @@ Reruns, with or without --upgrade, keep the settings of the existing installatio
 (installed-env, or installed-settings for older installs); explicit, non-empty
 environment values override them. A fresh install uses the defaults below.
 
-Environment: STRATA_REF=main, STRATA_COMMIT=<optional full SHA-1 pin>,
+Environment: STRATA_COMMIT=a0116b2782a5b82622358c04a06496485d12b2d6 (tested default),
+STRATA_REF=<branch or tag> (follow it when no commit is set); STRATA_COMMIT=
+explicitly follows main,
 STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (any family the
 checkout's setup.sh lists, e.g. swift, coder, unsloth), STRATA_CONTEXT=32768,
 STRATA_VISION=no, STRATA_PORT=8080, STRATA_READY_TIMEOUT=900 (seconds),
@@ -702,8 +705,16 @@ while (( $# )); do
 done
 acquire_install_lock
 saved_settings
+# A fresh invocation without a commit or ref uses the tested source. An
+# explicit ref, or an explicitly empty commit, keeps branch-based upgrades
+# available without silently following an upstream change by default.
+STRATA_DEFAULT_COMMIT=a0116b2782a5b82622358c04a06496485d12b2d6
+if [[ ! ${STRATA_COMMIT+x} && ! ${STRATA_REF+x} ]]; then
+    STRATA_COMMIT=$STRATA_DEFAULT_COMMIT
+else
+    STRATA_COMMIT=${STRATA_COMMIT:-}
+fi
 STRATA_REF=${STRATA_REF:-main}
-STRATA_COMMIT=${STRATA_COMMIT:-}
 STRATA_FAMILY=${STRATA_FAMILY:-qwen}
 # Default model per family (upstream offers IQ1_M only for coder and the
 # UD-* packs only for unsloth).

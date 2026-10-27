@@ -29,23 +29,13 @@ guest installer therefore reads the checked-out `setup.sh --help` and:
   choices that `setup.sh` lists. Any family the checkout offers is accepted
   (`qwen`, `swift`, `coder` and `unsloth` at the tested commit).
 
-By default, the installer fetches the latest commit on `STRATA_REF=main` on
-every run, so a re-provision or rerun picks up whatever upstream has pushed
-since. That fails safely (the options check refuses an incompatible release
-and a failed update rolls back), but it is still an unreviewed change to a
-production service.
-
-**For production, pin a tested commit.**
-[`a0116b2782a5b82622358c04a06496485d12b2d6`](https://github.com/Niko1221/Strata/commit/a0116b2782a5b82622358c04a06496485d12b2d6)
-is the commit this target's launcher regression test runs against:
-
-```bash
-STRATA_COMMIT=a0116b2782a5b82622358c04a06496485d12b2d6
-```
-
-The commit is fetched directly and need not be a branch tip. Move the pin
-deliberately, after `test-pinned-run-script.py` passes against the new commit
-(see [Check without Proxmox](#check-without-proxmox)).
+By default, fresh installs and reruns fetch the tested commit
+[`a0116b2782a5b82622358c04a06496485d12b2d6`](https://github.com/Niko1221/Strata/commit/a0116b2782a5b82622358c04a06496485d12b2d6).
+The target's launcher regression test runs against it. To use another tested
+commit, set `STRATA_COMMIT=<40-digit SHA-1>`. To follow a branch or tag, set
+`STRATA_REF=<name>` without setting `STRATA_COMMIT`; `STRATA_COMMIT=` explicitly
+follows `main`. Branch tips can change between runs, so first check a new
+commit with `test-pinned-run-script.py` (see [Check without Proxmox](#check-without-proxmox)).
 
 ## Before running
 
@@ -140,7 +130,7 @@ installation's settings from `/etc/strata-target/installed-env`, including custo
 model, context and port values. An install from before that record existed uses
 its `installed-settings` fingerprint instead. Non-empty environment settings
 override the corresponding saved values, and a new `STRATA_FAMILY` without `STRATA_MODEL` takes that family's default model.
-Only a fresh install uses the defaults. A fresh install records the settings
+Only a fresh install uses the model and port defaults. It records the settings
 it runs with in `/etc/strata-target/pending-env` before its first change, so a
 first install that stops part-way resumes with them on the next run;
 the file is removed once the install succeeds. An existing checkout or service
@@ -149,7 +139,8 @@ setting explicitly before the installer can proceed. A malformed `installed-env`
 must be repaired or removed before retrying.
 
 Copy the current `install-target.sh` and `strata.service` into the CT, then
-re-run the installer. It fetches the latest `main` and upgrades the service:
+re-run the installer. It fetches the tested commit and upgrades the service
+if the installed version differs:
 
 ```bash
 pct push 280 targets/strata/install-target.sh /root/strata-target-deploy/install-target.sh --perms 0755
@@ -157,8 +148,14 @@ pct push 280 targets/strata/strata.service /root/strata-target-deploy/strata.ser
 pct exec 280 -- bash /root/strata-target-deploy/install-target.sh
 ```
 
-To deploy a specific commit instead, set `STRATA_COMMIT=<40-digit SHA-1>` on
-that command. `--upgrade` remains available for an explicit upgrade request.
+To use another commit or follow a branch, pass `STRATA_COMMIT=<SHA>` or
+`STRATA_REF=<name>` after `-- env` in the `pct exec` command. For example,
+`pct exec 280 -- env STRATA_REF=main bash /root/strata-target-deploy/install-target.sh`
+follows `main`. An install previously following `main` will move to the tested
+pin on rerun unless you explicitly keep that ref; if its checkout is newer than
+the pin, that is a move to older upstream code (a failed setup rolls back as
+usual).
+`--upgrade` remains available for an explicit upgrade request.
 
 A rerun first fetches the selected commit or branch tip **while the service
 keeps running**; if the fetch fails, nothing is stopped or changed. When the
@@ -176,7 +173,7 @@ not used: it runs `git pull`, which cannot move a pinned checkout or provide
 this rollback path.
 
 Running the installer again also resumes an interrupted install, fetching the
-latest source before continuing setup.
+selected source before continuing setup.
 An install made by an earlier version of this script ran as root; re-running
 hands `/opt/strata` and `/var/lib/strata` over to the `strata` account.
 
