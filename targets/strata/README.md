@@ -48,7 +48,7 @@ commit with `test-pinned-run-script.py` (see [Check without Proxmox](#check-with
   `/dev/nvidia-uvm-tools` is passed through too when it exists. Set
   `GPU_DEVICES` to select another GPU or to list the nodes explicitly.
 - The nodes are given group `GPU_GID` (default 44, `video`) inside the CT, and
-  the `strata` account joins that group. They are never given root's group.
+  the `strata` account joins that group. It is never added to group root.
 - The provisioner sets the new CT's `lxc.prlimit.memlock` to `unlimited` and
   the service's `LimitMEMLOCK` to infinity so Strata can pin model memory. This
   matches a [reported Proxmox LXC Strata configuration](https://github.com/Niko1221/Strata/issues/1217).
@@ -85,6 +85,61 @@ Running this provisioner again with that CT ID stops before creating anything.
 To resume an interrupted install or upgrade Strata in the existing CT, run
 `pct exec 280 -- bash /root/strata-target-deploy/install-target.sh` (replace
 `280` with your Strata CT ID).
+
+### If a GPU node appears as group root
+
+On the Proxmox host, inspect the **existing** CT and its device assignments:
+
+```bash
+CT_ID=280  # replace with the Strata CT ID
+pct config "$CT_ID" | grep -E '^(dev[0-9]+|lxc\.mount\.entry):'
+pct exec "$CT_ID" -- stat -c '%n gid=%g mode=%a' \
+    /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
+```
+
+For the default layout created by this provisioner, `dev0` is `nvidia0`,
+`dev1` is `nvidiactl`, and `dev2` is `nvidia-uvm`. If the CT uses different
+`devN` indexes, match the indexes shown by `pct config`. Only if the `devN`
+configuration is missing or wrong, set each node's **container** GID to 44
+(`video`) and mode to 0660, then reboot the CT:
+
+```bash
+pct set "$CT_ID" --dev0 path=/dev/nvidia0,gid=44,mode=0660
+pct set "$CT_ID" --dev1 path=/dev/nvidiactl,gid=44,mode=0660
+pct set "$CT_ID" --dev2 path=/dev/nvidia-uvm,gid=44,mode=0660
+pct reboot "$CT_ID"
+```
+
+After the reboot, check the actual nodes and GPU access as the service user:
+
+```bash
+pct status "$CT_ID"
+pct exec "$CT_ID" -- stat -c '%n gid=%g mode=%a' \
+    /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
+pct exec "$CT_ID" -- runuser -u strata -- sh -c \
+    'for node in /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm; do test -r "$node" && test -w "$node" || exit 1; done; nvidia-smi -L'
+```
+
+If the `strata` account is not present yet, rerun the current installer after
+syncing these files from an updated repository checkout on the PVE host:
+
+```bash
+cd /path/to/ollama-smart-router
+pct push "$CT_ID" targets/strata/install-target.sh \
+    /root/strata-target-deploy/install-target.sh --perms 0755
+pct push "$CT_ID" targets/strata/strata.service \
+    /root/strata-target-deploy/strata.service --perms 0644
+pct exec "$CT_ID" -- bash /root/strata-target-deploy/install-target.sh
+```
+
+If `pct config` already shows `gid=44,mode=0660` but the CT still reports
+`gid=0,mode=666`, repeating `pct set` will not address that mismatch. A
+root-group node that `strata` can read and write is accepted with a warning;
+the restricted mapping remains preferable. If `nvidia-smi -L` fails as
+`strata`, inspect the CT's device mounts and NVIDIA setup. [Proxmox's `devN`
+options](https://github.com/proxmox/pve-docs/blob/master/generated/pct.conf.5-opts.adoc)
+specify the node's GID and mode inside the CT without changing host device
+ownership. The installer checks effective access inside the CT.
 
 Strata keeps its venv, engine and model configs in `/opt/strata`, and models in
 `/var/lib/strata`. Both are owned by `strata`, the only paths the service can

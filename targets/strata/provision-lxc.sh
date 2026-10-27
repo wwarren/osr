@@ -265,6 +265,17 @@ if (( ! dry_run )); then
         sleep 1
     done
     (( ready )) || die "CT $CT_ID did not start systemd within 60 seconds."
+    for i in "${!devices[@]}"; do
+        pct exec "$CT_ID" -- test -c "${devices[$i]}" ||
+            die "CT $CT_ID has no character device at ${devices[$i]}; inspect its --dev$i mapping with 'pct config $CT_ID'."
+        guest_perms=$(pct exec "$CT_ID" -- stat -c '%g %a' "${devices[$i]}") ||
+            die "CT $CT_ID cannot stat ${devices[$i]}; inspect its --dev$i mapping with 'pct config $CT_ID'."
+        read -r guest_gid guest_mode <<< "$guest_perms"
+        if [[ $guest_gid != "$GPU_GID" ]]; then
+            printf 'Warning: CT %s sees %s with gid %s and mode %s although --dev%s requests gid %s and mode 0660. The guest installer will check access as the strata account.\n' \
+                "$CT_ID" "${devices[$i]}" "$guest_gid" "$guest_mode" "$i" "$GPU_GID" >&2
+        fi
+    done
     online=0
     for (( attempt=0; attempt<60; attempt++ )); do
         if pct exec "$CT_ID" -- sh -c 'ip route show default | grep -q . && getent hosts github.com >/dev/null'; then

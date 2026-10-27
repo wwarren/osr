@@ -144,6 +144,38 @@ load_settings "$tmp_root/evil-env" && fail 'a malformed record was loaded'
 STRATA_PORT=8080
 pass 'the settings record is read back all-or-nothing and never executed'
 
+# Exercise the GPU access decision without root or Proxmox. A root-group node
+# is accepted only when the service user can actually read and write it.
+# shellcheck disable=SC1090
+source <(awk '/^ensure_service_user\(\) \{/ { capture=1 } capture { print } capture && /^}/ { exit }' "$target")
+mkdir -p "$tmp_root/dev"; touch "$tmp_root/dev/nvidia0"
+gpu_access_case() (
+    local fake_gid=$1 fake_access=$2 fake_smi=$3
+    SERVICE_USER=strata GPU_NODES="$tmp_root/dev/nvidia0"
+    getent() { return 0; }
+    id() { return 0; }
+    stat() { [[ $2 == %g ]] && printf '%s\n' "$fake_gid" || printf '%s\n' video; }
+    usermod() { printf 'joined %s\n' "$2"; }
+    as_service() {
+        case $1 in
+            test) [[ $fake_access == yes ]] ;;
+            nvidia-smi) [[ $fake_smi == yes ]] ;;
+            *) return 1 ;;
+        esac
+    }
+    note() { printf '%s\n' "$*"; }
+    ensure_service_user
+)
+out=$(gpu_access_case 0 yes yes) || fail 'accessible root-group GPU node was rejected'
+[[ $out == *'group root'* && $out != *'joined'* ]] || fail "root-group access decision: $out"
+out=$(gpu_access_case 0 no yes 2>&1) && fail 'inaccessible root-group GPU node was accepted'
+[[ $out == *'gid=44,mode=0660'* ]] || fail "root-group repair message: $out"
+out=$(gpu_access_case 44 yes yes) || fail 'video-group GPU node was rejected'
+[[ $out == *'joined video'* ]] || fail "video-group membership: $out"
+out=$(gpu_access_case 44 yes no 2>&1) && fail 'service-user nvidia-smi failure was ignored'
+[[ $out == *'cannot use the NVIDIA GPU'* ]] || fail "GPU probe message: $out"
+pass 'GPU access is checked as the service user without joining group root'
+
 # --- whole-script runs --------------------------------------------------------
 # From a copy, so a case can ship a changed unit for one attempted upgrade.
 deploy=$tmp_root/deploy; mkdir -p "$deploy"
@@ -161,7 +193,8 @@ stub getent 'exit 2'   # no strata group yet, so it is created
 stub mv 'if [[ ${FAKE_METADATA_FAIL:-0} == 1 && ${*: -1} == */installed-settings ]]; then exit 1; fi; exec /usr/bin/mv "$@"'
 stub openssl 'if [[ ${FAKE_KEY_FAIL:-0} == 1 ]]; then printf "partial"; exit 1; fi; exec /usr/bin/openssl "$@"'
 for command_name in apt-get groupadd useradd usermod chown sleep nvidia-smi; do stub "$command_name" 'exit 0'; done
-stub stat 'echo "${FAKE_GROUP:-video}"'
+stub stat 'case $2 in %g) [[ ${FAKE_GROUP:-video} == root ]] && echo 0 || echo 44;; %G) echo "${FAKE_GROUP:-video}";; *) exec /usr/bin/stat "$@";; esac'
+stub test 'if [[ ${FAKE_GROUP:-video} == root && ( $1 == -r || $1 == -w ) ]]; then exit 1; fi; exec /usr/bin/test "$@"'
 stub systemctl 'case "$1" in is-failed) exit 1;; is-active) exit "${FAKE_INACTIVE:-0}";; esac; exit 0'
 stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
 # install: drop -o/-g (the strata account does not exist here).
