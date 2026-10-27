@@ -266,7 +266,7 @@ if (( ! dry_run )); then
 fi
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
-run "${create[@]}"
+(umask 022; run "${create[@]}")
 # Xolotl pins tens of GiB of expert memory (XOLOTL_ARENA_GIB). systemd's LimitMEMLOCK must be
 # allowed by the outer LXC hard limit too.
 ct_config="/etc/pve/lxc/${CT_ID}.conf"

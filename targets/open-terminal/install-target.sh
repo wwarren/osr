@@ -166,9 +166,11 @@ id "$SERVICE_USER" >/dev/null 2>&1 ||
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$OT_SRV" "$OT_SRV/workspace"
 install -d -m 0755 "$OT_OPT"
 # The service reads the key through systemd (EnvironmentFile, read as root), so
-# neither file needs to be readable by the account the shell runs as.
+# neither file needs to be readable by the account the shell runs as. Open
+# Terminal also probes /etc/open-terminal/config.toml on startup, even when
+# that optional file is absent. Its account must be able to traverse OT_ETC.
 chown root:root "$OT_ETC" "$OT_ETC/api-key"
-chmod 0700 "$OT_ETC"
+chmod 0711 "$OT_ETC"
 chmod 0600 "$OT_ETC/api-key"
 
 # Source: the tag, refetched (+ forces a moved tag to show up), then checked
@@ -230,6 +232,10 @@ rollback() {
     systemctl stop open-terminal.service 2>/dev/null
     if [[ -n $previous && -x $previous/bin/open-terminal ]]; then
         ln -sfn "$previous" "$OT_OPT/venv" || return 1
+    elif [[ -z $previous ]]; then
+        # A first install never became active. Keep the built venv for a retry,
+        # but do not leave its symlink advertising a working installation.
+        rm -f -- "$OT_OPT/venv" || return 1
     fi
     if [[ -f $OT_ETC/service.env.prev ]]; then
         mv -f -- "$OT_ETC/service.env.prev" "$OT_ETC/service.env" || return 1
@@ -253,8 +259,7 @@ rollback() {
             return 1
         fi
     else
-        note 'Open Terminal installation failed; no previous installation was available.'
-        return 1
+        note 'Open Terminal installation failed; no previous installation was available. The service was stopped and its new configuration removed.'
     fi
     return 0
 }

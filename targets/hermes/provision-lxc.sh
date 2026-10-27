@@ -718,7 +718,8 @@ if [[ $mode == create ]]; then
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
     --description 'Hermes Agent for Ollama Smart Router')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
-  run "${create[@]}"
+  # Keep the mapped rootfs traversable while Proxmox extracts the template.
+  (umask 022; run "${create[@]}")
 
   firewall=$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port")
   if (( dry_run )); then

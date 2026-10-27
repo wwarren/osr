@@ -688,7 +688,8 @@ if [[ $mode != integrate ]]; then
         fi
     fi
     # The community script is interactive: it needs this terminal, not a pipe.
-    run env "${presets[@]}" bash "$script"
+    # It creates an unprivileged CT, so give that child a normal extraction umask.
+    (umask 022; run env "${presets[@]}" bash "$script")
     if (( ! dry_run )); then
         pct status "$CT_ID" >/dev/null 2>&1 || die "The community script did not create CT $CT_ID (did you change the ID in its menu?)."
         created=1

@@ -328,7 +328,7 @@ fi
 if [[ $gpu != none ]]; then
     printf 'GPU: %s%s. If the community script asks which GPU type to pass through, answer %s.\n' "$gpu" "${card:+ (the card at $card)}" "${gpu^^}"
 fi
-run env "${presets[@]}" bash "$script"
+(umask 022; run env "${presets[@]}" bash "$script")
 if (( ! dry_run )); then
     pct status "$CT_ID" >/dev/null 2>&1 || die "The community script did not create CT $CT_ID (did you change the ID in its menu?)."
     # The community script chooses the devices itself: check it passed this GPU.

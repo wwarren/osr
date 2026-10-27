@@ -268,7 +268,7 @@ printf 'pct' >> "$FAKE_LOG"; printf ' %q' "$@" >> "$FAKE_LOG"; printf '\n' >> "$
 cmd=$1 id=$2; shift 2
 case $cmd in
   status) [[ -e $FAKE_DIR/ct$id || $id == 280 ]] && echo 'status: running' ;;
-  create) mkdir -p "$FAKE_DIR/ct$id" ;;
+  create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")" ;;
   pull) [[ $1 == /etc/hermes-target/api-key ]] && printf '%s\n' "$FAKE_HERMES_KEY" > "$2" ;;
@@ -371,7 +371,7 @@ else printf 401; fi
 EOF
 chmod +x "$bin"/*
 python_cmd=${PYTHON_FOR_TEST:-$(command -v python3)}
-printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$python_cmd" > "$bin/python3"
+printf '#!/usr/bin/env bash\nset -o pipefail\n"%s" "$@" | tr -d "\\r"\n' "$python_cmd" > "$bin/python3"
 chmod +x "$bin/python3"
 touch "$fake/template"
 
@@ -400,6 +400,7 @@ grep -q -- '--hermes-url http://192.0.2.82:8642/v1' "$log" || fail 'integration 
 grep -q 'rm -rf -- /root/hermes-integration.AbC123' "$log" || fail 'the router staging directory was not removed'
 [[ $out == *'Open WebUI connection 1 added'* && $out == *'hermes-agent'* ]] || fail "summary: $out"
 grep -q 'pct create 282' "$log" || fail 'no CT created'
+grep -qx 'pct-create-umask 0022' "$log" || fail 'pct create inherited a restrictive umask'
 grep -q 'pct create 282.*--features nesting=1' "$log" || fail 'the Hermes CT was created without nesting'
 pass 'a full run pushes the router key as a file, firewalls the API to the router and registers it; no secret is in argv'
 

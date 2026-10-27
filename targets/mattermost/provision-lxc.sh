@@ -196,7 +196,7 @@ if [[ $mode != reconfigure ]]; then
         fi
     fi
     # The community script is interactive: it needs this terminal, not a pipe.
-    run env "${presets[@]}" bash "$script"
+    (umask 022; run env "${presets[@]}" bash "$script")
 
     address='<CT address>'
     if (( dry_run )); then

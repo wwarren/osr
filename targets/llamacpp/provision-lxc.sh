@@ -593,7 +593,7 @@ if (( ! dry_run )); then
 fi
 
 trap 'printf "Provisioning stopped at line %s. Any newly created CT is retained for inspection; no CT is deleted automatically.\n" "$LINENO" >&2' ERR
-run "${create[@]}"
+(umask 022; run "${create[@]}")
 run pct start "$CT_ID"
 if (( ! dry_run )); then
     ready=0

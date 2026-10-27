@@ -148,7 +148,8 @@ has 'ip=192.0.2.81/24\,gw=192.0.2.1\,firewall=1'
 has 'policy_in: DROP'
 has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8000'
 has 'wait for systemd, a default route and DNS'
-has '+ pct exec 281 -- install -d -m 0700 /etc/open-terminal'
+has '+ pct exec 281 -- install -d -m 0711 /etc/open-terminal'
+has '+ pct exec 281 -- install -d -m 0700 /root/open-terminal-deploy'
 for file in install-target.sh open-terminal.service requirements.in requirements.lock; do
     has "/root/open-terminal-deploy/$file"
 done

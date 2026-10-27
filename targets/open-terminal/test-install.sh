@@ -162,9 +162,20 @@ default_venv=$(venv_for "$default_commit")
 
 reset_tree
 chmod 0640 "$tree/etc/open-terminal/api-key"    # the old layout: group-readable
+chmod 0700 "$tree/etc/open-terminal"            # the layout that blocked config.toml lookup
+out=$(FAKE_DOWN=1 run_target 2>&1) && fail 'an unhealthy first install was accepted'
+[[ $out == *'no previous installation was available'* && $out != *'Rollback failed'* ]] ||
+    fail "first-install rollback message: $out"
+[[ ! -e $tree/etc/open-terminal/service.env && ! -e $tree/etc/systemd/system/open-terminal.service && ! -e $OT_OPT/venv ]] ||
+    fail 'failed first install left active service configuration or venv symlink'
+[[ -f $default_venv/.install-complete ]] || fail 'failed first install lost its reusable built venv'
+: > "$log"
 run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'fresh install'; }
+grep -q 'python3 -m venv' "$log" && fail 'retry rebuilt the complete venv'
 cmp -s "$tree/etc/systemd/system/open-terminal.service" "$unit" || fail 'unit not installed from the repo file'
 envf=$tree/etc/open-terminal/service.env
+[[ $(stat -c '%a %U' "$tree/etc/open-terminal") == '711 root' ]] ||
+    fail "config directory mode: $(stat -c '%a %U' "$tree/etc/open-terminal")"
 [[ $(stat -c '%a %U' "$envf") == '600 root' ]] || fail "service.env mode: $(stat -c '%a %U' "$envf")"
 [[ $(stat -c '%a' "$tree/etc/open-terminal/api-key") == 600 ]] || fail 'api-key is still group-readable'
 contains 'OPEN_TERMINAL_API_KEY=0123456789abcdef' "$envf"

@@ -153,7 +153,7 @@ log=$tmp/calls.log
 stub() { printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n%s\n' "$1" "$log" "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
 # The "community script" the stubbed curl downloads records the presets it got.
 community=$tmp/community.sh
-printf '#!/usr/bin/env bash\necho "community var_ctid=$var_ctid var_gpu=$var_gpu var_comfyui_gpu_type=$var_comfyui_gpu_type var_os=$var_os" >> "%s"\n' "$log" > "$community"
+printf '#!/usr/bin/env bash\necho "community var_ctid=$var_ctid var_gpu=$var_gpu var_comfyui_gpu_type=$var_comfyui_gpu_type var_os=$var_os" >> "%s"\necho "installer-umask $(umask)" >> "%s"\n' "$log" "$log" > "$community"
 good_sha=$(sha256sum "$community" | awk '{ print $1 }')
 # curl: -I answers FAKE_HF_STATUS (302) for weights, 403 for the gated 9B file
 # without the header file holding FAKE_HF_TOKEN; -o gets the community script.
@@ -205,6 +205,7 @@ real OPENWEBUI_ADMIN_TOKEN=owui-secret GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_N
     COMMUNITY_SCRIPT_SHA256="$good_sha" COMFYUI_MODEL_URL=https://huggingface.co/o/r/resolve/main/v1-5.safetensors || fail "full run failed"
 has "sha256 $good_sha"
 grep -q 'community var_ctid=286 var_gpu=yes var_comfyui_gpu_type=2 var_os=debian' "$log" || fail "presets: $(calls)"
+grep -qx 'installer-umask 0022' "$log" || fail 'community installer inherited a restrictive umask'
 [[ $(cat "$fw") == "$(firewall_config 8188 192.0.2.80 198.51.100.0/24)" ]] || fail "firewall file: $(cat "$fw")"
 grep -q 'pct set 286 --net0 name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:86,ip=192.0.2.86/24,gw=192.0.2.1,type=veth,firewall=1' "$log" ||
     fail "net0 not put behind the firewall: $(calls)"

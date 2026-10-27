@@ -83,6 +83,19 @@ The script keeps temporary credentials private with `umask 077`, but runs `pct c
 
 Before anything is saved, the integration step checks two things from the router CT. First, it checks the terminal's key directly against an endpoint that requires it (`/files/cwd`). Open WebUI's own verify reads only `/api/config`, which needs no key, so a wrong key would otherwise pass. Second, it checks reachability as Open WebUI's backend sees it. The step does not restart Open WebUI or change the router's version-controlled configuration. Existing Open WebUI terminal connections stay in place. If the last step fails, the terminal CT remains available: fix the issue and rerun with `CT_ID`, `ROUTER` and `--integrate-only` (plus the correct `OPEN_TERMINAL_PORT` if you changed it). `--integrate-only` also connects a terminal CT you already have to a different or rebuilt router.
 
+### Repair a CT created by the earlier installer
+
+The earlier installer made `/etc/open-terminal` mode `0700`. Open Terminal probes the optional `/etc/open-terminal/config.toml` on startup, so its `open-terminal` service account could not traverse the directory and exited with `PermissionError` even though pip had finished. The installer now sets the directory to `0711`; `api-key` and `service.env` remain root-only (`0600`). If the CT was created but installation failed, update the target files on the Proxmox host and retry **inside that CT**. For CT 155, from the `targets/open-terminal` directory:
+
+```bash
+pct push 155 install-target.sh /root/open-terminal-deploy/install-target.sh --perms 0755
+pct exec 155 -- bash /root/open-terminal-deploy/install-target.sh
+pct exec 155 -- curl -fsS http://127.0.0.1:8000/health
+CT_ID=155 bash provision-lxc.sh --integrate-only
+```
+
+The last command asks for the existing Open WebUI CT ID or IP address and its admin credential. Set `ROUTER` and `OPEN_TERMINAL_PORT` as needed. Do not run normal provisioning again with CT 155; it is already allocated.
+
 ## Verify and use
 
 ```bash

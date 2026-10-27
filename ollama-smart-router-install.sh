@@ -2870,7 +2870,8 @@ create_args=(
   -start 1
 )
 [[ -n "$NAMESERVER" ]] && create_args+=(-nameserver "$NAMESERVER")
-pct create "${create_args[@]}"
+# Proxmox inherits the caller's umask while extracting an unprivileged CT.
+(umask 022; pct create "${create_args[@]}")
 CT_CREATED=1
 
 wait_for_ct_ready
