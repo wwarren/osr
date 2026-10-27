@@ -64,11 +64,14 @@ Generated Gitea and Mattermost admin passwords are in
 | Router, Gitea, ComfyUI | Debian 13 | — |
 | Open Terminal, Hermes | Debian 13 | Debian 12 |
 | Ollama | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 (`OLLAMA_CT_OS`, `OLLAMA_CT_VERSION`) |
-| Mattermost | Ubuntu 26.04 | Ubuntu 22.04, 24.04 (`MATTERMOST_CT_VERSION`); Ubuntu only |
+| Mattermost | Ubuntu 24.04 | Ubuntu 22.04 (`MATTERMOST_CT_VERSION`); Ubuntu only |
 | AirLLM | chosen at prompt | Debian 12/13; Ubuntu 24.04/26.04 (Python 3.11+) |
 | llama.cpp | Debian 13 listed first | Debian 12/13 for CUDA or CPU; Debian 13 for Vulkan |
 | Basalt, Maya, Xolotl | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 |
 | Strata | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (no Ubuntu 26.04) |
+
+Mattermost's `MATTERMOST_CT_VERSION` also accepts Ubuntu 26.04 as an explicit
+override for future testing, but Mattermost does not currently support it.
 
 The template prompt prefers a downloaded Debian 13 template, then supported
 Ubuntu and Debian releases; it downloads Debian 13 if needed. Maya on a GPU

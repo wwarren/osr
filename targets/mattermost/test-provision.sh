@@ -37,7 +37,7 @@ refuse() {
 plan --create-only
 has '+ curl -fsSL -o '
 has 'https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/mattermost.sh'
-has '+ env var_ctid=275 var_hostname=mattermost var_cpu=2 var_ram=4096 var_disk=16 var_unprivileged=1 var_nesting=1 var_gpu=no var_brg=vmbr0 var_os=ubuntu var_version=26.04 var_net=192.0.2.75/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
+has '+ env var_ctid=275 var_hostname=mattermost var_cpu=2 var_ram=4096 var_disk=16 var_unprivileged=1 var_nesting=1 var_gpu=no var_brg=vmbr0 var_os=ubuntu var_version=24.04 var_net=192.0.2.75/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
 has 'api/v4/system/ping'
 has 'manage-model-servers set-webhook <webhook URL>'
 has 'Create the channel "ollama-monitor"'
@@ -61,8 +61,8 @@ refuse 'ROOTFS_GB must be at least' ROOTFS_GB=4
 refuse 'IP_CIDR' IP_CIDR=192.0.2.300/24
 refuse 'CT_ID' CT_ID=12
 refuse 'MATTERMOST_CT_VERSION must be 22.04, 24.04 or 26.04' MATTERMOST_CT_VERSION=13
-plan MATTERMOST_CT_VERSION=24.04
-has 'var_os=ubuntu var_version=24.04'
+plan MATTERMOST_CT_VERSION=26.04
+has 'var_os=ubuntu var_version=26.04'
 refuse 'MATTERMOST_CHANNEL' MATTERMOST_CHANNEL='Ollama Monitor'
 refuse 'COMMUNITY_SCRIPT_URL' COMMUNITY_SCRIPT_URL=http://example/mattermost.sh
 refuse 'COMMUNITY_SCRIPT_SHA256' COMMUNITY_SCRIPT_SHA256=abc

@@ -2,12 +2,15 @@
 
 Mattermost receives the router's **health alerts**. The `ollama-monitor`
 service posts host and service state changes to an incoming webhook (see the
-main README). This target creates a separate Ubuntu 26.04 LXC (`MATTERMOST_CT_VERSION=24.04`
-or `22.04` for an older one; Mattermost publishes for Ubuntu only) with the
+main README). This target creates a separate Ubuntu 24.04 LXC (`MATTERMOST_CT_VERSION=22.04`
+for an older one; Mattermost publishes for Ubuntu only) with the
 [Proxmox VE community script](https://community-scripts.org/scripts/mattermost)
 (`ct/mattermost.sh`; PostgreSQL 16, Mattermost from its apt repository, port
 8065). It then does the first-run setup inside the CT without the browser,
 and creates the webhook the monitor posts to.
+
+Ubuntu 26.04 can be selected explicitly for future testing, but Mattermost does
+not currently support it.
 
 The router installer offers this target at the start of an interactive install
 (menu entry `mattermost`). It creates the CT before the router, then reads the
@@ -56,6 +59,7 @@ All results are root-only (0600) files in `/etc/mattermost-target/`: `url`,
 | `MATTERMOST_TEAM`, `MATTERMOST_CHANNEL` | `ollama`, `ollama-monitor` | URL names (lowercase letters, digits, `-`, `_`). |
 | `MATTERMOST_ADMIN_USER`, `MATTERMOST_ADMIN_EMAIL` | `mmadmin`, `<name>@<host>.local` | The administrator. |
 | `READY_TIMEOUT` | 120 | Seconds to wait for Mattermost to answer. |
+| `MATTERMOST_CT_VERSION` | `24.04` | Ubuntu release for the CT. |
 | `COMMUNITY_SCRIPT_URL`, `COMMUNITY_SCRIPT_SHA256` | ProxmoxVE `main` | The script to run. Every run prints its checksum; a pin refuses any other copy. |
 
 | Mode | Does |
