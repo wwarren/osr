@@ -331,29 +331,87 @@ probe_setup_help() {
     validate_setup_options
 }
 
+# Upstream only provisions CUDA automatically on Ubuntu. Its Debian setup can
+# use a system toolkit once installed. Choose a release NVIDIA publishes for
+# each Debian version; cuda-toolkit-X-Y does not install a kernel driver.
+debian_cuda_version() {
+    local ID VERSION_ID
+    # shellcheck disable=SC1091
+    . "${STRATA_OS_RELEASE:-/etc/os-release}"
+    [[ $ID == debian ]] || return 1
+    case $VERSION_ID in
+        12) printf '13.0\n' ;;
+        13) printf '13.1\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+install_debian_cuda_toolkit() {
+    local version distro package keyring keyring_url temporary nvcc ID VERSION_ID
+    version=$(debian_cuda_version) || return 1
+    # The package choice is fixed above; the distro comes from the CT itself.
+    # shellcheck disable=SC1091
+    . "${STRATA_OS_RELEASE:-/etc/os-release}"
+    distro=debian$VERSION_ID
+    package=cuda-toolkit-${version/./-}
+    nvcc=${STRATA_NVCC:-/usr/local/cuda-$version/bin/nvcc}
+    keyring=cuda-keyring_1.1-1_all.deb
+    keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/$distro/x86_64/$keyring"
+    note "Strata needs a local engine build; installing $package from NVIDIA's $distro repository."
+    apt-get update
+    apt-get install -y ca-certificates curl build-essential
+    temporary=$(mktemp "${TMPDIR:-/tmp}/strata-cuda-keyring.XXXXXX.deb")
+    if ! curl -fsSL --retry 3 -o "$temporary" "$keyring_url"; then
+        rm -f -- "$temporary"
+        die "Could not download NVIDIA's CUDA keyring from $keyring_url."
+    fi
+    if ! dpkg -i "$temporary"; then
+        rm -f -- "$temporary"
+        die "Could not install NVIDIA's CUDA keyring for $distro."
+    fi
+    rm -f -- "$temporary"
+    apt-get update
+    apt-cache show "$package" >/dev/null 2>&1 ||
+        die "NVIDIA's $distro repository does not offer $package."
+    apt-get install -y "$package"
+    [[ -x $nvcc ]] || die "$package installed but $nvcc is missing."
+    "$nvcc" --version | grep -Fq "release $version" ||
+        die "$nvcc does not report CUDA $version after installing $package."
+    as_service nvidia-smi -L >/dev/null || die 'NVIDIA GPU access failed after the CUDA toolkit install.'
+    note "CUDA $version toolkit is ready; retrying Strata setup."
+}
+
 run_setup() {
     local -a args
-    local setup_log marker
+    local setup_log marker attempt
     mapfile -t args < <(setup_args)
     setup_log=$(mktemp "$STRATA_ETC_DIR/setup-output.XXXXXX")
     # A second in the past, so a launcher written in the same second still
     # counts as newer on filesystems with coarse timestamps.
     marker=$(mktemp "$STRATA_ETC_DIR/setup-start.XXXXXX")
     touch -d "@$(( $(date +%s) - 1 ))" "$marker"
-    if help_has --api-key; then
-        printf '+ bash setup.sh %s --api-key [redacted]\n' "${args[*]}"
-        if ! (cd "$STRATA_DIR" && umask 027 && as_service bash ./setup.sh "${args[@]}" --api-key "$api_key") 2>&1 | tee "$setup_log"; then
-            rm -f "$setup_log" "$marker"
-            return 1
+    for attempt in 1 2; do
+        if help_has --api-key; then
+            printf '+ bash setup.sh %s --api-key [redacted]\n' "${args[*]}"
+            if (cd "$STRATA_DIR" && umask 027 && as_service bash ./setup.sh "${args[@]}" --api-key "$api_key") 2>&1 | tee "$setup_log"; then
+                break
+            fi
+        else
+            note "WARNING: this Strata checkout has no --api-key option; its API is unauthenticated."
+            printf '+ bash setup.sh %s\n' "${args[*]}"
+            if (cd "$STRATA_DIR" && umask 027 && as_service bash ./setup.sh "${args[@]}") 2>&1 | tee "$setup_log"; then
+                break
+            fi
         fi
-    else
-        note "WARNING: this Strata checkout has no --api-key option; its API is unauthenticated."
-        printf '+ bash setup.sh %s\n' "${args[*]}"
-        if ! (cd "$STRATA_DIR" && umask 027 && as_service bash ./setup.sh "${args[@]}") 2>&1 | tee "$setup_log"; then
-            rm -f "$setup_log" "$marker"
-            return 1
+        if (( attempt == 1 )) &&
+            grep -Fq 'the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only' "$setup_log" &&
+            debian_cuda_version >/dev/null; then
+            install_debian_cuda_toolkit
+            continue
         fi
-    fi
+        rm -f "$setup_log" "$marker"
+        return 1
+    done
     if ! select_run_script "$setup_log" "$marker"; then
         rm -f "$setup_log" "$marker"
         return 1
@@ -542,6 +600,7 @@ do_install() {
         printf '+ bash setup.sh --help: keep only the options this checkout supports\n'
         printf '+ bash setup.sh --setup --no-start --yes [--no-browser] [--family %s] --model %s [--context %s] [--vision %s] --host 0.0.0.0 --port %s [--data-dir %s] --api-key [redacted]\n' \
             "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_VISION" "$STRATA_PORT" "$STRATA_DATA_DIR"
+        printf '+ if Debian setup needs a local engine build: install NVIDIA CUDA toolkit 13.0 (Debian 12) or 13.1 (Debian 13), then retry setup once\n'
         printf '+ verify setup generated run-<model>.sh; write %s/strata.env (STRATA_RUN_SCRIPT) and %s/strata.service\n' "$STRATA_ETC_DIR" "$UNIT_DIR"
         run systemctl enable strata.service
         run systemctl restart strata.service

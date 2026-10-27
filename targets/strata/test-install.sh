@@ -176,6 +176,71 @@ out=$(gpu_access_case 44 yes no 2>&1) && fail 'service-user nvidia-smi failure w
 [[ $out == *'cannot use the NVIDIA GPU'* ]] || fail "GPU probe message: $out"
 pass 'GPU access is checked as the service user without joining group root'
 
+# A Debian 13 checkout can need a locally compiled engine. Upstream setup
+# refuses to provision CUDA there, so the target installs only NVIDIA's
+# versioned toolkit package and retries setup once.
+# shellcheck disable=SC1090
+source <(awk '/^debian_cuda_version\(\)/ { capture=1 } /^# Serialize real runs/ { capture=0 } capture { print }' "$target")
+printf 'ID=debian\nVERSION_ID=13\n' > "$tmp_root/os-release"
+[[ $(STRATA_OS_RELEASE="$tmp_root/os-release" debian_cuda_version) == 13.1 ]] || fail 'Debian 13 CUDA version'
+printf 'ID=debian\nVERSION_ID=12\n' > "$tmp_root/os-release-12"
+[[ $(STRATA_OS_RELEASE="$tmp_root/os-release-12" debian_cuda_version) == 13.0 ]] || fail 'Debian 12 CUDA version'
+printf 'ID=ubuntu\nVERSION_ID=24.04\n' > "$tmp_root/os-release-ubuntu"
+if STRATA_OS_RELEASE="$tmp_root/os-release-ubuntu" debian_cuda_version >/dev/null; then fail 'Ubuntu used the Debian CUDA path'; fi
+cat > "$tmp_root/nvcc" <<'NVCC'
+#!/bin/sh
+echo 'Cuda compilation tools, release 13.1, V13.1.80'
+NVCC
+chmod +x "$tmp_root/nvcc"
+out=$(
+    STRATA_OS_RELEASE="$tmp_root/os-release" STRATA_NVCC="$tmp_root/nvcc" TMPDIR="$tmp_root"
+    note() { printf '%s\n' "$*"; }
+    apt-get() { printf 'apt-get %s\n' "$*"; }
+    apt-cache() { printf 'apt-cache %s\n' "$*"; }
+    curl() {
+        printf 'curl %s\n' "$*"
+        while (( $# )); do
+            if [[ $1 == -o ]]; then : > "$2"; break; fi
+            shift
+        done
+    }
+    dpkg() { printf 'dpkg %s\n' "$*"; }
+    as_service() { [[ $1 == nvidia-smi && $2 == -L ]]; }
+    install_debian_cuda_toolkit
+) || fail 'Debian toolkit installer failed against its command stubs'
+[[ $out == *'repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb'* ]] || fail "CUDA repo URL: $out"
+[[ $out == *'apt-get install -y cuda-toolkit-13-1'* ]] || fail "CUDA package choice: $out"
+[[ $out != *'apt-get install -y cuda '* && $out != *'cuda-drivers'* ]] || fail 'CUDA installer selected a driver package'
+pass 'Debian CUDA install selects NVIDIA toolkit 13.1 without a driver package'
+
+SETUP_HELP=$(< "$help_documented")
+STRATA_DIR=$tmp_root/retry/strata
+STRATA_ETC_DIR=$tmp_root/retry/etc
+mkdir -p "$STRATA_DIR" "$STRATA_ETC_DIR"
+api_key=test-key
+cat > "$STRATA_DIR/setup.sh" <<'SETUP'
+#!/bin/bash
+if [[ ! -e .attempted ]]; then
+    touch .attempted
+    echo '[X] the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only'
+    exit 1
+fi
+printf '#!/bin/sh\nexit 0\n' > run-iq2_xs.sh
+chmod +x run-iq2_xs.sh
+echo '  [ok] start script: run-iq2_xs.sh'
+SETUP
+out=$(
+    note() { printf '%s\n' "$*"; }
+    as_service() { "$@"; }
+    debian_cuda_version() { printf '13.1\n'; }
+    install_debian_cuda_toolkit() { touch "$tmp_root/retry/cuda-installed"; }
+    run_setup
+    start_env | tail -n1
+) || fail 'setup did not resume after installing the Debian toolkit'
+[[ -f $tmp_root/retry/cuda-installed && $out == *"STRATA_RUN_SCRIPT=$STRATA_DIR/run-iq2_xs.sh"* ]] ||
+    fail "CUDA retry or launcher selection failed: $out"
+pass 'setup retries once after the Debian CUDA failure and selects its launcher'
+
 # --- whole-script runs --------------------------------------------------------
 # From a copy, so a case can ship a changed unit for one attempted upgrade.
 deploy=$tmp_root/deploy; mkdir -p "$deploy"

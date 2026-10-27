@@ -86,6 +86,26 @@ To resume an interrupted install or upgrade Strata in the existing CT, run
 `pct exec 280 -- bash /root/strata-target-deploy/install-target.sh` (replace
 `280` with your Strata CT ID).
 
+If Strata has no ready-made engine for the selected GPU, setup compiles one.
+Upstream setup installs the CUDA toolkit automatically on Ubuntu 22.04/24.04,
+but stops on Debian. The guest installer recognizes that specific failure on
+Debian 12/13, installs NVIDIA's versioned `cuda-toolkit-13-0` or
+`cuda-toolkit-13-1` package respectively, and retries setup once. The package
+contains the toolkit, not a kernel driver; the guest's NVIDIA userspace must
+still match the PVE host driver. To resume an existing Debian 13 CT after this
+failure, sync the updated repository to the PVE host and run:
+
+```bash
+cd /path/to/ollama-smart-router
+pct push 154 targets/strata/install-target.sh \
+    /root/strata-target-deploy/install-target.sh --perms 0755
+pct exec 154 -- bash /root/strata-target-deploy/install-target.sh
+```
+
+The saved `/etc/strata-target/pending-env` keeps the model and port choices
+from the first attempt. The engine build and model download can take time after
+CUDA is installed.
+
 ### If a GPU node appears as group root
 
 On the Proxmox host, inspect the **existing** CT and its device assignments:
