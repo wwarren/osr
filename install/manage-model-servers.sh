@@ -82,7 +82,7 @@ Usage: manage-model-servers.sh <command> [options]
 Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
-  discover                   Ask the router to re-poll and print the live model inventory
+  discover                   Ask OSR to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
                              LM Studio, Strata, Basalt, Maya and Xolotl are detected
                              automatically, or use lmstudio://host / strata://host /
@@ -126,7 +126,7 @@ Commands:
                              Bearer token for Xolotl servers with an API key
                              (stored in secrets.env)
   set-api-key [key|--generate|--off]
-                             Require "Authorization: Bearer <key>" on the router
+                             Require "Authorization: Bearer <key>" on OSR
                              API (Open WebUI is given the same key)
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
@@ -713,7 +713,7 @@ cmd_list() {
 
 cmd_discover() {
   local body rc=0
-  echo "Asking the router to re-poll every configured host..."
+  echo "Asking OSR to re-poll every configured host..."
   local key; key="$(env_get ROUTER_API_KEY)"
   if [[ -n "$key" ]]; then
     # Header read from a file descriptor, so the key never shows up in `ps`.
@@ -723,7 +723,7 @@ cmd_discover() {
     body="$(curl -fsS -X POST "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
   fi
   if (( rc != 0 )) || [[ -z "$body" ]]; then
-    note "Could not reach the router at ${ROUTER_URL} (curl exit ${rc})."
+    note "Could not reach OSR at ${ROUTER_URL} (curl exit ${rc})."
     note "  Check it is running:  systemctl status ollama-router"
     note "  Or point elsewhere:   ROUTER_URL=http://host:8000 $0 discover"
     return 1
@@ -737,7 +737,7 @@ import sys, json
 try:
     data = json.load(sys.stdin)
 except Exception as exc:
-    print("  the router replied, but the response did not parse: %s" % exc)
+    print("  OSR replied, but the response did not parse: %s" % exc)
     raise SystemExit(1)
 
 status = data.get("server_status") or {}
@@ -1255,7 +1255,7 @@ cmd_set_keepalive() {
   env_set OLLAMA_KEEP_ALIVE "$value"
   regenerate_litellm
   note "  NOTE: Ollama's OpenAI-compatible endpoint ignores keep_alive, so models"
-  note "        served through the router are kept resident by the monitor, which"
+  note "        served through OSR are kept resident by the monitor, which"
   note "        re-pins them through the native API. Restart it to pick this up."
   note "        LM Studio servers are not affected: LM Studio loads models on demand"
   note "        and unloads them on its own idle TTL (set that in LM Studio)."
@@ -1341,7 +1341,7 @@ cmd_set_model() {
   TIER_MODEL_OVERRIDE["$tier"]="$tag"
   regenerate_litellm
   note "  NOTE: the tier's model tag governs the LiteLLM fallback path. In"
-  note "        discovery mode the router picks a model from the live inventory,"
+  note "        discovery mode OSR picks a model from the live inventory,"
   note "        so this does not by itself change discovery-mode routing."
 }
 
@@ -2127,8 +2127,8 @@ cmd_set_token() {
   CHANGED=true
 }
 
-# Router API key. Stored twice in the secrets file: ROUTER_API_KEY for the
-# router, OPENAI_API_KEYS for Open WebUI, which authenticates to the router as
+# OSR API key. Stored twice in the secrets file: ROUTER_API_KEY for OSR,
+# OPENAI_API_KEYS for Open WebUI, which authenticates to OSR as
 # an OpenAI connection. Both units load secrets.env.
 cmd_set_api_key() {
   local key="${1:-}"
@@ -2136,7 +2136,7 @@ cmd_set_api_key() {
     --off)
       env_set ROUTER_API_KEY ""
       env_set OPENAI_API_KEYS ""
-      echo "Router API key cleared: the API is open to anyone who can reach it."
+      echo "OSR API key cleared: the API is open to anyone who can reach it."
       CHANGED=true
       return 0 ;;
     --generate|"")
@@ -2146,7 +2146,7 @@ cmd_set_api_key() {
     die "set-api-key: use at least 16 characters from A-Z a-z 0-9 . _ ~ + / = -"
   env_set ROUTER_API_KEY "$key"
   env_set OPENAI_API_KEYS "$key"
-  echo "Stored the router API key in ${SECRETS_FILE}."
+  echo "Stored the OSR API key in ${SECRETS_FILE}."
   $DRY_RUN || echo "  key: ${key}"
   note "  Clients must send:  Authorization: Bearer <key>"
   note "  Open WebUI reads OPENAI_API_KEYS only on its FIRST start; on an existing"
@@ -2384,7 +2384,7 @@ ensure_config_or_forward() {
   [[ -f "$ENV_FILE" ]] && return 0
 
   if ! command -v pct >/dev/null 2>&1; then
-    die "config not found at ${ENV_FILE}. Run this inside the router container, or set CONFIG_REPO_DIR."
+    die "config not found at ${ENV_FILE}. Run this inside the OSR container, or set CONFIG_REPO_DIR."
   fi
 
   # On a Proxmox host: locate the container and hand off to it.
@@ -2405,7 +2405,7 @@ ensure_config_or_forward() {
   # Could not find it — say what was actually checked.
   echo "ERROR: ${ENV_FILE} does not exist here." >&2
   echo >&2
-  echo "This tool edits configuration that lives INSIDE the router container," >&2
+  echo "This tool edits configuration that lives INSIDE the OSR container," >&2
   echo "and you appear to be on the Proxmox host." >&2
   echo >&2
   local ids id2
@@ -2416,7 +2416,7 @@ ensure_config_or_forward() {
       printf '  %-6s %s\n' "$id2" "$(ct_name_of "$id2")" >&2
     done
     echo >&2
-    echo "If the router container is one of these, run:" >&2
+    echo "If the OSR container is one of these, run:" >&2
     echo "  CT_ID=<id> $0 ${ORIG_ARGS[*]}" >&2
   else
     echo "No running containers were found (pct list)." >&2

@@ -73,8 +73,11 @@ Generated Gitea and Mattermost admin passwords are in
 Mattermost's `MATTERMOST_CT_VERSION` also accepts Ubuntu 26.04 as an explicit
 override for future testing, but Mattermost does not currently support it.
 
-The template prompt prefers a downloaded Debian 13 template, then supported
-Ubuntu and Debian releases; it downloads Debian 13 if needed. Maya on a GPU
+The router's template storage is selected before target prompts. Strata defaults
+to that same template reference and lists other downloaded compatible templates
+at its prompt. Other GPU target template prompts prefer a downloaded Debian 13
+template, then supported Ubuntu and Debian releases; they download their preferred
+release if needed. Maya on a GPU
 with compute capability below 7.5 (such as V100) defaults to Ubuntu 24.04:
 CUDA 13 cannot build for that card. Debian 13's NVIDIA repository starts at
 CUDA 13.1 and Ubuntu 26.04's at 13.3; Basalt, Maya and Xolotl use those

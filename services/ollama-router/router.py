@@ -862,7 +862,7 @@ async def lifespan(_app):
             _HTTP["client"] = None
 
 
-app = FastAPI(title="Intelligent Ollama Complexity Router", lifespan=lifespan)
+app = FastAPI(title="Ollama Smart Router", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1216,7 +1216,7 @@ async def _stream_upstream(method: str, url: str, headers: dict,
         )
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"Router core disconnect: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"OSR core disconnect: {exc}") from exc
     return StreamingResponse(
         upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,

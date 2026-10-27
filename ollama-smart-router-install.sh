@@ -54,7 +54,7 @@ ROOTFS_GB="${ROOTFS_GB:-32}"
 # unreachable the install falls back to the default (CUDA) build with a warning
 # rather than failing the run.
 TORCH_CPU_ONLY="${TORCH_CPU_ONLY:-true}"
-# Service ports. Router (8000) and LiteLLM (4000) are fixed in their units;
+# Service ports. OSR (8000) and LiteLLM (4000) are fixed in their units;
 # Open WebUI reads its port from its env file, so only this one is wired.
 OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 # Open WebUI requires Python >=3.11,<3.13 (all releases). Debian 13 ships 3.13,
@@ -71,7 +71,7 @@ TEMPLATE_NAME="${TEMPLATE_NAME:-}"
 # Minimum free space wanted on the storage that holds the container template.
 TEMPLATE_MIN_GIB="${TEMPLATE_MIN_GIB:-2}"
 FIREWALL="${FIREWALL:-1}"
-# Bearer token required by the router API (8000). Blank = generate one. Stored
+# Bearer token required by the OSR API (8000). Blank = generate one. Stored
 # only in /app/router/secrets.env; change it later with
 #   manage-model-servers set-api-key [key|--generate|--off]
 ROUTER_API_KEY="${ROUTER_API_KEY:-}"
@@ -244,7 +244,7 @@ ensure_fw_rule() {
   printf '%s\n' "$rule" >> "$file"
 }
 
-# Write the CT firewall rules: SSH, the router API and Open WebUI from the
+# Write the CT firewall rules: SSH, the OSR API and Open WebUI from the
 # trusted CIDR. SSH is included because enabling the CT firewall switches the
 # default inbound policy to DROP -- without it the container locks you out.
 write_firewall_rules() {
@@ -632,6 +632,35 @@ select_available_debian_template() {
   echo "Run 'pveam available --section system | grep debian-13-standard' to inspect available templates." >&2
   return 1
 }
+select_router_template() {
+  local n t a
+  DOWNLOAD_TEMPLATE_NAME=""
+  if TEMPLATE_REF="$(find_existing_debian_template)"; then
+    # The lookup runs in a subshell; keep the storage it actually selected.
+    TEMPLATE_STORAGE="${TEMPLATE_REF%%:*}"
+    echo "Using existing Debian container template: ${TEMPLATE_REF}"
+    return 0
+  fi
+  TEMPLATE_REF=""
+  if ! storage_supports_vztmpl "$TEMPLATE_STORAGE"; then
+    echo "Storage '${TEMPLATE_STORAGE}' does not support vztmpl content; cannot download a template there." >&2
+    echo "Set TEMPLATE_STORAGE to a storage that lists 'vztmpl' in 'pvesm status -content vztmpl'." >&2
+    echo "Candidates with free space:" >&2
+    storage_candidates vztmpl | while IFS=$'\t' read -r n t a; do
+      echo "  ${n} (${t}): $(kib_to_gib "$a") GiB free" >&2
+    done
+    return 1
+  fi
+  local free_gib
+  free_gib="$(storage_free_gib "$TEMPLATE_STORAGE" vztmpl)"
+  if [[ "$free_gib" =~ ^[0-9]+$ ]] && (( free_gib < TEMPLATE_MIN_GIB )); then
+    echo "Storage '${TEMPLATE_STORAGE}' has only ${free_gib} GiB free;" >&2
+    echo "at least ${TEMPLATE_MIN_GIB} GiB is wanted for the container template." >&2
+    select_storage_with_space vztmpl "$TEMPLATE_MIN_GIB" TEMPLATE_STORAGE "$TEMPLATE_STORAGE" || return 1
+  fi
+  DOWNLOAD_TEMPLATE_NAME="$(select_available_debian_template)" || return 1
+  TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${DOWNLOAD_TEMPLATE_NAME}"
+}
 prompt_secret() {
   local prompt="$1" var_name="$2" first="" second=""
   while true; do
@@ -853,15 +882,15 @@ next_free_ct_id_excluding() {
 require_companion_credentials() {
   local status=0
   if [[ " ${TARGETS:-} " == *" gitea "* && "$CONFIG_SOURCE" != "repo" ]]; then
-    echo "The new Gitea LXC (CT $(target_setting gitea CT_ID)) is ready, but the router is not" >&2
+    echo "The new Gitea LXC (CT $(target_setting gitea CT_ID)) is ready, but OSR is not" >&2
     echo "using it (no Gitea URL, or its token or repository check failed). Rerun the" >&2
-    echo "router installer without selecting gitea, with GITEA_SERVER_URL, GITEA_ADMIN_USER" >&2
+    echo "OSR installer without selecting gitea, with GITEA_SERVER_URL, GITEA_ADMIN_USER" >&2
     echo "and GITEA_DEPLOY_TOKEN from /etc/gitea-target/ in that CT." >&2
     status=1
   fi
   if [[ " ${TARGETS:-} " == *" mattermost "* && -z "$MATTERMOST_WEBHOOK_URL" ]]; then
     echo "The new Mattermost LXC (CT $(target_setting mattermost CT_ID)) is ready, but no alert" >&2
-    echo "webhook was kept. Rerun the router installer without selecting mattermost, with" >&2
+    echo "webhook was kept. Rerun the OSR installer without selecting mattermost, with" >&2
     echo "MATTERMOST_WEBHOOK_URL from /etc/mattermost-target/webhook-url in that CT." >&2
     status=1
   fi
@@ -883,7 +912,7 @@ require_companion_credentials() {
 # preference; generations limit the cards (see target_gpu_spec).
 target_table() {
   printf '%s\n' \
-    'gitea|service|Gitea: the configuration repository (configured for the router)|||' \
+    'gitea|service|Gitea: the configuration repository (configured for OSR)|||' \
     'mattermost|service|Mattermost: health alerts (team, channel and webhook made for you)|||' \
     'ollama|model|Ollama from the PVE community script (NVIDIA, AMD or Intel Arc GPU when present)|http://@IP@:11434||optional:nvidia,amd,intel' \
     'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (CUDA, or Vulkan on AMD/Intel Arc)|http://@IP@:11434||required:nvidia,amd,intel' \
@@ -960,7 +989,7 @@ HOST_GPU_CARDS="" HOST_GPU_CUDA_ARCH=""
 host_gpu_tool() {
   local tool="${TARGETS_DIR}/../tools/setup-host-gpu.sh"
   if [[ ! -r "$tool" ]]; then
-    echo "Missing ${tool}. Run the router installer from the full repository checkout." >&2
+    echo "Missing ${tool}. Run the OSR installer from the full repository checkout." >&2
     return 1
   fi
   printf '%s\n' "$tool"
@@ -1149,12 +1178,12 @@ run_host_gpu_tool() {
   case "$rc" in
     0) ;;
     2)
-      echo "Reboot this host, then run the router installer again. The GPU driver is set up;" >&2
+      echo "Reboot this host, then run the OSR installer again. The GPU driver is set up;" >&2
       echo "nothing else was created." >&2
       return 1 ;;
     *)
       echo "The GPU is not ready for: ${targets}. Nothing was created;" >&2
-      echo "deselect those targets, or fix the GPU and run the router installer again." >&2
+      echo "deselect those targets, or fix the GPU and run the OSR installer again." >&2
       return 1 ;;
   esac
   state="$(sed -n 's/^GPU_STATE=//p' <<< "$out")"
@@ -1335,7 +1364,7 @@ prompt_target_selection() {
     if [[ -n "$(normalize_target_selection "$INSTALL_TARGETS")" ]]; then
       echo "INSTALL_TARGETS (or INSTALL_GITEA/INSTALL_MATTERMOST) needs an interactive run" >&2
       echo "(the community-script menus, GPU selection and the Open WebUI admin key)." >&2
-      echo "Install the router unattended without it, then run" >&2
+      echo "Install OSR unattended without it, then run" >&2
       echo "targets/<name>/provision-lxc.sh for each target." >&2
       return 1
     fi
@@ -1347,9 +1376,9 @@ prompt_target_selection() {
     i=$((i + 1))
     if [[ "$phase" != "$prev_phase" ]]; then
       case "$phase" in
-        service) echo "Services: created now, before the router, and connected to it." ;;
-        model) echo "Model servers: created after the router and added to its server list." ;;
-        companion) echo "Companions: added to the router's Open WebUI once it is running." ;;
+        service) echo "Services: created now, before OSR, and connected to it." ;;
+        model) echo "Model servers: created after OSR and added to its server list." ;;
+        companion) echo "Companions: added to OSR's Open WebUI once it is running." ;;
       esac
     fi
     printf '  %d) %-14s %s\n' "$i" "$name" "$label"
@@ -1364,7 +1393,7 @@ prompt_target_selection() {
   for name in $TARGETS; do
     if [[ ! -r "${TARGETS_DIR}/${name}/provision-lxc.sh" ]]; then
       echo "Cannot install ${name}: ${TARGETS_DIR}/${name}/provision-lxc.sh is missing." >&2
-      echo "Run the router installer from the full repository checkout." >&2
+      echo "Run the OSR installer from the full repository checkout." >&2
       return 1
     fi
   done
@@ -1387,6 +1416,19 @@ valid_target_template() {
 }
 valid_strata_template() {
   valid_target_template "$1" && [[ "$1" != *:vztmpl/ubuntu-26.04-* ]]
+}
+show_strata_template_alternatives() {
+  local selected="$1" storage ref shown=0
+  while IFS= read -r storage; do
+    while IFS= read -r ref; do
+      [[ "$ref" != "$selected" ]] && valid_strata_template "$ref" || continue
+      if (( shown == 0 )); then
+        echo "    Other downloaded Strata templates (enter a reference to use one):"
+        shown=1
+      fi
+      printf '      %s\n' "$ref"
+    done < <(pveam list "$storage" 2>/dev/null | awk 'NR > 1 {print $1}' | sort -V -r)
+  done < <(template_storages)
 }
 valid_comfyui_variant() { [[ $1 == klein-4b || $1 == klein-9b ]]; }
 valid_hf_token() { [[ $1 =~ ^hf_[A-Za-z0-9]{30,}$ ]]; }
@@ -1460,7 +1502,7 @@ prompt_target_settings() {
   echo
   echo "--- Target containers ---"
   echo "  Each target gets a static address on ${BRIDGE} with gateway ${GATEWAY},"
-  echo "  so the router can reach it."
+  echo "  so OSR can reach it."
   TARGET_RESERVED_IDS="$CT_ID"
   TARGET_RESERVED_IPS="${IP_CIDR%/*}"
   for name in $TARGETS; do
@@ -1504,11 +1546,14 @@ prompt_target_settings() {
     fi
     if target_needs_template "$name"; then
       default="${!template_var:-}"
-      [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
       if [[ $name == strata ]]; then
+        [[ -n "$default" ]] || default="${TEMPLATE_REF:-}"
+        [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
+        [[ "$NONINTERACTIVE" == true ]] || show_strata_template_alternatives "$default"
         prompt_until_valid "    Template (Ubuntu 22.04/24.04 or Debian 12/13; downloaded if missing)" \
           "$template_var" "$default" valid_strata_template || return 1
       else
+        [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
         prompt_until_valid "    Template (Ubuntu 22.04/24.04/26.04 or Debian 12/13; downloaded if missing; Ubuntu 26.04 needs CUDA 13.3+)" \
           "$template_var" "$default" valid_target_template || return 1
       fi
@@ -1548,7 +1593,7 @@ preset_target_model_servers() {
   MODEL_SERVER_COUNT=$n
   echo
   echo "  The new model targets are servers 1-${n} below. They answer once they are"
-  echo "  created after the router; until then the router skips them. Raise the"
+  echo "  created after OSR; until then OSR skips them. Raise the"
   echo "  count to keep other servers as well."
 }
 
@@ -1629,11 +1674,11 @@ provision_service_targets() {
     [[ "$(target_field "$name" phase)" == service ]] || continue
     id="$(target_setting "$name" CT_ID)"
     echo
-    echo "=== Target ${name} (CT ${id}), before the router ==="
+    echo "=== Target ${name} (CT ${id}), before OSR ==="
     if ! run_target_provisioner "$name"; then
       echo "Creating ${name} failed. CT ${id}, if it was made, is kept: repair it with" >&2
       echo "  CT_ID=${id} bash ${TARGETS_DIR}/${name}/provision-lxc.sh --reconfigure" >&2
-      echo "then rerun the router installer without selecting ${name}." >&2
+      echo "then rerun the OSR installer without selecting ${name}." >&2
       return 1
     fi
     case "$name" in
@@ -1642,10 +1687,10 @@ provision_service_targets() {
         GITEA_ADMIN_USER="$(service_result gitea router-user)"
         GITEA_DEPLOY_TOKEN="$(service_result gitea router-token)"
         if [[ -z "$GITEA_SERVER_URL" || -z "$GITEA_ADMIN_USER" || -z "$GITEA_DEPLOY_TOKEN" ]]; then
-          echo "Gitea in CT ${id} gave no URL, router account or token (/etc/gitea-target/)." >&2
+          echo "Gitea in CT ${id} gave no URL, OSR account or token (/etc/gitea-target/)." >&2
           return 1
         fi
-        echo "Gitea at ${GITEA_SERVER_URL}: the router uses its account ${GITEA_ADMIN_USER}." ;;
+        echo "Gitea at ${GITEA_SERVER_URL}: OSR uses its account ${GITEA_ADMIN_USER}." ;;
       mattermost)
         value="$(service_result mattermost webhook-url)"
         if [[ -z "$value" ]]; then
@@ -1669,7 +1714,7 @@ register_target_key() {
   id="$(target_setting "$name" CT_ID)"
   key="$(pct exec "$id" -- cat "/etc/${kind}-target/api-key" 2>/dev/null | tr -d '\r\n')" || key=""
   if [[ -z "$key" ]]; then
-    echo "WARNING: could not read /etc/${kind}-target/api-key in CT ${id}; set it on the router" >&2
+    echo "WARNING: could not read /etc/${kind}-target/api-key in CT ${id}; set it on OSR" >&2
     echo "         with: manage-model-servers set-${kind}-token --apply" >&2
     return 1
   fi
@@ -1715,7 +1760,7 @@ provision_selected_targets() {
   for name in $TARGETS; do
     case "$(target_field "$name" phase)" in
       service)
-        if [[ " ${SERVICES_DONE:-} " == *" ${name} "* ]]; then result[$name]="ok (created before the router)"; fi
+        if [[ " ${SERVICES_DONE:-} " == *" ${name} "* ]]; then result[$name]="ok (created before OSR)"; fi
         continue ;;
       companion) companions=true; continue ;;
     esac
@@ -1737,16 +1782,16 @@ provision_selected_targets() {
       if register_target_key "$name"; then
         key_targets+=("$name")
       else
-        result[$name]="ok (router key not set)"
+        result[$name]="ok (OSR key not set)"
       fi
     fi
   done
   if (( ${#key_targets[@]} > 0 )); then
-    echo "Applying the target keys on the router."
+    echo "Applying the target keys on OSR."
     if ! run_ct /usr/local/bin/manage-model-servers apply; then
-      echo "ERROR: manage-model-servers apply failed in router CT ${CT_ID}." >&2
+      echo "ERROR: manage-model-servers apply failed in OSR CT ${CT_ID}." >&2
       for name in "${key_targets[@]}"; do
-        result[$name]="failed (router key apply)"
+        result[$name]="failed (OSR key apply)"
       done
     fi
   fi
@@ -1774,7 +1819,7 @@ provision_selected_targets() {
     printf '  %-14s CT %-6s %s\n' "$name" "$id" "${result[$name]:-not run}"
     if [[ "${result[$name]:-}" != ok* || "${result[$name]}" == *"not set"* ]]; then
       status=1
-      if [[ "${result[$name]}" == "failed (router key apply)" ]]; then
+      if [[ "${result[$name]}" == "failed (OSR key apply)" ]]; then
         echo "                 run pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers apply"
       else
         echo "                 see targets/${name}/README.md; rerun targets/${name}/provision-lxc.sh"
@@ -1796,8 +1841,8 @@ prompt_router_ct_id() {
     default="$(find_next_ct_id)" || return 1
   fi
   echo
-  echo "--- Router container ---"
-  prompt_until_valid "Router CT ID" CT_ID "$default" valid_router_ct_id
+  echo "--- Ollama Smart Router container ---"
+  prompt_until_valid "OSR CT ID" CT_ID "$default" valid_router_ct_id
 }
 # Proxmox accepts guest IDs 100-999999999.
 valid_router_ct_id() {
@@ -1809,7 +1854,7 @@ prompt_network_config() {
   echo
   echo "--- Container network ---"
   prompt_until_valid "Proxmox bridge"            BRIDGE     "$BRIDGE"     valid_nonempty
-  prompt_until_valid "Router IP address / CIDR"  IP_CIDR    "$IP_CIDR"    valid_cidr
+  prompt_until_valid "OSR IP address / CIDR"     IP_CIDR    "$IP_CIDR"    valid_cidr
   prompt_until_valid "Gateway IP"                GATEWAY    "$GATEWAY"    valid_ipv4
   prompt_until_valid "DNS nameserver (blank = inherit host)" \
                                                  NAMESERVER "$NAMESERVER" valid_optional_ipv4
@@ -2679,6 +2724,9 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 # offers a default (Enter accepts); NONINTERACTIVE=true takes all defaults.
 prompt_network_config
 prompt_storage_config
+echo "Updating Proxmox appliance template index."
+pveam update
+select_router_template || exit 1
 prompt_target_settings || exit 1
 # Which GPU each AMD/Intel-capable target gets, then the host driver for every
 # chosen card: set up now, when missing, before anything is created (a reboot
@@ -2708,34 +2756,9 @@ if [[ "$CONFIG_SOURCE" == "repo" ]]; then
 fi
 require_companion_credentials || exit 1
 
-echo "Updating Proxmox appliance template index."
-pveam update
-if TEMPLATE_REF="$(find_existing_debian_template)"; then
-  echo "Using existing Debian container template: ${TEMPLATE_REF}"
-else
-  if ! storage_supports_vztmpl "$TEMPLATE_STORAGE"; then
-    echo "Storage '${TEMPLATE_STORAGE}' does not support vztmpl content; cannot download a template there." >&2
-    echo "Set TEMPLATE_STORAGE to a storage that lists 'vztmpl' in 'pvesm status -content vztmpl'." >&2
-    echo "Candidates with free space:" >&2
-    storage_candidates vztmpl | while IFS=$'\t' read -r n t a; do
-      echo "  ${n} (${t}): $(kib_to_gib "$a") GiB free" >&2
-    done
-    exit 1
-  fi
-  # A Debian standard template is a few hundred MB; refuse a storage that
-  # obviously cannot hold one rather than failing mid-download.
-  TEMPLATE_FREE_GIB="$(storage_free_gib "$TEMPLATE_STORAGE" vztmpl)"
-  if [[ "$TEMPLATE_FREE_GIB" =~ ^[0-9]+$ ]] && (( TEMPLATE_FREE_GIB < TEMPLATE_MIN_GIB )); then
-    echo "Storage '${TEMPLATE_STORAGE}' has only ${TEMPLATE_FREE_GIB} GiB free;" >&2
-    echo "at least ${TEMPLATE_MIN_GIB} GiB is wanted for the container template." >&2
-    if ! select_storage_with_space vztmpl "$TEMPLATE_MIN_GIB" TEMPLATE_STORAGE "$TEMPLATE_STORAGE"; then
-      exit 1
-    fi
-  fi
-  DOWNLOAD_TEMPLATE_NAME="$(select_available_debian_template)"
+if [[ -n "$DOWNLOAD_TEMPLATE_NAME" ]]; then
   echo "Downloading template ${DOWNLOAD_TEMPLATE_NAME} to ${TEMPLATE_STORAGE}."
   pveam download "$TEMPLATE_STORAGE" "$DOWNLOAD_TEMPLATE_NAME"
-  TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${DOWNLOAD_TEMPLATE_NAME}"
 fi
 
 echo "Creating Proxmox container ${CT_ID} (${CT_NAME})."
@@ -3710,7 +3733,7 @@ async def lifespan(_app):
             _HTTP["client"] = None
 
 
-app = FastAPI(title="Intelligent Ollama Complexity Router", lifespan=lifespan)
+app = FastAPI(title="Ollama Smart Router", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -4064,7 +4087,7 @@ async def _stream_upstream(method: str, url: str, headers: dict,
         )
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"Router core disconnect: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"OSR core disconnect: {exc}") from exc
     return StreamingResponse(
         upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,
@@ -5315,7 +5338,7 @@ Usage: manage-model-servers.sh <command> [options]
 Commands:
   list                       Show configured servers and their tier assignments
   status                     As list, plus a live reachability probe of each host
-  discover                   Ask the router to re-poll and print the live model inventory
+  discover                   Ask OSR to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
                              LM Studio, Strata, Basalt, Maya and Xolotl are detected
                              automatically, or use lmstudio://host / strata://host /
@@ -5359,7 +5382,7 @@ Commands:
                              Bearer token for Xolotl servers with an API key
                              (stored in secrets.env)
   set-api-key [key|--generate|--off]
-                             Require "Authorization: Bearer <key>" on the router
+                             Require "Authorization: Bearer <key>" on OSR
                              API (Open WebUI is given the same key)
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
@@ -5946,7 +5969,7 @@ cmd_list() {
 
 cmd_discover() {
   local body rc=0
-  echo "Asking the router to re-poll every configured host..."
+  echo "Asking OSR to re-poll every configured host..."
   local key; key="$(env_get ROUTER_API_KEY)"
   if [[ -n "$key" ]]; then
     # Header read from a file descriptor, so the key never shows up in `ps`.
@@ -5956,7 +5979,7 @@ cmd_discover() {
     body="$(curl -fsS -X POST "${ROUTER_URL}/routing/refresh" 2>/dev/null)" || rc=$?
   fi
   if (( rc != 0 )) || [[ -z "$body" ]]; then
-    note "Could not reach the router at ${ROUTER_URL} (curl exit ${rc})."
+    note "Could not reach OSR at ${ROUTER_URL} (curl exit ${rc})."
     note "  Check it is running:  systemctl status ollama-router"
     note "  Or point elsewhere:   ROUTER_URL=http://host:8000 $0 discover"
     return 1
@@ -5970,7 +5993,7 @@ import sys, json
 try:
     data = json.load(sys.stdin)
 except Exception as exc:
-    print("  the router replied, but the response did not parse: %s" % exc)
+    print("  OSR replied, but the response did not parse: %s" % exc)
     raise SystemExit(1)
 
 status = data.get("server_status") or {}
@@ -6488,7 +6511,7 @@ cmd_set_keepalive() {
   env_set OLLAMA_KEEP_ALIVE "$value"
   regenerate_litellm
   note "  NOTE: Ollama's OpenAI-compatible endpoint ignores keep_alive, so models"
-  note "        served through the router are kept resident by the monitor, which"
+  note "        served through OSR are kept resident by the monitor, which"
   note "        re-pins them through the native API. Restart it to pick this up."
   note "        LM Studio servers are not affected: LM Studio loads models on demand"
   note "        and unloads them on its own idle TTL (set that in LM Studio)."
@@ -6574,7 +6597,7 @@ cmd_set_model() {
   TIER_MODEL_OVERRIDE["$tier"]="$tag"
   regenerate_litellm
   note "  NOTE: the tier's model tag governs the LiteLLM fallback path. In"
-  note "        discovery mode the router picks a model from the live inventory,"
+  note "        discovery mode OSR picks a model from the live inventory,"
   note "        so this does not by itself change discovery-mode routing."
 }
 
@@ -7360,8 +7383,8 @@ cmd_set_token() {
   CHANGED=true
 }
 
-# Router API key. Stored twice in the secrets file: ROUTER_API_KEY for the
-# router, OPENAI_API_KEYS for Open WebUI, which authenticates to the router as
+# OSR API key. Stored twice in the secrets file: ROUTER_API_KEY for OSR,
+# OPENAI_API_KEYS for Open WebUI, which authenticates to OSR as
 # an OpenAI connection. Both units load secrets.env.
 cmd_set_api_key() {
   local key="${1:-}"
@@ -7369,7 +7392,7 @@ cmd_set_api_key() {
     --off)
       env_set ROUTER_API_KEY ""
       env_set OPENAI_API_KEYS ""
-      echo "Router API key cleared: the API is open to anyone who can reach it."
+      echo "OSR API key cleared: the API is open to anyone who can reach it."
       CHANGED=true
       return 0 ;;
     --generate|"")
@@ -7379,7 +7402,7 @@ cmd_set_api_key() {
     die "set-api-key: use at least 16 characters from A-Z a-z 0-9 . _ ~ + / = -"
   env_set ROUTER_API_KEY "$key"
   env_set OPENAI_API_KEYS "$key"
-  echo "Stored the router API key in ${SECRETS_FILE}."
+  echo "Stored the OSR API key in ${SECRETS_FILE}."
   $DRY_RUN || echo "  key: ${key}"
   note "  Clients must send:  Authorization: Bearer <key>"
   note "  Open WebUI reads OPENAI_API_KEYS only on its FIRST start; on an existing"
@@ -7617,7 +7640,7 @@ ensure_config_or_forward() {
   [[ -f "$ENV_FILE" ]] && return 0
 
   if ! command -v pct >/dev/null 2>&1; then
-    die "config not found at ${ENV_FILE}. Run this inside the router container, or set CONFIG_REPO_DIR."
+    die "config not found at ${ENV_FILE}. Run this inside the OSR container, or set CONFIG_REPO_DIR."
   fi
 
   # On a Proxmox host: locate the container and hand off to it.
@@ -7638,7 +7661,7 @@ ensure_config_or_forward() {
   # Could not find it — say what was actually checked.
   echo "ERROR: ${ENV_FILE} does not exist here." >&2
   echo >&2
-  echo "This tool edits configuration that lives INSIDE the router container," >&2
+  echo "This tool edits configuration that lives INSIDE the OSR container," >&2
   echo "and you appear to be on the Proxmox host." >&2
   echo >&2
   local ids id2
@@ -7649,7 +7672,7 @@ ensure_config_or_forward() {
       printf '  %-6s %s\n' "$id2" "$(ct_name_of "$id2")" >&2
     done
     echo >&2
-    echo "If the router container is one of these, run:" >&2
+    echo "If the OSR container is one of these, run:" >&2
     echo "  CT_ID=<id> $0 ${ORIG_ARGS[*]}" >&2
   else
     echo "No running containers were found (pct list)." >&2
@@ -7800,7 +7823,7 @@ RDEOF
 # --- systemd units (one per service directory) ---
 cat > "${REPO_DIR}/services/ollama-router/ollama-router.service" <<'UNITEOF'
 [Unit]
-Description=Intelligent Ollama Prompt Complexity Router Middleware
+Description=Ollama Smart Router Middleware
 # LiteLLM is the *fallback* dispatch path, not a hard requirement: the router
 # serves traffic from its own live discovery inventory and only forwards to
 # LiteLLM when discovery is off or the inventory is empty. Wants= keeps the
@@ -8061,7 +8084,7 @@ run_ct chmod 0640 /app/openwebui/.env
 
 # ------------------------------------------------------------------------------
 # Optional: if the CT firewall is on, the default input policy can drop inbound
-# traffic. Allow SSH (22), the Router API (8000) and Open WebUI (OPENWEBUI_PORT)
+# traffic. Allow SSH (22), the OSR API (8000) and Open WebUI (OPENWEBUI_PORT)
 # from the trusted subnet. LiteLLM (4000) stays localhost-only and needs no rule.
 if [[ "$FIREWALL" == "1" && -n "$API_ALLOW_CIDR" ]]; then
   echo "Adding firewall rules to allow tcp/22, tcp/8000 and tcp/${OPENWEBUI_PORT} from ${API_ALLOW_CIDR}."
@@ -8088,7 +8111,7 @@ cat > "$motd_tmp" <<EOF
   SERVICES
   ---------------------------------------------------------------------------
    Open WebUI (chat UI)       http://${ROUTER_IP}:${OPENWEBUI_PORT}        [open-webui.service]
-   Smart Router (OpenAI API)  http://${ROUTER_IP}:8000/v1     [ollama-router.service]
+   OSR (OpenAI API)           http://${ROUTER_IP}:8000/v1     [ollama-router.service]
      (Bearer key: ROUTER_API_KEY in /app/router/secrets.env)
    LiteLLM proxy              http://127.0.0.1:4000  (local)  [litellm-proxy.service]
    Health monitor             Mattermost alerts               [ollama-monitor.service]
@@ -8103,7 +8126,7 @@ cat > "$motd_tmp" <<EOF
 
   PATHS & COMMANDS
   ---------------------------------------------------------------------------
-   Router config : /app/router/.env  /app/router/litellm_config.yaml
+   OSR config    : /app/router/.env  /app/router/litellm_config.yaml
    Tunables      : /app/router/router.ini  /app/router/monitor.ini
    WebUI config  : /app/openwebui/.env
    Config repo   : ${CONFIG_REPO_DIR}  (git pull && ./install/apply-config.sh)
@@ -8135,7 +8158,7 @@ echo "Container ID: ${CT_ID}"
 echo "Service IP: ${ROUTER_IP}"
 echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"
-echo "  -> create the admin account on first visit; it is pre-connected to the router."
+echo "  -> create the admin account on first visit; it is pre-connected to OSR."
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
 if [[ "$CONFIG_SOURCE" == "repo" ]]; then
   echo "Config source: git clone of ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"

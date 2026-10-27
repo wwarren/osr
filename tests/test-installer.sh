@@ -268,7 +268,7 @@ _gpu_reset
 assert_eq "the checkout's tool" "$TARGETS_DIR/../tools/setup-host-gpu.sh" "$(host_gpu_tool)"
 mv "$_tt/tools/setup-host-gpu.sh" "$_tt/tools/gone"
 assert_fail "the tool must be in the checkout" host_gpu_tool
-assert_contains "and says so" "Run the router installer from the full repository checkout" "$(host_gpu_tool 2>&1)"
+assert_contains "and says so" "Run the OSR installer from the full repository checkout" "$(host_gpu_tool 2>&1)"
 mv "$_tt/tools/gone" "$_tt/tools/setup-host-gpu.sh"
 
 describe load_host_gpu_cards
@@ -718,6 +718,39 @@ assert_eq "else a Debian 13 one to download into TEMPLATE_STORAGE" \
 assert_eq "an Ubuntu 24.04 one for Maya on a V100" \
   local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(HOST_GPU_CUDA_ARCH=70 default_gpu_target_template maya)"
 
+describe show_strata_template_alternatives
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB
+local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst 150MB'
+_pveam_list_nfs='NAME SIZE
+nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
+out="$(show_strata_template_alternatives local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst)"
+assert_contains "lists a compatible alternate on another storage" \
+  nfs:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$out"
+assert_not_contains "does not list the selected default" \
+  local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$out"
+assert_not_contains "does not list Ubuntu 26.04 for Strata" \
+  local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst "$out"
+
+describe select_router_template
+_pveam_list_local='NAME SIZE'
+_pveam_list_nfs='NAME SIZE
+nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+TEMPLATE_STORAGE=local; TEMPLATE_NAME=""; TEMPLATE_MIN_GIB=2
+select_router_template > /dev/null
+assert_eq "records the storage of the router's existing template" nfs "$TEMPLATE_STORAGE"
+assert_eq "keeps that router template" \
+  nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$TEMPLATE_REF"
+assert_eq "an existing template does not need a download" "" "$DOWNLOAD_TEMPLATE_NAME"
+_pveam_list_nfs='NAME SIZE'
+storage_supports_vztmpl() { [[ $1 == local ]]; }
+storage_free_gib() { echo 10; }
+TEMPLATE_STORAGE=local
+select_router_template > /dev/null
+assert_eq "a missing router template will be downloaded into its chosen storage" \
+  local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$TEMPLATE_REF"
+assert_eq "records the needed download" debian-13-standard_13.1-2_amd64.tar.zst "$DOWNLOAD_TEMPLATE_NAME"
+
 describe ensure_target_template
 _pveam_list_local='NAME SIZE
 local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
@@ -733,6 +766,7 @@ unset FAKE_DOWNLOAD_RC
 describe prompt_target_settings
 next_free_ct_id_excluding() { local id max=0; for id in "$@"; do (( id > max )) && max=$id; done; echo $((max + 1)); }
 default_gpu_target_template() { echo local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst; }
+TEMPLATE_REF=nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
 CT_ID=910; IP_CIDR=192.0.2.80/24; GATEWAY=192.0.2.1; BRIDGE=vmbr0; STORAGE=router-store
 TARGETS="ollama strata"
 unset OLLAMA_CT_ID OLLAMA_IP_CIDR OLLAMA_STORAGE STRATA_CT_ID STRATA_IP_CIDR STRATA_STORAGE STRATA_TEMPLATE
@@ -744,8 +778,16 @@ assert_eq "the router's address is refused, the next answer kept" 192.0.2.90/24 
 assert_eq "an address already taken is refused" 192.0.2.91/24 "$STRATA_IP_CIDR"
 assert_eq "storage defaults to the router's" router-store "$OLLAMA_STORAGE"
 assert_eq "or takes the answer" gpu-store "$STRATA_STORAGE"
-assert_eq "a GPU target gets a template" local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$STRATA_TEMPLATE"
+assert_eq "Strata defaults to the router's selected template location" "$TEMPLATE_REF" "$STRATA_TEMPLATE"
 assert_eq "Ollama is not given one (the community script chooses)" "" "${OLLAMA_TEMPLATE:-}"
+TARGETS=strata; STRATA_TEMPLATE=""
+_pveam_list_local='NAME SIZE
+local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
+prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\nlocal:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst\n'
+assert_contains "offers the alternate template at the prompt" \
+  local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(cat "$_out")"
+assert_eq "accepts the alternate template location" \
+  local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$STRATA_TEMPLATE"
 OLLAMA_CT_ID=930; OLLAMA_IP_CIDR=10.9.9.9/24; TARGETS=ollama
 prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n'
 assert_eq "a preset CT ID is the default" 930 "$OLLAMA_CT_ID"

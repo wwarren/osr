@@ -923,7 +923,7 @@ describe cmd_discover
 reset_repo
 mock_command curl 7
 out="$(cmd_discover 2>&1)"; rc=$?
-assert_contains "reports an unreachable router" "Could not reach the router" "$out"
+assert_contains "reports an unreachable OSR" "Could not reach OSR" "$out"
 assert_ne "returns non-zero" "0" "$rc"
 mock_command curl 0 '{"server_status":{"http://a":{"up":true,"model_count":2}},"age_seconds":1.5,"models":[{"server":"http://a","name":"m1","params_b":7,"is_code":true,"is_vision":false,"is_embedding":false}],"errors":{}}'
 out="$(cmd_discover 2>&1)"

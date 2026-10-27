@@ -1,5 +1,5 @@
 [Unit]
-Description=Intelligent Ollama Prompt Complexity Router Middleware
+Description=Ollama Smart Router Middleware
 # LiteLLM is the *fallback* dispatch path, not a hard requirement: the router
 # serves traffic from its own live discovery inventory and only forwards to
 # LiteLLM when discovery is off or the inventory is empty. Wants= keeps the
