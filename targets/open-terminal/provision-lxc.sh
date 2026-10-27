@@ -33,7 +33,8 @@ Required for a new install: CT_ID (unused terminal CT ID >=100 on this host),
           ROUTER (existing Open WebUI CT ID/IP/hostname), TEMPLATE (downloaded
           Debian 12/13 amd64 LXC template), STORAGE (active rootdir storage),
           IP_CIDR (new terminal CT's static IPv4/CIDR), GATEWAY. Interactive
-          runs prompt for missing values. --integrate-only needs CT_ID and ROUTER.
+          runs list downloaded templates and eligible storage when those values
+          are unset. --integrate-only needs CT_ID and ROUTER.
 Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=2048,
           SWAP_MB=512, ROOTFS_GB=16, ONBOOT=1, NAMESERVER, VLAN_TAG,
           ROUTER_SSH_PORT=22,
@@ -98,6 +99,129 @@ remote_command() {
     out+="'${arg//\'/\'\\\'\'}' "
   done
   printf '%s' "${out% }"
+}
+
+# pvesm moves the Available column between releases; locate it by its header.
+parse_pvesm_status() {
+  awk '
+    NR == 1 {
+      header = $0; gsub(/\([^)]*\)/, "", header)
+      count = split(header, columns, /[[:space:]]+/)
+      position = 0
+      for (i = 1; i <= count; i++) {
+        if (columns[i] == "") continue
+        position++
+        column = tolower(columns[i])
+        if (column == "name") name = position
+        if (column == "type") type = position
+        if (column == "status") status = position
+        if (column == "available" || column == "avail") available = position
+      }
+      next
+    }
+    name && type && status && available && NF >= available && $(status) == "active" {
+      printf "%s\t%s\t%s\n", $(name), $(type), $(available)
+    }'
+}
+
+# The filtered pvesm table is empty on some Proxmox releases. In that case,
+# intersect the full active table with storage.cfg content declarations.
+storage_rows() {
+  local content=$1 filtered rows all allowed config=${STORAGE_CFG:-/etc/pve/storage.cfg}
+  filtered=$(pvesm status -content "$content" 2>/dev/null) || filtered=''
+  rows=$(printf '%s\n' "$filtered" | parse_pvesm_status)
+  if [[ -n $rows ]]; then
+    printf '%s\n' "$rows"
+    return 0
+  fi
+  [[ -r $config ]] || return 1
+  all=$(pvesm status 2>/dev/null) || return 1
+  allowed=$(awk -v want="$content" '
+    /^[a-z]+:[[:space:]]*[^[:space:]]+/ {
+      split($0, fields, ":"); name = fields[2]; gsub(/[[:space:]]/, "", name); next
+    }
+    /^[[:space:]]*content[[:space:]]/ {
+      line = $0; sub(/^[[:space:]]*content[[:space:]]+/, "", line)
+      count = split(line, types, ",")
+      for (i = 1; i <= count; i++) {
+        gsub(/[[:space:]]/, "", types[i])
+        if (types[i] == want && name != "") { print name; break }
+      }
+    }' "$config")
+  [[ -n $allowed ]] || return 0
+  printf '%s\n' "$all" | parse_pvesm_status |
+    awk -F '\t' -v list="$allowed" '
+      BEGIN { count = split(list, names, "\n"); for (i = 1; i <= count; i++) ok[names[i]] = 1 }
+      $1 in ok'
+}
+
+downloaded_debian_templates() {
+  local storage type available ref
+  while IFS=$'\t' read -r storage type available; do
+    [[ -n $storage ]] || continue
+    while IFS= read -r ref; do
+      [[ $ref =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-(12|13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || continue
+      printf '%s\n' "$ref"
+    done < <(pveam list "$storage" 2>/dev/null | awk 'NR > 1 {print $1}')
+  done < <(storage_rows vztmpl)
+}
+
+select_template() {
+  local -a choices=()
+  local choice i
+  command -v pveam >/dev/null || die 'Missing command: pveam'
+  command -v pvesm >/dev/null || die 'Missing command: pvesm'
+  mapfile -t choices < <(downloaded_debian_templates | awk -F/ '{print $NF "\t" $0}' | sort -V -r | cut -f2-)
+  (( ${#choices[@]} )) || die 'No downloaded Debian 12/13 amd64 templates were found on active vztmpl storage. Download one with pveam download <storage> <template-name>.'
+  printf '\nDownloaded Debian 12/13 amd64 LXC templates:\n' >&2
+  for i in "${!choices[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${choices[i]}" >&2; done
+  while true; do
+    read -r -p 'Select template [1]: ' choice || die 'No template was selected.'
+    choice=${choice:-1}
+    if [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#choices[@]} )); then
+      TEMPLATE=${choices[choice - 1]}
+      note "Using template: $TEMPLATE"
+      return 0
+    fi
+    note "Enter a number from 1 to ${#choices[@]}."
+  done
+}
+
+select_storage() {
+  local -a names=() types=() free_gib=()
+  local name type available choice i best=0 best_free=-1 gib
+  command -v pvesm >/dev/null || die 'Missing command: pvesm'
+  while IFS=$'\t' read -r name type available; do
+    [[ -n $name ]] || continue
+    [[ $available =~ ^[0-9]+$ ]] || continue
+    gib=$(( available / 1048576 ))
+    names+=("$name"); types+=("$type"); free_gib+=("$gib")
+    if (( gib >= ROOTFS_GB && gib > best_free )); then
+      best=${#names[@]}; best_free=$gib
+    fi
+  done < <(storage_rows rootdir)
+  (( ${#names[@]} )) || die 'No active storage supporting rootdir was found (check pvesm status -content rootdir).'
+  (( best )) || die "No active rootdir storage has ${ROOTFS_GB} GiB free. Free space or reduce ROOTFS_GB."
+  printf '\nStorage for the Open Terminal root disk (need %s GiB):\n' "$ROOTFS_GB" >&2
+  for i in "${!names[@]}"; do
+    printf '  %d) %s (%s, %s GiB free)' "$((i + 1))" "${names[i]}" "${types[i]}" "${free_gib[i]}" >&2
+    if (( free_gib[i] < ROOTFS_GB )); then printf ' [too small]' >&2; fi
+    printf '\n' >&2
+  done
+  while true; do
+    read -r -p "Select storage [$best]: " choice || die 'No storage was selected.'
+    choice=${choice:-$best}
+    if [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#names[@]} )); then
+      if (( free_gib[choice - 1] >= ROOTFS_GB )); then
+        STORAGE=${names[choice - 1]}
+        note "Using storage: $STORAGE (${free_gib[choice - 1]} GiB free)"
+        return 0
+      fi
+      note "${names[choice - 1]} has only ${free_gib[choice - 1]} GiB free; ${ROOTFS_GB} GiB is required."
+    else
+      note "Enter a number from 1 to ${#names[@]}."
+    fi
+  done
 }
 # End provision helpers. --------------------------------------------------------
 
@@ -198,8 +322,17 @@ fi
   die 'Open Terminal CT_ID must be numeric and at least 100; it is separate from the existing Open WebUI CT ID or IP.'
 [[ $router_kind == ssh || $CT_ID != "$ROUTER_CT_ID" ]] || die 'Terminal and router CT IDs must differ.'
 if (( ! integrate_only )); then
-  prompt_required TEMPLATE 'Downloaded Debian 12/13 amd64 template (e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst): '
-  prompt_required STORAGE 'Storage for the new terminal CT root disk (e.g. local-lvm): '
+  positive ROOTFS_GB "$ROOTFS_GB"
+  if [[ -z $TEMPLATE && -t 0 ]] && (( ! dry_run )); then
+    select_template
+  else
+    prompt_required TEMPLATE 'Downloaded Debian 12/13 amd64 template (e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst): '
+  fi
+  if [[ -z $STORAGE && -t 0 ]] && (( ! dry_run )); then
+    select_storage
+  else
+    prompt_required STORAGE 'Storage for the new terminal CT root disk (e.g. local-lvm): '
+  fi
   prompt_required IP_CIDR 'Static IP/CIDR for the new terminal CT (e.g. 192.168.11.81/24): '
   prompt_required GATEWAY 'Gateway for the new terminal CT (e.g. 192.168.11.1): '
 fi
@@ -343,7 +476,8 @@ else
     [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge does not exist: $BRIDGE"
     template_path=$(pvesm path "$TEMPLATE")
     [[ -r $template_path ]] || die "Template is unreadable: $TEMPLATE"
-    pvesm status --content rootdir | awk -v s="$STORAGE" '$1==s && $3=="active" {found=1} END {exit !found}' || die 'STORAGE is inactive or does not support rootdir.'
+    storage_rows rootdir | awk -F '\t' -v s="$STORAGE" '$1==s {found=1} END {exit !found}' ||
+      die 'STORAGE is inactive or does not support rootdir.'
   fi
   TERMINAL_IP=${IP_CIDR%%/*}
 fi

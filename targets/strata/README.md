@@ -1,5 +1,7 @@
 # Strata inference target for Proxmox VE 9
 
+On an interactive Proxmox run, `provision-lxc.sh` lists downloaded compatible templates and active `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE` and `STORAGE` to skip the menus. Dry runs make no Proxmox queries, so supply those values explicitly.
+
 `provision-lxc.sh` creates a dedicated, unprivileged LXC on an NVIDIA GPU
 node, fetches the [official Strata repository](https://github.com/Niko1221/Strata)
 inside it, runs Strata's Linux setup without starting the model, and runs the

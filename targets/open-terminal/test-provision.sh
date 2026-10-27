@@ -15,6 +15,8 @@ source <(awk '
     /^# End provision helpers\./ { capture=0 }
     capture { print }
 ' "$provision")
+die() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
 check() { "$@" || { printf 'FAIL %s\n' "$*" >&2; exit 1; }; }
 check [ "$(classify_router 280)" = 'ct 280' ]
 check [ "$(classify_router 192.0.2.80)" = 'ssh 192.0.2.80' ]
@@ -35,6 +37,81 @@ probe_code=$(cat "$here/verify-webui.py")
 mapfile -d '' -t round < <(sh -c "printf '%s\\0' $(remote_command python3 -c "$probe_code" 8080)")
 check [ "${round[2]}" = "$probe_code" ]
 check [ "${round[3]}" = 8080 ]
+passed=$((passed + 1))
+
+# Both selectors use Proxmox discovery, including a storage.cfg fallback when
+# pvesm's content filter returns an empty table.
+pvesm() {
+    case "$*" in
+        'status -content vztmpl') cat <<'TABLE'
+Name Type Status Total (KiB) Used (KiB) Available (KiB) %
+local dir active 100000000 1000000 99000000 1%
+zstore dir active 100000000 1000000 99000000 1%
+offline dir inactive 100000000 0 100000000 0%
+TABLE
+            ;;
+        'status -content rootdir') cat <<'TABLE'
+Name Type Status Total (KiB) Used (KiB) Available (KiB) %
+local-lvm lvmthin active 80000000 45000000 35000000 56%
+tiny dir active 20000000 11000000 9000000 55%
+big zfspool active 100000000 30000000 70000000 30%
+offline dir inactive 100000000 0 100000000 0%
+TABLE
+            ;;
+        status) cat <<'TABLE'
+Name Type Status Total (KiB) Used (KiB) Available (KiB) %
+local dir active 100000000 1000000 99000000 1%
+local-lvm lvmthin active 80000000 45000000 35000000 56%
+tiny dir active 20000000 11000000 9000000 55%
+big zfspool active 100000000 30000000 70000000 30%
+TABLE
+            ;;
+        *) return 1 ;;
+    esac
+}
+pveam() {
+    [[ $1 == list ]] || return 1
+    case $2 in
+      local) cat <<'TABLE'
+Volid Format Type Size
+local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst tar.zst vztmpl 1000
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst tar.zst vztmpl 1000
+local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst tar.zst vztmpl 1000
+TABLE
+        ;;
+      zstore) cat <<'TABLE'
+Volid Format Type Size
+zstore:vztmpl/debian-12-standard_12.9-1_amd64.tar.zst tar.zst vztmpl 1000
+TABLE
+        ;;
+      *) return 1 ;;
+    esac
+}
+check [ "$(storage_rows rootdir | wc -l | tr -d ' ')" = 3 ]
+check [ "$(downloaded_debian_templates | wc -l | tr -d ' ')" = 3 ]
+ROOTFS_GB=16
+TEMPLATE=''
+select_template <<< '' 2>/dev/null
+check [ "$TEMPLATE" = local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst ]
+TEMPLATE=''
+select_template <<< $'4\n2\n' 2>/dev/null
+check [ "$TEMPLATE" = zstore:vztmpl/debian-12-standard_12.9-1_amd64.tar.zst ]
+STORAGE=''
+select_storage <<< $'2\n\n' 2>/dev/null
+check [ "$STORAGE" = big ]
+fallback_cfg=$(mktemp)
+printf 'dir: local\n  content vztmpl,iso\nlvmthin: local-lvm\n  content rootdir,images\n' > "$fallback_cfg"
+STORAGE_CFG=$fallback_cfg
+pvesm() {
+    if [[ $* == 'status -content '* ]]; then printf 'Name Type Status Available (KiB)\n'; return 0; fi
+    [[ $* == status ]] || return 1
+    printf 'Name Type Status Available (KiB)\nlocal dir active 50000000\nlocal-lvm lvmthin active 30000000\n'
+}
+check [ "$(storage_rows rootdir)" = $'local-lvm\tlvmthin\t30000000' ]
+check [ "$(storage_rows vztmpl)" = $'local\tdir\t50000000' ]
+rm -f -- "$fallback_cfg"
+unset STORAGE_CFG
+unset -f pvesm pveam
 passed=$((passed + 1))
 
 has() { [[ $output == *"$1"* ]] || { printf 'FAIL missing %s\n%s\n' "$1" "$output" >&2; exit 1; }; }

@@ -9,6 +9,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/gitea.sh
 usage() {
     cat <<'USAGE'
@@ -29,7 +30,8 @@ Defaults") to accept the presets below.
 
 Settings (environment; all optional):
   CT_ID=<next free>  CT_HOSTNAME=gitea  CORES=1  MEMORY_MB=1024  ROOTFS_GB=8
-  STORAGE=<rootdir storage>  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
+  TEMPLATE_STORAGE=<vztmpl storage>  STORAGE=<rootdir storage>
+  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
   READY_TIMEOUT=120                   seconds to wait for the Gitea web UI
   GITEA_SITE_ADMIN=gitea-admin  GITEA_ROUTER_USER=ollama-router
@@ -76,6 +78,7 @@ community_vars() {
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
     [[ -z $VLAN_TAG ]] || printf '%s\n' "var_vlan=$VLAN_TAG"
+    [[ -z $TEMPLATE_STORAGE ]] || printf '%s\n' "var_template_storage=$TEMPLATE_STORAGE"
     [[ -z $STORAGE ]] || printf '%s\n' "var_container_storage=$STORAGE"
     if [[ -n $SSH_PUBLIC_KEY ]]; then
         # The community script takes the key itself, not a path.
@@ -104,6 +107,7 @@ CORES=${CORES:-1}
 MEMORY_MB=${MEMORY_MB:-1024}
 ROOTFS_GB=${ROOTFS_GB:-8}
 STORAGE=${STORAGE:-}
+TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-}
 BRIDGE=${BRIDGE:-vmbr0}
 IP_CIDR=${IP_CIDR:-}
 GATEWAY=${GATEWAY:-}
@@ -136,6 +140,11 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ -z $SSH_PUBLIC_KEY || -r $SSH_PUBLIC_KEY || $dry_run == 1 ]] || die "SSH_PUBLIC_KEY is not readable: $SSH_PUBLIC_KEY"
 [[ $COMMUNITY_SCRIPT_URL =~ ^https://[A-Za-z0-9./_-]+\.sh$ ]] || die 'COMMUNITY_SCRIPT_URL must be an https URL of a .sh file.'
 [[ -z $COMMUNITY_SCRIPT_SHA256 || $COMMUNITY_SCRIPT_SHA256 =~ ^[0-9A-Fa-f]{64}$ ]] || die 'COMMUNITY_SCRIPT_SHA256 must be 64 hex digits.'
+[[ -z $TEMPLATE_STORAGE || $TEMPLATE_STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid TEMPLATE_STORAGE.'
+if [[ $mode != reconfigure ]]; then
+    pve_select_storage TEMPLATE_STORAGE vztmpl 0
+    pve_select_storage STORAGE rootdir "$ROOTFS_GB"
+fi
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deploy=/root/gitea-target-deploy

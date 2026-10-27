@@ -76,6 +76,8 @@ pass 'router location and source-address helpers'
 plan
 has 'https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/comfyui.sh'
 has '+ env var_ctid=286 var_hostname=comfyui var_cpu=4 var_ram=16384 var_disk=64 var_unprivileged=1 var_nesting=1 var_os=debian var_version=13 var_gpu=no var_comfyui_gpu_type=1 var_brg=vmbr0 var_net=192.0.2.86/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
+plan TEMPLATE_STORAGE=local
+has 'var_template_storage=local var_container_storage=local-lvm'
 has '+ write /etc/pve/firewall/286.fw:'
 has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8188'
 has 'COMFYUI_DEVICE=cpu'

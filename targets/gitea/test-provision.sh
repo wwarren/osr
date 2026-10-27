@@ -38,6 +38,8 @@ plan --create-only
 has '+ curl -fsSL -o '
 has 'https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/gitea.sh'
 has '+ env var_ctid=275 var_hostname=gitea var_cpu=1 var_ram=1024 var_disk=8 var_unprivileged=1 var_nesting=1 var_gpu=no var_os=debian var_version=13 var_brg=vmbr0 var_net=192.0.2.75/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
+plan --create-only TEMPLATE_STORAGE=local
+has 'var_template_storage=local var_container_storage=local-lvm'
 has 'http://127.0.0.1:3000/'
 has 'Select SQLite3'
 has 'GITEA_SERVER_URL'

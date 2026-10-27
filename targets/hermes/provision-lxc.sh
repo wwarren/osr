@@ -8,6 +8,7 @@ set -Eeuo pipefail
 umask 077
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 note() { printf '%s\n' "$*" >&2; }
 usage() {
   cat <<'USAGE'
@@ -30,7 +31,8 @@ force one kind.
 
 Required: CT_ID, ROUTER (or the prompt); for a new CT also TEMPLATE (Debian
           12/13 amd64), STORAGE (active rootdir storage), IP_CIDR, GATEWAY.
-Interactive runs prompt for missing required values. CT_ID is the Hermes CT,
+Interactive runs list downloaded templates and eligible rootdir storage when
+those values are unset. CT_ID is the Hermes CT,
 separate from the existing router CT ID or IP address.
 Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=65536 (>=64000; the model's
           host must serve it), HERMES_CHANNEL=stable, HERMES_COMMIT,
@@ -437,6 +439,9 @@ fi
 [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'Hermes CT_ID must be numeric and at least 100; it is separate from the router CT ID or IP.'
 [[ $router_kind == ssh || $CT_ID != "$ROUTER_CT_ID" ]] || die 'Hermes and router CT IDs must differ.'
 if [[ $mode == create ]]; then
+  pve_select_template TEMPLATE '^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-(12|13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
+  positive ROOTFS_GB "$ROOTFS_GB"
+  pve_select_storage STORAGE rootdir "$ROOTFS_GB"
   prompt_required TEMPLATE 'Downloaded Debian 12/13 amd64 template (e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst): '
   prompt_required STORAGE 'Storage for the new Hermes CT root disk (e.g. local-lvm): '
   prompt_required IP_CIDR 'Static IP/CIDR for the new Hermes CT: '

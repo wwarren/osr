@@ -6,6 +6,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/ollama.sh
 usage() {
     cat <<'USAGE'
@@ -26,7 +27,8 @@ the community defaults (unprivileged, nesting).
 
 Settings (environment; all optional):
   CT_ID=<next free>  CT_HOSTNAME=ollama  CORES=4  MEMORY_MB=16384  ROOTFS_GB=128
-  STORAGE=<rootdir storage>  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
+  TEMPLATE_STORAGE=<vztmpl storage>  STORAGE=<rootdir storage>
+  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
   GPU=auto|nvidia|amd|intel|none   auto: nvidia when /dev/nvidia0 exists, else amd
                       when /dev/kfd exists, else intel for an Arc card's render
@@ -86,6 +88,7 @@ community_vars() {
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
     [[ -z $VLAN_TAG ]] || printf '%s\n' "var_vlan=$VLAN_TAG"
+    [[ -z $TEMPLATE_STORAGE ]] || printf '%s\n' "var_template_storage=$TEMPLATE_STORAGE"
     [[ -z $STORAGE ]] || printf '%s\n' "var_container_storage=$STORAGE"
     if [[ -n $SSH_PUBLIC_KEY ]]; then
         # The community script takes the key itself, not a path.
@@ -195,6 +198,7 @@ CORES=${CORES:-4}
 MEMORY_MB=${MEMORY_MB:-16384}
 ROOTFS_GB=${ROOTFS_GB:-128}
 STORAGE=${STORAGE:-}
+TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-}
 BRIDGE=${BRIDGE:-vmbr0}
 IP_CIDR=${IP_CIDR:-}
 GATEWAY=${GATEWAY:-}
@@ -230,6 +234,9 @@ valid_models "$OLLAMA_PULL_MODELS" || die 'OLLAMA_PULL_MODELS is a space-separat
 [[ -z $COMMUNITY_SCRIPT_SHA256 || $COMMUNITY_SCRIPT_SHA256 =~ ^[0-9A-Fa-f]{64}$ ]] || die 'COMMUNITY_SCRIPT_SHA256 must be 64 hex digits.'
 valid_ct_os "$OLLAMA_CT_OS" "$OLLAMA_CT_VERSION" ||
     die 'OLLAMA_CT_OS/OLLAMA_CT_VERSION must be debian 12|13 or ubuntu 22.04|24.04|26.04.'
+[[ -z $TEMPLATE_STORAGE || $TEMPLATE_STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid TEMPLATE_STORAGE.'
+pve_select_storage TEMPLATE_STORAGE vztmpl 0
+pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 gpu=$(gpu_vendor "$GPU") || die 'GPU must be auto, nvidia, amd, intel or none (yes means nvidia, no means none).'
 card=''
 if [[ -n $GPU_CARD ]]; then

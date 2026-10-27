@@ -1,5 +1,7 @@
 # Basalt inference target for Proxmox VE 9
 
+On an interactive Proxmox run, `provision-lxc.sh` lists downloaded compatible templates and active `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE` and `STORAGE` to skip the menus. Dry runs make no Proxmox queries, so supply those values explicitly.
+
 `provision-lxc.sh` creates a dedicated, unprivileged LXC on a Blackwell GPU
 node. It installs matching NVIDIA userspace, a CUDA 13 toolkit, builds the
 [Basalt engine](https://github.com/jesdga95/basalt), downloads one

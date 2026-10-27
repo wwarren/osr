@@ -1,5 +1,7 @@
 # Ollama inference target
 
+On an interactive run, `provision-lxc.sh` lists active LXC template storage and `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE_STORAGE` and `STORAGE` to skip the menus. The community script chooses or downloads its template on the selected template storage. Dry runs make no Proxmox queries.
+
 A plain Ollama server in its own CT, for the router to use like any other
 Ollama host. The CT and the initial Ollama install come from the Proxmox VE
 community script

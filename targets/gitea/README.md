@@ -1,5 +1,7 @@
 # Gitea service for Ollama Smart Router
 
+On an interactive new install, `provision-lxc.sh` lists active LXC template storage and `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE_STORAGE` and `STORAGE` to skip the menus. The community script chooses or downloads its Debian template on the selected template storage. `--reconfigure` and dry runs skip these Proxmox queries.
+
 Gitea holds the router's **configuration repository**. The router clones it at
 provisioning, and `manage-model-servers commit` pushes every change to it (see
 the main README). This target creates a separate Debian 13 LXC with the

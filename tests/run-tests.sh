@@ -56,6 +56,7 @@ for _t in "${ROOT}"/targets/*/test-*.sh; do
   _target=$(basename "$(dirname "$_t")")
   add_suite "${_target}-$(basename "$_t" .sh | sed 's/^test-//')" shell "$_t"
 done
+add_suite pve-select shell "${ROOT}/targets/test-pve-select.sh"
 # The router and the llama.cpp bridge pin different fastapi versions, so each
 # pytest suite can run under its own interpreter (CI builds one venv per
 # service from its requirements.txt). Both default to python3. The AirLLM

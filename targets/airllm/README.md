@@ -1,5 +1,7 @@
 # AirLLM inference target
 
+On an interactive Proxmox run, `provision-lxc.sh` lists downloaded compatible templates and active `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE` and `STORAGE` to skip the menus. Dry runs make no Proxmox queries, so supply those values explicitly.
+
 An Ollama-compatible API in front of [AirLLM](https://github.com/lyogavin/airllm),
 so the smart router, LiteLLM and Open WebUI can use a model far larger than the
 target's RAM or VRAM. AirLLM streams the model one layer at a time from disk.

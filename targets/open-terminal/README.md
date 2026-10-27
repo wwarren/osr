@@ -57,7 +57,7 @@ cd /path/to/ollama-smart-router/targets/open-terminal
 bash provision-lxc.sh
 ```
 
-The script prompts for the existing Open WebUI CT ID or IP address, the new Open Terminal CT ID, the Debian template, storage, the new terminal's static IP/CIDR and gateway, and the Open WebUI admin key. To preview the plan without changing Proxmox, run `bash provision-lxc.sh --dry-run`; it asks for the same install settings but does not ask for the admin key.
+The script prompts for the existing Open WebUI CT ID or IP address and the new Open Terminal CT ID. It then shows numbered lists of downloaded Debian 12/13 amd64 templates and active storage that supports container root disks. Press Enter for the suggested choice or enter a number. Storage with less free space than `ROOTFS_GB` is shown but cannot be selected. The script also asks for the new terminal's static IP/CIDR, gateway, and Open WebUI admin key. Set `TEMPLATE` and `STORAGE` to skip their menus. To preview the plan without changing or querying Proxmox, run `bash provision-lxc.sh --dry-run`; supply `TEMPLATE` and `STORAGE` yourself (or enter them when prompted), since dry runs do not query the host. Dry runs do not ask for the admin key.
 
 For an unattended run, supply the required values as environment variables:
 

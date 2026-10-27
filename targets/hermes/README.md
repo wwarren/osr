@@ -1,5 +1,7 @@
 # Hermes Agent companion for Ollama Smart Router
 
+On an interactive new install, `provision-lxc.sh` lists downloaded Debian 12/13 templates and active `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE` and `STORAGE` to skip the menus. Integration or repair modes and dry runs skip these Proxmox queries.
+
 Hermes is an **agent client** of the router, not a model-serving inference
 target. This target creates a dedicated unprivileged Debian LXC with nesting
 enabled and installs

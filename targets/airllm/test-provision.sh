@@ -62,6 +62,7 @@ has '--rootfs local-lvm:100'
 fails 'a disk too small for the model is refused' 'needs about 323 GB' ROOTFS_GB=300
 fails 'too little RAM is refused' 'MEMORY_MB must be at least' MEMORY_MB=4096
 fails 'an unsupported template is refused' 'TEMPLATE' TEMPLATE=local:vztmpl/alpine-3.20-default_amd64.tar.xz
+fails 'a template for another CPU architecture is refused' 'TEMPLATE' TEMPLATE=local:vztmpl/debian-12-standard_12.12-1_arm64.tar.zst
 fails 'a bad address is refused' 'IP_CIDR' IP_CIDR=192.0.2.300/24
 fails 'unattended runs need the required settings' 'Set CT_ID' CT_ID=
 fails 'a bad device path is refused' 'Invalid device path' GPU_DEVICES='/dev/../etc/passwd'

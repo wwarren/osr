@@ -9,6 +9,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/mattermost.sh
 usage() {
     cat <<'USAGE'
@@ -30,7 +31,8 @@ Defaults") to accept the presets below.
 
 Settings (environment; all optional):
   CT_ID=<next free>  CT_HOSTNAME=mattermost  CORES=2  MEMORY_MB=4096  ROOTFS_GB=16
-  STORAGE=<rootdir storage>  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
+  TEMPLATE_STORAGE=<vztmpl storage>  STORAGE=<rootdir storage>
+  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
   MATTERMOST_CHANNEL=ollama-monitor   the alert channel (its URL name)
   MATTERMOST_TEAM=ollama  MATTERMOST_ADMIN_USER=mmadmin  MATTERMOST_ADMIN_EMAIL
@@ -78,6 +80,7 @@ community_vars() {
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
     [[ -z $VLAN_TAG ]] || printf '%s\n' "var_vlan=$VLAN_TAG"
+    [[ -z $TEMPLATE_STORAGE ]] || printf '%s\n' "var_template_storage=$TEMPLATE_STORAGE"
     [[ -z $STORAGE ]] || printf '%s\n' "var_container_storage=$STORAGE"
     if [[ -n $SSH_PUBLIC_KEY ]]; then
         # The community script takes the key itself, not a path.
@@ -106,6 +109,7 @@ CORES=${CORES:-2}
 MEMORY_MB=${MEMORY_MB:-4096}
 ROOTFS_GB=${ROOTFS_GB:-16}
 STORAGE=${STORAGE:-}
+TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-}
 BRIDGE=${BRIDGE:-vmbr0}
 IP_CIDR=${IP_CIDR:-}
 GATEWAY=${GATEWAY:-}
@@ -144,6 +148,11 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 # 26.04 remains selectable for future testing, but Mattermost does not currently support it.
 [[ $MATTERMOST_CT_VERSION =~ ^(22\.04|24\.04|26\.04)$ ]] ||
     die 'MATTERMOST_CT_VERSION must be 22.04, 24.04 or 26.04 (Mattermost publishes for Ubuntu only).'
+[[ -z $TEMPLATE_STORAGE || $TEMPLATE_STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid TEMPLATE_STORAGE.'
+if [[ $mode != reconfigure ]]; then
+    pve_select_storage TEMPLATE_STORAGE vztmpl 0
+    pve_select_storage STORAGE rootdir "$ROOTFS_GB"
+fi
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deploy=/root/mattermost-target-deploy

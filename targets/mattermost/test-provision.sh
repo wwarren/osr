@@ -38,6 +38,8 @@ plan --create-only
 has '+ curl -fsSL -o '
 has 'https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/mattermost.sh'
 has '+ env var_ctid=275 var_hostname=mattermost var_cpu=2 var_ram=4096 var_disk=16 var_unprivileged=1 var_nesting=1 var_gpu=no var_brg=vmbr0 var_os=ubuntu var_version=24.04 var_net=192.0.2.75/24 var_gateway=192.0.2.1 var_container_storage=local-lvm bash '
+plan --create-only TEMPLATE_STORAGE=local
+has 'var_template_storage=local var_container_storage=local-lvm'
 has 'api/v4/system/ping'
 has 'manage-model-servers set-webhook <webhook URL>'
 has 'Create the channel "ollama-monitor"'

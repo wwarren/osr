@@ -10,6 +10,7 @@ set -Eeuo pipefail
 umask 077
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 note() { printf '%s\n' "$*" >&2; }
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/comfyui.sh
 usage() {
@@ -45,7 +46,8 @@ ROUTER_CT_ID or ROUTER_SSH_HOST force one kind. Without ROUTER the script asks.
 
 Settings (environment; all optional unless noted):
   CT_ID=<next free>  CT_HOSTNAME=comfyui  CORES=4  MEMORY_MB=16384  ROOTFS_GB=64
-  STORAGE=<rootdir storage>  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
+  TEMPLATE_STORAGE=<vztmpl storage>  STORAGE=<rootdir storage>
+  BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
   GPU=auto|nvidia|amd|intel|none   auto: nvidia when /dev/nvidia0 exists, else none
                                    (none runs ComfyUI with --cpu: very slow); with
@@ -149,6 +151,7 @@ community_vars() {
     [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || printf '%s\n' "var_gateway=$GATEWAY"
     [[ -z $NAMESERVER ]] || printf '%s\n' "var_ns=$NAMESERVER"
     [[ -z $VLAN_TAG ]] || printf '%s\n' "var_vlan=$VLAN_TAG"
+    [[ -z $TEMPLATE_STORAGE ]] || printf '%s\n' "var_template_storage=$TEMPLATE_STORAGE"
     [[ -z $STORAGE ]] || printf '%s\n' "var_container_storage=$STORAGE"
     if [[ -n $SSH_PUBLIC_KEY ]]; then
         # The community script takes the key itself, not a path.
@@ -286,6 +289,7 @@ CORES=${CORES:-4}
 MEMORY_MB=${MEMORY_MB:-16384}
 ROOTFS_GB=${ROOTFS_GB:-64}
 STORAGE=${STORAGE:-}
+TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-}
 BRIDGE=${BRIDGE:-vmbr0}
 IP_CIDR=${IP_CIDR:-}
 GATEWAY=${GATEWAY:-}
@@ -339,6 +343,11 @@ for name in CORES MEMORY_MB ROOTFS_GB READY_TIMEOUT; do positive_int "$name" "${
 (( MEMORY_MB >= 8192 )) || die 'MEMORY_MB must be at least 8192; image models need several GB of RAM.'
 (( ROOTFS_GB >= 32 )) || die 'ROOTFS_GB must be at least 32; PyTorch alone takes about 10 GB, and models are several GB each.'
 [[ -z $STORAGE || $STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STORAGE.'
+[[ -z $TEMPLATE_STORAGE || $TEMPLATE_STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid TEMPLATE_STORAGE.'
+if [[ $mode != integrate ]]; then
+    pve_select_storage TEMPLATE_STORAGE vztmpl 0
+    pve_select_storage STORAGE rootdir "$ROOTFS_GB"
+fi
 [[ $BRIDGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid BRIDGE.'
 [[ -z $IP_CIDR ]] || valid_container_ip "$IP_CIDR" || die 'IP_CIDR must be a.b.c.d/nn or dhcp.'
 [[ -z $GATEWAY ]] || ipv4 "$GATEWAY" || die 'GATEWAY must be an IPv4 address.'

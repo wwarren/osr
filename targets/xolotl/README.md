@@ -1,5 +1,7 @@
 # Xolotl (DeepSeek-V4.1-Flash) inference target for Proxmox VE 9
 
+On an interactive Proxmox run, `provision-lxc.sh` lists downloaded compatible templates and active `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE` and `STORAGE` to skip the menus. Dry runs make no Proxmox queries, so supply those values explicitly.
+
 [Xolotl](https://github.com/Indras-Mirror/Xolotl) is Indras Mirror's fork of
 [Strata](https://github.com/Niko1221/Strata): Strata's engine, server and
 kernels (merged at 0.1.44.1) plus its own engines for DeepSeek-V4.1-Flash

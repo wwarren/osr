@@ -1,5 +1,7 @@
 # ComfyUI image generation target
 
+On an interactive new install, `provision-lxc.sh` lists active LXC template storage and `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE_STORAGE` and `STORAGE` to skip the menus. The community script chooses or downloads its Debian template on the selected template storage. `--integrate-only` and dry runs skip these Proxmox queries.
+
 [ComfyUI](https://github.com/Comfy-Org/ComfyUI) in its own CT, used by the
 router's Open WebUI as its **image generation engine** (the image button in
 chats, and image requests through Open WebUI's API). It is not a model server:

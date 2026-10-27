@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -20,7 +21,8 @@ Required: CT_ID (unused, >=100), TEMPLATE (downloaded Ubuntu 22.04/24.04 or
 Debian 12/13 amd64), STORAGE (rootdir storage), IP_CIDR (a.b.c.d/nn or dhcp).
 GATEWAY is required for a static address. The host needs NVIDIA driver
 580.173.02 and the repository's matching LXC user-space installer by default.
-Interactive runs prompt for missing required values. This script creates a new
+Interactive runs list downloaded templates and eligible rootdir storage when
+those values are unset. This script creates a new
 CT; to resume or upgrade an existing Strata CT, run its guest install-target.sh.
 
 Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
@@ -136,6 +138,9 @@ STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}
 STRATA_ALLOW_NO_KEY=${STRATA_ALLOW_NO_KEY:-false}
 
 prompt_required CT_ID 'New Strata CT ID on this Proxmox host (unused, at least 100): '
+pve_select_template TEMPLATE '^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
+positive_int ROOTFS_GB "$ROOTFS_GB"
+pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 prompt_required TEMPLATE 'Downloaded Ubuntu or Debian amd64 template (e.g. local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst): '
 prompt_required STORAGE 'Storage for the new Strata CT root disk (e.g. local-lvm): '
 prompt_required IP_CIDR 'IP/CIDR for the new Strata CT (or dhcp): '

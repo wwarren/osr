@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--install-target] [--dry-run]
@@ -12,9 +13,10 @@ to /root/airllm-target-deploy, and with --install-target (or INSTALL_TARGET=1)
 runs install-target.sh inside it.
 
 Missing settings are prompted on a terminal: CT ID, template, IPv4/CIDR or
-dhcp, gateway, root disk storage. NONINTERACTIVE=true disables prompts; then
+dhcp, gateway, root disk storage. Downloaded templates and active rootdir
+storage have numbered selectors. NONINTERACTIVE=true disables prompts; then
 CT_ID, TEMPLATE, STORAGE and IP_CIDR are required.
-  CT_ID=<id>  TEMPLATE=<storage>:vztmpl/<debian-12|debian-13|ubuntu-24.04|ubuntu-26.04>-...tar.zst
+  CT_ID=<id>  TEMPLATE=<storage>:vztmpl/<debian-12|debian-13|ubuntu-24.04|ubuntu-26.04>-..._amd64.tar.zst
   STORAGE=<rootdir storage>  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
 Optional: CT_HOSTNAME=airllm-target, BRIDGE=vmbr0, NAMESERVER, VLAN_TAG,
           CORES=4, MEMORY_MB=32768, SWAP_MB=4096, ROOTFS_GB=<sized for the model>,
@@ -44,7 +46,7 @@ ipv4() {
 }
 valid_container_id() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 >= 100 )); }
 valid_container_template() {
-    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(debian-1[23]|ubuntu-2[46]\.04)-[A-Za-z0-9._-]+\.tar\.(zst|xz|gz)$ ]]
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(debian-1[23]|ubuntu-2[46]\.04)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]]
 }
 valid_container_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_container_gateway() { [[ -z $1 ]] || ipv4 "$1"; }
@@ -150,10 +152,18 @@ ROOTFS_GB=${ROOTFS_GB:-$min_disk}
 next_id=''
 (( dry_run )) || next_id=$(pvesh get /cluster/nextid 2>/dev/null || true)
 prompt_container_setting CT_ID 'CT ID' "$next_id" valid_container_id 'Use a free numeric ID of 100 or more.'
+pve_select_template TEMPLATE '^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(debian-1[23]|ubuntu-2[46]\.04)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
+positive_int ROOTFS_GB "$ROOTFS_GB"
+pve_select_storage STORAGE rootdir "$ROOTFS_GB"
+template_default=''; storage_default=''
+if (( ! dry_run )); then
+    [[ -n ${TEMPLATE:-} ]] || template_default=$(first_listed list_container_templates)
+    [[ -n ${STORAGE:-} ]] || storage_default=$(first_listed list_container_storage)
+fi
 prompt_container_setting TEMPLATE 'Template volume (Debian 12/13 or Ubuntu 24.04/26.04)' \
-    "$(first_listed list_container_templates)" valid_container_template \
-    'Use <storage>:vztmpl/<debian-12|debian-13|ubuntu-24.04|ubuntu-26.04>-...tar.zst (pveam download first).'
-prompt_container_setting STORAGE 'Root disk storage' "$(first_listed list_container_storage)" valid_container_storage \
+    "$template_default" valid_container_template \
+    'Use <storage>:vztmpl/<debian-12|debian-13|ubuntu-24.04|ubuntu-26.04>-..._amd64.tar.zst (pveam download first).'
+prompt_container_setting STORAGE 'Root disk storage' "$storage_default" valid_container_storage \
     'Use an active storage ID that supports rootdir content.'
 prompt_container_setting IP_CIDR 'IPv4 address/CIDR or dhcp' '' valid_container_ip 'Use a.b.c.d/nn or dhcp.'
 GATEWAY=${GATEWAY:-}

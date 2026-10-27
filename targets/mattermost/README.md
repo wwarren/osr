@@ -1,5 +1,7 @@
 # Mattermost service for Ollama Smart Router
 
+On an interactive new install, `provision-lxc.sh` lists active LXC template storage and `rootdir` storage with enough free space for `ROOTFS_GB`. Set `TEMPLATE_STORAGE` and `STORAGE` to skip the menus. The community script chooses or downloads its Ubuntu template on the selected template storage. `--reconfigure` and dry runs skip these Proxmox queries.
+
 Mattermost receives the router's **health alerts**. The `ollama-monitor`
 service posts host and service state changes to an incoming webhook (see the
 main README). This target creates a separate Ubuntu 24.04 LXC (`MATTERMOST_CT_VERSION=22.04`

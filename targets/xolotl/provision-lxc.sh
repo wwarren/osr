@@ -3,9 +3,11 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 usage() {
     cat <<'USAGE'
-Usage: CT_ID=282 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_<version>_amd64.tar.zst \
+Usage: bash provision-lxc.sh [--dry-run]
+   or: CT_ID=282 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_<version>_amd64.tar.zst \
        STORAGE=local-lvm IP_CIDR=192.0.2.82/24 GATEWAY=192.0.2.1 \
        bash targets/xolotl/provision-lxc.sh [--dry-run]
 
@@ -23,6 +25,8 @@ drive), IP_CIDR (a.b.c.d/nn or dhcp). GATEWAY is required for a static address.
 The host needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 series
 and later) with 24 GB of VRAM (16 GB is untested upstream), NVIDIA driver
 580.173.02 and the repository's matching LXC user-space installer by default.
+An interactive run lists downloaded templates and eligible rootdir storage
+when TEMPLATE or STORAGE is unset.
 
 On a host without an NVIDIA driver, run tools/setup-host-gpu.sh first: it
 asks for the GPU generation and installs the driver (the router installer runs
@@ -140,6 +144,9 @@ XOLOTL_MODEL_NAME=${XOLOTL_MODEL_NAME:-deepseek-v4.1-flash}
 XOLOTL_READY_TIMEOUT=${XOLOTL_READY_TIMEOUT:-1800}
 
 [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'CT_ID must be an unused numeric ID of 100 or more.'
+pve_select_template TEMPLATE '^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04|26\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
+positive_int ROOTFS_GB "$ROOTFS_GB"
+pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 [[ $TEMPLATE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04|26\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || \
     die 'TEMPLATE must be a downloaded Ubuntu 22.04/24.04/26.04 or Debian 12/13 amd64 LXC template.'
 [[ $STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'STORAGE must be a Proxmox rootdir storage ID.'
