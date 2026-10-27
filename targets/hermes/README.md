@@ -27,7 +27,9 @@ account inside the Hermes CT.
 The Hermes web dashboard also starts on boot at `http://<Hermes-CT-IP>:9119/`.
 It binds to `0.0.0.0`, so every CT IPv4 address can serve it. The installer
 generates a dashboard login when none is configured; the login is required for
-a non-loopback bind. The dashboard can manage agent settings and secrets, so
+a non-loopback bind. Its generated username is `admin`, not the CT's Linux
+`hermes` user; its password is a random value stored in `~/.hermes/.env`.
+The dashboard can manage agent settings and secrets, so
 reach this HTTP endpoint only over a trusted LAN or VPN.
 
 ## Before you start

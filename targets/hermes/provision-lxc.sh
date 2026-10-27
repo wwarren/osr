@@ -862,7 +862,8 @@ if [[ $OPENWEBUI == true ]]; then
   printf 'whoever can chat with it runs tools as the hermes account in CT %s and shares one Hermes memory.\n' "$CT_ID"
 fi
 if [[ $mode != integrate && $HERMES_DASHBOARD == true ]]; then
-  printf 'Dashboard: http://%s:9119/ (login required). Read its generated login with:\n' "$HERMES_IP"
+  printf 'Dashboard: http://%s:9119/ (login separate from the CT user; generated default username: admin).\n' "$HERMES_IP"
+  printf 'Read the configured username and password, if using the generated login, with:\n'
   printf "pct exec %s -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env\n" "$CT_ID"
 fi
 printf 'CLI: pct exec %s -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes\n' "$CT_ID"

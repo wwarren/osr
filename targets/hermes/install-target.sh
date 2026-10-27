@@ -564,7 +564,7 @@ if [[ $HERMES_DASHBOARD == true &&
     ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_USERNAME=$dashboard_user \
     ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$dashboard_password \
       env_file_update "$HERMES_HOME/.env"
-    note 'Generated Hermes dashboard login; read the password from /home/hermes/.hermes/.env as root in the CT.'
+    note "Generated Hermes dashboard username '$dashboard_user'; read its password from /home/hermes/.hermes/.env as root in the CT."
   fi
   if [[ -z $(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_BASIC_AUTH_SECRET) ]]; then
     ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -hex 32) \
