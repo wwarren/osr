@@ -168,7 +168,7 @@ conf=$GITEA_CONF_DIR/app.ini
 
 if (( dry_run )); then
   printf '+ stop gitea; write %s (SQLite, ROOT_URL %s/, INSTALL_LOCK, registration off) unless it is already locked\n' "$conf" "$url"
-  printf '+ gitea migrate; start gitea; wait for %s/api/v1/version\n' "http://127.0.0.1:$GITEA_PORT"
+  printf '+ gitea migrate; start gitea; wait for %s/api/healthz\n' "http://127.0.0.1:$GITEA_PORT"
   printf '+ create administrator %s (password in %s/admin-password) if missing\n' "$GITEA_SITE_ADMIN" "$GITEA_TARGET_ETC"
   printf '+ create non-admin %s and a write:repository,write:user token in %s/router-token\n' "$GITEA_ROUTER_USER" "$GITEA_TARGET_ETC"
   exit 0
@@ -183,10 +183,13 @@ as_gitea() {
   runuser -u "$GITEA_SERVICE_USER" -- env HOME="$GITEA_WORK_DIR/data" USER="$GITEA_SERVICE_USER" \
     GITEA_WORK_DIR="$GITEA_WORK_DIR" "$GITEA_BIN" --config "$conf" --work-path "$GITEA_WORK_DIR" "$@"
 }
+# /api/healthz needs no sign-in (it checks the database and cache). The
+# /api/v1 routes, /api/v1/version included, answer 401 to anonymous callers
+# once REQUIRE_SIGNIN_VIEW is on, so they cannot tell when Gitea is up.
 gitea_ready() {
   local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
   while (( SECONDS < deadline )); do
-    curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$GITEA_PORT/api/v1/version" 2>/dev/null && return 0
+    curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$GITEA_PORT/api/healthz" 2>/dev/null && return 0
     sleep 2
   done
   return 1
@@ -218,7 +221,7 @@ else
 fi
 systemctl enable gitea.service >/dev/null 2>&1 || true
 systemctl restart gitea.service
-gitea_ready || die "Gitea did not answer $url/api/v1/version within ${HEALTH_TIMEOUT}s; see: journalctl -u gitea"
+gitea_ready || die "Gitea did not answer http://127.0.0.1:$GITEA_PORT/api/healthz within ${HEALTH_TIMEOUT}s; see: journalctl -u gitea"
 write_secret "$GITEA_TARGET_ETC/url" "$url"
 
 # --- accounts ---------------------------------------------------------------------

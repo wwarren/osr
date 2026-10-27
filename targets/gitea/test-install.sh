@@ -103,7 +103,9 @@ case "$1 $2 $3" in
 esac
 EOF
 chmod +x "$bin/gitea"
-# curl: the Gitea API answers while "running"; /api/v1/user checks the token.
+# curl: Gitea answers while "running". REQUIRE_SIGNIN_VIEW is on, so anonymous
+# /api/v1 calls (version included) fail and only /api/healthz is open;
+# /api/v1/user checks the token.
 cat > "$bin/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >> "$FAKE_LOG"
@@ -114,7 +116,7 @@ while (( $# )); do
   url=$1; shift
 done
 case $url in
-  */api/v1/version) exit 0 ;;
+  */api/healthz) exit 0 ;;
   */api/v1/user) token=${hdr#Authorization: token }; grep -qx "$token" "$FAKE_STATE/tokens" 2>/dev/null || exit 22 ;;
   *) exit 22 ;;
 esac
