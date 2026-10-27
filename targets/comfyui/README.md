@@ -109,7 +109,13 @@ CT afterwards, the repository's NVIDIA 580.173.02 user-space helper is run.
 PyTorch's CUDA 13 build, which the community install picks, needs host driver
 580 or newer. `GPU=amd` and `GPU=intel` pass `/dev/dri` (and `/dev/kfd`) through
 and install ROCm or XPU PyTorch. `GPU=none` installs CPU-only operation
-(`--cpu`), which works but takes minutes per image. The router installer sets `GPU` from
+(`--cpu`), which works but takes minutes per image. `GPU_CARD=<PCI address>`
+(for example `0000:03:00.0`) picks one card on a host with several (`GPU=auto`
+then means that card's vendor): after the community script, which passes
+every card of the vendor, the CT keeps only that card's device nodes plus the
+shared ones (`/dev/kfd`, `/dev/nvidiactl`, `/dev/nvidia-uvm*`), and is
+restarted before the firewall and the guest install. The router installer
+asks which card ComfyUI should use and sets `GPU` and `GPU_CARD` after
 `tools/setup-host-gpu.sh`, which first makes the host's NVIDIA, AMD (`amdgpu`)
 or Intel Arc (`i915`/`xe`) driver work; run that tool yourself before a direct
 `provision-lxc.sh` run on a host whose GPU is not set up yet.

@@ -951,25 +951,267 @@ target_gpu_need() {
   printf '%s\n' "${spec%%|*}"
 }
 
-# The GPU prepare_host_gpu found, for the targets that adapt to it.
-HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE="" HOST_GPU_CUDA_ARCH=""
+# The GPUs on this host (load_host_gpu_cards), one address|vendor|generation|
+# driver|name line per card, and GPU 0's compute capability once the GPU step
+# has run for the NVIDIA-only targets.
+HOST_GPU_CARDS="" HOST_GPU_CUDA_ARCH=""
 
-# prepare_host_gpu: before anything is created, make sure the selected GPU
-# targets find a working GPU driver on this host. tools/setup-host-gpu.sh
-# reports a working one, or lists the cards, asks for the GPU generation and
-# (with consent) sets up the driver: NVIDIA's from the repository, or the
-# kernel's amdgpu, i915 or xe for AMD Radeon and Intel Arc. All selected
-# targets use one GPU vendor. Targets that need the GPU stop the install
-# without one; those that only use it when present go on without.
+# host_gpu_tool: tools/setup-host-gpu.sh of this checkout.
+host_gpu_tool() {
+  local tool="${TARGETS_DIR}/../tools/setup-host-gpu.sh"
+  if [[ ! -r "$tool" ]]; then
+    echo "Missing ${tool}. Run the router installer from the full repository checkout." >&2
+    return 1
+  fi
+  printf '%s\n' "$tool"
+}
+
+# load_host_gpu_cards: HOST_GPU_CARDS from the host tool's --list (NVIDIA cards,
+# and AMD Radeon and Intel Arc cards of a supported generation). Nothing is
+# changed on the host.
+load_host_gpu_cards() {
+  local tool out
+  tool="$(host_gpu_tool)" || return 1
+  out="$(bash "$tool" --list --vendors nvidia,amd,intel)" || return 1
+  HOST_GPU_CARDS="$(sed -n 's/^GPU_CARD=//p' <<< "$out")"
+}
+
+# host_gpu_card ADDRESS: the HOST_GPU_CARDS line of a card (03:00.0 and
+# 0000:03:00.0 both match), or nothing.
+host_gpu_card() {
+  local address="${1,,}" line
+  [[ -n "$address" ]] || return 1
+  [[ "$address" == *:*:* ]] || address="0000:${address}"
+  while IFS= read -r line; do
+    [[ -n "$line" && "${line%%|*}" == "$address" ]] && { printf '%s\n' "$line"; return 0; }
+  done <<< "${HOST_GPU_CARDS:-}"
+  return 1
+}
+
+# gpu_card_label LINE: a card as the GPU menus show it.
+gpu_card_label() {
+  local address vendor gen driver name state
+  IFS='|' read -r address vendor gen driver name <<< "$1"
+  case "$driver" in
+    "") state="no driver yet; set up next" ;;
+    vfio-pci) state="bound to vfio-pci" ;;
+    *) state="driver ${driver}" ;;
+  esac
+  printf '%s  %s (%s%s)\n' "$address" "$name" "${gen:+${gen}, }" "$state"
+}
+
+# target_gpu_prompted NAME: does the target run on AMD Radeon or Intel Arc as
+# configured, so that each install asks which card it gets? NVIDIA-only
+# targets use the NVIDIA driver's GPU 0 (or their GPU_DEVICES).
+target_gpu_prompted() {
+  local need vendors
+  IFS='|' read -r need vendors _ <<< "$(target_gpu_spec "$1")" || return 1
+  [[ -n "$need" && ( ",$vendors," == *",amd,"* || ",$vendors," == *",intel,"* ) ]]
+}
+
+# target_gpu_choices NAME: the cards the target can use, one HOST_GPU_CARDS
+# line each, in the target's vendor order: not bound to vfio-pci, and of a
+# generation the target accepts.
+target_gpu_choices() {
+  local need vendors gens v line vendor gen driver
+  IFS='|' read -r need vendors gens <<< "$(target_gpu_spec "$1")" || return 1
+  [[ -n "$need" ]] || return 0
+  for v in ${vendors//,/ }; do
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS='|' read -r _ vendor gen driver _ <<< "$line"
+      [[ "$vendor" == "$v" && "$driver" != vfio-pci ]] || continue
+      [[ -z "$gens" || ",$gens," == *",$gen,"* ]] || continue
+      printf '%s\n' "$line"
+    done <<< "${HOST_GPU_CARDS:-}"
+  done
+}
+
+# valid_gpu_choice VALUE: a menu number, a listed card's PCI address, or none
+# when GPU_CHOICE_NONE is true. GPU_CHOICE_ADDRESSES holds the menu's cards.
+valid_gpu_choice() {
+  local value="${1,,}" count
+  local -a addresses=()
+  read -r -a addresses <<< "${GPU_CHOICE_ADDRESSES:-}"
+  count=${#addresses[@]}
+  [[ "${GPU_CHOICE_NONE:-false}" != true ]] || count=$((count + 1))
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    (( 10#$value >= 1 && 10#$value <= count ))
+    return
+  fi
+  [[ "$value" != none ]] || { [[ "${GPU_CHOICE_NONE:-false}" == true ]]; return; }
+  [[ "$value" == *:*:* ]] || value="0000:${value}"
+  [[ " ${GPU_CHOICE_ADDRESSES:-} " == *" ${value} "* ]]
+}
+
+# prompt_target_gpus: for each selected target that runs on AMD Radeon or Intel
+# Arc (Ollama, llama.cpp, ComfyUI), ask which of the host's GPUs it gets; the
+# answer is <PREFIX>_GPU_CARD (a PCI address, or none: the CPU). Targets that
+# use a GPU only when present can also take none. A preset is checked and
+# offered as the default. With one card and a target that needs it, that card
+# is taken without asking.
+prompt_target_gpus() {
+  local name var preset value line i default need choices
+  local -a lines=() addresses=()
+  [[ -n "${TARGETS:-}" ]] || return 0
+  for name in $TARGETS; do target_gpu_prompted "$name" && break; name=""; done
+  [[ -n "$name" ]] || return 0
+  load_host_gpu_cards || return 1
+  echo
+  echo "--- GPU for each target ---"
+  if [[ -z "$HOST_GPU_CARDS" ]]; then
+    echo "  No NVIDIA, AMD Radeon (RX 7000/9000) or Intel Arc GPU is on this host's PCI bus."
+  else
+    echo "  GPUs on this host:"
+    while IFS= read -r line; do echo "    $(gpu_card_label "$line")"; done <<< "$HOST_GPU_CARDS"
+  fi
+  for name in $TARGETS; do
+    target_gpu_prompted "$name" || continue
+    var="$(target_var_prefix "$name")_GPU_CARD"
+    preset="${!var:-}"
+    need="$(target_gpu_need "$name")"
+    choices="$(target_gpu_choices "$name")"
+    lines=(); addresses=()
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      lines+=("$line"); addresses+=("${line%%|*}")
+    done <<< "$choices"
+    GPU_CHOICE_ADDRESSES="${addresses[*]:-}"
+    GPU_CHOICE_NONE=false
+    [[ "$need" != optional ]] || GPU_CHOICE_NONE=true
+    if [[ -n "$preset" ]] && ! valid_gpu_choice "$preset"; then
+      if [[ "${preset,,}" == none ]]; then
+        echo "${var}=none: ${name} needs a GPU (llama.cpp: set BACKEND=cpu to build without one)." >&2
+      else
+        echo "${var}=${preset} is not a GPU ${name} can use on this host." >&2
+      fi
+      return 1
+    fi
+    if (( ${#lines[@]} == 0 )); then
+      # The GPU step reports the missing card (and stops a target that needs one).
+      [[ -n "$preset" ]] || printf -v "$var" '%s' ""
+      echo "  ${name}: no GPU it can use on this host."
+      continue
+    fi
+    if [[ -z "$preset" && "$need" == required && ${#lines[@]} == 1 ]]; then
+      printf -v "$var" '%s' "${addresses[0]}"
+      echo "  ${name} uses the only GPU it can: $(gpu_card_label "${lines[0]}")"
+      continue
+    fi
+    echo "  Which GPU should ${name} use?"
+    for i in "${!lines[@]}"; do printf '    %d) %s\n' "$((i + 1))" "$(gpu_card_label "${lines[i]}")"; done
+    if [[ "$GPU_CHOICE_NONE" == true ]]; then
+      printf '    %d) none: run on the CPU\n' "$(( ${#lines[@]} + 1 ))"
+    fi
+    default="${preset:-1}"
+    prompt_until_valid "  GPU for ${name} (number, PCI address$([[ $GPU_CHOICE_NONE != true ]] || printf ' or none'))" \
+      "$var" "$default" valid_gpu_choice || return 1
+    value="${!var,,}"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+      if (( 10#$value > ${#addresses[@]} )); then value=none; else value="${addresses[10#$value - 1]}"; fi
+    elif [[ "$value" != none && "$value" != *:*:* ]]; then
+      value="0000:${value}"
+    fi
+    printf -v "$var" '%s' "$value"
+  done
+  unset GPU_CHOICE_ADDRESSES GPU_CHOICE_NONE
+}
+
+# target_gpu_result NAME [FIELD]: what the GPU step found for a target, as
+# state|vendor|render node|NVIDIA minor|PCI address, or one FIELD of it (state,
+# vendor, render, minor, pci). Empty before the step ran for the target.
+target_gpu_result() {
+  local var value state vendor render minor pci
+  var="GPU_RESULT_$(target_var_prefix "$1")"
+  value="${!var:-}"
+  [[ -n "${2:-}" ]] || { printf '%s\n' "$value"; return 0; }
+  IFS='|' read -r state vendor render minor pci <<< "$value"
+  case "$2" in
+    state) printf '%s\n' "$state" ;;
+    vendor) printf '%s\n' "$vendor" ;;
+    render) printf '%s\n' "$render" ;;
+    minor) printf '%s\n' "$minor" ;;
+    pci) printf '%s\n' "$pci" ;;
+    *) return 1 ;;
+  esac
+}
+
+# run_host_gpu_tool NEED VENDORS CARD TARGETS [ARGS...]: one run of
+# tools/setup-host-gpu.sh for the targets that share a card (CARD) or, without
+# a card, the vendors; their results go to GPU_RESULT_<PREFIX>.
+run_host_gpu_tool() {
+  local need="$1" vendors="$2" card="$3" targets="$4" tool out rc=0 state vendor gen render name
+  shift 4
+  tool="$(host_gpu_tool)" || return 1
+  echo
+  echo "--- GPU${card:+ ${card}} for: ${targets} ---"
+  out="$(bash "$tool" --need "$need" --vendors "$vendors" --for "$targets" ${card:+--card "$card"} "$@")" || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      echo "Reboot this host, then run the router installer again. The GPU driver is set up;" >&2
+      echo "nothing else was created." >&2
+      return 1 ;;
+    *)
+      echo "The GPU is not ready for: ${targets}. Nothing was created;" >&2
+      echo "deselect those targets, or fix the GPU and run the router installer again." >&2
+      return 1 ;;
+  esac
+  state="$(sed -n 's/^GPU_STATE=//p' <<< "$out")"
+  vendor="$(sed -n 's/^GPU_VENDOR=//p' <<< "$out")"
+  gen="$(sed -n 's/^GPU_GENERATION=//p' <<< "$out")"
+  render="$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$out")"
+  for name in $targets; do
+    printf -v "GPU_RESULT_$(target_var_prefix "$name")" '%s|%s|%s|%s|%s' "$state" "$vendor" "$render" \
+      "$(sed -n 's/^GPU_NVIDIA_MINOR=//p' <<< "$out")" "$(sed -n 's/^GPU_PCI=//p' <<< "$out")"
+  done
+  if [[ "$state" != ready ]]; then
+    echo "No GPU (${state}): ${targets} will run without one."
+    return 0
+  fi
+  case "$vendor" in
+    nvidia)
+      HOST_GPU_CUDA_ARCH="$(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out")"
+      echo "NVIDIA GPU ready: ${gen:-} (compute capability ${HOST_GPU_CUDA_ARCH})." ;;
+    amd) echo "AMD Radeon GPU ready: ${gen} ($(sed -n 's/^GPU_GFX=//p' <<< "$out"), ${render} and /dev/kfd)." ;;
+    *) echo "Intel Arc GPU ready: ${gen} (${render})." ;;
+  esac
+}
+
+# prepare_host_gpu: before anything is created, make sure each selected GPU
+# target finds a working driver for its GPU on this host.
+# tools/setup-host-gpu.sh reports a working one, or (with consent) sets up the
+# driver: NVIDIA's from the repository, or the kernel's amdgpu, i915 or xe for
+# AMD Radeon and Intel Arc. It runs once per card chosen in prompt_target_gpus
+# (targets that chose the same card share the run), and once for the targets
+# without a chosen card (the NVIDIA-only ones), which must share one vendor.
+# Targets that need the GPU stop the install without one; those that only use
+# it when present go on without. A target that chose none runs on the CPU.
 prepare_host_gpu() {
-  local name need vendors gens v kept tool out rc=0 mode state vendor_list="nvidia,amd,intel"
-  local -a required=() optional=() args=() wants=()
+  local name need vendors gens v kept card line vendor_list="nvidia,amd,intel" mode
+  local -a required=() optional=() args=() wants=() cards=()
+  local -A card_targets=() card_need=() card_args=()
   for name in ${TARGETS:-}; do
     IFS='|' read -r need vendors gens <<< "$(target_gpu_spec "$name")"
+    [[ -n "$need" ]] || continue
+    card="$(target_setting "$name" GPU_CARD)"
+    if [[ "${card,,}" == none ]]; then
+      printf -v "GPU_RESULT_$(target_var_prefix "$name")" '%s' "declined||||"
+      echo "${name} runs on the CPU (no GPU chosen)."
+      continue
+    fi
+    if [[ -n "$card" ]]; then
+      line="$(host_gpu_card "$card")" || { echo "${name}: no GPU at ${card} on this host." >&2; return 1; }
+      card="${line%%|*}"
+      [[ -n "${card_targets[$card]:-}" ]] || cards+=("$card")
+      card_targets[$card]+="${card_targets[$card]:+ }${name}"
+      [[ "${card_need[$card]:-}" == required ]] || card_need[$card]="$need"
+      [[ -z "$gens" ]] || card_args[$card]+="${card_args[$card]:+ }--allow ${gens}:${name}"
+      continue
+    fi
     case "$need" in
       required) required+=("$name") ;;
-      optional) optional+=("$name") ;;
-      *) continue ;;
+      *) optional+=("$name") ;;
     esac
     wants+=("${name} (${vendors//,/\/})")
     kept=""
@@ -979,65 +1221,49 @@ prepare_host_gpu() {
     vendor_list="$kept"
     [[ -z "$gens" ]] || args+=(--allow "${gens}:${name}")
   done
-  (( ${#required[@]} + ${#optional[@]} > 0 )) || return 0
-  if [[ -z "$vendor_list" ]]; then
+  if (( ${#required[@]} + ${#optional[@]} )) && [[ -z "$vendor_list" ]]; then
     echo "The selected targets cannot share one GPU: ${wants[*]}." >&2
     echo "Deselect one, or set BACKEND (llama.cpp) or GPU (Ollama, ComfyUI) to match. Nothing was created." >&2
     return 1
   fi
-  tool="${TARGETS_DIR}/../tools/setup-host-gpu.sh"
-  if [[ ! -r "$tool" ]]; then
-    echo "Missing ${tool}. Run the router installer from the full repository checkout." >&2
-    return 1
-  fi
-  if (( ${#required[@]} )); then mode=required; else mode=optional; fi
-  echo
-  echo "--- GPU for: ${required[*]} ${optional[*]} ---"
-  out="$(bash "$tool" --need "$mode" --vendors "$vendor_list" --for "${required[*]:-${optional[*]}}" "${args[@]}")" || rc=$?
-  case "$rc" in
-    0) ;;
-    2)
-      echo "Reboot this host, then run the router installer again. The GPU driver is set up;" >&2
-      echo "nothing else was created." >&2
-      return 1 ;;
-    *)
-      echo "The GPU is not ready for: ${required[*]:-${optional[*]}}. Nothing was created;" >&2
-      echo "deselect those targets, or fix the GPU and run the router installer again." >&2
-      return 1 ;;
-  esac
-  state="$(sed -n 's/^GPU_STATE=//p' <<< "$out")"
-  HOST_GPU_STATE="$state"
-  HOST_GPU_VENDOR="$(sed -n 's/^GPU_VENDOR=//p' <<< "$out")"
-  HOST_GPU_RENDER_NODE="$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$out")"
-  HOST_GPU_CUDA_ARCH="$(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out")"
-  if [[ "$state" == ready ]]; then
-    case "$HOST_GPU_VENDOR" in
-      nvidia) echo "NVIDIA GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") (compute capability $(sed -n 's/^GPU_CUDA_ARCH=//p' <<< "$out"))." ;;
-      amd) echo "AMD Radeon GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") ($(sed -n 's/^GPU_GFX=//p' <<< "$out"), ${HOST_GPU_RENDER_NODE} and /dev/kfd)." ;;
-      *) echo "Intel Arc GPU ready: $(sed -n 's/^GPU_GENERATION=//p' <<< "$out") (${HOST_GPU_RENDER_NODE})." ;;
-    esac
-  else
-    echo "No GPU (${state}): ${optional[*]} will run without one."
+  for card in "${cards[@]}"; do
+    line="$(host_gpu_card "$card")"
+    IFS='|' read -r _ v _ <<< "$line"
+    # shellcheck disable=SC2086  # --allow <gens>:<name> pairs
+    run_host_gpu_tool "${card_need[$card]}" "$v" "$card" "${card_targets[$card]}" ${card_args[$card]:-} || return 1
+  done
+  if (( ${#required[@]} + ${#optional[@]} )); then
+    if (( ${#required[@]} )); then mode=required; else mode=optional; fi
+    run_host_gpu_tool "$mode" "$vendor_list" "" "${required[*]}${required[*]:+${optional[*]:+ }}${optional[*]}" "${args[@]}" || return 1
   fi
 }
 
 # target_gpu_env NAME: the GPU settings a target gets from prepare_host_gpu
-# (NAME=value lines), unless they were preset: GPU for Ollama and ComfyUI; for
-# llama.cpp BACKEND (cuda or vulkan) and, for Vulkan, the card's render node.
+# (NAME=value lines), unless they were preset: GPU for Ollama and ComfyUI and,
+# for a chosen card, GPU_CARD (its PCI address); for llama.cpp BACKEND (cuda
+# or vulkan) and GPU_DEVICES: the card's render node for Vulkan, its
+# /dev/nvidia<minor> with the control and UVM devices for CUDA.
 target_gpu_env() {
-  [[ -n "${HOST_GPU_STATE:-}" ]] || return 0
+  local state vendor render minor pci
+  IFS='|' read -r state vendor render minor pci <<< "$(target_gpu_result "$1")"
+  [[ -n "$state" ]] || return 0
   case "$1" in
     ollama|comfyui)
-      [[ -z "${GPU:-}" || "${GPU}" == auto ]] || return 0
-      if [[ $HOST_GPU_STATE == ready ]]; then echo "GPU=${HOST_GPU_VENDOR}"; else echo "GPU=none"; fi ;;
+      if [[ -z "${GPU:-}" || "${GPU}" == auto ]]; then
+        if [[ $state == ready ]]; then echo "GPU=${vendor}"; else echo "GPU=none"; fi
+      fi
+      if [[ $state == ready && -n "$pci" ]]; then echo "GPU_CARD=${pci}"; fi ;;
     llamacpp)
       local backend="${BACKEND:-}"
-      if [[ -z "$backend" && $HOST_GPU_STATE == ready ]]; then
-        case "$HOST_GPU_VENDOR" in nvidia) backend=cuda ;; amd|intel) backend=vulkan ;; esac
+      if [[ -z "$backend" && $state == ready ]]; then
+        case "$vendor" in nvidia) backend=cuda ;; amd|intel) backend=vulkan ;; esac
         echo "BACKEND=${backend}"
       fi
-      if [[ "$backend" == vulkan && -z "${GPU_DEVICES:-}" && -n "${HOST_GPU_RENDER_NODE:-}" ]]; then
-        echo "GPU_DEVICES=${HOST_GPU_RENDER_NODE}"
+      [[ -z "${GPU_DEVICES:-}" && $state == ready ]] || return 0
+      if [[ "$backend" == vulkan && -n "$render" ]]; then
+        echo "GPU_DEVICES=${render}"
+      elif [[ "$backend" == cuda && -n "$minor" ]]; then
+        echo "GPU_DEVICES=/dev/nvidia${minor} /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools"
       fi ;;
   esac
 }
@@ -2454,8 +2680,10 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 prompt_network_config
 prompt_storage_config
 prompt_target_settings || exit 1
-# The selected GPU targets need the host's NVIDIA driver: installed now, when
-# missing, before anything is created (a reboot then costs nothing but a rerun).
+# Which GPU each AMD/Intel-capable target gets, then the host driver for every
+# chosen card: set up now, when missing, before anything is created (a reboot
+# then costs nothing but a rerun).
+prompt_target_gpus || exit 1
 prepare_host_gpu || exit 1
 # Gitea and Mattermost, if selected, are created now: the prompts below take
 # their URL, token and webhook.

@@ -568,7 +568,14 @@ Target units use their own service accounts, limited writable paths and no
 capabilities. GPU nodes are group-accessible rather than root-owned.
 Strata-style keys are generated inside the CT and stored outside unit files.
 The [README's distribution table](README.md#lxc-distribution-support) lists
-supported CT releases; GPU driver setup precedes CT creation.
+supported CT releases; GPU driver setup precedes CT creation. The installer
+asks each target that also runs on AMD Radeon or Intel Arc (Ollama, llama.cpp,
+ComfyUI) which of the host's GPUs it gets (`tools/setup-host-gpu.sh --list`),
+then checks or sets up the driver once per chosen card (`--card`) and once for
+the NVIDIA-only targets, so targets on one host can use different cards and
+vendors. Ollama and ComfyUI receive `GPU_CARD` and keep only that card's
+device nodes after their community scripts pass every card of the vendor;
+llama.cpp receives the card's nodes as `GPU_DEVICES`.
 
 **Upgrade contract.** Sources and downloads are prepared and verified before
 service interruption. An unchanged healthy target is left alone. Successful

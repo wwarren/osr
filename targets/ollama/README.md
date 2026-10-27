@@ -62,6 +62,16 @@ community script passes the devices through itself; when the host has more
 than one GPU type it asks which, so answer the vendor the wrapper names. The
 wrapper then checks the CT config and warns if the GPU is missing.
 
+`GPU_CARD=<PCI address>` (for example `0000:03:00.0`, as `lspci -D` shows it)
+picks one card on a host with several; `GPU=auto` then means that card's
+vendor. The community script passes every card of the vendor, so afterwards
+the wrapper deletes the CT's device entries of the other cards (their
+`/dev/dri/renderD*` and `card*` nodes, or `/dev/nvidia<N>`), keeps the shared
+ones (`/dev/kfd`, `/dev/nvidiactl`, `/dev/nvidia-uvm*`, `/dev/nvidia-caps/*`)
+and restarts the CT before `install-target.sh` runs. It warns if the CT does
+not pass the chosen card at all. The router installer asks which card Ollama
+should use and passes `GPU` and `GPU_CARD`.
+
 | GPU | Passed through | `install-target.sh` adds |
 |---|---|---|
 | NVIDIA | `/dev/nvidia*` | the repository's NVIDIA 580.173.02 user-space helper, when `nvidia-smi` is missing (before adoption) |
@@ -69,7 +79,8 @@ wrapper then checks the CT config and warns if the GPU is missing.
 | Intel Arc A/B | `/dev/dri/renderD*` | Mesa's Vulkan driver (`mesa-vulkan-drivers libvulkan1`) for Ollama's built-in Vulkan backend; Arc B needs Mesa 24.2+ (Debian 13 has 25.0, Ubuntu 24.04 25.0 after `apt upgrade`, Ubuntu 26.04 26.0) |
 
 Set the host's driver up first with `tools/setup-host-gpu.sh --vendors
-nvidia,amd,intel` (the router installer does, and passes `GPU`). Inside the CT,
+nvidia,amd,intel` (add `--card <address>` for one card; the router installer
+does this, and passes `GPU` and `GPU_CARD`). Inside the CT,
 `OLLAMA_GPU` (auto: `/dev/kfd` is AMD, an Intel render node is an Arc) tells
 `install-target.sh` which runtime to add. Without exposing VRAM through
 `cap_perfmon` (which the hardened unit does not grant), Ollama's Vulkan backend

@@ -172,7 +172,8 @@ printf 'provision %s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(basename "$(dirna
 [[ -z ${COMMUNITY_SCRIPT_URL:-}${COMMUNITY_SCRIPT_SHA256:-}${MATTERMOST_CHANNEL:-} ]] ||
   printf 'service-env %s|%s|%s\n' "${COMMUNITY_SCRIPT_URL:-}" "${COMMUNITY_SCRIPT_SHA256:-}" "${MATTERMOST_CHANNEL:-}" >> "$MOCK_LOG"
 [[ -z ${COMFYUI_IMAGE_VARIANT:-} ]] || printf 'image-variant %s\n' "$COMFYUI_IMAGE_VARIANT" >> "$MOCK_LOG"
-[[ -z ${GPU:-}${BACKEND:-}${GPU_DEVICES:-} ]] || printf 'gpu-env %s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
+[[ -z ${GPU:-}${BACKEND:-}${GPU_DEVICES:-}${GPU_CARD:-} ]] ||
+  printf 'gpu-env %s|%s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" "${GPU_CARD:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-} ]] ||
   printf 'cuda-env %s|%s|%s\n' "${CUDA_VERSION:-}" "${MAYA_CUDA_VERSION:-}" "${XOLOTL_CUDA_VERSION:-}" >> "$MOCK_LOG"
 if [[ -n ${HF_TOKEN:-} ]]; then
@@ -234,80 +235,265 @@ assert_eq "AirLLM with GPU_DEVICES does" required "$(GPU_DEVICES=/dev/nvidia0 ta
 assert_eq "Gitea never" "" "$(target_gpu_need gitea)"
 assert_fail "an unknown target" target_gpu_need nope
 
-describe prepare_host_gpu
+# The GPU step's fake tool: --list prints FAKE_GPU_LIST; a run for --card
+# 0000:03:00.0 or 0000:04:00.0 answers for that AMD or Intel card, any other
+# run FAKE_GPU_OUT with FAKE_GPU_RC.
 mkdir -p "$_tt/tools"
 cat > "$_tt/tools/setup-host-gpu.sh" <<'EOF'
 printf 'gpu-tool %s\n' "$*" >> "$MOCK_LOG"
+case " $* " in
+  *" --list "*) [[ -z ${FAKE_GPU_LIST:-} ]] || printf '%s\n' "$FAKE_GPU_LIST"; exit 0 ;;
+  *" --card 0000:03:00.0 "*) printf '%s\n' GPU_STATE=ready GPU_GENERATION=rdna3 GPU_VENDOR=amd GPU_GFX=gfx1100 \
+      GPU_RENDER_NODE=/dev/dri/renderD128 GPU_PCI=0000:03:00.0; exit 0 ;;
+  *" --card 0000:04:00.0 "*) printf '%s\n' GPU_STATE=ready GPU_GENERATION=arc-b GPU_VENDOR=intel \
+      GPU_RENDER_NODE=/dev/dri/renderD129 GPU_PCI=0000:04:00.0; exit 0 ;;
+esac
 printf '%s\n' "${FAKE_GPU_OUT:-GPU_STATE=ready}"
 exit "${FAKE_GPU_RC:-0}"
 EOF
+_cards=$'0000:01:00.0|nvidia|rtx40|nouveau|NVIDIA AD102 [GeForce RTX 4090]
+0000:03:00.0|amd|rdna3|amdgpu|AMD Radeon Navi 31 [Radeon RX 7900 XTX]
+0000:04:00.0|intel|arc-b||Intel Arc Battlemage G21 [Arc B580]
+0000:05:00.0|amd|rdna4|vfio-pci|AMD Radeon Navi 48 [Radeon RX 9070 XT]'
+_card_list="$(sed 's/^/GPU_CARD=/' <<< "$_cards")"
+_gpu_reset() {
+  unset OLLAMA_GPU_CARD LLAMACPP_GPU_CARD COMFYUI_GPU_CARD GPU_RESULT_OLLAMA GPU_RESULT_LLAMACPP GPU_RESULT_COMFYUI \
+    GPU_RESULT_STRATA GPU_RESULT_BASALT GPU_RESULT_XOLOTL FAKE_GPU_OUT FAKE_GPU_RC FAKE_GPU_LIST BACKEND GPU GPU_DEVICES
+  HOST_GPU_CARDS="" HOST_GPU_CUDA_ARCH=""
+  mock_reset_log
+}
+
+describe host_gpu_tool
+_gpu_reset
+assert_eq "the checkout's tool" "$TARGETS_DIR/../tools/setup-host-gpu.sh" "$(host_gpu_tool)"
+mv "$_tt/tools/setup-host-gpu.sh" "$_tt/tools/gone"
+assert_fail "the tool must be in the checkout" host_gpu_tool
+assert_contains "and says so" "Run the router installer from the full repository checkout" "$(host_gpu_tool 2>&1)"
+mv "$_tt/tools/gone" "$_tt/tools/setup-host-gpu.sh"
+
+describe load_host_gpu_cards
+_gpu_reset
+export FAKE_GPU_LIST="$_card_list"
+load_host_gpu_cards
+assert_eq "every card, without the GPU_CARD= prefix" "$_cards" "$HOST_GPU_CARDS"
+assert_contains "listed for every vendor" "gpu-tool --list --vendors nvidia,amd,intel" "$(cat "$MOCK_LOG")"
+unset FAKE_GPU_LIST
+load_host_gpu_cards
+assert_eq "a host without cards lists none" "" "$HOST_GPU_CARDS"
+
+describe host_gpu_card
+HOST_GPU_CARDS="$_cards"
+assert_eq "by its full address" "0000:04:00.0|intel|arc-b||Intel Arc Battlemage G21 [Arc B580]" "$(host_gpu_card 0000:04:00.0)"
+assert_eq "or the short one, in any case" "0000:03:00.0" "$(host_gpu_card 03:00.0 | cut -d'|' -f1)"
+assert_fail "a card not on the host" host_gpu_card 0000:09:00.0
+assert_fail "nothing for nothing" host_gpu_card ""
+
+describe gpu_card_label
+assert_eq "a card and its driver" "0000:03:00.0  AMD Radeon Navi 31 [Radeon RX 7900 XTX] (rdna3, driver amdgpu)" \
+  "$(gpu_card_label "$(host_gpu_card 03:00.0)")"
+assert_eq "one without a driver yet" "0000:04:00.0  Intel Arc Battlemage G21 [Arc B580] (arc-b, no driver yet; set up next)" \
+  "$(gpu_card_label "$(host_gpu_card 04:00.0)")"
+assert_eq "an NVIDIA card of no listed generation" "0000:41:00.0  NVIDIA GA100 (driver nvidia)" \
+  "$(gpu_card_label '0000:41:00.0|nvidia||nvidia|NVIDIA GA100')"
+
+describe target_gpu_prompted
+_gpu_reset
+assert_ok "Ollama asks" target_gpu_prompted ollama
+assert_ok "so does llama.cpp" target_gpu_prompted llamacpp
+assert_ok "and ComfyUI" target_gpu_prompted comfyui
+assert_fail "not llama.cpp built for CUDA" env BACKEND=cuda bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted llamacpp"
+assert_fail "not Ollama on NVIDIA only" env GPU=nvidia bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted ollama"
+assert_fail "not without a GPU" env GPU=none bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted comfyui"
+assert_fail "not the NVIDIA-only targets" target_gpu_prompted strata
+assert_fail "not the targets without a GPU" target_gpu_prompted hermes
+
+describe target_gpu_choices
+HOST_GPU_CARDS="$_cards"
+assert_eq "Ollama: the target's vendor order, no vfio-pci card" "0000:01:00.0 0000:03:00.0 0000:04:00.0" \
+  "$(target_gpu_choices ollama | cut -d'|' -f1 | paste -sd' ')"
+assert_eq "llama.cpp's Vulkan build: AMD and Intel" "0000:03:00.0 0000:04:00.0" \
+  "$(BACKEND=vulkan target_gpu_choices llamacpp | cut -d'|' -f1 | paste -sd' ')"
+assert_eq "GPU=intel: Intel only" "0000:04:00.0" "$(GPU=intel target_gpu_choices comfyui | cut -d'|' -f1)"
+assert_eq "a generation limit applies (Basalt: rtx50)" "" "$(target_gpu_choices basalt)"
+assert_eq "no GPU, no choice" "" "$(GPU=none target_gpu_choices ollama)"
+
+describe valid_gpu_choice
+GPU_CHOICE_ADDRESSES="0000:03:00.0 0000:04:00.0" GPU_CHOICE_NONE=false
+assert_ok "a menu number" valid_gpu_choice 2
+assert_fail "past the menu" valid_gpu_choice 3
+assert_fail "zero" valid_gpu_choice 0
+assert_ok "a listed address" valid_gpu_choice 0000:04:00.0
+assert_ok "short and upper-case" valid_gpu_choice 03:00.0
+assert_fail "an unlisted card" valid_gpu_choice 0000:05:00.0
+assert_fail "none for a target that needs a GPU" valid_gpu_choice none
+GPU_CHOICE_NONE=true
+assert_ok "none for one that does not" valid_gpu_choice none
+assert_ok "or the number after the cards" valid_gpu_choice 3
+assert_fail "free text" valid_gpu_choice radeon
+unset GPU_CHOICE_ADDRESSES GPU_CHOICE_NONE
+
+describe prompt_target_gpus
+_gpu_reset
+TARGETS="strata hermes"
+assert_ok "nothing to ask without an AMD/Intel-capable target" prompt_target_gpus
+assert_eq "and the host is not even listed" "" "$(cat "$MOCK_LOG")"
+export FAKE_GPU_LIST="$_card_list"
+TARGETS="ollama llamacpp strata"
+_out="$(mktemp)"
+prompt_target_gpus > "$_out" 2>&1 <<< $'3\n9\n2\n'
+assert_eq "Ollama takes the third card" 0000:04:00.0 "${OLLAMA_GPU_CARD:-}"
+assert_eq "llama.cpp re-asks past the menu, then takes the second" 0000:03:00.0 "${LLAMACPP_GPU_CARD:-}"
+assert_contains "the host's cards are shown" "0000:05:00.0  AMD Radeon Navi 48 [Radeon RX 9070 XT] (rdna4, bound to vfio-pci)" "$(cat "$_out")"
+assert_contains "Ollama's menu" "Which GPU should ollama use?" "$(cat "$_out")"
+assert_contains "offers the CPU" "4) none: run on the CPU" "$(cat "$_out")"
+assert_not_contains "llama.cpp's does not" "4) none" "$(sed -n '/llamacpp use/,$p' "$_out")"
+assert_not_contains "the NVIDIA-only target is not asked" "strata use" "$(cat "$_out")"
+assert_eq "no vfio-pci card in a menu" 0 "$(grep -c '[0-9]) 0000:05:00.0' "$_out")"
+_gpu_reset; export FAKE_GPU_LIST="$_card_list"
+TARGETS="ollama comfyui"
+prompt_target_gpus > "$_out" 2>&1 <<< $'none\n4\n'
+assert_eq "none by name" none "$OLLAMA_GPU_CARD"
+assert_eq "or by number" none "$COMFYUI_GPU_CARD"
+_gpu_reset; export FAKE_GPU_LIST="$_card_list"
+OLLAMA_GPU_CARD=03:00.0 TARGETS=ollama
+prompt_target_gpus > "$_out" 2>&1 <<< $'\n'
+assert_eq "a preset is the default, written out in full" 0000:03:00.0 "$OLLAMA_GPU_CARD"
+OLLAMA_GPU_CARD=0000:05:00.0
+assert_fail "a preset card the target cannot use" prompt_target_gpus
+assert_contains "is named" "OLLAMA_GPU_CARD=0000:05:00.0 is not a GPU ollama can use on this host." "$(prompt_target_gpus 2>&1 <<< '')"
+_gpu_reset; export FAKE_GPU_LIST="$_card_list"
+LLAMACPP_GPU_CARD=none TARGETS=llamacpp
+assert_contains "none for a target that needs a GPU" "LLAMACPP_GPU_CARD=none: llamacpp needs a GPU" "$(prompt_target_gpus 2>&1 <<< '')"
+_gpu_reset; export FAKE_GPU_LIST="GPU_CARD=0000:03:00.0|amd|rdna3|amdgpu|AMD Radeon Navi 31"
+TARGETS=llamacpp
+prompt_target_gpus > "$_out" 2>&1 </dev/null
+assert_eq "one card and a target that needs it: taken without asking" 0000:03:00.0 "$LLAMACPP_GPU_CARD"
+assert_contains "and said" "llamacpp uses the only GPU it can: 0000:03:00.0" "$(cat "$_out")"
+TARGETS=comfyui
+prompt_target_gpus > "$_out" 2>&1 <<< $'\n'
+assert_eq "a target that can do without is still asked (card or CPU)" 0000:03:00.0 "$COMFYUI_GPU_CARD"
+_gpu_reset
+TARGETS="ollama"
+prompt_target_gpus > "$_out" 2>&1 </dev/null
+assert_contains "a host without cards says so" "No NVIDIA, AMD Radeon (RX 7000/9000) or Intel Arc GPU" "$(cat "$_out")"
+assert_eq "and leaves the target to the GPU step" "" "${OLLAMA_GPU_CARD:-}"
+rm -f "$_out"; TARGETS=""
+
+describe target_gpu_result
+GPU_RESULT_OLLAMA="ready|amd|/dev/dri/renderD128||0000:03:00.0"
+assert_eq "the whole result" "ready|amd|/dev/dri/renderD128||0000:03:00.0" "$(target_gpu_result ollama)"
+assert_eq "its state" ready "$(target_gpu_result ollama state)"
+assert_eq "the render node" /dev/dri/renderD128 "$(target_gpu_result ollama render)"
+assert_eq "the card" 0000:03:00.0 "$(target_gpu_result ollama pci)"
+assert_eq "an empty field" "" "$(target_gpu_result ollama minor)"
+assert_eq "nothing before the step" "" "$(target_gpu_result comfyui state)"
+assert_fail "an unknown field" target_gpu_result ollama colour
+
+describe run_host_gpu_tool
+_gpu_reset
+_out="$(run_host_gpu_tool optional amd 0000:03:00.0 "ollama comfyui" 2>&1)"
+assert_contains "one run for the card, with its vendor" "gpu-tool --need optional --vendors amd --for ollama comfyui --card 0000:03:00.0" "$(cat "$MOCK_LOG")"
+assert_contains "headed by the card" "--- GPU 0000:03:00.0 for: ollama comfyui ---" "$_out"
+assert_contains "the card is reported" "AMD Radeon GPU ready: rdna3 (gfx1100, /dev/dri/renderD128 and /dev/kfd)" "$_out"
+run_host_gpu_tool optional amd 0000:03:00.0 "ollama comfyui" >/dev/null 2>&1
+assert_eq "each target gets the result" "ready|amd|/dev/dri/renderD128||0000:03:00.0 ready|amd|/dev/dri/renderD128||0000:03:00.0" \
+  "${GPU_RESULT_OLLAMA} ${GPU_RESULT_COMFYUI}"
 mock_reset_log
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rtx50\nGPU_CUDA_ARCH=120\nGPU_VENDOR=nvidia\nGPU_NVIDIA_MINOR=1\nGPU_PCI=0000:02:00.0'
+run_host_gpu_tool required nvidia "" "strata basalt" --allow rtx50:basalt > "$MOCK_BIN/out" 2>&1
+assert_contains "no card: the vendors and --allow rules" "gpu-tool --need required --vendors nvidia --for strata basalt --allow rtx50:basalt" "$(cat "$MOCK_LOG")"
+assert_not_contains "and no --card" "--card" "$(cat "$MOCK_LOG")"
+assert_contains "NVIDIA is reported" "NVIDIA GPU ready: rtx50 (compute capability 120)" "$(cat "$MOCK_BIN/out")"
+assert_eq "its compute capability is kept" 120 "$HOST_GPU_CUDA_ARCH"
+assert_eq "and its minor" 1 "$(target_gpu_result basalt minor)"
+export FAKE_GPU_OUT=GPU_STATE=absent
+assert_contains "no GPU: the targets go on without" "No GPU (absent): ollama will run without one." "$(run_host_gpu_tool optional nvidia "" ollama 2>&1)"
+export FAKE_GPU_RC=2
+assert_fail "a reboot stops the install" run_host_gpu_tool required nvidia "" xolotl
+assert_contains "and says to rerun" "Reboot this host" "$(run_host_gpu_tool required nvidia "" xolotl 2>&1)"
+FAKE_GPU_RC=1
+assert_contains "a GPU that is not ready names the targets" "The GPU is not ready for: xolotl" "$(run_host_gpu_tool required nvidia "" xolotl 2>&1)"
+_gpu_reset
+
+describe prepare_host_gpu
+_gpu_reset
 TARGETS="gitea hermes"
 assert_ok "nothing to do without GPU targets" prepare_host_gpu
 assert_eq "and the tool is not run" "" "$(cat "$MOCK_LOG")"
-TARGETS="ollama strata basalt"
+HOST_GPU_CARDS="$_cards"
+TARGETS="ollama comfyui llamacpp strata basalt"
+OLLAMA_GPU_CARD=0000:03:00.0 COMFYUI_GPU_CARD=03:00.0 LLAMACPP_GPU_CARD=0000:04:00.0
 export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rtx50\nGPU_CUDA_ARCH=120\nGPU_VENDOR=nvidia'
 _out="$(prepare_host_gpu 2>&1)"
-assert_contains "required targets set the need and the shared vendor" \
+assert_contains "targets sharing a card share a run" "gpu-tool --need optional --vendors amd --for ollama comfyui --card 0000:03:00.0" "$(cat "$MOCK_LOG")"
+assert_contains "each card gets its own" "gpu-tool --need required --vendors intel --for llamacpp --card 0000:04:00.0" "$(cat "$MOCK_LOG")"
+assert_contains "the NVIDIA-only targets share one, with their limits" \
   "gpu-tool --need required --vendors nvidia --for strata basalt --allow rtx50:basalt" "$(cat "$MOCK_LOG")"
-assert_contains "reports the GPU" "NVIDIA GPU ready: rtx50 (compute capability 120)" "$_out"
-mock_reset_log
+assert_eq "three runs" 3 "$(mock_call_count gpu-tool)"
+assert_contains "the Arc card is reported" "Intel Arc GPU ready: arc-b (/dev/dri/renderD129)" "$_out"
+prepare_host_gpu >/dev/null 2>&1
+assert_eq "each target keeps its card's result" "amd intel nvidia" \
+  "$(target_gpu_result ollama vendor) $(target_gpu_result llamacpp vendor) $(target_gpu_result basalt vendor)"
+_gpu_reset; HOST_GPU_CARDS="$_cards"
+TARGETS="ollama comfyui"; OLLAMA_GPU_CARD=none COMFYUI_GPU_CARD=0000:04:00.0
+_out="$(prepare_host_gpu 2>&1)"
+assert_contains "none: the CPU, no run" "ollama runs on the CPU (no GPU chosen)." "$_out"
+assert_eq "only the chosen card is set up" 1 "$(mock_call_count gpu-tool)"
+prepare_host_gpu >/dev/null 2>&1
+assert_eq "and the target knows" declined "$(target_gpu_result ollama state)"
+OLLAMA_GPU_CARD=0000:09:00.0
+assert_fail "a card that is not on the host" prepare_host_gpu
+_gpu_reset; HOST_GPU_CARDS="$_cards"
+TARGETS="ollama llamacpp comfyui"; OLLAMA_GPU_CARD=0000:03:00.0 LLAMACPP_GPU_CARD=0000:03:00.0 COMFYUI_GPU_CARD=0000:03:00.0
+prepare_host_gpu >/dev/null 2>&1
+assert_contains "a card shared with a target that needs it is required" \
+  "gpu-tool --need required --vendors amd --for ollama llamacpp comfyui --card 0000:03:00.0" "$(cat "$MOCK_LOG")"
+_gpu_reset
 TARGETS="ollama comfyui"; export FAKE_GPU_OUT=GPU_STATE=absent
 _out="$(prepare_host_gpu 2>&1)"
-assert_contains "optional targets alone, any vendor" "gpu-tool --need optional --vendors nvidia,amd,intel --for ollama comfyui" "$(cat "$MOCK_LOG")"
-assert_contains "go on without a GPU" "No GPU (absent): ollama comfyui will run without one." "$_out"
-mock_reset_log
-TARGETS="llamacpp comfyui"
-export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rdna3\nGPU_VENDOR=amd\nGPU_GFX=gfx1100\nGPU_RENDER_NODE=/dev/dri/renderD128'
-_out="$(BACKEND=vulkan prepare_host_gpu 2>&1)"
-assert_contains "llama.cpp's Vulkan build narrows the vendors" "--vendors amd,intel --for llamacpp" "$(cat "$MOCK_LOG")"
-assert_contains "an AMD card is reported" "AMD Radeon GPU ready: rdna3 (gfx1100, /dev/dri/renderD128 and /dev/kfd)" "$_out"
-export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=arc-b\nGPU_VENDOR=intel\nGPU_RENDER_NODE=/dev/dri/renderD129'
-assert_contains "and an Intel Arc" "Intel Arc GPU ready: arc-b (/dev/dri/renderD129)" "$(prepare_host_gpu 2>&1)"
-mock_reset_log
+assert_contains "without chosen cards (no inventory): one run, any vendor" "gpu-tool --need optional --vendors nvidia,amd,intel --for ollama comfyui" "$(cat "$MOCK_LOG")"
+assert_contains "and they go on without a GPU" "No GPU (absent): ollama comfyui will run without one." "$_out"
+_gpu_reset
 TARGETS="strata llamacpp"
-BACKEND=vulkan
-assert_fail "targets that cannot share a GPU" prepare_host_gpu
-unset BACKEND
+assert_fail "card-less targets that cannot share a GPU" env BACKEND=vulkan bash -c "$(declare -f); TARGETS='$TARGETS' TARGETS_DIR='$TARGETS_DIR' prepare_host_gpu"
 _out="$(BACKEND=vulkan prepare_host_gpu 2>&1 || true)"
 assert_contains "are named, before the tool runs" "cannot share one GPU: strata (nvidia) llamacpp (amd/intel)" "$_out"
 assert_eq "and nothing ran" "" "$(cat "$MOCK_LOG")"
-TARGETS="xolotl"; export FAKE_GPU_RC=2
+HOST_GPU_CARDS="$_cards" LLAMACPP_GPU_CARD=0000:03:00.0
+_out="$(BACKEND=vulkan prepare_host_gpu 2>&1)"
+assert_contains "with a card each, mixed vendors are fine" "--vendors amd --for llamacpp --card 0000:03:00.0" "$(cat "$MOCK_LOG")"
+TARGETS="xolotl"; unset LLAMACPP_GPU_CARD; export FAKE_GPU_RC=2
 assert_fail "a reboot stops the install" prepare_host_gpu
-assert_contains "and says to rerun" "Reboot this host" "$(prepare_host_gpu 2>&1)"
 FAKE_GPU_RC=1
 assert_fail "a GPU that is not ready stops it" prepare_host_gpu
-assert_contains "naming the targets" "The GPU is not ready for: xolotl" "$(prepare_host_gpu 2>&1)"
-unset FAKE_GPU_RC
-export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_VENDOR=amd\nGPU_RENDER_NODE=/dev/dri/renderD128'
-TARGETS="ollama"
-prepare_host_gpu >/dev/null 2>&1
-assert_eq "the result is kept for the targets" "ready amd /dev/dri/renderD128" "$HOST_GPU_STATE $HOST_GPU_VENDOR $HOST_GPU_RENDER_NODE"
-unset FAKE_GPU_OUT
-mv "$_tt/tools/setup-host-gpu.sh" "$_tt/tools/gone"
-assert_fail "the tool must be in the checkout" prepare_host_gpu
-mv "$_tt/tools/gone" "$_tt/tools/setup-host-gpu.sh"
+_gpu_reset
 TARGETS=""; unset _out
-mock_reset_log
 
 describe target_gpu_env
-HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+_gpu_reset
 assert_eq "nothing before the GPU step ran" "" "$(target_gpu_env ollama)"
-HOST_GPU_STATE=ready HOST_GPU_VENDOR=amd HOST_GPU_RENDER_NODE=/dev/dri/renderD128
-assert_eq "Ollama gets the vendor" GPU=amd "$(target_gpu_env ollama)"
-assert_eq "so does ComfyUI" GPU=amd "$(target_gpu_env comfyui)"
-assert_eq "unless GPU was set" "" "$(GPU=no target_gpu_env comfyui)"
-assert_eq "llama.cpp gets Vulkan and the render node" $'BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD128' "$(target_gpu_env llamacpp)"
-assert_eq "a preset GPU_DEVICES is kept" "BACKEND=vulkan" "$(GPU_DEVICES=/dev/dri/renderD129 target_gpu_env llamacpp)"
+GPU_RESULT_OLLAMA="ready|amd|/dev/dri/renderD128||0000:03:00.0"
+GPU_RESULT_COMFYUI="ready|intel|/dev/dri/renderD129||0000:04:00.0"
+assert_eq "Ollama gets the vendor and its card" $'GPU=amd\nGPU_CARD=0000:03:00.0' "$(target_gpu_env ollama)"
+assert_eq "ComfyUI its own" $'GPU=intel\nGPU_CARD=0000:04:00.0' "$(target_gpu_env comfyui)"
+assert_eq "a preset GPU is kept; the card is still passed" "GPU_CARD=0000:04:00.0" "$(GPU=intel target_gpu_env comfyui)"
+GPU_RESULT_LLAMACPP="ready|intel|/dev/dri/renderD129||0000:04:00.0"
+assert_eq "llama.cpp gets Vulkan and its card's render node" $'BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD129' "$(target_gpu_env llamacpp)"
+assert_eq "a preset GPU_DEVICES is kept" "BACKEND=vulkan" "$(GPU_DEVICES=/dev/dri/renderD130 target_gpu_env llamacpp)"
 assert_eq "a preset BACKEND is kept" "" "$(BACKEND=cpu target_gpu_env llamacpp)"
-HOST_GPU_VENDOR=nvidia HOST_GPU_RENDER_NODE=""
-assert_eq "NVIDIA: llama.cpp builds for CUDA" BACKEND=cuda "$(target_gpu_env llamacpp)"
+GPU_RESULT_LLAMACPP="ready|nvidia|||"
+GPU_RESULT_COMFYUI="ready|nvidia|||"
+assert_eq "NVIDIA without a chosen card: llama.cpp asks for its devices itself" BACKEND=cuda "$(target_gpu_env llamacpp)"
 assert_eq "NVIDIA: ComfyUI" GPU=nvidia "$(target_gpu_env comfyui)"
-HOST_GPU_STATE=declined
+GPU_RESULT_LLAMACPP="ready|nvidia||1|0000:02:00.0"
+assert_eq "NVIDIA card: its /dev/nvidia<minor> with the control and UVM devices" \
+  $'BACKEND=cuda\nGPU_DEVICES=/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' "$(target_gpu_env llamacpp)"
+GPU_RESULT_OLLAMA="declined||||" GPU_RESULT_LLAMACPP="absent||||"
 assert_eq "no GPU: Ollama runs on the CPU" GPU=none "$(target_gpu_env ollama)"
 assert_eq "no GPU: llama.cpp keeps its own default" "" "$(target_gpu_env llamacpp)"
+GPU_RESULT_STRATA="ready|nvidia|||"
 assert_eq "other targets get nothing" "" "$(target_gpu_env strata)"
-HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+_gpu_reset
 
 describe target_var_prefix
 assert_eq "dashes become underscores" OPEN_TERMINAL "$(target_var_prefix open-terminal)"
@@ -393,6 +579,55 @@ assert_ok "a free ID" valid_target_ct_id 921
 assert_fail "the router's or an earlier target's ID" valid_target_ct_id 920
 assert_fail "an ID in use on the cluster" valid_target_ct_id 905
 assert_fail "below 100" valid_target_ct_id 99
+
+describe valid_router_ct_id
+ct_id_free() { [[ $1 != 905 ]]; }
+assert_ok   "a free ID" valid_router_ct_id 921
+assert_ok   "the top of the Proxmox range" valid_router_ct_id 999999999
+assert_fail "an ID in use on the cluster" valid_router_ct_id 905
+assert_contains "says it is taken" "already in use" "$(valid_router_ct_id 905 2>&1)"
+assert_fail "below 100" valid_router_ct_id 99
+assert_fail "a leading zero" valid_router_ct_id 0123
+assert_fail "not a number" valid_router_ct_id abc
+assert_fail "blank" valid_router_ct_id ""
+assert_fail "above the Proxmox range" valid_router_ct_id 1000000000
+
+describe prompt_router_ct_id
+_saved_ct_id="$CT_ID"
+find_next_ct_id() { echo 940; }
+CT_ID=""
+prompt_router_ct_id >/dev/null 2>&1 <<< $'\n'
+assert_eq "Enter takes the next free ID" 940 "$CT_ID"
+CT_ID=""
+prompt_router_ct_id >/dev/null 2>&1 <<< $'950\n'
+assert_eq "or a typed one" 950 "$CT_ID"
+CT_ID=""
+_out="$(prompt_router_ct_id 2>&1 <<< $'905\nabc\n951\n'; echo "id=$CT_ID")"
+assert_contains "a taken ID is refused and re-asked" "already in use" "$_out"
+assert_contains "so is a malformed one" "Not a valid value: 'abc'" "$_out"
+assert_contains "until a free ID is given" "id=951" "$_out"
+CT_ID=960
+prompt_router_ct_id >/dev/null 2>&1 <<< $'\n'
+assert_eq "a CT_ID preset is the default Enter takes" 960 "$CT_ID"
+CT_ID=905
+prompt_router_ct_id >/dev/null 2>&1 <<< $'\n952\n'
+assert_eq "a taken preset is re-asked, not accepted" 952 "$CT_ID"
+CT_ID=905
+assert_fail "input running out on a taken ID gives up" prompt_router_ct_id <<< $'905\n'
+find_next_ct_id() { return 1; }
+CT_ID=""
+assert_fail "no free ID found stops the install" prompt_router_ct_id
+NONINTERACTIVE=true
+find_next_ct_id() { echo 940; }
+CT_ID=""
+prompt_router_ct_id >/dev/null 2>&1
+assert_eq "NONINTERACTIVE takes the next free ID" 940 "$CT_ID"
+CT_ID=905
+assert_fail "NONINTERACTIVE refuses a taken preset" prompt_router_ct_id
+NONINTERACTIVE=false
+unset -f find_next_ct_id
+source "$FUNCS"   # restore the real find_next_ct_id and ct_id_free
+CT_ID="$_saved_ct_id"; unset _saved_ct_id _out
 
 describe valid_target_ip
 TARGET_RESERVED_IPS="192.0.2.80 192.0.2.90"
@@ -613,16 +848,18 @@ assert_not_contains "(no guest install)" "--install-target" "$(mock_calls)"
 MODEL_ALIAS=qwen3:8b MODEL_PATH=/var/lib/llama-target/models/m.gguf run_target_provisioner llamacpp
 assert_contains "with a model it installs" "|no|--install-target" "$(mock_calls)"
 mock_reset_log
-HOST_GPU_STATE=ready HOST_GPU_VENDOR=intel HOST_GPU_RENDER_NODE=/dev/dri/renderD129
+GPU_RESULT_LLAMACPP="ready|intel|/dev/dri/renderD129||0000:04:00.0"
+GPU_RESULT_OLLAMA="ready|amd|/dev/dri/renderD128||0000:03:00.0"
+GPU_RESULT_STRATA="ready|nvidia|||"
 run_target_provisioner llamacpp
-assert_contains "llama.cpp gets the host GPU's Vulkan settings" "gpu-env |vulkan|/dev/dri/renderD129" "$(mock_calls)"
+assert_contains "llama.cpp gets its card's Vulkan settings" "gpu-env |vulkan|/dev/dri/renderD129|" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner ollama
-assert_contains "Ollama gets the GPU vendor" "gpu-env intel||" "$(mock_calls)"
+assert_contains "Ollama gets its card's vendor and address" "gpu-env amd|||0000:03:00.0" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner strata
 assert_not_contains "Strata gets none of it" "gpu-env" "$(mock_calls)"
-HOST_GPU_STATE="" HOST_GPU_VENDOR="" HOST_GPU_RENDER_NODE=""
+unset GPU_RESULT_LLAMACPP GPU_RESULT_OLLAMA GPU_RESULT_STRATA
 mock_reset_log
 run_target_provisioner hermes
 assert_eq "a companion gets the router CT, the router's template and the token" \

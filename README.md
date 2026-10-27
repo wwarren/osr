@@ -82,8 +82,6 @@ target README for Python, CUDA and GPU requirements.
 
 ### Host GPU
 
-All selected GPU targets must support the same GPU vendor:
-
 | Target | Requirement |
 |---|---|
 | Strata, Maya, Xolotl | NVIDIA required |
@@ -92,16 +90,32 @@ All selected GPU targets must support the same GPU vendor:
 | AirLLM | NVIDIA when `GPU_DEVICES` is set |
 | Ollama, ComfyUI | NVIDIA, AMD or Intel if present; otherwise CPU |
 
-Before creating CTs, the installer checks for a working host driver. If one
-is missing, [tools/setup-host-gpu.sh](tools/setup-host-gpu.sh) identifies the
+**Which GPU each target gets.** The installer lists the host's NVIDIA cards
+and its AMD Radeon RX 7000/9000 and Intel Arc A/B cards (from `lspci`; Intel
+iGPUs and older Radeons are not listed). Ollama, llama.cpp and ComfyUI, the
+targets that also run on AMD and Intel, then each ask which of those cards to
+use, so one host can give Ollama a Radeon, llama.cpp an Arc and ComfyUI an
+NVIDIA card. Ollama and ComfyUI also offer `none` (the CPU). Several targets
+may pick the same card. When only one card fits a target that needs a GPU,
+it is taken without asking. Cards bound to `vfio-pci` are not offered.
+Presets: `OLLAMA_GPU_CARD`, `LLAMACPP_GPU_CARD`, `COMFYUI_GPU_CARD` (a PCI
+address such as `0000:03:00.0`, or `none`). Strata, Basalt, Maya, Xolotl and
+AirLLM run on NVIDIA only and are not asked; they use the NVIDIA driver's
+GPU 0 (or their `GPU_DEVICES`).
+
+Before creating CTs, the installer checks for a working host driver for each
+chosen card, and once for the NVIDIA-only targets. If one is missing, [tools/setup-host-gpu.sh](tools/setup-host-gpu.sh) identifies the
 card and offers to install it: NVIDIA 580.173.02, or the Proxmox kernel driver
 and missing firmware for AMD/Intel. It reports blacklisted or `vfio-pci`-bound
 cards without changing them. For unattended driver setup, set
 `GPU_GENERATION` (for example `rtx40`, `7900`, `9070`, `A770`, `B580`) and
 `INSTALL_HOST_DRIVER=yes`. A required GPU missing or needing a reboot stops
-the install before any CT is created; reboot and rerun when asked. The detected
-vendor is passed to Ollama/ComfyUI as `GPU` and to llama.cpp as `BACKEND` and
-`GPU_DEVICES`, unless you set them explicitly. Intel Arc B needs a Proxmox
+the install before any CT is created; reboot and rerun when asked. The chosen
+card is passed to Ollama and ComfyUI as `GPU` (its vendor) and `GPU_CARD` (its
+address): their community scripts pass every card of that vendor into the CT,
+and the provisioner then keeps only that card's device nodes. llama.cpp gets
+`BACKEND` and `GPU_DEVICES` for the card (its render node for Vulkan, its
+`/dev/nvidia<minor>` for CUDA). Settings you preset are kept. Intel Arc B needs a Proxmox
 kernel with Linux 6.12 or newer.
 
 ### Router settings

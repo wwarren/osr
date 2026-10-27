@@ -90,8 +90,10 @@ on both vendors with Debian's own packages; Debian 12's Mesa 22.3 and Vulkan
 1.3 are too old for RDNA 4, Arc B and llama.cpp's shaders, hence Debian 13.
 
 Set the host's driver up first: `bash tools/setup-host-gpu.sh --vendors amd,intel`
-(the router installer does this and passes `BACKEND=vulkan` and
-`GPU_DEVICES=/dev/dri/renderD<n>`). The render node gets gid 993 like the CUDA
+(`--card <address>` for one card). The router installer asks which card
+llama.cpp should use, sets that card's driver up, and passes `BACKEND` and
+`GPU_DEVICES`: `vulkan` and the card's `/dev/dri/renderD<n>` for AMD or Intel,
+`cuda` and its `/dev/nvidia<minor>` with the control and UVM nodes for NVIDIA. The render node gets gid 993 like the CUDA
 nodes. The installer checks, as `llama-target`, that the node opens and that
 `vulkaninfo` lists a discrete GPU, not only Mesa's CPU renderer, before
 building. `GPU_LAYERS` defaults to `auto`. A backend switch by `--upgrade` stays

@@ -20,6 +20,7 @@ cat > "$stubs/nvidia-smi" <<STUB
 #!/usr/bin/env bash
 [[ -e "$tmp/loaded" ]] || exit 9
 case "\$*" in
+    *pci.bus_id*) printf '%s\n' "\${FAKE_NV_GPUS:-0, 00000000:01:00.0, \${FAKE_CAP:-8.9}}" ;;
     *compute_cap*) echo "\${FAKE_CAP:-8.9}" ;;
     *) echo "GPU 0: NVIDIA GeForce RTX 4090 (UUID: GPU-0)" ;;
 esac
@@ -380,6 +381,89 @@ kgpu GPU_GENERATION=rdna3 -- "${all[@]}" --dry-run --allow rtx50:Basalt
 kgpu GPU_GENERATION=a6000 -- "${all[@]}" --dry-run
 [[ $rc == 1 ]] || fail 'a6000 (an NVIDIA workstation card) became an Arc'
 pass 'AMD and Intel model numbers, names and menu numbers; several generations on the bus give no suggestion'
+
+# ── one card out of several: --list and --card ──
+kgpu -- --list "${all[@]}"
+[[ $rc == 0 ]] || fail "list: $output"
+has 'GPU_CARD=0000:03:00.0|amd|rdna3||AMD Radeon Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]'
+has 'GPU_CARD=0000:04:00.0|intel|arc-b||Intel Arc Battlemage G21 [Arc B580]'
+has 'GPU_CARD=0000:05:00.0|amd|rdna4||'
+has 'GPU_CARD=0000:06:00.0|intel|arc-a||Intel Arc DG2 [Arc A770]'
+lacks 'UHD Graphics 770'
+[[ $(grep -c '^GPU_CARD=' <<< "$stdout") == 4 && $stdout != *GPU_STATE* ]] || fail "list lines: $stdout"
+gpu -- --list --vendors nvidia
+has 'GPU_CARD=0000:01:00.0|nvidia|rtx40|nouveau|NVIDIA AD102 [GeForce RTX 4090]'
+printf '41:00.0 3D controller [0302]: NVIDIA Corporation GA100 [A100 PCIe 40GB] [10de:20f1] (rev a1)\n\tKernel driver in use: nvidia\n' > "$tmp/lspci-a100"
+gpu FAKE_LSPCI="$tmp/lspci-a100" -- --list --vendors nvidia,amd
+has 'GPU_CARD=0000:41:00.0|nvidia||nvidia|NVIDIA GA100 [A100 PCIe 40GB]'
+gpu FAKE_LSPCI="$tmp/lspci-none" -- --list
+[[ $rc == 0 && -z $stdout ]] || fail "empty list: $output"
+pass '--list prints every card of the vendors with its address, generation and driver, and changes nothing'
+
+two=$tmp/lspci-two-bound
+cat "$tmp/lspci-amd-bound" "$tmp/lspci-arcb-bound" > "$two"
+reset_kernel "$two" "$two" 0000:03:00.0
+mkdir -p "$sys/bus/pci/devices/0000:03:00.0/drm/renderD128" "$sys/bus/pci/devices/0000:04:00.0/drm/renderD129" "$dev/dri"
+touch "$dev/kfd" "$dev/dri/renderD128" "$dev/dri/renderD129"
+kgpu -- --vendors intel --card 0000:04:00.0
+[[ $rc == 0 && $(field GPU_STATE) == ready && $(field GPU_VENDOR) == intel && $(field GPU_RENDER_NODE) == /dev/dri/renderD129 &&
+   $(field GPU_PCI) == 0000:04:00.0 ]] || fail "card arc: $output"
+kgpu -- --vendors amd --card 03:00.0
+[[ $rc == 0 && $(field GPU_VENDOR) == amd && $(field GPU_RENDER_NODE) == /dev/dri/renderD128 && $(field GPU_PCI) == 0000:03:00.0 ]] ||
+    fail "card amd: $output"
+kgpu -- "${all[@]}"
+[[ $(field GPU_PCI) == 0000:03:00.0 ]] || fail "the first ready card reports its address: $output"
+kgpu -- --vendors amd --card 0000:04:00.0 --for Ollama
+[[ $rc == 1 ]] || fail 'an Intel card passed as AMD'; has 'The GPU at 0000:04:00.0 is Intel Arc, not AMD Radeon (for Ollama).'
+kgpu -- --vendors amd --card 0000:09:00.0 --need optional
+[[ $rc == 0 && $(field GPU_STATE) == absent ]] || fail "missing card, optional: $output"
+has 'No supported AMD Radeon GPU is at 0000:09:00.0'
+kgpu -- --vendors amd --card 0000:09:00.0
+[[ $rc == 1 ]] || fail 'a missing card passed a required target'
+kgpu -- --card 3:0.0
+[[ $rc == 1 ]] || fail 'a malformed --card was accepted'; has '--card takes a PCI address'
+pass '--card checks and reports that card only (render node, address), and refuses one of another vendor or not on the bus'
+
+sed 's/^\(0000:05:00.0 .*\)$/\1\n\tKernel driver in use: amdgpu/' "$mixed" > "$tmp/lspci-mixed-9070"
+reset_kernel "$mixed" "$tmp/lspci-mixed-9070" 0000:05:00.0
+kgpu INSTALL_HOST_DRIVER=yes -- "${all[@]}" --card 0000:05:00.0 --for Ollama
+[[ $rc == 0 && $(field GPU_STATE) == ready && $(field GPU_GENERATION) == rdna4 && $(field GPU_GFX) == gfx1201 &&
+   $(field GPU_PCI) == 0000:05:00.0 ]] || fail "card setup: $output"
+grep -qx 'modprobe amdgpu' "$log" || fail "modprobe: $(cat "$log")"
+lacks 'Which generation is the GPU?'
+pass "--card takes the card's generation from its PCI ID: no question, even without a terminal"
+
+nvtwo=$tmp/lspci-nv-two
+cat > "$nvtwo" <<'PCI'
+0000:01:00.0 VGA compatible controller [0300]: NVIDIA Corporation AD102 [GeForce RTX 4090] [10de:2684] (rev a1)
+	Kernel driver in use: nvidia
+0000:02:00.0 VGA compatible controller [0300]: NVIDIA Corporation GB202 [GeForce RTX 5090] [10de:2b85] (rev a1)
+	Kernel driver in use: nvidia
+PCI
+nvp=$tmp/proc-nvidia
+mkdir -p "$nvp/gpus/0000:01:00.0" "$nvp/gpus/0000:02:00.0"
+printf 'Model: \t\t NVIDIA GeForce RTX 4090\nDevice Minor: \t 0\n' > "$nvp/gpus/0000:01:00.0/information"
+printf 'Model: \t\t NVIDIA GeForce RTX 5090\nDevice Minor: \t 1\n' > "$nvp/gpus/0000:02:00.0/information"
+nvgpus=$'0, 00000000:01:00.0, 8.9\n1, 00000000:02:00.0, 12.0'
+touch "$tmp/loaded"; : > "$log"
+gpu FAKE_LSPCI="$nvtwo" NVIDIA_PROC="$nvp" FAKE_NV_GPUS="$nvgpus" -- --card 0000:02:00.0 --allow rtx50:Basalt
+[[ $rc == 0 && $(field GPU_STATE) == ready && $(field GPU_GENERATION) == rtx50 && $(field GPU_CUDA_ARCH) == 120 &&
+   $(field GPU_NVIDIA_MINOR) == 1 && $(field GPU_PCI) == 0000:02:00.0 ]] || fail "nvidia card 2: $output"
+has 'An NVIDIA driver is loaded (The GPU at 0000:02:00.0: compute capability 120).'
+gpu FAKE_LSPCI="$nvtwo" NVIDIA_PROC="$nvp" FAKE_NV_GPUS="$nvgpus" -- --card 0000:01:00.0 --allow rtx50:Basalt
+[[ $rc == 1 ]] || fail 'the RTX 4090 passed Basalt'; has 'this one is rtx40'
+gpu FAKE_LSPCI="$nvtwo" NVIDIA_PROC="$nvp" FAKE_NV_GPUS="$nvgpus" -- --card 0000:01:00.0
+[[ $rc == 0 && $(field GPU_NVIDIA_MINOR) == 0 && $(field GPU_CUDA_ARCH) == 89 ]] || fail "nvidia card 1: $output"
+gpu FAKE_LSPCI="$nvtwo" NVIDIA_PROC="$nvp" -- --card 0000:02:00.0
+[[ $rc == 2 ]] || fail "a card the driver does not list: rc=$rc $output"
+has 'it does not list the GPU at 0000:02:00.0'
+sed -i '4s/nvidia/vfio-pci/' "$nvtwo"
+gpu FAKE_LSPCI="$nvtwo" NVIDIA_PROC="$nvp" -- --card 0000:02:00.0 --need optional
+[[ $rc == 0 && $(field GPU_STATE) == absent ]] || fail "nvidia vfio card: $output"
+has 'The GPU at 0000:02:00.0 is bound to vfio-pci'
+[[ ! -s $log ]] || fail 'the helper ran with a driver already loaded'
+rm -f "$tmp/loaded"
+pass "NVIDIA --card: that card's compute capability and /dev/nvidia minor; one the driver does not list needs a reboot, a vfio-pci one is absent"
 
 output=$(bash "$tool" --help)
 has 'Usage: bash tools/setup-host-gpu.sh'

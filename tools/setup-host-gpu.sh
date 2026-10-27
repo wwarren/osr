@@ -8,7 +8,8 @@ usage() {
     cat <<'USAGE'
 Usage: bash tools/setup-host-gpu.sh [--dry-run] [--need required|optional]
                                     [--vendors nvidia[,amd][,intel]] [--for "<targets>"]
-                                    [--allow <gen>[,<gen>...]:<target>]...
+                                    [--allow <gen>[,<gen>...]:<target>]... [--card <pci address>]
+       bash tools/setup-host-gpu.sh --list [--vendors nvidia[,amd][,intel]]
 
 Makes sure the host has a working driver for the GPU the targets will use. When
 one is already working, it only reports it. Otherwise it lists the GPUs on the
@@ -46,6 +47,15 @@ needs a reboot to pick up new firmware, reboot and run this again.
                   (default: nvidia)
 --for             the target names, for messages
 --allow           generations a target accepts (e.g. rtx50:Basalt); repeatable
+--card            only this card (PCI address, e.g. 0000:03:00.0, as --list
+                  prints it): it must be one of the vendors, and it is the card
+                  that is checked, set up and reported. Its generation comes
+                  from its PCI ID when that is known, so it is not asked.
+--list            print the cards of the vendors, one GPU_CARD=<address>|<vendor>|
+                  <generation>|<driver in use>|<name> line each, and exit; nothing
+                  is checked or changed. NVIDIA cards outside rtx20-rtx50 have an
+                  empty generation; AMD and Intel cards are only listed when their
+                  generation is supported.
 --dry-run         show what would happen; change nothing
 
 Environment: GPU_GENERATION=<gen> (or a model number such as 4090, 7900 XTX,
@@ -53,8 +63,9 @@ Environment: GPU_GENERATION=<gen> (or a model number such as 4090, 7900 XTX,
 the consent; NVIDIA_HELPER=<path> another host/LXC NVIDIA driver helper.
 
 Prints GPU_STATE=ready|absent|declined|planned, GPU_GENERATION, GPU_CUDA_ARCH
-(NVIDIA), GPU_VENDOR, GPU_GFX (AMD, e.g. gfx1100) and GPU_RENDER_NODE (AMD and
-Intel) lines on stdout; messages go to stderr. Exit status: 0, 1 on an error,
+(NVIDIA), GPU_VENDOR, GPU_GFX (AMD, e.g. gfx1100), GPU_RENDER_NODE (AMD and
+Intel), GPU_PCI (the card's PCI address, when known) and GPU_NVIDIA_MINOR (with
+--card: the card's /dev/nvidia<minor>) lines on stdout; messages go to stderr. Exit status: 0, 1 on an error,
 2 when the host must be rebooted before the driver can use the card.
 USAGE
 }
@@ -163,7 +174,44 @@ pci_gpus() {
             next
         }
         line != "" && /Kernel driver in use:/ { sub(/.*Kernel driver in use:[[:space:]]*/, ""); line = line " {" $0 "}" }
-        END { if (line != "") print line }'
+        END { if (line != "") print line }' | {
+        # --card: only that card's line.
+        if [[ -z $card_filter ]]; then
+            cat
+        else
+            while IFS= read -r line; do
+                [[ $(card_address "$line") != "$card_filter" ]] || printf '%s\n' "$line"
+            done
+        fi
+    }
+}
+# normalize_pci_address ADDRESS: 0000:03:00.0 for 03:00.0 or 0000:03:00.0 (any case).
+normalize_pci_address() {
+    local address=${1,,}
+    [[ $address =~ ^([0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || return 1
+    [[ $address == *:*:* ]] || address=0000:$address
+    printf '%s\n' "$address"
+}
+# card_name LINE: the card's name without the class, vendor company, IDs and
+# driver ("AMD Radeon Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]").
+card_name() {
+    local name=${1#*]: }
+    name=$(sed -E 's/ \{[^}]*\}$//; s/ \(rev [0-9a-f]+\)//; s/ \[[0-9a-f]{4}:[0-9a-f]{4}\]//;
+        s/^(NVIDIA Corporation|Advanced Micro Devices, Inc\. \[AMD\/ATI\]|Intel Corporation) //' <<< "$name")
+    printf '%s %s\n' "$(vendor_name "$(card_vendor "$1")")" "$name"
+}
+# list_cards: the GPU_CARD lines of --list: every NVIDIA card, and the AMD and
+# Intel cards of a supported generation.
+list_cards() {
+    local line gen vendor
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        vendor=$(card_vendor "$line")
+        gen=$(card_generation "$line")
+        [[ $vendor == nvidia || -n $gen ]] || continue
+        printf 'GPU_CARD=%s|%s|%s|%s|%s\n' "$(card_address "$line")" "$vendor" "$gen" \
+            "$(card_driver "$line" || true)" "$(card_name "$line")"
+    done <<< "$(pci_gpus)"
 }
 card_vendor() {
     case $1 in
@@ -224,11 +272,35 @@ card_usable() {
 host_driver_loaded() { command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; }
 module_loaded() { grep -q "^$1 " "${PROC_MODULES:-/proc/modules}" 2>/dev/null; }
 nouveau_loaded() { module_loaded nouveau; }
-# gpu0_arch: GPU 0's compute capability as the driver reports it (89), or nothing.
+# nvidia_card_listed: does the loaded NVIDIA driver list the --card card?
+nvidia_card_listed() {
+    local bus
+    while IFS=, read -r _ bus _; do
+        bus=${bus//[[:space:]]/}; bus=${bus,,}
+        [[ ${bus: -12} == "$card_filter" ]] && return 0
+    done < <(nvidia-smi --query-gpu=index,pci.bus_id,compute_cap --format=csv,noheader 2>/dev/null)
+    return 1
+}
+# gpu0_arch: the compute capability the driver reports (89), or nothing: GPU
+# 0's, or with --card that card's.
 gpu0_arch() {
-    local cap
-    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | head -n1 | tr -d '[:space:]')
+    local cap='' bus c
+    if [[ -n $card_filter ]]; then
+        while IFS=, read -r _ bus c; do
+            bus=${bus//[[:space:]]/}; bus=${bus,,}
+            [[ ${bus: -12} == "$card_filter" ]] && cap=${c//[[:space:]]/}
+        done < <(nvidia-smi --query-gpu=index,pci.bus_id,compute_cap --format=csv,noheader 2>/dev/null)
+    else
+        cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | head -n1 | tr -d '[:space:]')
+    fi
     [[ $cap =~ ^([0-9]+)\.([0-9])$ ]] && printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+# nvidia_minor: the --card card's /dev/nvidia<minor> number, from the driver's
+# /proc/driver/nvidia/gpus/<address>/information.
+nvidia_minor() {
+    [[ -n $card_filter ]] || return 0
+    sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' \
+        "$NVIDIA_PROC/gpus/$card_filter/information" 2>/dev/null | head -n1
 }
 # kernel_module GEN: the in-kernel driver of an AMD or Intel generation.
 kernel_module() { case $1 in rdna3|rdna4) echo amdgpu ;; arc-a) echo i915 ;; arc-b) echo xe ;; *) return 1 ;; esac; }
@@ -268,7 +340,7 @@ nvidia_unlisted_ok() {
     (( ${#allow_rules[@]} == 0 )) && return 0
     local rule limits=''
     for rule in "${allow_rules[@]}"; do limits+="${limits:+; }${rule#*:}: ${rule%%:*}"; done
-    not_usable "GPU 0's compute capability (${1:-unreadable}) is not a generation the targets accept ($limits)." absent
+    not_usable "$nv_label's compute capability (${1:-unreadable}) is not a generation the targets accept ($limits)." absent
 }
 
 # check_allowed GEN: GEN's vendor must be allowed, and every --allow list must contain GEN.
@@ -338,16 +410,18 @@ confirm_host_driver() {
     [[ ${answer,,} == y || ${answer,,} == yes ]]
 }
 
-# report STATE [GEN] [ARCH] [VENDOR] [GFX] [RENDER]: the machine-readable result on stdout.
+# report STATE [GEN] [ARCH] [VENDOR] [GFX] [RENDER] [PCI] [MINOR]: the
+# machine-readable result on stdout (PCI defaults to --card).
 report() {
-    printf 'GPU_STATE=%s\nGPU_GENERATION=%s\nGPU_CUDA_ARCH=%s\nGPU_VENDOR=%s\nGPU_GFX=%s\nGPU_RENDER_NODE=%s\n' \
-        "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+    printf 'GPU_STATE=%s\nGPU_GENERATION=%s\nGPU_CUDA_ARCH=%s\nGPU_VENDOR=%s\nGPU_GFX=%s\nGPU_RENDER_NODE=%s\nGPU_PCI=%s\nGPU_NVIDIA_MINOR=%s\n' \
+        "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-$card_filter}" "${8:-}"
 }
 # report_card STATE LINE: report an AMD or Intel card.
 report_card() {
     local gen
     gen=$(card_generation "$2")
-    report "$1" "$gen" '' "$(generation_field "$gen" vendor)" "$(card_gfx "$2")" "$(card_render_node "$2" || true)"
+    report "$1" "$gen" '' "$(generation_field "$gen" vendor)" "$(card_gfx "$2")" "$(card_render_node "$2" || true)" \
+        "$(card_address "$2")"
 }
 
 # not_usable MESSAGE STATE: required targets stop here; optional ones go on without a GPU.
@@ -366,15 +440,24 @@ ready_vendor() {
     case $1 in
         nvidia)
             host_driver_loaded || return 1
+            if [[ -n $card_filter ]] && ! nvidia_card_listed; then
+                line=${gpus%%$'\n'*}
+                [[ $(card_vendor "$line") == nvidia ]] || return 1
+                if [[ $(card_driver "$line" || true) == vfio-pci ]]; then
+                    not_usable "The GPU at $card_filter is bound to vfio-pci (reserved for VM passthrough); release it from vfio-pci and reboot to use it here." absent
+                fi
+                note "An NVIDIA driver is loaded, but it does not list the GPU at $card_filter ($(card_driver "$line" || echo 'no driver') holds it). Reboot this host, then run this again; nothing was changed."
+                exit 2
+            fi
             real_arch=$(gpu0_arch || true)
             GPU_GENERATION=$(arch_generation "$real_arch")
-            note "An NVIDIA driver is loaded (GPU 0: compute capability ${real_arch:-unreadable})."
+            note "An NVIDIA driver is loaded ($nv_label: compute capability ${real_arch:-unreadable})."
             if [[ -n $GPU_GENERATION ]]; then
                 check_allowed "$GPU_GENERATION"
             else
                 nvidia_unlisted_ok "$real_arch"
             fi
-            report ready "$GPU_GENERATION" "$real_arch" nvidia
+            report ready "$GPU_GENERATION" "$real_arch" nvidia '' '' '' "$(nvidia_minor)"
             return 0 ;;
         amd|intel)
             while IFS= read -r line; do
@@ -411,9 +494,9 @@ setup_nvidia() {
     # The driver sees the card now: trust what it reports over the answer.
     real_arch=$(gpu0_arch || true)
     if [[ -z $real_arch ]]; then
-        note "Note: GPU 0's compute capability is unreadable after installing NVIDIA $driver_version."
+        note "Note: $nv_label's compute capability is unreadable after installing NVIDIA $driver_version."
     elif [[ $real_arch != "$arch" ]]; then
-        note "Note: GPU 0 reports compute capability $real_arch, not $GPU_GENERATION's $arch; using $real_arch."
+        note "Note: $nv_label reports compute capability $real_arch, not $GPU_GENERATION's $arch; using $real_arch."
     fi
     GPU_GENERATION=$(arch_generation "$real_arch")
     arch=$real_arch
@@ -423,7 +506,7 @@ setup_nvidia() {
         nvidia_unlisted_ok "$real_arch"
     fi
     note "NVIDIA $driver_version is loaded."
-    report ready "$GPU_GENERATION" "$arch" nvidia
+    report ready "$GPU_GENERATION" "$arch" nvidia '' '' '' "$(nvidia_minor)"
 }
 
 # setup_kernel_driver: firmware, the in-kernel driver and device nodes for an
@@ -498,6 +581,22 @@ setup_kernel_driver() {
 main() {
     local suggestion vendor line candidates='' usable=0 gen found=''
     gpus=$(pci_gpus)
+    if [[ -n $card_filter && -z $gpus ]]; then
+        # A card of another vendor is a wrong choice, not a missing card.
+        local -a allowed=("${vendors[@]}")
+        vendors=(nvidia amd intel)
+        line=$(pci_gpus)
+        vendors=("${allowed[@]}")
+        [[ -z $line ]] ||
+            die "The GPU at $card_filter is $(vendor_name "$(card_vendor "$line")"), not $(vendor_phrase)${for_targets:+ (for $for_targets)}."
+    fi
+    if [[ -n $card_filter && -n $gpus ]]; then
+        gen=$(card_generation "$gpus")
+        # The card's generation is known from its PCI ID: no need to ask.
+        if [[ -z $GPU_GENERATION && -n $gen ]]; then GPU_GENERATION=$gen; fi
+    elif [[ -n $card_filter ]] && command -v lspci >/dev/null 2>&1; then
+        not_usable "No supported $(vendor_phrase) GPU is at $card_filter on this host's PCI bus." absent
+    fi
     for vendor in "${vendors[@]}"; do
         ready_vendor "$vendor" && return 0
     done
@@ -551,6 +650,8 @@ main() {
 }
 
 dry_run=0
+list_only=0
+card_filter=''
 need=required
 for_targets=''
 allow_rules=()
@@ -564,6 +665,8 @@ while (( $# )); do
             [[ ${2:-} =~ ^(nvidia|amd|intel)(,(nvidia|amd|intel))*$ ]] || die '--vendors takes nvidia, amd and/or intel, comma-separated.'
             IFS=, read -r -a vendors <<< "$2"; shift ;;
         --for) for_targets=${2:-}; shift ;;
+        --card) card_filter=$(normalize_pci_address "${2:-}") || die '--card takes a PCI address such as 0000:03:00.0.'; shift ;;
+        --list) list_only=1 ;;
         --allow)
             [[ ${2:-} =~ ^([a-z0-9-]+(,[a-z0-9-]+)*):[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]] ||
                 die '--allow takes <gen>[,<gen>...]:<target>, e.g. rtx50:Basalt.'
@@ -583,6 +686,10 @@ DEV_ROOT=${DEV_ROOT:-/dev}
 FIRMWARE_DIR=${FIRMWARE_DIR:-/lib/firmware}
 MODPROBE_DIR=${MODPROBE_DIR:-/etc/modprobe.d}
 MODULES_LOAD_DIR=${MODULES_LOAD_DIR:-/etc/modules-load.d}
+NVIDIA_PROC=${NVIDIA_PROC:-/proc/driver/nvidia}
+nv_label='GPU 0'
+[[ -z $card_filter ]] || nv_label="The GPU at $card_filter"
+if (( list_only )); then list_cards; exit 0; fi
 if [[ -n $GPU_GENERATION ]]; then
     GPU_GENERATION=$(normalize_generation "$GPU_GENERATION") && [[ -n $GPU_GENERATION ]] ||
         die "GPU_GENERATION must be $(vendor_generations | paste -sd, - | sed 's/,\([^,]*\)$/ or \1/; s/,/, /g') (or a model number such as $(model_examples))."

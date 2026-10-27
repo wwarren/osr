@@ -66,6 +66,39 @@ has 'OLLAMA_GPU=amd'
 ok 'GPU=none (or no) runs on the CPU' GPU=no
 has 'var_gpu=no'; lacks 'answer'
 
+# --- one card out of several (GPU_CARD) ---
+# shellcheck disable=SC1090
+source <(awk '/^# Container configuration helpers/ { capture=1; next } /^# End container configuration helpers/ { capture=0 } capture' "$provision")
+pci=$fake_drm/pci
+mkdir -p "$pci/0000:03:00.0/drm/renderD128" "$pci/0000:03:00.0/drm/card0" "$pci/0000:04:00.0/drm/renderD129" \
+    "$pci/0000:04:00.0/drm/card1" "$pci/0000:01:00.0" "$fake_drm/nv/gpus/0000:01:00.0"
+printf '0x1002\n' > "$pci/0000:03:00.0/vendor"; printf '0x8086\n' > "$pci/0000:04:00.0/vendor"; printf '0x10de\n' > "$pci/0000:01:00.0/vendor"
+printf 'Model: \t\t NVIDIA GeForce RTX 4090\nDevice Minor: \t 1\n' > "$fake_drm/nv/gpus/0000:01:00.0/information"
+[[ $(normalize_pci_address 03:00.0) == 0000:03:00.0 && $(normalize_pci_address 0000:0A:00.1) == 0000:0a:00.1 ]] || { echo 'FAIL: normalize_pci_address' >&2; exit 1; }
+! normalize_pci_address 3:0.0 >/dev/null && ! normalize_pci_address 0000:03:00.8 >/dev/null || { echo 'FAIL: a bad PCI address passed' >&2; exit 1; }
+[[ $(PCI_SYSFS=$pci card_vendor_kind 0000:03:00.0)$(PCI_SYSFS=$pci card_vendor_kind 0000:04:00.0)$(PCI_SYSFS=$pci card_vendor_kind 0000:01:00.0) == amdintelnvidia ]] ||
+    { echo 'FAIL: card_vendor_kind' >&2; exit 1; }
+[[ $(PCI_SYSFS=$pci card_device_nodes 0000:04:00.0 | paste -sd' ') == '/dev/dri/renderD129 /dev/dri/card1' ]] || { echo 'FAIL: card_device_nodes (Arc)' >&2; exit 1; }
+[[ $(PCI_SYSFS=$pci NVIDIA_PROC=$fake_drm/nv card_device_nodes 0000:01:00.0) == /dev/nvidia1 ]] || { echo 'FAIL: card_device_nodes (NVIDIA)' >&2; exit 1; }
+config=$'arch: amd64\ndev0: /dev/dri/renderD128,gid=104\ndev1: /dev/dri/card0,gid=44\ndev2: path=/dev/dri/renderD129,gid=104\ndev3: /dev/dri/card1,gid=44\ndev4: /dev/kfd,gid=104\nnet0: name=eth0'
+[[ $(other_card_devices /dev/dri/renderD129 /dev/dri/card1 <<< "$config" | paste -sd,) == dev0,dev1 ]] || { echo 'FAIL: other_card_devices (AMD)' >&2; exit 1; }
+config=$'dev0: /dev/nvidia0,gid=44\ndev1: /dev/nvidia1,gid=44\ndev2: /dev/nvidiactl,gid=44\ndev3: /dev/nvidia-uvm,gid=44\ndev4: /dev/nvidia-uvm-tools,gid=44\ndev5: /dev/nvidia-caps/nvidia-cap1,gid=44'
+[[ $(other_card_devices /dev/nvidia1 <<< "$config") == dev0 ]] || { echo 'FAIL: other_card_devices (NVIDIA)' >&2; exit 1; }
+[[ -z $(other_card_devices /dev/nvidia0 /dev/nvidia1 <<< "$config") ]] || { echo 'FAIL: other_card_devices kept too little' >&2; exit 1; }
+passed=$((passed + 1)); printf 'PASS %s\n' 'GPU_CARD helpers: PCI address, vendor, the card'"'"'s nodes, and the device entries of other cards'
+
+FLAGS=--install-target ok 'GPU_CARD picks the vendor and keeps only that card' GPU=auto GPU_CARD=03:00.0 PCI_SYSFS="$pci"
+has 'var_gpu=yes'; has 'OLLAMA_GPU=amd'; has 'GPU: amd (the card at 0000:03:00.0)'; has 'answer AMD'
+has '+ keep only the GPU at 0000:03:00.0 in CT 270'
+[[ $out == *'+ keep only the GPU'*'install-target.sh'* ]] || { echo 'FAIL: the CT was narrowed after the guest install' >&2; exit 1; }
+ok 'GPU_CARD with a matching GPU' GPU=intel GPU_CARD=0000:04:00.0 PCI_SYSFS="$pci"
+has 'answer INTEL'
+ok 'without GPU_CARD nothing is narrowed' GPU=amd
+lacks 'keep only the GPU'
+fails 'GPU_CARD of another vendor is refused' 'GPU_CARD 0000:03:00.0 is an AMD card, not INTEL' GPU=intel GPU_CARD=0000:03:00.0 PCI_SYSFS="$pci"
+fails 'GPU_CARD without a GPU is refused' 'GPU is none' GPU=none GPU_CARD=0000:03:00.0 PCI_SYSFS="$pci"
+fails 'a malformed GPU_CARD is refused' 'GPU_CARD must be a PCI address' GPU_CARD=gpu1
+
 ok 'another supported distribution is passed to the community script' OLLAMA_CT_OS=ubuntu OLLAMA_CT_VERSION=26.04
 has 'var_os=ubuntu var_version=26.04'
 

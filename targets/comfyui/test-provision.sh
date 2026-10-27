@@ -39,7 +39,8 @@ refuse() {
 # --- helpers in isolation ------------------------------------------------------
 # shellcheck disable=SC1090
 source <(awk '/^# Provision helpers/ { capture=1; next } /^# End provision helpers/ { capture=0 } capture' "$tool")
-for helper in allow_list gpu_kind community_gpu_choice community_vars firewall_config net_with_firewall classify_router route_src; do
+for helper in allow_list gpu_kind community_gpu_choice community_vars firewall_config net_with_firewall classify_router route_src \
+        normalize_pci_address card_vendor_kind card_device_nodes config_devices other_card_devices; do
     declare -F "$helper" >/dev/null || fail "helper extraction failed: $helper"
 done
 [[ $(allow_list '192.0.2.0/24, 198.51.100.7 203.0.113.0/28' | paste -sd' ') == '192.0.2.0/24 198.51.100.7 203.0.113.0/28' ]] || fail 'allow_list'
@@ -177,7 +178,8 @@ stub pct 'case "$*" in
     "exec 286 -- nvidia-smi -L") exit "${FAKE_NO_NVIDIA_SMI:-0}" ;;
     "exec 286 -- hostname -I") echo "192.0.2.86 fd00::86" ;;
     "exec 286 -- sed -n "*) echo 8191 ;;
-    "config 286") echo "net0: name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:86,ip=192.0.2.86/24,gw=192.0.2.1,type=veth" ;;
+    "config 286") echo "net0: name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:86,ip=192.0.2.86/24,gw=192.0.2.1,type=veth"
+                  [[ -z ${FAKE_CT_DEVICES:-} ]] || printf "%s\n" "$FAKE_CT_DEVICES" ;;
     push*) [[ $* != *admin-token* ]] || cp "$3" "'"$tmp"'/pushed-token"
            [[ $* != *hf-token* ]] || cp "$3" "'"$tmp"'/pushed-hf-token" ;;
     "exec 286 -- env "*) exit "${FAKE_GUEST_RC:-0}" ;;
@@ -245,6 +247,38 @@ real --no-webui UI_ALLOW_CIDR=198.51.100.0/24 FAKE_FW_STATUS=disabled/running ||
 [[ $(cat "$fw") == "$(firewall_config 8188 198.51.100.0/24)" ]] || fail '--no-webui firewall'
 has 'the Proxmox firewall is not enabled for the datacenter'
 pass '--no-webui: no router, the firewall admits UI_ALLOW_CIDR; a disabled datacenter firewall is reported'
+
+# --- one card out of several (GPU_CARD) ---------------------------------------------
+pci=$tmp/pci; nvp=$tmp/nvidia
+mkdir -p "$pci/0000:03:00.0/drm/renderD128" "$pci/0000:03:00.0/drm/card0" "$pci/0000:04:00.0/drm/renderD129" \
+    "$pci/0000:04:00.0/drm/card1" "$pci/0000:02:00.0" "$nvp/gpus/0000:02:00.0"
+printf '0x1002\n' > "$pci/0000:03:00.0/vendor"; printf '0x1002\n' > "$pci/0000:04:00.0/vendor"; printf '0x10de\n' > "$pci/0000:02:00.0/vendor"
+printf 'Device Minor: \t 1\n' > "$nvp/gpus/0000:02:00.0/information"
+amd_devs=$'dev0: /dev/dri/renderD128,gid=104\ndev1: /dev/dri/card0,gid=44\ndev2: /dev/dri/renderD129,gid=104\ndev3: /dev/dri/card1,gid=44\ndev4: /dev/kfd,gid=104'
+real OPENWEBUI_ADMIN_TOKEN=t GPU_CARD=0000:04:00.0 PCI_SYSFS="$pci" FAKE_CT_DEVICES="$amd_devs" || fail "GPU_CARD run failed"
+grep -q 'community var_ctid=286 var_gpu=yes var_comfyui_gpu_type=3' "$log" || fail "GPU_CARD did not pick AMD: $(calls)"
+grep -qx 'pct set 286 --delete dev0,dev1' "$log" || fail "other cards not removed: $(calls)"
+has 'CT 286: passing only the GPU at 0000:04:00.0 (/dev/dri/renderD129 /dev/dri/card1).'
+order=$(grep -nE '^community |pct stop 286|pct set 286 --delete|pct start 286|pct set 286 --net0|install-target.sh$' "$log" | cut -d: -f1 | paste -sd' ')
+read -r a b c d e f <<< "$order"
+[[ -n $f ]] && (( a < b && b < c && c < d && d < e && e < f )) || fail "narrowing out of order ($order): $(calls)"
+grep -q 'COMFYUI_DEVICE=gpu' "$log" || fail 'the guest install runs without the GPU'
+real OPENWEBUI_ADMIN_TOKEN=t GPU_CARD=0000:03:00.0 PCI_SYSFS="$pci" FAKE_CT_DEVICES=$'dev0: /dev/dri/renderD128,gid=104\ndev1: /dev/kfd,gid=104' ||
+    fail "GPU_CARD, nothing to remove"
+! grep -q 'pct stop 286' "$log" || fail 'restarted a CT that passes only the chosen card'
+real OPENWEBUI_ADMIN_TOKEN=t GPU_CARD=0000:04:00.0 PCI_SYSFS="$pci" FAKE_CT_DEVICES=$'dev0: /dev/dri/renderD128,gid=104' || fail 'GPU_CARD, card not passed'
+has 'Warning: CT 286 does not pass /dev/dri/renderD129, the GPU at 0000:04:00.0.'
+nv_devs=$'dev0: /dev/nvidia0,gid=44\ndev1: /dev/nvidia1,gid=44\ndev2: /dev/nvidiactl,gid=44\ndev3: /dev/nvidia-uvm,gid=44\ndev4: /dev/nvidia-caps/nvidia-cap1,gid=44'
+real OPENWEBUI_ADMIN_TOKEN=t GPU_CARD=02:00.0 PCI_SYSFS="$pci" NVIDIA_PROC="$nvp" FAKE_CT_DEVICES="$nv_devs" || fail "NVIDIA GPU_CARD run failed"
+grep -q 'community var_ctid=286 var_gpu=yes var_comfyui_gpu_type=2' "$log" || fail "GPU_CARD did not pick NVIDIA: $(calls)"
+grep -qx 'pct set 286 --delete dev0' "$log" || fail "the other NVIDIA card was kept: $(calls)"
+real OPENWEBUI_ADMIN_TOKEN=t GPU=amd GPU_CARD=0000:02:00.0 PCI_SYSFS="$pci" && fail 'an NVIDIA GPU_CARD passed GPU=amd'
+has 'GPU_CARD 0000:02:00.0 is an NVIDIA card, not AMD'; ! grep -q '^community' "$log" || fail 'the CT was created'
+real OPENWEBUI_ADMIN_TOKEN=t GPU_CARD=0000:09:00.0 PCI_SYSFS="$pci" && fail 'a missing GPU_CARD passed'
+has 'GPU_CARD: no NVIDIA, AMD or Intel GPU at 0000:09:00.0'
+plan GPU_CARD=0000:04:00.0
+has '+ keep only the GPU at 0000:04:00.0 in CT 286'
+pass "GPU_CARD: only the chosen card's nodes stay in the CT (restarted before the firewall and guest install); a wrong vendor or missing card is refused first"
 
 # --- the image model's weights -------------------------------------------------------
 plan COMFYUI_IMAGE_VARIANT=klein-9b
