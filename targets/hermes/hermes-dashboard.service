@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes Agent web dashboard
+Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes
+Environment=HOME=/home/hermes
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hermes/.hermes/.env
+ExecStart=/home/hermes/.local/bin/hermes dashboard --no-open --host 0.0.0.0 --port 9119
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=78
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

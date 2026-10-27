@@ -48,6 +48,7 @@ Environment:
                                OpenAI-compatible API server (for Open WebUI)
   HERMES_API_PORT=8642         API server port
   HERMES_API_MODEL_NAME=hermes-agent   model name the API server advertises
+  HERMES_DASHBOARD=true       start the authenticated dashboard on all CT IPv4 addresses, port 9119
   HERMES_SKIP_CHAT_PROBE=false true: skip the test chat request
 Hermes code updates are made with `hermes update` as the hermes user.
 USAGE
@@ -66,9 +67,17 @@ settings_record() {
   printf 'HERMES_API_SERVER=%s\n' "$HERMES_API_SERVER"
   printf 'HERMES_API_PORT=%s\n' "$HERMES_API_PORT"
   printf 'HERMES_API_MODEL_NAME=%s\n' "$HERMES_API_MODEL_NAME"
+  printf 'HERMES_DASHBOARD=%s\n' "$HERMES_DASHBOARD"
   printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
   printf 'BACKEND_KEYS_SHA256=%s\n' "$backend_keys_sha256"
+  printf 'DASHBOARD_AUTH_SHA256=%s\n' "$dashboard_auth_sha256"
   printf 'UNIT_SHA256=%s\n' "$unit_sha256"
+}
+
+dashboard_auth_hash() {
+  [[ $HERMES_DASHBOARD == true && -f $HERMES_HOME/.env ]] || { printf 'none\n'; return; }
+  awk -F= '$1 ~ /^HERMES_DASHBOARD_(BASIC_AUTH|OAUTH|OIDC)_/ {print}' "$HERMES_HOME/.env" |
+    sha256sum | cut -d' ' -f1
 }
 
 # env_file_update FILE: set or remove KEY=VALUE lines in a dotenv file. The
@@ -172,11 +181,14 @@ HERMES_INSTALLER_SHA256=${HERMES_INSTALLER_SHA256:-}
 HERMES_API_SERVER=${HERMES_API_SERVER:-false}
 HERMES_API_PORT=${HERMES_API_PORT:-8642}
 HERMES_API_MODEL_NAME=${HERMES_API_MODEL_NAME:-hermes-agent}
+HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
 HERMES_SKIP_CHAT_PROBE=${HERMES_SKIP_CHAT_PROBE:-false}
 HERMES_HOME=$HERMES_USER_HOME/.hermes
 HERMES_BIN=$HERMES_USER_HOME/.local/bin/hermes
 UNIT=hermes-gateway.service
 DIRECT_UNIT=hermes-direct.service
+DASHBOARD_UNIT=hermes-dashboard.service
+DASHBOARD_PORT=9119
 DIRECT_URL=http://127.0.0.1:8765
 BACKEND_KEYS_FILE=${BACKEND_KEYS_FILE:-$source_dir/backend-keys}
 
@@ -194,6 +206,7 @@ ROUTER_URL=${ROUTER_URL%/}
 [[ -z $HERMES_INSTALLER_SHA256 || $HERMES_INSTALLER_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
   die 'HERMES_INSTALLER_SHA256 must be 64 lowercase hex digits.'
 [[ $HERMES_API_SERVER =~ ^(true|false)$ ]] || die 'HERMES_API_SERVER must be true or false.'
+[[ $HERMES_DASHBOARD =~ ^(true|false)$ ]] || die 'HERMES_DASHBOARD must be true or false.'
 [[ $HERMES_SKIP_CHAT_PROBE =~ ^(true|false)$ ]] || die 'HERMES_SKIP_CHAT_PROBE must be true or false.'
 [[ $HERMES_API_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( HERMES_API_PORT <= 65535 )) || die 'Invalid HERMES_API_PORT.'
 # Hermes reserves 8644-8646 for other gateway adapters.
@@ -207,6 +220,9 @@ done
 [[ $HERMES_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid HERMES_USER.'
 if [[ $HERMES_API_SERVER == true ]]; then
   [[ -r $source_dir/$UNIT ]] || die "Missing $source_dir/$UNIT (provision-lxc.sh pushes it)."
+fi
+if [[ $HERMES_DASHBOARD == true ]]; then
+  [[ -r $source_dir/$DASHBOARD_UNIT ]] || die "Missing $source_dir/$DASHBOARD_UNIT (provision-lxc.sh pushes it)."
 fi
 [[ -r $source_dir/$DIRECT_UNIT && -r $source_dir/direct-dispatch.py ]] ||
   die 'Missing Hermes direct dispatcher and service (provision-lxc.sh pushes them).'
@@ -228,6 +244,11 @@ if (( dry_run )); then
     printf '+ install %s/%s, enable and start it, wait for /health and /v1/models\n' "$UNIT_DIR" "$UNIT"
   else
     printf '+ no API server: stop and remove %s if present\n' "$UNIT"
+  fi
+  if [[ $HERMES_DASHBOARD == true ]]; then
+    printf '+ generate dashboard login if needed; enable %s on 0.0.0.0:%s; verify /api/status requires authentication\n' "$DASHBOARD_UNIT" "$DASHBOARD_PORT"
+  else
+    printf '+ stop and remove %s if present\n' "$DASHBOARD_UNIT"
   fi
   exit 0
 fi
@@ -305,7 +326,11 @@ unit_sha256=none
 if [[ $HERMES_API_SERVER == true ]]; then
   unit_sha256=$(sha256sum "$source_dir/$UNIT" | cut -d' ' -f1)
 fi
+if [[ $HERMES_DASHBOARD == true ]]; then
+  unit_sha256=$(printf '%s\n' "$unit_sha256" | cat - "$source_dir/$DASHBOARD_UNIT" | sha256sum | cut -d' ' -f1)
+fi
 unit_sha256=$(printf '%s\n' "$unit_sha256" | cat - "$source_dir/$DIRECT_UNIT" "$source_dir/direct-dispatch.py" | sha256sum | cut -d' ' -f1)
+dashboard_auth_sha256=$(dashboard_auth_hash)
 settings=$(settings_record)
 
 # gateway_healthy [PORT] [MODEL_NAME]: /health is ok and /v1/models, with the
@@ -327,6 +352,26 @@ wait_gateway() {
   done
   return 1
 }
+dashboard_healthy() {
+  [[ $(api "http://127.0.0.1:$DASHBOARD_PORT/api/status" /dev/null) == 200 ]] || return 1
+  python3 - "$stage/response" <<'PY'
+import json, sys
+try:
+    status = json.load(open(sys.argv[1], encoding="utf-8"))
+    assert status.get("auth_required") is True
+    assert status.get("auth_providers")
+except (OSError, ValueError, AssertionError):
+    raise SystemExit(1)
+PY
+}
+wait_dashboard() {
+  local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+  while (( SECONDS < deadline )); do
+    dashboard_healthy && return 0
+    sleep 2
+  done
+  return 1
+}
 direct_healthy() {
   [[ $(api "$DIRECT_URL/healthz" /dev/null) == 200 ]] || return 1
   [[ $(api "$DIRECT_URL/v1/models" /dev/null) == 200 ]] || return 1
@@ -344,6 +389,23 @@ run_hermes() {
   runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
     PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$HERMES_BIN" "$@"
 }
+dashboard_config_value() {
+  local value
+  value=$(run_hermes config get "$1" --json 2>/dev/null || true)
+  python3 -c 'import json,sys
+try: value=json.load(sys.stdin)
+except (ValueError, OSError): value=None
+if isinstance(value,str) and value: print(value)' <<< "$value"
+}
+dashboard_config_has_auth() {
+  [[ -z $(dashboard_config_value dashboard.oauth.client_id) ]] || return 0
+  if [[ -n $(dashboard_config_value dashboard.oauth.self_hosted.issuer) &&
+        -n $(dashboard_config_value dashboard.oauth.self_hosted.client_id) ]]; then return 0; fi
+  if [[ -n $(dashboard_config_value dashboard.basic_auth.username) &&
+        ( -n $(dashboard_config_value dashboard.basic_auth.password) ||
+          -n $(dashboard_config_value dashboard.basic_auth.password_hash) ) ]]; then return 0; fi
+  return 1
+}
 installed_commit() {
   git -C "$HERMES_HOME/hermes-agent" rev-parse HEAD 2>/dev/null || true
 }
@@ -354,7 +416,9 @@ if [[ -x $HERMES_BIN && -f $HERMES_ETC/settings ]] &&
    run_hermes --version >/dev/null 2>&1; then
   if systemctl is-active --quiet "$DIRECT_UNIT" && direct_healthy &&
      { [[ $HERMES_API_SERVER == false ]] ||
-       { systemctl is-active --quiet "$UNIT" && gateway_healthy; }; }; then
+       { systemctl is-active --quiet "$UNIT" && gateway_healthy; }; } &&
+     { [[ $HERMES_DASHBOARD == false ]] ||
+       { systemctl is-active --quiet "$DASHBOARD_UNIT" && dashboard_healthy; }; }; then
     rm -f -- "$ROUTER_API_KEY_FILE"
     note 'Hermes is healthy with these settings; nothing to do.'
     exit 0
@@ -412,24 +476,28 @@ fi
 backup=$stage/backup
 install -d -m 0700 "$backup"
 for file in "$HERMES_HOME/config.yaml" "$HERMES_HOME/.env" "$UNIT_DIR/$UNIT" \
-            "$UNIT_DIR/$DIRECT_UNIT" "$DIRECT_LIB" "$HERMES_ETC/backend-keys" "$HERMES_ETC/settings"; do
+            "$UNIT_DIR/$DIRECT_UNIT" "$UNIT_DIR/$DASHBOARD_UNIT" "$DIRECT_LIB" "$HERMES_ETC/backend-keys" "$HERMES_ETC/settings"; do
   if [[ -f $file ]]; then cp -a -- "$file" "$backup/$(basename "$file").prev"; fi
 done
 gateway_was_active=0
 if systemctl is-active --quiet "$UNIT" 2>/dev/null; then gateway_was_active=1; fi
 direct_was_active=0
 if systemctl is-active --quiet "$DIRECT_UNIT" 2>/dev/null; then direct_was_active=1; fi
+dashboard_was_active=0
+if systemctl is-active --quiet "$DASHBOARD_UNIT" 2>/dev/null; then dashboard_was_active=1; fi
 
 restore() {
   local file name
   for file in "$HERMES_HOME/config.yaml" "$HERMES_HOME/.env" "$UNIT_DIR/$UNIT" \
-              "$UNIT_DIR/$DIRECT_UNIT" "$DIRECT_LIB" "$HERMES_ETC/backend-keys" "$HERMES_ETC/settings"; do
+              "$UNIT_DIR/$DIRECT_UNIT" "$UNIT_DIR/$DASHBOARD_UNIT" "$DIRECT_LIB" "$HERMES_ETC/backend-keys" "$HERMES_ETC/settings"; do
     name=$(basename "$file")
     if [[ -f $backup/$name.prev ]]; then cp -a -- "$backup/$name.prev" "$file"; else rm -f -- "$file"; fi
   done
   systemctl daemon-reload || true
   if (( direct_was_active )); then systemctl restart "$DIRECT_UNIT" || true
   else systemctl disable --now "$DIRECT_UNIT" >/dev/null 2>&1 || true; fi
+  if (( dashboard_was_active )); then systemctl restart "$DASHBOARD_UNIT" || true
+  else systemctl disable --now "$DASHBOARD_UNIT" >/dev/null 2>&1 || true; fi
   if (( gateway_was_active )); then
     # Health-check the restored settings, not the ones that failed.
     local port name
@@ -483,8 +551,31 @@ else
   ENV_UNSET_IF_OPENAI_API_KEY=no-key \
     env_file_update "$HERMES_HOME/.env"
 fi
+if [[ $HERMES_DASHBOARD == true &&
+      -z $(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_OAUTH_CLIENT_ID) &&
+      -z $(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_OIDC_CLIENT_ID) ]] &&
+   ! dashboard_config_has_auth; then
+  dashboard_user=$(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_BASIC_AUTH_USERNAME)
+  dashboard_password=$(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)
+  dashboard_hash=$(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH)
+  if [[ -z $dashboard_user || ( -z $dashboard_password && -z $dashboard_hash ) ]]; then
+    dashboard_user=${dashboard_user:-admin}
+    dashboard_password=$(openssl rand -hex 24)
+    ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_USERNAME=$dashboard_user \
+    ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$dashboard_password \
+      env_file_update "$HERMES_HOME/.env"
+    note 'Generated Hermes dashboard login; read the password from /home/hermes/.hermes/.env as root in the CT.'
+  fi
+  if [[ -z $(env_file_get "$HERMES_HOME/.env" HERMES_DASHBOARD_BASIC_AUTH_SECRET) ]]; then
+    ENV_SET_HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -hex 32) \
+      env_file_update "$HERMES_HOME/.env"
+  fi
+  unset dashboard_user dashboard_password dashboard_hash
+fi
 chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.env"
 chmod 0600 "$HERMES_HOME/.env"
+dashboard_auth_sha256=$(dashboard_auth_hash)
+settings=$(settings_record)
 run_hermes --version >/dev/null
 
 # The local dispatcher runs for both CLI and API-server installations.
@@ -535,6 +626,25 @@ elif [[ -f $UNIT_DIR/$UNIT ]]; then
   rm -f -- "$UNIT_DIR/$UNIT"
   systemctl daemon-reload
   note "$UNIT was stopped and removed (HERMES_API_SERVER=false)."
+fi
+
+if [[ $HERMES_DASHBOARD == true ]]; then
+  install -m 0644 "$source_dir/$DASHBOARD_UNIT" "$UNIT_DIR/$DASHBOARD_UNIT"
+  systemctl daemon-reload
+  systemctl enable "$DASHBOARD_UNIT" >/dev/null
+  systemctl restart "$DASHBOARD_UNIT"
+  if ! wait_dashboard; then
+    trap - ERR
+    note "$DASHBOARD_UNIT did not answer /api/status with authentication within ${HEALTH_TIMEOUT}s. Check: journalctl -u $DASHBOARD_UNIT"
+    restore
+    exit 1
+  fi
+  note "Hermes dashboard: http://<CT-IP>:$DASHBOARD_PORT/ (login required)."
+elif [[ -f $UNIT_DIR/$DASHBOARD_UNIT ]]; then
+  systemctl disable --now "$DASHBOARD_UNIT" >/dev/null 2>&1 || true
+  rm -f -- "$UNIT_DIR/$DASHBOARD_UNIT"
+  systemctl daemon-reload
+  note "$DASHBOARD_UNIT was stopped and removed (HERMES_DASHBOARD=false)."
 fi
 
 trap - ERR

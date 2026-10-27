@@ -30,6 +30,7 @@ out=$(ROUTER_URL=http://r:8000 HERMES_API_SERVER=true HERMES_COMMIT="$(printf 'a
   bash "$script" --dry-run) || fail 'dry run with the API server'
 [[ $out == *'API server on 0.0.0.0:8642 as model hermes-agent'* && $out == *'--commit aaaa'* ]] ||
   fail "dry run omitted the API server or pin: $out"
+[[ $out == *'hermes-dashboard.service on 0.0.0.0:9119'* ]] || fail 'dry run omitted the dashboard'
 pass 'dry runs plan the official installer, the router key, the chat probe and the API server'
 
 refused() { if env "$@" bash "$script" --dry-run >/dev/null 2>&1; then fail "accepted: $*"; fi; }
@@ -44,6 +45,7 @@ refused ROUTER_URL=http://router:8000 HERMES_INSTALLER_SHA256=xyz
 refused ROUTER_URL=http://router:8000 HERMES_CHANNEL=nightly
 refused ROUTER_URL=http://router:8000 HERMES_API_PORT=8645
 refused ROUTER_URL=http://router:8000 HERMES_API_SERVER=yes
+refused ROUTER_URL=http://router:8000 HERMES_DASHBOARD=yes
 msg=$(ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=8192 bash "$script" --dry-run 2>&1 || true)
 [[ $msg == *'at least 64000'* ]] || fail "context refusal does not explain the minimum: $msg"
 ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=64000 bash "$script" --dry-run >/dev/null || fail '64000 refused'
@@ -55,6 +57,7 @@ source <(awk '/^# Install helpers/{c=1;next} /^# End install helpers\./{c=0} c' 
 for helper in settings_record env_file_update env_file_get models_has chat_probe_body error_message; do
   declare -F "$helper" >/dev/null || fail "helper extraction failed: $helper"
 done
+declare -F dashboard_auth_hash >/dev/null || fail 'dashboard auth hash helper missing'
 envf=$tmp_root/helper.env
 printf '# keep me\nOPENAI_API_KEY=no-key\nOTHER=1\nAPI_SERVER_PORT=1\nAPI_SERVER_PORT=2\n' > "$envf"
 ENV_SET_API_SERVER_PORT=8642 ENV_SET_NEW='a=b c' ENV_UNSET_OTHER=1 ENV_UNSET_IF_OPENAI_API_KEY=no-key \
@@ -65,12 +68,21 @@ ENV_UNSET_IF_OPENAI_API_KEY=no-key env_file_update "$envf"
 [[ $(< "$envf") == 'OPENAI_API_KEY=sk-real' ]] || fail 'a real OPENAI_API_KEY was removed'
 [[ $(env_file_get "$envf" OPENAI_API_KEY) == sk-real && -z $(env_file_get "$envf" NONE) ]] || fail env_file_get
 pass 'the .env editor sets, removes and keeps lines, and only drops the old no-key placeholder'
+HERMES_HOME=$tmp_root/hash-home; mkdir -p "$HERMES_HOME"
+HERMES_DASHBOARD=true
+printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD=first\n' > "$HERMES_HOME/.env"
+first_hash=$(dashboard_auth_hash)
+sed -i 's/PASSWORD=first/PASSWORD=second/' "$HERMES_HOME/.env"
+[[ $(dashboard_auth_hash) != "$first_hash" ]] || fail 'dashboard password rotation was not detected'
+HERMES_DASHBOARD=false
+[[ $(dashboard_auth_hash) == none ]] || fail 'disabled dashboard still hashes its login'
+pass 'dashboard login changes trigger reconfiguration without recording the password'
 
 # settings_record reads these globals.
 # shellcheck disable=SC2034
 ROUTER_URL=http://r:8000 HERMES_MODEL=auto HERMES_CONTEXT_LENGTH=65536 HERMES_CHANNEL=stable HERMES_COMMIT=
 # shellcheck disable=SC2034
-HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent unit_sha256=u
+HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent HERMES_DASHBOARD=true unit_sha256=u dashboard_auth_sha256=none
 backend_keys_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
 record=$(settings_record)
@@ -90,6 +102,11 @@ grep -qx 'User=hermes' "$unit" || fail 'unit runs as hermes'
 grep -qx 'ProtectHome=read-only' "$unit" && grep -qx 'ReadWritePaths=/home/hermes' "$unit" || fail 'unit home access'
 grep -q 'API_SERVER_KEY=' <(grep -v '^#' "$unit") && fail 'the API key must not be in the unit'
 pass 'the gateway unit runs hardened as hermes and carries no secret'
+dashboard_unit=$here/hermes-dashboard.service
+grep -qx 'ExecStart=/home/hermes/.local/bin/hermes dashboard --no-open --host 0.0.0.0 --port 9119' "$dashboard_unit" || fail 'dashboard bind command'
+grep -qx 'EnvironmentFile=/home/hermes/.hermes/.env' "$dashboard_unit" || fail 'dashboard does not load auth credentials'
+grep -qx 'WantedBy=multi-user.target' "$dashboard_unit" || fail 'dashboard is not enabled at boot'
+pass 'the dashboard unit binds all CT IPv4 addresses and loads its authentication settings'
 
 # --- whole-script runs --------------------------------------------------------------
 if (( EUID != 0 )); then
@@ -112,7 +129,9 @@ stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
 # install: drop -o/-g (the hermes account does not exist here).
 stub install 'a=(); while (( $# )); do case $1 in -o|-g) shift 2;; *) a+=("$1"); shift;; esac; done; exec /usr/bin/install "${a[@]}"'
 stub git '[[ $1 == -C && $3 == rev-parse ]] || exit 1; cat "$2/.commit" 2>/dev/null || exit 128'
-stub systemctl 'unit=${*: -1}; file=$FAKE_STATE/active; [[ $unit != hermes-direct.service ]] || file=$FAKE_STATE/direct-active
+stub systemctl 'unit=${*: -1}; file=$FAKE_STATE/active
+[[ $unit != hermes-direct.service ]] || file=$FAKE_STATE/direct-active
+[[ $unit != hermes-dashboard.service ]] || file=$FAKE_STATE/dashboard-active
 case $1 in
   is-active) [[ -e $file ]] ;;
   restart) touch "$file" ;;
@@ -133,6 +152,7 @@ echo "hermes $*" >> "$FAKE_LOG"
 case $1 in
   --version) echo 'Hermes Agent 0.0-test' ;;
   config)
+    if [[ $2 == get ]]; then echo null; exit 0; fi
     [[ $2 == set ]] || exit 2
     [[ ${FAKE_CONFIG_FAIL:-} != "$3" ]] || exit 1
     grep -v "^$3=" "$HERMES_HOME/config.kv" > "$HERMES_HOME/config.kv.new" 2>/dev/null || true
@@ -207,6 +227,12 @@ if url.startswith(router):
         reply(200, {"choices": [{"message": {"role": "assistant", "content": "ready"}}]})
 if url.startswith("http://127.0.0.1:"):
     port = url.split(":")[2].split("/")[0]
+    if port == "9119":
+        if not os.path.exists(os.path.join(state, "dashboard-active")): refused()
+        if url.endswith("/api/status"):
+            if not env_file("HERMES_DASHBOARD_BASIC_AUTH_USERNAME") or not (env_file("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD") or env_file("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH")):
+                reply(200, {"auth_required": False, "auth_providers": []})
+            reply(200, {"auth_required": True, "auth_providers": ["basic"]})
     if port == "8765":
         if not os.path.exists(os.path.join(state, "direct-active")): refused()
         if url.endswith("/healthz"): reply(200, {"status": "ok"})
@@ -241,7 +267,7 @@ units=$tmp_root/systemd
 reset_tree() {
   rm -rf -- "${deploy:?}" "${tmp_root:?}/home" "${tmp_root:?}/etc" "${units:?}" "${state:?}"/* "${log:?}"
   mkdir -p "$deploy" "$units" "$tmp_root/etc"
-  cp "$script" "$here/hermes-gateway.service" "$deploy/"
+  cp "$script" "$here/hermes-gateway.service" "$here/hermes-dashboard.service" "$deploy/"
   cp "$here/direct-dispatch.py" "$here/hermes-direct.service" "$deploy/"
   : > "$log"
 }
@@ -273,9 +299,13 @@ env_file=$home/.hermes/.env
 [[ $(kv API_SERVER_ENABLED "$env_file") == true && $(kv API_SERVER_HOST "$env_file") == 0.0.0.0 ]] || fail 'API server env'
 [[ $(kv API_SERVER_PORT "$env_file") == 8642 && $(kv API_SERVER_MODEL_NAME "$env_file") == hermes-agent ]] || fail 'API port/name'
 [[ $(kv API_SERVER_KEY "$env_file") == "$(< "$etc/api-key")" && $(wc -c < "$etc/api-key") -ge 64 ]] || fail 'API key'
+[[ $(kv HERMES_DASHBOARD_BASIC_AUTH_USERNAME "$env_file") == admin ]] || fail 'dashboard login name'
+dashboard_password=$(kv HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "$env_file")
+dashboard_secret=$(kv HERMES_DASHBOARD_BASIC_AUTH_SECRET "$env_file")
+[[ ${#dashboard_password} -ge 40 && ${#dashboard_secret} -ge 40 ]] || fail 'dashboard login secret was not generated'
 [[ $(stat -c %a "$env_file") == 600 && $(stat -c %a "$etc/api-key") == 600 ]] || fail 'secret file modes'
 [[ ! -e $deploy/router-api-key ]] || fail 'the pushed router key was not removed'
-[[ -f $units/hermes-gateway.service && -e $state/active && -e $state/direct-active ]] || fail 'gateway or direct unit not started'
+[[ -f $units/hermes-gateway.service && -e $state/active && -e $state/direct-active && -f $units/hermes-dashboard.service && -e $state/dashboard-active ]] || fail 'gateway, direct or dashboard unit not started'
 grep -q "ROUTER_KEY_SHA256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)" "$etc/settings" || fail 'settings key hash'
 grep -q "$router_key" "$etc/settings" && fail 'the settings record holds the router key'
 grep '^curl ' "$log" | grep -q "$router_key" && fail 'the router key was passed to curl in argv'
@@ -381,6 +411,14 @@ out=$(guest HERMES_API_SERVER=false) || fail "API server off: $out"
 grep -q '^API_SERVER_' "$env_file" && fail 'API server settings left in .env'
 [[ $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] || fail 'ROUTER_API_KEY lost'
 pass 'HERMES_API_SERVER=false stops and removes the gateway and its settings'
+
+dashboard_password=$(kv HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "$env_file")
+out=$(guest HERMES_API_SERVER=false HERMES_DASHBOARD=false) || fail "dashboard off: $out"
+[[ ! -e $units/hermes-dashboard.service && ! -e $state/dashboard-active ]] || fail 'dashboard service remained enabled'
+out=$(guest HERMES_API_SERVER=false) || fail "dashboard on: $out"
+[[ -e $units/hermes-dashboard.service && -e $state/dashboard-active ]] || fail 'dashboard service did not restart'
+[[ $(kv HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "$env_file") == "$dashboard_password" ]] || fail 'dashboard password changed on reconfigure'
+pass 'the dashboard can be disabled and reenabled without rotating its login'
 
 # 12. An install made by the first version of this target is migrated.
 reset_tree; push_key

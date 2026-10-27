@@ -38,6 +38,8 @@ Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=65536 (>=64000; the model's
           host must serve it), HERMES_CHANNEL=stable, HERMES_COMMIT,
           HERMES_INSTALLER_SHA256, HERMES_API_PORT=8642,
           HERMES_API_MODEL_NAME=hermes-agent.
+Dashboard: HERMES_DASHBOARD=true (authenticated web UI on all CT IPv4 addresses,
+           port 9119); false disables it.
 Router:   ROUTER_URL (default http://<router address>:<router port>),
           ROUTER_IP (the address the router uses to reach this CT; detected),
           ROUTER_SSH_PORT=22.
@@ -118,29 +120,30 @@ url_port() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest##*:}"
 FW_TAG='ollama-smart-router hermes'
 HERMES_CT_DESCRIPTION='Hermes Agent for Ollama Smart Router'
 
-# hermes_fw_rules ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT RESTRICTED: the
+# hermes_fw_rules ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT RESTRICTED DASHBOARD_PORT: the
 # owned rules. Inbound: only the router, to the API server (an empty API_PORT
 # admits nothing). Restricted egress also admits inventory model hosts.
 hermes_fw_rules() {
   local rule
   [[ -z $2 ]] || printf 'IN ACCEPT -source %s/32 -p tcp -dport %s -log nolog # %s-api\n' "$1" "$2" "$FW_TAG"
+  [[ -z ${6:-} ]] || printf 'IN ACCEPT -p tcp -dport %s -log nolog # %s-dashboard\n' "$6" "$FW_TAG"
   [[ $5 != true ]] || printf 'OUT ACCEPT -dest %s/32 -p tcp -dport %s -log nolog # %s-router\n' "$3" "$4" "$FW_TAG"
   if [[ $5 == true ]]; then
     for rule in "${model_rules[@]-}"; do [[ -z $rule ]] || printf '%s\n' "$rule"; done
   fi
 }
 
-# firewall_config EGRESS ROUTER_IP ROUTER_DEST ROUTER_PORT API_PORT: the CT's
+# firewall_config EGRESS ROUTER_IP ROUTER_DEST ROUTER_PORT API_PORT DASHBOARD_PORT: the CT's
 # /etc/pve/firewall/<id>.fw. The owned rules, then for restricted outbound: DNS,
 # then HTTP(S) to anything that is not a private, CGNAT or link-local address.
 # Proxmox applies the first matching rule.
 firewall_config() {
-  local egress=$1 router_ip=$2 router_dest=$3 router_port=$4 api_port=$5 net restricted=false
+  local egress=$1 router_ip=$2 router_dest=$3 router_port=$4 api_port=$5 dashboard_port=${6:-} net restricted=false
   [[ $egress != restricted ]] || restricted=true
   printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n'
   if $restricted; then printf 'policy_out: DROP\n'; else printf 'policy_out: ACCEPT\n'; fi
   printf '\n[RULES]\n'
-  hermes_fw_rules "$router_ip" "$api_port" "$router_dest" "$router_port" "$restricted"
+  hermes_fw_rules "$router_ip" "$api_port" "$router_dest" "$router_port" "$restricted" "$dashboard_port"
   if $restricted; then
     printf 'OUT ACCEPT -p udp -dport 53 -log nolog\n'
     printf 'OUT ACCEPT -p tcp -dport 53 -log nolog\n'
@@ -153,7 +156,7 @@ firewall_config() {
 }
 
 # hermes_fw_update FILE KEEP ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT
-#                  OLD_API_SERVER OLD_API_PORT: FILE
+#                  OLD_API_SERVER OLD_API_PORT DASHBOARD_PORT: FILE
 # with this target's rules replaced by the current ones, at the top of [RULES]
 # so they match first; every other line is kept as it is. KEEP=keep also keeps
 # the old owned rules (marked), so a reconfigure that fails half-way leaves the
@@ -167,10 +170,11 @@ firewall_config() {
 hermes_fw_update() {
   local file=$1 keep=$2 router_ip=$3 api_port=$4 router_dest=$5 router_port=$6
   local old_api_server=${7:-unknown} old_api_port=${8:-}
+  local dashboard_port=${9:-}
   local begin='# BEGIN ollama-smart-router Hermes API' end='# END ollama-smart-router Hermes API'
   local in_re='^IN ACCEPT -source [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
   local out_re='^OUT ACCEPT -dest [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
-  local mark_re=" # ${FW_TAG}-(api|router|model)\$"
+  local mark_re=" # ${FW_TAG}-(api|router|model|dashboard)\$"
   local -a lines=() rest=() old=() rules=()
   local -A owned=()
   local rule_re='^(IN|OUT) '
@@ -200,7 +204,7 @@ hermes_fw_update() {
     fi
     if [[ $line =~ $mark_re ]]; then
       owned[$i]=1; old+=("$line")
-      [[ $line == *" # ${FW_TAG}-model" ]] || marked=$((marked + 1))
+      [[ $line == *" # ${FW_TAG}-model" || $line == *" # ${FW_TAG}-dashboard" ]] || marked=$((marked + 1))
       continue
     fi
     [[ -z ${line//[[:space:]]/} || $line == \#* ]] || rest+=("$i")
@@ -238,12 +242,13 @@ hermes_fw_update() {
       owned[${rest[$pos]}]=1; old+=("${lines[${rest[$pos]}]%$'\r'}")
     fi
   fi
-  mapfile -t rules < <(hermes_fw_rules "$router_ip" "$api_port" "$router_dest" "$router_port" "$restricted")
+  mapfile -t rules < <(hermes_fw_rules "$router_ip" "$api_port" "$router_dest" "$router_port" "$restricted" "$dashboard_port")
   if [[ $keep == keep ]]; then
     for line in "${old[@]}"; do
       local old_tag=${line##* # ${FW_TAG}-}
       line=${line%% \#*}
-      if [[ $line == IN\ * ]]; then rule="$line # ${FW_TAG}-api"
+      if [[ $old_tag == dashboard ]]; then rule="$line # ${FW_TAG}-dashboard"
+      elif [[ $line == IN\ * ]]; then rule="$line # ${FW_TAG}-api"
       elif [[ $old_tag == model ]]; then rule="$line # ${FW_TAG}-model"
       else rule="$line # ${FW_TAG}-router"; fi
       have=0
@@ -394,6 +399,7 @@ HERMES_COMMIT=${HERMES_COMMIT:-}
 HERMES_INSTALLER_SHA256=${HERMES_INSTALLER_SHA256:-}
 HERMES_API_PORT=${HERMES_API_PORT:-8642}
 HERMES_API_MODEL_NAME=${HERMES_API_MODEL_NAME:-hermes-agent}
+HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
 # Taken out of the environment at once so no child process (pct, ssh) inherits it.
 saved_admin_token=${OPENWEBUI_ADMIN_TOKEN:-}
 unset OPENWEBUI_ADMIN_TOKEN
@@ -463,6 +469,7 @@ if [[ -n $VLAN_TAG ]]; then
 fi
 [[ $EGRESS =~ ^(restricted|open)$ ]] || die 'EGRESS must be restricted or open.'
 [[ $OPENWEBUI =~ ^(true|false)$ ]] || die 'OPENWEBUI must be true or false.'
+[[ $HERMES_DASHBOARD =~ ^(true|false)$ ]] || die 'HERMES_DASHBOARD must be true or false.'
 [[ $mode != integrate || $OPENWEBUI == true ]] || die '--integrate-only needs OPENWEBUI=true.'
 if [[ -n $OPENWEBUI_PORT ]]; then
   positive OPENWEBUI_PORT "$OPENWEBUI_PORT"
@@ -496,6 +503,7 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 verify_webui=$source_dir/../open-terminal/verify-webui.py
 for file in "$source_dir/install-target.sh" "$source_dir/hermes-gateway.service" \
             "$source_dir/direct-dispatch.py" "$source_dir/hermes-direct.service" \
+            "$source_dir/hermes-dashboard.service" \
             "$source_dir/integrate-webui.py" "$verify_webui"; do
   [[ -r $file ]] || die "Deployment file is missing: $file"
 done
@@ -716,6 +724,8 @@ api_server=false
 [[ $OPENWEBUI == false ]] || api_server=true
 api_rule_port=''
 [[ $api_server == false ]] || api_rule_port=$HERMES_API_PORT
+dashboard_rule_port=''
+[[ $HERMES_DASHBOARD == false ]] || dashboard_rule_port=9119
 fw_router_port=$(url_port "$ROUTER_URL")
 
 # --- the Hermes CT -------------------------------------------------------------------
@@ -730,7 +740,7 @@ if [[ $mode == create ]]; then
   # Keep the mapped rootfs traversable while Proxmox extracts the template.
   (umask 022; run "${create[@]}")
 
-  firewall=$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port")
+  firewall=$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port" "$dashboard_rule_port")
   if (( dry_run )); then
     printf '+ write %s:\n%s\n' "$firewall_file" "$firewall"
   else
@@ -759,7 +769,7 @@ if [[ $mode == create ]]; then
       printf '+ resolve model server host names inside CT %s and admit their addresses in %s\n' "$CT_ID" "$firewall_file"
     else
       model_rules_for all
-      write_if_changed "$firewall_file" "$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port")" ||
+      write_if_changed "$firewall_file" "$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port" "$dashboard_rule_port")" ||
         die "Could not write $firewall_file."
     fi
   fi
@@ -783,7 +793,7 @@ if [[ $mode == reconfigure ]]; then
   if (( dry_run )); then
     printf '+ check the Hermes rules in %s, and admit the new router address and port next to the old ones\n' "$firewall_file"
   elif [[ -e $firewall_file ]]; then
-    fw_new=$(hermes_fw_update "$firewall_file" keep "$ROUTER_IP" "$api_rule_port" "$router_dest" "$fw_router_port" "$old_api_server" "$old_api_port") ||
+    fw_new=$(hermes_fw_update "$firewall_file" keep "$ROUTER_IP" "$api_rule_port" "$router_dest" "$fw_router_port" "$old_api_server" "$old_api_port" "$dashboard_rule_port") ||
       die "Nothing was changed. Fix $firewall_file (or move it aside), then rerun --reconfigure."
     write_if_changed "$firewall_file" "$fw_new" || die "Could not write $firewall_file."
   else
@@ -797,6 +807,7 @@ if [[ $mode != integrate ]]; then
   run pct push "$CT_ID" "$source_dir/hermes-gateway.service" "$deploy/hermes-gateway.service" --perms 0644
   run pct push "$CT_ID" "$source_dir/direct-dispatch.py" "$deploy/direct-dispatch.py" --perms 0644
   run pct push "$CT_ID" "$source_dir/hermes-direct.service" "$deploy/hermes-direct.service" --perms 0644
+  run pct push "$CT_ID" "$source_dir/hermes-dashboard.service" "$deploy/hermes-dashboard.service" --perms 0644
   run pct push "$CT_ID" "$stage/backend-keys" "$deploy/backend-keys" --perms 0600
   if (( dry_run )) || [[ -s $stage/router-api-key ]]; then
     run pct push "$CT_ID" "$stage/router-api-key" "$deploy/router-api-key" --perms 0600
@@ -804,7 +815,7 @@ if [[ $mode != integrate ]]; then
   run pct exec "$CT_ID" -- env "ROUTER_URL=$ROUTER_URL" "HERMES_MODEL=$HERMES_MODEL" \
     "HERMES_CONTEXT_LENGTH=$HERMES_CONTEXT_LENGTH" "HERMES_CHANNEL=$HERMES_CHANNEL" \
     "HERMES_COMMIT=$HERMES_COMMIT" "HERMES_INSTALLER_SHA256=$HERMES_INSTALLER_SHA256" \
-    "HERMES_API_SERVER=$api_server" "HERMES_API_PORT=$HERMES_API_PORT" \
+    "HERMES_API_SERVER=$api_server" "HERMES_API_PORT=$HERMES_API_PORT" "HERMES_DASHBOARD=$HERMES_DASHBOARD" \
     "HERMES_API_MODEL_NAME=$HERMES_API_MODEL_NAME" bash "$deploy/install-target.sh"
 fi
 
@@ -814,7 +825,7 @@ if [[ $mode == reconfigure ]]; then
   if (( dry_run )); then
     printf '+ sync Hermes API rule in %s (router %s, port %s)\n' "$firewall_file" "$ROUTER_IP" "${api_rule_port:-closed}"
   elif [[ -e $firewall_file ]]; then
-    fw_new=$(hermes_fw_update "$firewall_file" replace "$ROUTER_IP" "$api_rule_port" "$router_dest" "$fw_router_port" "$old_api_server" "$old_api_port") ||
+    fw_new=$(hermes_fw_update "$firewall_file" replace "$ROUTER_IP" "$api_rule_port" "$router_dest" "$fw_router_port" "$old_api_server" "$old_api_port" "$dashboard_rule_port") ||
       die "Hermes is reconfigured, but $firewall_file changed meanwhile and still admits the old router address or port. Fix it, then rerun --reconfigure."
     write_if_changed "$firewall_file" "$fw_new" || die "Could not write $firewall_file."
   fi
@@ -849,5 +860,9 @@ printf 'Hermes CT %s discovers via %s and dispatches model %s directly.\n' "$CT_
 if [[ $OPENWEBUI == true ]]; then
   printf 'Open WebUI: choose "%s" in the model list. Check its visibility under Admin Settings > Models before sharing it:\n' "$HERMES_API_MODEL_NAME"
   printf 'whoever can chat with it runs tools as the hermes account in CT %s and shares one Hermes memory.\n' "$CT_ID"
+fi
+if [[ $mode != integrate && $HERMES_DASHBOARD == true ]]; then
+  printf 'Dashboard: http://%s:9119/ (login required). Read its generated login with:\n' "$HERMES_IP"
+  printf "pct exec %s -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env\n" "$CT_ID"
 fi
 printf 'CLI: pct exec %s -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes\n' "$CT_ID"

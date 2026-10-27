@@ -24,6 +24,12 @@ browser -> Open WebUI :8080 -> Hermes API server :8642 -> local dispatcher :8765
 The agent's tools (terminal, files, web) run as the unprivileged `hermes`
 account inside the Hermes CT.
 
+The Hermes web dashboard also starts on boot at `http://<Hermes-CT-IP>:9119/`.
+It binds to `0.0.0.0`, so every CT IPv4 address can serve it. The installer
+generates a dashboard login when none is configured; the login is required for
+a non-loopback bind. The dashboard can manage agent settings and secrets, so
+reach this HTTP endpoint only over a trusted LAN or VPN.
+
 ## Before you start
 
 - **The router is installed** and its API port (8000) is reachable from the
@@ -106,6 +112,8 @@ installer, dispatcher, systemd units and keys. The guest installer then:
 4. Generates the API server key in `/etc/hermes-target/api-key` (0600) and
    writes the `API_SERVER_*` settings to `~/.hermes/.env`.
 5. Starts `hermes-gateway.service` and waits for `/health` and `/v1/models`.
+6. Creates dashboard login credentials if needed, then enables
+   `hermes-dashboard.service` and checks that `/api/status` requires login.
 
 Finally, `integrate-webui.py` runs in the router CT:
 
@@ -122,7 +130,8 @@ Finally, `integrate-webui.py` runs in the router CT:
 | `HERMES_CHANNEL` | `stable` | Upstream update channel (`stable` or `main`). |
 | `HERMES_COMMIT` | — | Pin the Hermes checkout to a commit. A changed pin is applied on the next run. The installer reports the installed commit so you can pin it. |
 | `HERMES_INSTALLER_SHA256` | — | Refuse an `install.sh` with another SHA-256. Every run prints the downloaded installer's checksum. |
-| `OPENWEBUI` | `true` | `false`: CLI only. No API server, no inbound port, no admin token needed. |
+| `OPENWEBUI` | `true` | `false`: no Open WebUI integration or Hermes API server; no admin token needed. The dashboard remains available unless `HERMES_DASHBOARD=false`. |
+| `HERMES_DASHBOARD` | `true` | Enable the authenticated Hermes web dashboard on every CT IPv4 address, TCP 9119. Set `false` to stop it and close its firewall port. |
 | `TASK_MODEL` | `fast` | Router model for Open WebUI's titles, tags and follow-ups (Admin Settings → Interface → Task Model (External)). It is set only when unset, or when it points at Hermes. Blank leaves it alone. |
 | `HERMES_API_PORT` / `HERMES_API_MODEL_NAME` | `8642` / `hermes-agent` | API server port, and the model name Open WebUI shows. Ports 8644–8646 are reserved by Hermes. |
 | `EGRESS` | `restricted` | See [Network](#network). |
@@ -178,8 +187,8 @@ progress and keepalives, so long tool runs do not time out.
 ## Network
 
 With the Proxmox firewall enabled at datacenter level, the CT's
-`/etc/pve/firewall/<CT_ID>.fw` admits inbound only the router's address, and
-only to the API server port. Inbound SSH is not admitted; use
+`/etc/pve/firewall/<CT_ID>.fw` admits the API server port only from the router's
+address and admits dashboard TCP 9119 when enabled. Inbound SSH is not admitted; use
 `pct enter <CT_ID>`.
 
 With `EGRESS=restricted` (default), outbound traffic is allowed, in this order:
@@ -207,9 +216,9 @@ finishing the chunked response. `EGRESS=open`
 allows all outbound traffic, for example when packages must come through a LAN
 proxy.
 
-**What `--reconfigure` changes.** The inbound API rule, outbound router rule
+**What `--reconfigure` changes.** The inbound API and dashboard rules, outbound router rule
 and outbound model rules belong to this target. They carry rule comments
-`ollama-smart-router hermes-api`, `hermes-router` and `hermes-model`, which Proxmox keeps when
+`ollama-smart-router hermes-api`, `hermes-dashboard`, `hermes-router` and `hermes-model`, which Proxmox keeps when
 you edit the firewall in its GUI. `--reconfigure` replaces only those rules,
 puts them first in `[RULES]` so they match first, and leaves every other line
 as it is.
@@ -241,6 +250,15 @@ The installer uses Hermes's non-interactive mode and skips the browser and
 computer-use downloads for this headless CT. Code and profile live under
 `/home/hermes/.hermes`. `hermes-gateway.service` runs `hermes gateway run`,
 hardened: the agent can write only to `/home/hermes` and a private `/tmp`.
+
+To read the generated dashboard login from the Proxmox host, run:
+
+```bash
+pct exec 282 -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env
+```
+
+The password and session signing secret are kept in that 0600 file and are
+preserved on reconfigure. Existing OAuth dashboard credentials are also kept.
 
 Upgrade the agent with Hermes's own updater, then restart the gateway:
 

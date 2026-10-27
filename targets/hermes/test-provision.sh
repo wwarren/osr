@@ -41,6 +41,8 @@ for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16;
 done
 fw=$(firewall_config open 192.0.2.80 192.0.2.80 8000 '')
 [[ $fw == *'policy_out: ACCEPT'* && $fw != *'IN ACCEPT'* && $fw != *'OUT '* ]] || fail "open egress, no API: $fw"
+fw=$(firewall_config restricted 192.0.2.80 192.0.2.80 8000 8642 9119)
+grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard' <<< "$fw" || fail 'dashboard inbound rule'
 pass 'helpers: router kind, route source, URL parts, and firewall rules in first-match order'
 
 inv=$tmp_root/inventory.json
@@ -209,6 +211,8 @@ has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8642'
 has 'policy_out: DROP'
 has '/root/hermes-deploy/router-api-key --perms 0600'
 has 'HERMES_API_SERVER=true'
+has 'HERMES_DASHBOARD=true'
+has 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard'
 has 'ROUTER_URL=http://\<router-source-ip\>:8000'
 has 'integrate-webui.py --webui-url http://127.0.0.1:8080 --hermes-url http://192.0.2.82:8642/v1'
 has '--task-model fast'
@@ -217,7 +221,9 @@ pass 'the default plan reads the router key, firewalls the API to the router, in
 
 plan OPENWEBUI=false
 has 'HERMES_API_SERVER=false'
-lacks 'IN ACCEPT'; lacks 'integrate-webui.py --webui-url'; lacks 'pct pull'
+lacks 'hermes-api'; has 'hermes-dashboard'; lacks 'integrate-webui.py --webui-url'; lacks 'pct pull'
+plan OPENWEBUI=false HERMES_DASHBOARD=false
+lacks 'IN ACCEPT'
 plan EGRESS=open ROUTER_URL=http://10.1.2.3:8001 TASK_MODEL=
 has 'policy_out: ACCEPT'; lacks 'OUT DROP'; has 'ROUTER_URL=http://10.1.2.3:8001'
 has "--task-model ''"
@@ -244,6 +250,7 @@ reject 'Hermes and router CT IDs must differ' CT_ID=280
 reject 'at least 64000' HERMES_CONTEXT_LENGTH=32768
 reject 'IP_CIDR' IP_CIDR=192.0.2.999/24
 reject 'EGRESS must be' EGRESS=none
+reject 'HERMES_DASHBOARD must be' HERMES_DASHBOARD=yes
 reject 'reserved by Hermes' HERMES_API_PORT=8644
 reject 'TASK_MODEL must be a router model' TASK_MODEL=hermes-agent
 reject 'no /v1' ROUTER_URL=http://r:8000/v1
@@ -398,6 +405,9 @@ grep -q 'install-target.sh' "$log" && grep -q 'HERMES_API_SERVER=true' "$log" ||
 grep -q 'ROUTER_URL=http://192.0.2.80:8000' "$log" || fail 'ROUTER_URL not derived from the router address'
 fwfile=$fake/pve/firewall/282.fw
 grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
+grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard' "$fwfile" || fail 'dashboard firewall rule'
+grep -q 'HERMES_DASHBOARD=true' "$log" || fail 'guest installer did not receive dashboard setting'
+grep -q 'hermes-dashboard.service' "$log" || fail 'dashboard service not pushed'
 grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" || fail 'router egress rule'
 grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fwfile" || fail 'model egress rule'
 grep -q -- '--hermes-url http://192.0.2.82:8642/v1' "$log" || fail 'integration URL'
@@ -408,12 +418,19 @@ grep -qx 'pct-create-umask 0022' "$log" || fail 'pct create inherited a restrict
 grep -q 'pct create 282.*--features nesting=1' "$log" || fail 'the Hermes CT was created without nesting'
 pass 'a full run pushes the router key as a file, firewalls the API to the router and registers it; no secret is in argv'
 
+out=$(real --reconfigure HERMES_DASHBOARD=false) || fail "dashboard off: $out"
+grep -q 'hermes-dashboard' "$fwfile" && fail 'dashboard rule remained after disabling it'
+grep -q 'HERMES_DASHBOARD=false' "$log" || fail 'guest did not receive dashboard disable setting'
+out=$(real --reconfigure) || fail "dashboard on again: $out"
+[[ $(grep -c 'hermes-dashboard$' "$fwfile") == 1 ]] || fail 'dashboard rule was not restored exactly once'
+pass 'reconfigure closes and restores the dashboard firewall port with HERMES_DASHBOARD'
+
 reset_fake
-out=$(real OPENWEBUI=false OPENWEBUI_ADMIN_TOKEN=) || fail "CLI-only run: $out"
+out=$(real OPENWEBUI=false HERMES_DASHBOARD=false OPENWEBUI_ADMIN_TOKEN=) || fail "CLI-only run: $out"
 grep -q 'integrate-webui.py' "$log" && fail 'CLI-only run registered with Open WebUI'
 grep -q '^IN ' "$fake/pve/firewall/282.fw" && fail 'CLI-only run opened an inbound port'
 grep -q 'HERMES_API_SERVER=false' "$log" || fail 'CLI-only run enabled the API server'
-pass 'OPENWEBUI=false needs no admin token, opens no port and runs no API server'
+pass 'OPENWEBUI=false and HERMES_DASHBOARD=false need no admin token or inbound port'
 
 reset_fake
 out=$(real FAKE_ROUTER_REJECTS=1) && fail 'a rejected router key was accepted'
@@ -464,7 +481,7 @@ out=$(real OPENWEBUI=false OPENWEBUI_ADMIN_TOKEN=) || fail "CLI-only run: $out"
 : > "$log"
 out=$(real --reconfigure) || fail "CLI-only to Open WebUI: $out"
 grep -qxF "$api80" "$fake/fw-at-integrate" || fail "the router was not admitted before Open WebUI checked Hermes: $(cat "$fake/fw-at-integrate")"
-[[ $(grep -c '^IN ' "$fwfile") == 1 ]] || fail "API rule count: $(cat "$fwfile")"
+[[ $(grep -c 'hermes-api$' "$fwfile") == 1 && $(grep -c 'hermes-dashboard$' "$fwfile") == 1 ]] || fail "API or dashboard rule count: $(cat "$fwfile")"
 pass '--reconfigure of a CLI-only CT with OPENWEBUI=true opens the API port to the router before Open WebUI checks it'
 
 : > "$log"
@@ -522,6 +539,7 @@ pass 'a legacy CLI-only CT keeps an unmarked custom inbound rule and stops befor
 reset_fake
 out=$(real HERMES_API_PORT=8643) || fail "API server on 8643: $out"
 sed -i '/hermes-model/d' "$fwfile"
+sed -i '/hermes-dashboard/d' "$fwfile"
 sed -i 's/ # ollama-smart-router hermes-[a-z]*$//' "$fwfile"
 grep -q 'ollama-smart-router' "$fwfile" && fail 'test setup: the legacy layout still has comments'
 : > "$log"
@@ -530,7 +548,7 @@ grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # ollama
   fail "legacy API rule not adopted: $(cat "$fwfile")"
 grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" ||
   fail 'legacy router rule not adopted'
-[[ $(grep -c '^IN ' "$fwfile") == 1 && $(grep -c 'dport 8000 ' "$fwfile") == 1 ]] || fail "legacy rules duplicated: $(cat "$fwfile")"
+[[ $(grep -c 'hermes-api$' "$fwfile") == 1 && $(grep -c 'hermes-dashboard$' "$fwfile") == 1 && $(grep -c 'dport 8000 ' "$fwfile") == 1 ]] || fail "legacy rules duplicated: $(cat "$fwfile")"
 grep -q 'integrate-webui.py' "$log" || fail 'the upgraded CT was not registered again'
 pass 'a CT from the previous version with its API server on 8643 is upgraded: both rules adopted and marked'
 
