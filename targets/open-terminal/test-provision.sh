@@ -37,6 +37,15 @@ probe_code=$(cat "$here/verify-webui.py")
 mapfile -d '' -t round < <(sh -c "printf '%s\\0' $(remote_command python3 -c "$probe_code" 8080)")
 check [ "${round[2]}" = "$probe_code" ]
 check [ "${round[3]}" = 8080 ]
+# pct create needs a normal umask for Proxmox's unprivileged template
+# extraction, while the parent still creates credentials with 077.
+saved_umask=$(umask)
+umask 077
+run() { printf '%s %s\n' "$(umask)" "$*"; }
+check [ "$(run_pct_create pct create 158)" = '0022 pct create 158' ]
+check [ "$(umask)" = 0077 ]
+unset -f run
+umask "$saved_umask"
 passed=$((passed + 1))
 
 # Both selectors use Proxmox discovery, including a storage.cfg fallback when

@@ -223,6 +223,14 @@ select_storage() {
     fi
   done
 }
+# Proxmox extracts an unprivileged CT template with the caller's umask. The
+# mapped root user must traverse the rootfs path, and template directories
+# must keep their intended permissions. Scope 022 to pct create only; the
+# script's staging directory and credentials retain the private 077 umask.
+run_pct_create() (
+  umask 022
+  run "$@"
+)
 # End provision helpers. --------------------------------------------------------
 
 positive() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
@@ -373,6 +381,9 @@ done
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/open-terminal-setup.XXXXXX")
 router_stage=''
+create_attempted=0
+create_succeeded=0
+terminal_installed=0
 # One multiplexed SSH connection for the whole run: a password, if the router
 # asks for one, is entered once. ControlPath lives in the 0700 stage directory.
 # Options go before the destination; everything after it is the remote command.
@@ -419,8 +430,15 @@ cleanup() {
   fi
   rm -f -- "$stage/admin-token" "$stage/api-key" 2>/dev/null || true
   rm -rf -- "$stage" 2>/dev/null || true
-  if (( rc != 0 && ! dry_run )); then
-    printf 'Setup stopped. CT %s, if created, is retained. Re-run with --integrate-only after fixing the error.\n' "$CT_ID" >&2
+  if (( rc != 0 && ! dry_run && create_attempted )); then
+    if (( ! create_succeeded )); then
+      printf 'CT %s was not created successfully. Check for a partial CT or root disk with pct config %s and pvesm list %s --vmid %s before retrying. --integrate-only requires an installed terminal.\n' \
+        "$CT_ID" "$CT_ID" "$STORAGE" "$CT_ID" >&2
+    elif (( ! terminal_installed )); then
+      printf 'CT %s was created, but Open Terminal installation did not finish. Inspect and repair that CT before integration.\n' "$CT_ID" >&2
+    else
+      printf 'Open Terminal is installed in CT %s. After fixing the integration error, re-run with --integrate-only.\n' "$CT_ID" >&2
+    fi
   fi
 }
 trap cleanup EXIT
@@ -523,7 +541,9 @@ else
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
     --description 'Open Terminal workspace for Ollama Smart Router Open WebUI')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
-  run "${create[@]}"
+  create_attempted=1
+  run_pct_create "${create[@]}"
+  create_succeeded=1
 
   firewall_file="/etc/pve/firewall/${CT_ID}.fw"
   firewall=$(printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source %s/32 -p tcp -dport %s -log nolog\n' \
@@ -569,6 +589,7 @@ else
   run pct exec "$CT_ID" -- env "OPEN_TERMINAL_PORT=$OPEN_TERMINAL_PORT" \
     "OPEN_TERMINAL_VERSION=$OPEN_TERMINAL_VERSION" "OPEN_TERMINAL_COMMIT=$OPEN_TERMINAL_COMMIT" \
     bash /root/open-terminal-deploy/install-target.sh
+  terminal_installed=1
 fi
 
 # --- register it with Open WebUI on the router ---------------------------------------
