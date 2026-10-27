@@ -116,6 +116,7 @@ url_port() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest##*:}"
 # The rules this target owns carry a rule comment, which Proxmox keeps when
 # the firewall is edited in its GUI or API (comment-only lines are dropped).
 FW_TAG='ollama-smart-router hermes'
+HERMES_CT_DESCRIPTION='Hermes Agent for Ollama Smart Router'
 
 # hermes_fw_rules ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT RESTRICTED: the
 # owned rules. Inbound: only the router, to the API server (an empty API_PORT
@@ -620,7 +621,15 @@ elif (( dry_run )); then
   HERMES_IP='<hermes-eth0-ip>'
 else
   pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "Hermes CT $CT_ID is not running on this host."
-  pct exec "$CT_ID" -- test -f /etc/hermes-target/settings || die "CT $CT_ID has no Hermes installation from this target."
+  existing_install=false
+  if pct exec "$CT_ID" -- test -f /etc/hermes-target/settings; then
+    existing_install=true
+  elif [[ $mode == reconfigure && -f $firewall_file ]] &&
+       pct config "$CT_ID" 2>/dev/null | grep -qxF "description: $HERMES_CT_DESCRIPTION"; then
+    note "CT $CT_ID has no completed Hermes settings; resuming its partial installation."
+  else
+    die "CT $CT_ID has no completed Hermes installation. A partial install can be resumed only when this target's CT description and firewall file remain."
+  fi
   if [[ $mode == integrate ]]; then
     pct exec "$CT_ID" -- test -s /etc/hermes-target/api-key ||
       die "CT $CT_ID runs no Hermes API server; use --reconfigure (with OPENWEBUI=true) to add it."
@@ -716,7 +725,7 @@ if [[ $mode == create ]]; then
   create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype debian
     --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
-    --description 'Hermes Agent for Ollama Smart Router')
+    --description "$HERMES_CT_DESCRIPTION")
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
   # Keep the mapped rootfs traversable while Proxmox extracts the template.
   (umask 022; run "${create[@]}")
@@ -762,11 +771,14 @@ fi
 # the guest installer reaches the router through them, and a failed run leaves
 # the CT reachable as before. After the guest step, only the new rules stay.
 if [[ $mode == reconfigure ]]; then
-  if (( ! dry_run )); then
+  if (( ! dry_run )) && $existing_install; then
     old_settings=$(pct exec "$CT_ID" -- cat /etc/hermes-target/settings) ||
       die "Could not read CT $CT_ID's existing Hermes settings."
     old_api_server=$(sed -n 's/^HERMES_API_SERVER=//p' <<< "$old_settings" | head -n 1)
     old_api_port=$(sed -n 's/^HERMES_API_PORT=//p' <<< "$old_settings" | head -n 1)
+  else
+    old_api_server=unknown
+    old_api_port=''
   fi
   if (( dry_run )); then
     printf '+ check the Hermes rules in %s, and admit the new router address and port next to the old ones\n' "$firewall_file"

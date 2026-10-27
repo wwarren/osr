@@ -34,6 +34,8 @@ pass 'dry runs plan the official installer, the router key, the chat probe and t
 
 refused() { if env "$@" bash "$script" --dry-run >/dev/null 2>&1; then fail "accepted: $*"; fi; }
 refused ROUTER_URL=http://bad-host:8000/v1
+msg=$(env -u ROUTER_URL bash "$script" --dry-run 2>&1 || true)
+[[ $msg == *'ROUTER_URL is unset'* && $msg == *'provision-lxc.sh --reconfigure'* ]] || fail "missing router URL gives no recovery path: $msg"
 refused ROUTER_URL=http://router:8000 HERMES_MODEL='bad model'
 refused ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=32768
 refused ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=63999

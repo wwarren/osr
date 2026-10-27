@@ -268,7 +268,9 @@ printf 'pct' >> "$FAKE_LOG"; printf ' %q' "$@" >> "$FAKE_LOG"; printf '\n' >> "$
 cmd=$1 id=$2; shift 2
 case $cmd in
   status) [[ -e $FAKE_DIR/ct$id || $id == 280 ]] && echo 'status: running' ;;
-  create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id" ;;
+  create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id"
+    printf 'description: Hermes Agent for Ollama Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
+  config) cat "$FAKE_DIR/ct$id/description" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")" ;;
   pull) [[ $1 == /etc/hermes-target/api-key ]] && printf '%s\n' "$FAKE_HERMES_KEY" > "$2" ;;
@@ -318,9 +320,11 @@ case $cmd in
           exit "$found" ;;
         sh\ -c\ test\ -d\ /run/systemd/system*) exit 0 ;;
         'install -d -m 0700 /root/hermes-deploy') : ;;
-        env\ *install-target.sh) touch "$FAKE_DIR/ct$id/installed"
+        env\ *install-target.sh)
           cp "$FAKE_DIR/pve/firewall/$id.fw" "$FAKE_DIR/fw-at-guest" 2>/dev/null || : > "$FAKE_DIR/fw-at-guest"
           [[ -z ${FAKE_FW_EDIT:-} ]] || printf '[RULES]\n' >> "$FAKE_DIR/pve/firewall/$id.fw"
+          [[ ${FAKE_GUEST_RC:-0} == 0 ]] || exit "$FAKE_GUEST_RC"
+          touch "$FAKE_DIR/ct$id/installed"
           [[ $all =~ HERMES_API_SERVER=(true|false) ]] && server=${BASH_REMATCH[1]}
           [[ $all =~ HERMES_API_PORT=([0-9]+) ]] && port=${BASH_REMATCH[1]}
           printf '%s\n' "${server:-false}" > "$FAKE_DIR/ct$id/api-state"
@@ -424,12 +428,15 @@ pass 'a router that rejects its own key stops before pct create; a router withou
 reset_fake
 out=$(real FAKE_GUEST_RC=1) && fail 'a failed guest install was accepted'
 [[ $out == *'re-run with --reconfigure'* ]] || fail "failure hint: $out"
-pass 'a failed guest install keeps the CT and points to --reconfigure'
+[[ ! -e $fake/ct282/installed ]] || fail 'the failed guest install wrote completed settings'
+pass 'a failed guest install leaves an incomplete CT and points to --reconfigure'
 
 # --reconfigure and --integrate-only on the CT made above.
 : > "$log"; rm -f "$fake"/pushed-*
 out=$(real --reconfigure) || fail "reconfigure: $out"
 grep -q 'pct create' "$log" && fail '--reconfigure created a CT'
+[[ -e $fake/ct282/installed ]] || fail '--reconfigure did not complete the partial guest install'
+[[ $out == *'resuming its partial installation'* ]] || fail "no partial-install recovery notice: $out"
 [[ $(cat "$fake/pushed-282-router-api-key") == "$router_key" ]] || fail '--reconfigure did not push the current key'
 grep -q 'integrate-webui.py' "$log" || fail '--reconfigure did not register again'
 : > "$log"
@@ -553,6 +560,21 @@ grep -q -e '192.0.2.73/32' -e '192.0.2.74/32' "$fwfile" && fail "old addresses s
 grep -qxF 'OUT ACCEPT -dest 192.0.2.76/32 -p tcp -dport 80 -log nolog # ollama-smart-router hermes-model' "$fwfile" ||
   fail 'an unchanged name lost its rule'
 pass 'model server names are resolved inside the CT (every address), ports default to 80/443, and --reconfigure follows DNS changes'
+
+reset_fake
+mkdir -p "$fake/ct282"
+printf 'description: unrelated CT\n' > "$fake/ct282/description"
+printf '[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api\n' > "$fake/pve/firewall/282.fw"
+out=$(real --reconfigure) && fail 'an unrelated CT without Hermes settings was accepted'
+[[ $out == *'no completed Hermes installation'* ]] || fail "unrelated CT message: $out"
+grep -q 'pct push' "$log" && fail 'an unrelated CT was modified'
+printf 'description: Hermes Agent for Ollama Smart Router\n' > "$fake/ct282/description"
+rm -f "$fake/pve/firewall/282.fw"
+: > "$log"
+out=$(real --reconfigure) && fail 'an incomplete CT without a firewall was accepted'
+[[ $out == *'no completed Hermes installation'* ]] || fail "missing partial firewall message: $out"
+grep -q 'pct push' "$log" && fail 'an incomplete CT without a firewall was modified'
+pass 'partial recovery requires this target’s CT description and firewall file'
 
 reset_fake
 out=$(real FAKE_UID=1000) && fail 'a run without root was accepted'

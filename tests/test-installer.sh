@@ -1108,6 +1108,10 @@ assert_eq "a failed target fails the run" 1 "$_rc"
 assert_contains "and says how to retry it" "rerun targets/strata/provision-lxc.sh" "$(cat "$_out")"
 assert_contains "while the others still run" "run hermes" "$(mock_calls)"
 assert_not_contains "and no key is applied for it" "manage-model-servers apply" "$(mock_calls)"
+FAKE_FAIL=hermes provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed Hermes companion fails the run" 1 "$_rc"
+assert_contains "and gives the partial CT recovery command" \
+  "CT_ID=914 ROUTER_CT_ID=910 bash targets/hermes/provision-lxc.sh --reconfigure" "$(cat "$_out")"
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "no admin key fails the run" 1 "$_rc"
 assert_contains "and the companions are skipped, not run" "skipped (no Open WebUI admin key)" "$(cat "$_out")"

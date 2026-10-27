@@ -141,6 +141,13 @@ For a CT created before nesting was enabled by this target, enable **Nesting**
 under the CT's **Options → Features** in Proxmox and restart the CT.
 `--reconfigure` does not change CT features.
 
+If the first install failed after creating the CT, rerun `--reconfigure` on the
+Proxmox host after fixing the reported cause. It can resume a CT created by
+this target even if the guest installer never wrote its settings file, provided
+the CT description and firewall file remain. Running `install-target.sh` by
+itself inside the CT lacks the `ROUTER_URL` and other settings that the host
+provisioner supplies for that run.
+
 Rerunning the guest installer with unchanged settings says "nothing to do".
 It compares a settings record that includes hashes of the router and backend
 keys, so a rotated key counts as a change. A failure while configuring restores

@@ -1912,6 +1912,9 @@ provision_selected_targets() {
       status=1
       if [[ "${result[$name]}" == "failed (OSR key apply)" ]]; then
         echo "                 run pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers apply"
+      elif [[ "$name" == hermes && "${result[$name]}" == failed ]]; then
+        echo "                 see targets/hermes/README.md; if CT ${id} exists, resume on the Proxmox host with:"
+        echo "                 CT_ID=${id} ROUTER_CT_ID=${CT_ID} bash targets/hermes/provision-lxc.sh --reconfigure"
       else
         echo "                 see targets/${name}/README.md; rerun targets/${name}/provision-lxc.sh"
       fi

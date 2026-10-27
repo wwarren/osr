@@ -180,6 +180,8 @@ DIRECT_UNIT=hermes-direct.service
 DIRECT_URL=http://127.0.0.1:8765
 BACKEND_KEYS_FILE=${BACKEND_KEYS_FILE:-$source_dir/backend-keys}
 
+[[ -n $ROUTER_URL ]] ||
+  die 'ROUTER_URL is unset. Resume from the Proxmox host with provision-lxc.sh --reconfigure; direct guest runs must set ROUTER_URL=http://router-address:8000.'
 [[ $ROUTER_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
   die 'ROUTER_URL must be an HTTP(S) host and port, such as http://192.168.11.80:8000.'
 ROUTER_URL=${ROUTER_URL%/}
