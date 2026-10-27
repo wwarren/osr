@@ -237,6 +237,10 @@ if (( ! dry_run )); then
     done
     (( online )) || die "CT $CT_ID has no default route or DNS after 180 seconds; check network settings."
 fi
+# QEMU guest agent: Proxmox does not use it for an LXC (no virtio-serial port, so
+# the service stays inactive), but every guest carries it. A failure is not fatal.
+run pct exec "$CT_ID" -- sh -c 'export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3 4 5; do apt-get update -q && apt-get install -y -q qemu-guest-agent && exit 0; sleep 5; done; exit 1' ||
+    printf 'Warning: qemu-guest-agent did not install in CT %s; continuing.\n' "$CT_ID" >&2
 run pct exec "$CT_ID" -- install -d -m 0700 /root/maya-target-deploy
 run pct push "$CT_ID" "$source_dir/install-target.sh" /root/maya-target-deploy/install-target.sh --perms 0755
 run pct push "$CT_ID" "$source_dir/maya.service" /root/maya-target-deploy/maya.service --perms 0644

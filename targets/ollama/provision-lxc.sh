@@ -230,6 +230,10 @@ if (( ! dry_run )); then
 fi
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2; rm -f -- "$script"' ERR
+# QEMU guest agent: Proxmox does not use it for an LXC (no virtio-serial port, so
+# the service stays inactive), but every guest carries it. A failure is not fatal.
+run pct exec "$CT_ID" -- sh -c 'export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3 4 5; do apt-get update -q && apt-get install -y -q qemu-guest-agent && exit 0; sleep 5; done; exit 1' ||
+    printf 'Warning: qemu-guest-agent did not install in CT %s; continuing.\n' "$CT_ID" >&2
 run pct exec "$CT_ID" -- install -d -m 0700 /root/ollama-target-deploy
 for file in "${files[@]}"; do
     run pct push "$CT_ID" "$source_dir/$file" "/root/ollama-target-deploy/$file" --perms 0644
