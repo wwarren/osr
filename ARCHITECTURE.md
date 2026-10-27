@@ -308,9 +308,7 @@ command list is in the README). It rewrites `MODEL_SERVERS` and `BACKEND_*` in
   failure.** It restarts only services whose inputs changed and brings the
   LiteLLM and Open WebUI venvs in line with their pins (backing up `webui.db`
   first). The LiteLLM venv itself is not rolled back.
-* **No automatic migration** of old tier names. The services do read the old
-  env keys through a read-only fallback chain, and anything `router.ini` omits
-  uses the defaults in `router.py`, so older configs still start.
+* Anything `router.ini` omits uses the defaults in `router.py`.
 * `commit` pushes with the deploy token through a temporary 0600 credential
   file. The credential uses the remote's URL scheme, because git will not match
   `https://` credentials to an `http://` request. Prompting is disabled, so a

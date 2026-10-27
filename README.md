@@ -466,25 +466,6 @@ their existing installation settings carry forward unless explicitly
 overridden. See the target README and [architecture upgrade contract](ARCHITECTURE.md#16-inference-targets-targets)
 before upgrading.
 
-### Old tier names
-
-Configs from before the `xlarge` tier may use old names. Nothing migrates them
-automatically. The services still read the old env keys, but API callers must
-switch to `large`. Edit `env/router.env`, `litellm_config.yaml` and
-`router.ini`:
-
-| Old | New |
-|---|---|
-| `BACKEND_QWEN_HEAVY` / `BACKEND_HEAVY`, `MODEL_HEAVY` | `BACKEND_LARGE`, `MODEL_LARGE` |
-| `BACKEND_QWEN_FAST` / `_MEDIUM` | `BACKEND_FAST` / `BACKEND_MEDIUM` |
-| `model_name: qwen-heavy` / `heavy`; `heavy =` in `[thresholds]`, `[keywords]`, `[tiers]` | `large` |
-| `heavy_params = 20:999` | `large_params = 20:70` and `xlarge_params = 70:999` |
-| `prefer_larger_heavy` / `prefer_smaller_fast` | `prefer_larger` / `prefer_smaller` |
-
-Then populate the new tier: `manage-model-servers set-tier xlarge <host>` and
-`set-model xlarge <tag> --apply --commit`. Settings `router.ini` omits use the
-built-in defaults.
-
 ## Troubleshooting
 
 Start with the services' logs and the router's view of the pool, inside the
