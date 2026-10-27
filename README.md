@@ -106,7 +106,7 @@ kernel with Linux 6.12 or newer.
 
 ### Router settings
 
-The router prompts for its root password, network, storage and size; Gitea
+The router prompts for its CT ID (Enter takes the next free one), root password, network, storage and size; Gitea
 URL, account, repository and token; Mattermost webhook (blank disables
 alerts); and 1–20 model servers, tiers and model tags. Selected model targets
 fill the first server slots. Increase the count to include existing servers.

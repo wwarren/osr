@@ -29,7 +29,7 @@ set -euo pipefail
 #   * Routing thresholds/keywords moved out of router.py into router.ini, and
 #     monitor polling into monitor.ini, so behaviour is configurable per commit.
 # ==============================================================================
-CT_ID="${CT_ID:-}"
+CT_ID="${CT_ID:-}"                    # blank = offer the cluster's next free ID at the prompt
 CT_NAME="${CT_NAME:-ollama-smart-router}"
 BRIDGE="${BRIDGE:-vmbr0}"
 IP_CIDR="${IP_CIDR:-192.168.11.80/24}"
@@ -1560,6 +1560,25 @@ provision_selected_targets() {
 }
 
 # --- interactive configuration ----------------------------------------------
+# The router's CT ID. The default offered is the CT_ID preset, else the
+# cluster's next free ID; any other free ID can be typed in. An ID that is
+# malformed or already in use anywhere in the cluster is refused and re-asked
+# (with NONINTERACTIVE=true it stops the install instead).
+prompt_router_ct_id() {
+  local default="$CT_ID"
+  if [[ -z "$default" ]]; then
+    default="$(find_next_ct_id)" || return 1
+  fi
+  echo
+  echo "--- Router container ---"
+  prompt_until_valid "Router CT ID" CT_ID "$default" valid_router_ct_id
+}
+# Proxmox accepts guest IDs 100-999999999.
+valid_router_ct_id() {
+  [[ "$1" =~ ^[1-9][0-9]{2,8}$ ]] || { echo "  A CT ID is a whole number from 100 to 999999999." >&2; return 1; }
+  ct_id_free "$1" || { echo "  CT $1 is already in use in this cluster." >&2; return 1; }
+}
+
 prompt_network_config() {
   echo
   echo "--- Container network ---"
@@ -2422,7 +2441,8 @@ require_command python3
 # Which targets to create alongside the router (their settings follow below).
 prompt_target_selection || exit 1
 
-CT_ID="$(find_next_ct_id)"
+# Asked before the password prompt, which names the container by its ID.
+prompt_router_ct_id || exit 1
 ROOT_PASSWORD=""
 GITEA_DEPLOY_TOKEN="${GITEA_DEPLOY_TOKEN:-}"
 echo "Using container ID: ${CT_ID}"
