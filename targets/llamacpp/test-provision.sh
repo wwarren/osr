@@ -26,6 +26,7 @@ check() {
     if [[ $expected == success ]]; then
         if (( status != 0 )); then printf 'FAIL %s\n%s\n' "$label" "$output" >&2; exit 1; fi
         [[ $output == *'+ pct create 250 '* && $output == *'--unprivileged 1'* && $output == *'--features nesting=1'* && $output == *'+ pct push 250 '* ]] || { printf 'FAIL %s: incomplete command plan\n' "$label" >&2; exit 1; }
+        [[ $output != *'huggingface.co/'*'/blob/'* ]] || { printf 'FAIL %s: Hugging Face browser URL was not normalized\n' "$label" >&2; exit 1; }
         [[ $output == *'install_nvidia_580_173_02.sh /root/llama-target-deploy/install_nvidia_580_173_02.sh --perms 0755'* ]] || { printf 'FAIL %s: NVIDIA helper was not copied into the deployment directory\n' "$label" >&2; exit 1; }
         [[ $output != *'CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc'* ]] || { printf 'FAIL %s: command plan injected a CUDA compiler path that was not configured\n' "$label" >&2; exit 1; }
         if [[ $mode == install || $mode == install-env || $mode == install-url ]]; then
@@ -74,6 +75,7 @@ check success 'install permits a full commit override' install LLAMA_CPP_REF=7fe
 check success 'CUDA install accepts an intentional all-layers override' install GPU_LAYERS=all MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'CPU install skips the NVIDIA user-space helper' install BACKEND=cpu GPU_DEVICES= GPU_LAYERS=0 MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'install URL-only source is forwarded to the noninteractive guest' install-url MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf?download=true
+check success 'install normalizes a Hugging Face browser URL before forwarding' install-url MODEL_ALIAS=qwen3.6:35b MODEL_DOWNLOAD_URL=https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
 check success 'install URL can use an explicit custom model path' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf MODEL_PATH=/mnt/models/local.gguf
 check success 'environment can explicitly enable guest installation' install-env INSTALL_TARGET=1 MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'guest install still requires model settings' install
@@ -95,7 +97,7 @@ check failure 'guest install rejects an invalid alias' install 'MODEL_ALIAS=bad 
 check success 'LLAMA_EXTRA_ARGS is passed to the guest' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf 'LLAMA_EXTRA_ARGS=--flash-attn on'
 check failure 'LLAMA_EXTRA_ARGS rejects shell metacharacters' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf 'LLAMA_EXTRA_ARGS=--x;reboot'
 check failure 'guest install rejects model traversal' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/models/../model.gguf
-check failure 'guest install rejects an unsafe model download URL' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/blob/main/model.gguf
+check failure 'guest install rejects a non-file Hugging Face URL' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/tree/main/model.gguf
 check failure 'guest install rejects a noncanonical Hugging Face host' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.com/org/repo/resolve/main/model.gguf
 check failure 'guest install rejects an unpinned build ref' install LLAMA_CPP_REF=main MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check failure 'invalid GPU layer policy is rejected' install GPU_LAYERS=maximum MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf

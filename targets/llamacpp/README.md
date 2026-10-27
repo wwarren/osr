@@ -191,7 +191,9 @@ IOMMU/VFIO configuration, or disable LXC confinement.
 `MODEL_ALIAS` plus either `MODEL_PATH` or a direct public
 `MODEL_DOWNLOAD_URL`, because the guest command is non-interactive. URL-only
 installation uses the default model store; combine a URL with `MODEL_PATH` to
-choose its destination. `--create-only` always preserves the default CT-only
+choose its destination. Hugging Face `/resolve/` download links and `/blob/`
+browser links are accepted; `/blob/` is normalized to `/resolve/` before the
+guest installer runs. `--create-only` always preserves the default CT-only
 behavior.
 
 These scripts do not create a complete network firewall policy. Restrict target
@@ -303,7 +305,9 @@ same-directory `.part` file, checks that it is nonempty and starts with the
 `GGUF` header, then atomically promotes it without overwriting an existing
 GGUF. It does not use a Hugging Face token, so gated/private repositories are
 not supported by this prompt. Inspect or remove a retained `.part` file before
-retrying a failed download.
+retrying a failed download. Paste either a Hugging Face `/resolve/` download
+link or a `/blob/` browser link; the installer converts `/blob/` to `/resolve/`
+before downloading.
 
 To skip prompts, preconfigure `MODEL_ALIAS` and either `MODEL_PATH` or
 `MODEL_DIR` plus `MODEL_FILE`. `MODEL_DOWNLOAD_URL` can supply the filename, so

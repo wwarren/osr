@@ -60,6 +60,8 @@ commit with `test-pinned-run-script.py` (see [Check without Proxmox](#check-with
 From this repository's root on the Proxmox host:
 
 ```bash
+bash targets/strata/provision-lxc.sh  # prompts for the new Strata CT ID and install settings
+
 CT_ID=280 \
 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst \
 STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1 \
@@ -77,6 +79,10 @@ The service is enabled for future CT starts. The installer waits up to
 because the first load of the model takes a while. A partially configured CT is
 kept if setup fails, so you can inspect it. The script never deletes an
 existing CT.
+Running this provisioner again with that CT ID stops before creating anything.
+To resume an interrupted install or upgrade Strata in the existing CT, run
+`pct exec 280 -- bash /root/strata-target-deploy/install-target.sh` (replace
+`280` with your Strata CT ID).
 
 Strata keeps its venv, engine and model configs in `/opt/strata`, and models in
 `/var/lib/strata`. Both are owned by `strata`, the only paths the service can

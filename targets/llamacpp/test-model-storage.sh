@@ -14,7 +14,7 @@ source <(awk '
     capture { print }
 ' "$script_dir/install-target.sh")
 
-for helper in valid_huggingface_gguf_url huggingface_gguf_filename \
+for helper in normalize_huggingface_gguf_url valid_huggingface_gguf_url huggingface_gguf_filename \
     list_model_storage_volumes select_model_storage configure_model; do
     declare -F "$helper" >/dev/null || die "Installer helper extraction failed: $helper"
 done
@@ -45,6 +45,11 @@ hf_filename() {
     printf 'FILENAME|%s\n' "$(huggingface_gguf_filename "$url")"
 }
 
+hf_blob_normalized() {
+    local url='https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf'
+    printf 'NORMALIZED|%s\n' "$(normalize_huggingface_gguf_url "$url")"
+}
+
 hf_url_invalid() {
     local url
     for url in \
@@ -55,7 +60,7 @@ hf_url_invalid() {
         'https://huggingface.co@evil.example/org/repo/resolve/main/model.gguf' \
         'https://user@huggingface.co/org/repo/resolve/main/model.gguf' \
         'https://huggingface.co:443/org/repo/resolve/main/model.gguf' \
-        'https://huggingface.co/org/repo/blob/main/model.gguf' \
+        'https://huggingface.co/org/repo/tree/main/model.gguf' \
         'https://huggingface.co/org/repo/resolve/main/model.safetensors' \
         'https://huggingface.co/org/repo/resolve/main/model.gguf#fragment' \
         'https://huggingface.co/org/repo/resolve/main/model.gguf%2Fetc' \
@@ -143,6 +148,8 @@ check 'direct Hugging Face resolve GGUF URL is accepted' ok \
     'URL|https://huggingface.co/' hf_url_valid
 check 'Hugging Face resolve URL with a query yields the GGUF filename' ok \
     'FILENAME|Qwen2.5-7B-Instruct-Q4_K_M.gguf' hf_filename
+check 'Hugging Face blob GGUF URL is normalized to a raw resolve URL' ok \
+    'NORMALIZED|https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf' hf_blob_normalized
 check 'non-direct, non-HTTPS, lookalike, and non-GGUF URLs are rejected' ok \
     'REJECTED invalid Hugging Face URLs' hf_url_invalid
 check 'empty selector input chooses the default model directory' ok \

@@ -26,8 +26,9 @@ Without --upgrade: fresh installations only. Missing model settings are prompted
 MODEL_ALIAS accepts a model name or name:tag (a bare name gets :latest).
 Set MODEL_PATH, or MODEL_DIR plus MODEL_FILE, to skip the storage prompts.
 MODEL_DIR defaults to /var/lib/llama-target/models; MODEL_FILE is a GGUF basename.
-MODEL_DOWNLOAD_URL optionally fetches one public GGUF from a direct
-https://huggingface.co/<org>/<repo>/resolve/<revision>/<file>.gguf URL.
+MODEL_DOWNLOAD_URL optionally fetches one public GGUF from a Hugging Face
+/resolve/ download URL or /blob/ browser URL. Valid /blob/ URLs are converted
+to /resolve/ before download.
 NONINTERACTIVE=true disables prompts and requires MODEL_ALIAS plus a GGUF file
 setting or a valid MODEL_DOWNLOAD_URL.
 Optional: LLAMA_CPP_REF=<release-tag-or-full-commit> ($LLAMA_CPP_DEFAULT_REF),
@@ -74,17 +75,21 @@ valid_model_dir() {
 valid_model_file() {
     [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*\.gguf$ ]]
 }
-valid_huggingface_gguf_url() {
+normalize_huggingface_gguf_url() {
     local url=$1 path
     [[ $url != *[[:space:]]* && $url != *'#'* ]] || return 1
     path=${url%%\?*}
     [[ $path != *'/../'* && $path != */.. && $path != *'/./'* && $path != */. ]] || return 1
-    [[ $url =~ ^https://huggingface\.co/[^/?#]+/[^/?#]+/resolve/[^?#]+\.gguf(\?[^#[:space:]]*)?$ ]]
+    [[ $url =~ ^https://huggingface\.co/[^/?#]+/[^/?#]+/(resolve|blob)/[^?#]+\.gguf(\?[^#[:space:]]*)?$ ]] || return 1
+    printf '%s\n' "${url/\/blob\//\/resolve\/}"
+}
+valid_huggingface_gguf_url() {
+    normalize_huggingface_gguf_url "$1" >/dev/null
 }
 huggingface_gguf_filename() {
-    local path filename
-    valid_huggingface_gguf_url "$1" || return 1
-    path=${1%%\?*}
+    local normalized path filename
+    normalized=$(normalize_huggingface_gguf_url "$1") || return 1
+    path=${normalized%%\?*}
     filename=${path##*/}
     valid_model_file "$filename" || return 1
     printf '%s\n' "$filename"
@@ -218,8 +223,9 @@ configure_model() {
     local directory_guidance='Use an absolute model directory without spaces or traversal components, outside home and temporary directories.'
     local file_default='' candidate download_filename=''
     prompt_optional_model_setting MODEL_DOWNLOAD_URL 'Hugging Face GGUF download URL' valid_huggingface_gguf_url \
-        'Use a direct HTTPS huggingface.co/<org>/<repo>/resolve/<revision>/<file>.gguf URL, or leave it blank.'
+        'Use an HTTPS huggingface.co GGUF file URL containing /resolve/ or /blob/, or leave it blank.'
     if [[ -n $MODEL_DOWNLOAD_URL ]]; then
+        MODEL_DOWNLOAD_URL=$(normalize_huggingface_gguf_url "$MODEL_DOWNLOAD_URL") || die 'MODEL_DOWNLOAD_URL must be a supported Hugging Face GGUF file URL.'
         download_filename=$(huggingface_gguf_filename "$MODEL_DOWNLOAD_URL") || die 'MODEL_DOWNLOAD_URL must end with a supported .gguf filename.'
     fi
     if [[ -n $MODEL_PATH ]]; then

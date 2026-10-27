@@ -43,7 +43,7 @@ check 'bare model name uses latest tag' ok 'Model alias: qwen3:latest' settings 
 check 'unattended directory default' ok '/var/lib/llama-target/models/weights.gguf' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_FILE=weights.gguf
 check 'download URL supplies the default GGUF filename' ok '/var/lib/llama-target/models/model.gguf' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf
 check 'explicit MODEL_PATH remains the download destination' ok '/srv/models/local-name.gguf' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/model.gguf MODEL_PATH=/srv/models/local-name.gguf
-check 'invalid download URL fails before installation' fail 'MODEL_DOWNLOAD_URL' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/blob/main/model.gguf MODEL_FILE=weights.gguf
+check 'browser blob URL is normalized before installation' ok '/resolve/main/model.gguf' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/blob/main/model.gguf MODEL_FILE=weights.gguf
 check 'missing unattended filename fails' fail 'Set MODEL_FILE' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b
 check 'conflicting directory fails' fail 'MODEL_DIR conflicts' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_PATH=/srv/models/weights.gguf MODEL_DIR=/mnt/models
 check 'conflicting filename fails' fail 'MODEL_FILE conflicts' settings NONINTERACTIVE=true MODEL_ALIAS=qwen3:8b MODEL_PATH=/srv/models/weights.gguf MODEL_FILE=other.gguf

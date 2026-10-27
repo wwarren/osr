@@ -5,9 +5,10 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'USAGE'
-Usage: CT_ID=280 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_<version>_amd64.tar.zst \
+Usage: bash provision-lxc.sh [--dry-run]
+   or: CT_ID=280 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_<version>_amd64.tar.zst \
        STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1 \
-       bash targets/strata/provision-lxc.sh [--dry-run]
+       bash provision-lxc.sh [--dry-run]
 
 Creates an unprivileged Proxmox VE 9 LXC, passes an NVIDIA GPU through, clones
 https://github.com/Niko1221/Strata.git inside the CT, runs Strata's Linux
@@ -19,6 +20,8 @@ Required: CT_ID (unused, >=100), TEMPLATE (downloaded Ubuntu 22.04/24.04 or
 Debian 12/13 amd64), STORAGE (rootdir storage), IP_CIDR (a.b.c.d/nn or dhcp).
 GATEWAY is required for a static address. The host needs NVIDIA driver
 580.173.02 and the repository's matching LXC user-space installer by default.
+Interactive runs prompt for missing required values. This script creates a new
+CT; to resume or upgrade an existing Strata CT, run its guest install-target.sh.
 
 Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           SWAP_MB=0, ROOTFS_GB=160, ONBOOT=1, NAMESERVER, VLAN_TAG,
@@ -63,6 +66,13 @@ valid_ip_cidr() {
     ipv4 "$address" && [[ $prefix =~ ^(0|[1-9][0-9]?)$ ]] && (( prefix <= 32 ))
 }
 positive_int() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
+prompt_required() {
+    local name=$1 label=$2
+    [[ -n ${!name} ]] && return 0
+    [[ -t 0 ]] || die "Set ${name} for an unattended run (or run interactively to be prompted)."
+    read -r -p "$label" "$name" || die "No ${name} was entered."
+    [[ -n ${!name} ]] || die "${name} is required."
+}
 run() {
     printf '+'; printf ' %q' "$@"; printf '\n'
     if (( ! dry_run )); then "$@"; fi
@@ -124,6 +134,14 @@ STRATA_VISION=${STRATA_VISION:-no}
 STRATA_PORT=${STRATA_PORT:-8080}
 STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}
 STRATA_ALLOW_NO_KEY=${STRATA_ALLOW_NO_KEY:-false}
+
+prompt_required CT_ID 'New Strata CT ID on this Proxmox host (unused, at least 100): '
+prompt_required TEMPLATE 'Downloaded Ubuntu or Debian amd64 template (e.g. local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst): '
+prompt_required STORAGE 'Storage for the new Strata CT root disk (e.g. local-lvm): '
+prompt_required IP_CIDR 'IP/CIDR for the new Strata CT (or dhcp): '
+if [[ $IP_CIDR != dhcp ]]; then
+    prompt_required GATEWAY 'Gateway for the new Strata CT: '
+fi
 
 [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'CT_ID must be an unused numeric ID of 100 or more.'
 [[ $TEMPLATE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || \
@@ -199,7 +217,12 @@ if (( ! dry_run )); then
     done
     [[ $(pveversion) == pve-manager/9.* ]] || die 'This script targets Proxmox VE 9.x.'
     [[ -d /etc/pve/nodes ]] || die '/etc/pve is unavailable.'
-    pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null || die "CT ID $CT_ID is already in use."
+    if ! pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null; then
+        if pct status "$CT_ID" >/dev/null 2>&1; then
+            die "CT $CT_ID already exists. This script only creates new Strata CTs; resume or upgrade it with: pct exec $CT_ID -- bash /root/strata-target-deploy/install-target.sh"
+        fi
+        die "CT ID $CT_ID is unavailable in this cluster."
+    fi
     [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge interface is missing: $BRIDGE"
     template_path=$(pvesm path "$TEMPLATE")
     [[ -f $template_path && -r $template_path ]] || die "Template is not readable: $TEMPLATE"

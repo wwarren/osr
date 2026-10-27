@@ -121,7 +121,8 @@ pass '--integrate-only only registers the existing CT'
 
 refuse 'With --no-webui nothing would be admitted' --no-webui
 refuse 'Use only one of' --integrate-only --no-webui
-refuse '--integrate-only needs the existing CT_ID' --integrate-only CT_ID=
+refuse 'Set CT_ID for an unattended run' --integrate-only CT_ID=
+refuse 'Set CT_ID for an unattended run' CT_ID=
 refuse 'MEMORY_MB must be at least 8192' MEMORY_MB=4096
 refuse 'ROOTFS_GB must be at least 32' ROOTFS_GB=25
 refuse 'GPU must be' GPU=radeon
@@ -163,7 +164,7 @@ fi
 [[ -z $out ]] || cp "'"$community"'" "$out"'
 stub pveversion 'exit 0'
 stub id '[[ $1 == -u ]] && echo 0'
-stub pvesh '[[ $* == *--vmid* ]] || echo 286; exit 0'
+stub pvesh '[[ -z ${FAKE_ID_USED:-} ]] || exit 1; [[ $* == *--vmid* ]] || echo 286; exit 0'
 stub pve-firewall 'echo "Status: ${FAKE_FW_STATUS:-enabled/running}"'
 # pct: the router is CT 280 with a healthy Open WebUI; the new CT is 286.
 stub pct 'case "$*" in
@@ -192,6 +193,11 @@ real() {
         "$bash_bin" "$tool" "${flags[@]}" 2>&1)
 }
 calls() { cat "$log"; }
+
+real OPENWEBUI_ADMIN_TOKEN=t FAKE_ID_USED=1 && fail 'an existing CT ID was accepted for a new install'
+has 'CT 286 already exists'; has '--integrate-only'
+! grep -q '^community' "$log" || fail 'the community script ran for an existing CT ID'
+pass 'a rerun with an existing CT ID stops before the community script and points to the existing-CT flow'
 
 real OPENWEBUI_ADMIN_TOKEN=owui-secret GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_NVIDIA_SMI=1 UI_ALLOW_CIDR=198.51.100.0/24 \
     COMMUNITY_SCRIPT_SHA256="$good_sha" COMFYUI_MODEL_URL=https://huggingface.co/o/r/resolve/main/v1-5.safetensors || fail "full run failed"

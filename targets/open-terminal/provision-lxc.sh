@@ -10,9 +10,10 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 usage() {
   cat <<'USAGE'
-Usage: CT_ID=281 TEMPLATE=local:vztmpl/debian-13-standard_..._amd64.tar.zst \
+Usage: bash provision-lxc.sh [--dry-run] [--integrate-only]
+   or: CT_ID=281 ROUTER=280 TEMPLATE=local:vztmpl/debian-13-standard_..._amd64.tar.zst \
        STORAGE=local-lvm IP_CIDR=192.168.11.81/24 GATEWAY=192.168.11.1 \
-       bash targets/open-terminal/provision-lxc.sh [--dry-run] [--integrate-only]
+       bash provision-lxc.sh [--dry-run] [--integrate-only]
 
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Open Terminal from
 the open-webui/open-terminal v0.14.0 GitHub tag, and registers an admin-only
@@ -28,9 +29,11 @@ force one kind. It verifies the selected host's Open WebUI before creating the
 terminal CT. SSH uses one connection for the whole run, so a password is asked
 for at most once; unattended runs need key-based login.
 
-Required: CT_ID (unused ID >=100 on this host), ROUTER (or the prompt),
-          TEMPLATE (downloaded Debian 12/13 amd64 LXC template),
-          STORAGE (active rootdir storage), IP_CIDR (static IPv4/CIDR), GATEWAY.
+Required for a new install: CT_ID (unused terminal CT ID >=100 on this host),
+          ROUTER (existing Open WebUI CT ID/IP/hostname), TEMPLATE (downloaded
+          Debian 12/13 amd64 LXC template), STORAGE (active rootdir storage),
+          IP_CIDR (new terminal CT's static IPv4/CIDR), GATEWAY. Interactive
+          runs prompt for missing values. --integrate-only needs CT_ID and ROUTER.
 Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=2048,
           SWAP_MB=512, ROOTFS_GB=16, ONBOOT=1, NAMESERVER, VLAN_TAG,
           ROUTER_SSH_PORT=22,
@@ -99,6 +102,13 @@ remote_command() {
 # End provision helpers. --------------------------------------------------------
 
 positive() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
+prompt_required() {
+  local name=$1 label=$2
+  [[ -n ${!name} ]] && return 0
+  [[ -t 0 ]] || die "Set ${name} for an unattended run (or run interactively to be prompted)."
+  read -r -p "$label" "$name" || die "No ${name} was entered."
+  [[ -n ${!name} ]] || die "${name} is required."
+}
 run() {
   printf '+'; printf ' %q' "$@"; printf '\n'
   if (( ! dry_run )); then "$@"; fi
@@ -179,8 +189,20 @@ else
   router_label="router ${ROUTER_SSH_USER}@${ROUTER_SSH_HOST}"
 fi
 
-[[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'CT_ID must be numeric and at least 100.'
+if (( integrate_only )); then
+  prompt_required CT_ID 'Existing Open Terminal CT ID on this Proxmox host: '
+else
+  prompt_required CT_ID 'New Open Terminal CT ID on this Proxmox host (unused, at least 100): '
+fi
+[[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] ||
+  die 'Open Terminal CT_ID must be numeric and at least 100; it is separate from the existing Open WebUI CT ID or IP.'
 [[ $router_kind == ssh || $CT_ID != "$ROUTER_CT_ID" ]] || die 'Terminal and router CT IDs must differ.'
+if (( ! integrate_only )); then
+  prompt_required TEMPLATE 'Downloaded Debian 12/13 amd64 template (e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst): '
+  prompt_required STORAGE 'Storage for the new terminal CT root disk (e.g. local-lvm): '
+  prompt_required IP_CIDR 'Static IP/CIDR for the new terminal CT (e.g. 192.168.11.81/24): '
+  prompt_required GATEWAY 'Gateway for the new terminal CT (e.g. 192.168.11.1): '
+fi
 for name in CORES MEMORY_MB ROOTFS_GB OPEN_TERMINAL_PORT; do positive "$name" "${!name}"; done
 (( OPEN_TERMINAL_PORT <= 65535 )) || die 'OPEN_TERMINAL_PORT must be <=65535.'
 [[ $SWAP_MB =~ ^(0|[1-9][0-9]{0,8})$ ]] || die 'SWAP_MB must be nonnegative.'

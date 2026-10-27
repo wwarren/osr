@@ -14,8 +14,9 @@ note() { printf '%s\n' "$*" >&2; }
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/comfyui.sh
 usage() {
     cat <<'USAGE'
-Usage: CT_ID=286 IP_CIDR=192.168.11.86/24 GATEWAY=192.168.11.1 ROUTER=280 \
-       bash targets/comfyui/provision-lxc.sh [--dry-run] [--integrate-only | --no-webui]
+Usage: bash provision-lxc.sh [--dry-run] [--integrate-only | --no-webui]
+   or: CT_ID=286 IP_CIDR=192.168.11.86/24 GATEWAY=192.168.11.1 ROUTER=280 \
+       bash provision-lxc.sh [--dry-run] [--integrate-only | --no-webui]
 
 Runs the community script
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/comfyui.sh)"
@@ -34,6 +35,8 @@ It asks for an Open WebUI admin API key unless OPENWEBUI_ADMIN_TOKEN is set.
 The community script still shows its own menu; pick "Default" (or "My
 Defaults") to accept the presets below. Its install takes a long time
 (PyTorch alone is several GB).
+An interactive run asks for CT_ID: the new ComfyUI CT ID, or the existing CT ID
+with --integrate-only. It does not silently choose another CT when rerun.
 
 The router (the LXC or VM running Open WebUI) is given as ROUTER:
   ROUTER=280                a CT on this Proxmox host, reached with pct
@@ -321,12 +324,16 @@ saved_hf_token=${HF_TOKEN:-}
 unset OPENWEBUI_ADMIN_TOKEN HF_TOKEN
 
 # --- settings --------------------------------------------------------------------
-[[ $mode != integrate || -n $CT_ID ]] || die '--integrate-only needs the existing CT_ID.'
 if [[ -z $CT_ID ]]; then
-    (( dry_run )) || CT_ID=$(pvesh get /cluster/nextid 2>/dev/null || true)
-    [[ -n $CT_ID ]] || die 'Set CT_ID (the next free ID could not be read from the cluster).'
+    [[ -t 0 ]] || die 'Set CT_ID for an unattended run (or run interactively to be prompted).'
+    if [[ $mode == integrate ]]; then
+        read -r -p 'Existing ComfyUI CT ID on this Proxmox host: ' CT_ID || die 'No CT_ID was entered.'
+    else
+        read -r -p 'New ComfyUI CT ID on this Proxmox host (unused, at least 100): ' CT_ID || die 'No CT_ID was entered.'
+    fi
+    [[ -n $CT_ID ]] || die 'CT_ID is required.'
 fi
-valid_container_id "$CT_ID" || die 'CT_ID must be a numeric ID of 100 or more.'
+valid_container_id "$CT_ID" || die 'ComfyUI CT_ID must be a numeric ID of 100 or more.'
 [[ $CT_HOSTNAME =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || die 'CT_HOSTNAME must be a DNS label.'
 for name in CORES MEMORY_MB ROOTFS_GB READY_TIMEOUT; do positive_int "$name" "${!name}"; done
 (( MEMORY_MB >= 8192 )) || die 'MEMORY_MB must be at least 8192; image models need several GB of RAM.'
@@ -558,7 +565,12 @@ if (( ! dry_run )); then
     if [[ $mode == integrate ]]; then
         pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "CT $CT_ID is not a running CT on this host."
     else
-        pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null || die "ID $CT_ID is unavailable in this cluster."
+        if ! pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null; then
+            if pct status "$CT_ID" >/dev/null 2>&1; then
+                die "CT $CT_ID already exists. To re-register it, use --integrate-only; to resume or upgrade ComfyUI, run its guest install-target.sh in that CT."
+            fi
+            die "ID $CT_ID is unavailable in this cluster."
+        fi
         [[ -d $SYS_NET_DIR/$BRIDGE ]] || die "Bridge interface is not present: $BRIDGE"
         [[ $FIREWALL == 0 || ! -e $firewall_file ]] || die "Refusing to replace existing firewall file: $firewall_file"
     fi

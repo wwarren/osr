@@ -66,6 +66,11 @@ has 'STRATA_FAMILY=unsloth'
 has 'STRATA_MODEL=UD-IQ4_XS'
 
 reject 'CT_ID' CT_ID=99
+reject 'Set CT_ID for an unattended run' CT_ID=
+reject 'Set TEMPLATE for an unattended run' TEMPLATE=
+reject 'Set STORAGE for an unattended run' STORAGE=
+reject 'Set IP_CIDR for an unattended run' IP_CIDR=
+reject 'Set GATEWAY for an unattended run' GATEWAY=
 reject 'IP_CIDR' IP_CIDR=192.0.2.999/24
 reject 'TEMPLATE' TEMPLATE=local:vztmpl/alpine-3.20-standard_amd64.tar.zst
 reject 'Duplicate GPU device' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia0'

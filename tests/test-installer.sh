@@ -45,7 +45,10 @@ STORAGE_QUERY_ERROR=""
 GITEA_CURL_OPTS=(--location)
 CT_ID=100
 TEMPLATE_STORAGE="local"
+TEMPLATE_STORAGE_EXPLICIT=""
 TEMPLATE_NAME=""
+TEMPLATE_REF=""
+TEMPLATE_MIN_GIB=2
 CONFIG_UPDATE_CODE=true
 # The owned-code list is data, not a function: lift it from the real script so
 # the tests exercise the list that actually ships.
@@ -732,11 +735,26 @@ assert_not_contains "does not list the selected default" \
 assert_not_contains "does not list Ubuntu 26.04 for Strata" \
   local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst "$out"
 
+describe prompt_template_storage
+_saved_storage_candidates="$(declare -f storage_candidates)"
+storage_candidates() { printf 'nfs\tnfs\t10000000\nlocal\tdir\t10000000\n'; }
+TEMPLATE_STORAGE=local; TEMPLATE_STORAGE_EXPLICIT=""
+_out="$(mktemp)"
+prompt_template_storage > "$_out" <<< ''
+assert_eq "local is the default even when Proxmox lists NFS first" local "$TEMPLATE_STORAGE"
+assert_contains "shows both template storages" 'nfs (nfs)' "$(cat "$_out")"
+TEMPLATE_STORAGE=local
+prompt_template_storage > "$_out" <<< '1'
+assert_eq "the user can select the NFS alternative" nfs "$TEMPLATE_STORAGE"
+eval "$_saved_storage_candidates"
+rm -f "$_out"
+TEMPLATE_STORAGE_EXPLICIT=""
+
 describe select_router_template
 _pveam_list_local='NAME SIZE'
 _pveam_list_nfs='NAME SIZE
 nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
-TEMPLATE_STORAGE=local; TEMPLATE_NAME=""; TEMPLATE_MIN_GIB=2
+TEMPLATE_STORAGE=local; TEMPLATE_NAME=""; TEMPLATE_REF=""
 select_router_template > /dev/null
 assert_eq "records the storage of the router's existing template" nfs "$TEMPLATE_STORAGE"
 assert_eq "keeps that router template" \
@@ -745,11 +763,33 @@ assert_eq "an existing template does not need a download" "" "$DOWNLOAD_TEMPLATE
 _pveam_list_nfs='NAME SIZE'
 storage_supports_vztmpl() { [[ $1 == local ]]; }
 storage_free_gib() { echo 10; }
-TEMPLATE_STORAGE=local
+TEMPLATE_STORAGE=local; TEMPLATE_REF=""
 select_router_template > /dev/null
 assert_eq "a missing router template will be downloaded into its chosen storage" \
   local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$TEMPLATE_REF"
 assert_eq "records the needed download" debian-13-standard_13.1-2_amd64.tar.zst "$DOWNLOAD_TEMPLATE_NAME"
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+_pveam_list_nfs='NAME SIZE
+nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+TEMPLATE_STORAGE=nfs; TEMPLATE_REF=""
+select_router_template > /dev/null <<< 'local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst'
+assert_eq "a typed local reference wins over the NFS default" \
+  local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$TEMPLATE_REF"
+assert_eq "the router uses the typed template storage" local "$TEMPLATE_STORAGE"
+TEMPLATE_REF=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
+TEMPLATE_STORAGE=nfs; NONINTERACTIVE=true
+select_router_template > /dev/null
+assert_eq "an explicit TEMPLATE_REF wins unattended" local "$TEMPLATE_STORAGE"
+NONINTERACTIVE=false
+_pveam_list_local='NAME SIZE'
+TEMPLATE_STORAGE=local; TEMPLATE_STORAGE_EXPLICIT=1; TEMPLATE_REF=""
+select_router_template > /dev/null
+assert_eq "an explicit TEMPLATE_STORAGE does not fall back to NFS" \
+  local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$TEMPLATE_REF"
+assert_eq "it downloads to the requested storage" \
+  debian-13-standard_13.1-2_amd64.tar.zst "$DOWNLOAD_TEMPLATE_NAME"
+TEMPLATE_STORAGE_EXPLICIT=""
 
 describe ensure_target_template
 _pveam_list_local='NAME SIZE

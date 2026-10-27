@@ -1,7 +1,8 @@
 # Hermes Agent companion for Ollama Smart Router
 
 Hermes is an **agent client** of the router, not a model-serving inference
-target. This target creates a dedicated unprivileged Debian LXC and installs
+target. This target creates a dedicated unprivileged Debian LXC with nesting
+enabled and installs
 [Hermes Agent](https://hermes-agent.nousresearch.com/) with the [official POSIX
 installer](https://hermes-agent.nousresearch.com/install.sh). Hermes's custom
 OpenAI-compatible provider points at `127.0.0.1:8765/v1` inside the CT. The
@@ -51,6 +52,13 @@ account inside the Hermes CT.
     the router sends them tool requests.
 
 ## Provision on the Proxmox host
+
+Run `bash targets/hermes/provision-lxc.sh` interactively to enter the existing
+router CT ID or IP address, then a separate **new Hermes CT ID**, Debian template,
+storage and network settings. To resume or update an existing Hermes CT, use
+`bash targets/hermes/provision-lxc.sh --reconfigure`; enter that **existing
+Hermes CT ID** when prompted. `--integrate-only` needs the existing Hermes CT ID
+and registers its API server in Open WebUI again.
 
 ```bash
 CT_ID=282 ROUTER=280 \
@@ -126,6 +134,10 @@ Finally, `integrate-webui.py` runs in the router CT:
 | default | Creates a new CT. A failed run leaves the CT for inspection; fix the error and use `--reconfigure`. |
 | `--reconfigure` | An existing Hermes CT. Pushes the router's **current** and backend keys, installer, dispatcher and units; updates the CT's Hermes firewall rules from the current inventory; then registers it again. Use it after a key rotation, adding a model server, or changing model, context, port, `OPENWEBUI` or router address. |
 | `--integrate-only` | Registers an existing CT's API server in Open WebUI again, for example after resetting `webui.db`. |
+
+For a CT created before nesting was enabled by this target, enable **Nesting**
+under the CT's **Options → Features** in Proxmox and restart the CT.
+`--reconfigure` does not change CT features.
 
 Rerunning the guest installer with unchanged settings says "nothing to do".
 It compares a settings record that includes hashes of the router and backend

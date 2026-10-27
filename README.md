@@ -73,8 +73,12 @@ Generated Gitea and Mattermost admin passwords are in
 Mattermost's `MATTERMOST_CT_VERSION` also accepts Ubuntu 26.04 as an explicit
 override for future testing, but Mattermost does not currently support it.
 
-The router's template storage is selected before target prompts. Strata defaults
-to that same template reference and lists other downloaded compatible templates
+The installer asks for the router's template storage, defaulting to `local`,
+then prompts for its Debian 13 template reference before target prompts. Enter a
+full reference such as `local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst`
+to override the offered default. `TEMPLATE_REF` presets that choice; an explicit
+`TEMPLATE_STORAGE` restricts automatic discovery to that storage. Strata defaults
+to the router's selected reference and lists other downloaded compatible templates
 at its prompt. Other GPU target template prompts prefer a downloaded Debian 13
 template, then supported Ubuntu and Debian releases; they download their preferred
 release if needed. Maya on a GPU
@@ -137,7 +141,7 @@ Settings can be preset as environment variables:
 
 | Area | Variables (default) |
 |---|---|
-| CT | `CT_ID`, `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 with CPU-only torch) |
+| CT | `CT_ID`, `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_REF`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 with CPU-only torch) |
 | Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it when enabling the firewall or 8000/8080 may be dropped) |
 | Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` |

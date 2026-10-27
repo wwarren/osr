@@ -90,12 +90,16 @@ valid_container_cores() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 <= 8192 )); }
 valid_container_memory() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 >= 1024 )); }
 valid_container_disk() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]]; }
 valid_container_gateway() { [[ -z $1 ]] || ipv4 "$1"; }
-valid_huggingface_gguf_url() {
+normalize_huggingface_gguf_url() {
     local url=$1 path
     [[ $url != *[[:space:]]* && $url != *'#'* ]] || return 1
     path=${url%%\?*}
     [[ $path != *'/../'* && $path != */.. && $path != *'/./'* && $path != */. ]] || return 1
-    [[ $url =~ ^https://huggingface\.co/[^/?#]+/[^/?#]+/resolve/[^?#]+\.gguf(\?[^#[:space:]]*)?$ ]]
+    [[ $url =~ ^https://huggingface\.co/[^/?#]+/[^/?#]+/(resolve|blob)/[^?#]+\.gguf(\?[^#[:space:]]*)?$ ]] || return 1
+    printf '%s\n' "${url/\/blob\//\/resolve\/}"
+}
+valid_huggingface_gguf_url() {
+    normalize_huggingface_gguf_url "$1" >/dev/null
 }
 valid_container_ip() {
     local address prefix
@@ -511,7 +515,9 @@ if (( INSTALL_TARGET )); then
         [[ $MODEL_PATH =~ ^/[A-Za-z0-9_./-]+\.gguf$ && $MODEL_PATH != *'/../'* && $MODEL_PATH != *'/./'* ]] || die 'MODEL_PATH must be an absolute .gguf path without spaces or traversal components.'
         [[ $MODEL_PATH != /root/* && $MODEL_PATH != /home/* ]] || die 'Place models outside /root and /home.'
     fi
-    [[ -z $MODEL_DOWNLOAD_URL ]] || valid_huggingface_gguf_url "$MODEL_DOWNLOAD_URL" || die 'MODEL_DOWNLOAD_URL must be a direct HTTPS huggingface.co/<org>/<repo>/resolve/<revision>/<file>.gguf URL.'
+    if [[ -n $MODEL_DOWNLOAD_URL ]]; then
+        MODEL_DOWNLOAD_URL=$(normalize_huggingface_gguf_url "$MODEL_DOWNLOAD_URL") || die 'MODEL_DOWNLOAD_URL must be an HTTPS huggingface.co GGUF file URL containing /resolve/ or /blob/.'
+    fi
     for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION; do [[ ${!name} =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid $name."; done
     [[ $MODEL_CAPABILITIES =~ ^(completion|tools|vision|embedding)(,(completion|tools|vision|embedding))*$ ]] || die 'MODEL_CAPABILITIES may contain completion,tools,vision,embedding.'
     [[ $CUDA_ARCHITECTURES == native || $CUDA_ARCHITECTURES =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]] || die 'Invalid CUDA_ARCHITECTURES (use native or e.g. 86;89;120).'

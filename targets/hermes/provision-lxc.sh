@@ -11,9 +11,10 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 usage() {
   cat <<'USAGE'
-Usage: CT_ID=282 ROUTER=280 TEMPLATE=local:vztmpl/debian-13-standard_..._amd64.tar.zst \
+Usage: bash provision-lxc.sh [--dry-run] [--reconfigure | --integrate-only]
+   or: CT_ID=282 ROUTER=280 TEMPLATE=local:vztmpl/debian-13-standard_..._amd64.tar.zst \
        STORAGE=local-lvm IP_CIDR=192.168.11.82/24 GATEWAY=192.168.11.1 \
-       bash targets/hermes/provision-lxc.sh [--dry-run] [--reconfigure | --integrate-only]
+       bash provision-lxc.sh [--dry-run] [--reconfigure | --integrate-only]
 
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Hermes Agent with
 its official installer, configures a CT-local dispatcher to discover models
@@ -29,6 +30,8 @@ force one kind.
 
 Required: CT_ID, ROUTER (or the prompt); for a new CT also TEMPLATE (Debian
           12/13 amd64), STORAGE (active rootdir storage), IP_CIDR, GATEWAY.
+Interactive runs prompt for missing required values. CT_ID is the Hermes CT,
+separate from the existing router CT ID or IP address.
 Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=65536 (>=64000; the model's
           host must serve it), HERMES_CHANNEL=stable, HERMES_COMMIT,
           HERMES_INSTALLER_SHA256, HERMES_API_PORT=8642,
@@ -335,6 +338,13 @@ run() {
   printf '+'; printf ' %q' "$@"; printf '\n'
   if (( ! dry_run )); then "$@"; fi
 }
+prompt_required() {
+  local name=$1 label=$2
+  [[ -n ${!name} ]] && return 0
+  [[ -t 0 ]] || die "Set ${name} for an unattended run (or run interactively to be prompted)."
+  read -r -p "$label" "$name" || die "No ${name} was entered."
+  [[ -n ${!name} ]] || die "${name} is required."
+}
 
 dry_run=0
 mode=create
@@ -419,8 +429,19 @@ else
 fi
 
 # --- validation, before anything is touched ---------------------------------------
-[[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'CT_ID must be numeric and at least 100.'
+if [[ $mode == create ]]; then
+  prompt_required CT_ID 'New Hermes CT ID on this Proxmox host (unused, at least 100): '
+else
+  prompt_required CT_ID 'Existing Hermes CT ID on this Proxmox host: '
+fi
+[[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'Hermes CT_ID must be numeric and at least 100; it is separate from the router CT ID or IP.'
 [[ $router_kind == ssh || $CT_ID != "$ROUTER_CT_ID" ]] || die 'Hermes and router CT IDs must differ.'
+if [[ $mode == create ]]; then
+  prompt_required TEMPLATE 'Downloaded Debian 12/13 amd64 template (e.g. local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst): '
+  prompt_required STORAGE 'Storage for the new Hermes CT root disk (e.g. local-lvm): '
+  prompt_required IP_CIDR 'Static IP/CIDR for the new Hermes CT: '
+  prompt_required GATEWAY 'Gateway for the new Hermes CT: '
+fi
 for name in CORES MEMORY_MB ROOTFS_GB HERMES_API_PORT; do positive "$name" "${!name}"; done
 (( HERMES_API_PORT <= 65535 )) || die 'HERMES_API_PORT must be <=65535.'
 (( HERMES_API_PORT < 8644 || HERMES_API_PORT > 8646 )) || die 'HERMES_API_PORT 8644-8646 are reserved by Hermes.'
@@ -688,7 +709,7 @@ if [[ $mode == create ]]; then
   net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,gw=$GATEWAY,firewall=1"
   [[ -z $VLAN_TAG ]] || net+=",tag=$VLAN_TAG"
   create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype debian
-    --unprivileged 1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
+    --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
     --description 'Hermes Agent for Ollama Smart Router')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")

@@ -203,6 +203,7 @@ reject() {
 plan
 has '+ pct create 282 local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst'
 has '--unprivileged 1'
+has '--features nesting=1'
 has 'read ROUTER_API_KEY from /app/router/secrets.env on router CT 280 into a 0600 file'
 has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8642'
 has 'policy_out: DROP'
@@ -232,6 +233,13 @@ lacks '+ pct create'; lacks 'install-target.sh'; has 'pct pull 282 /etc/hermes-t
 pass '--reconfigure reruns the installer and registration; --integrate-only only registers'
 
 reject 'CT_ID must be numeric' CT_ID=99
+reject 'Set CT_ID for an unattended run' CT_ID=
+reject 'Set CT_ID for an unattended run' --reconfigure CT_ID=
+reject 'Set CT_ID for an unattended run' --integrate-only CT_ID=
+reject 'Set TEMPLATE for an unattended run' TEMPLATE=
+reject 'Set STORAGE for an unattended run' STORAGE=
+reject 'Set IP_CIDR for an unattended run' IP_CIDR=
+reject 'Set GATEWAY for an unattended run' GATEWAY=
 reject 'Hermes and router CT IDs must differ' CT_ID=280
 reject 'at least 64000' HERMES_CONTEXT_LENGTH=32768
 reject 'IP_CIDR' IP_CIDR=192.0.2.999/24
@@ -392,6 +400,7 @@ grep -q -- '--hermes-url http://192.0.2.82:8642/v1' "$log" || fail 'integration 
 grep -q 'rm -rf -- /root/hermes-integration.AbC123' "$log" || fail 'the router staging directory was not removed'
 [[ $out == *'Open WebUI connection 1 added'* && $out == *'hermes-agent'* ]] || fail "summary: $out"
 grep -q 'pct create 282' "$log" || fail 'no CT created'
+grep -q 'pct create 282.*--features nesting=1' "$log" || fail 'the Hermes CT was created without nesting'
 pass 'a full run pushes the router key as a file, firewalls the API to the router and registers it; no secret is in argv'
 
 reset_fake

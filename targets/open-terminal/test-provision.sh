@@ -83,6 +83,10 @@ has 'http://127.0.0.1:3000 --terminal-url http://192.0.2.81:8100'
 has '\,tag=20'
 has '--nameserver 192.0.2.53'
 
+plan ROUTER_CT_ID= ROUTER=150
+has '+ verify Open WebUI install, open-webui.service, /health and /api/version on router CT 150:'
+has '+ pct create 281'
+
 commit=0123456789abcdef0123456789abcdef01234567
 plan OPEN_TERMINAL_VERSION=v0.15.0 OPEN_TERMINAL_COMMIT=$commit
 has "OPEN_TERMINAL_VERSION=v0.15.0 OPEN_TERMINAL_COMMIT=$commit"
@@ -117,6 +121,8 @@ has '--terminal-url http://\<terminal-eth0-ip\>:8000'
 passed=$((passed + 1))
 
 reject 'CT_ID' CT_ID=99
+reject 'Set CT_ID for an unattended run' CT_ID=
+reject 'Set CT_ID for an unattended run' ROUTER_CT_ID= ROUTER=192.0.2.80 CT_ID=
 reject 'must differ' ROUTER_CT_ID=281
 reject 'must differ' ROUTER_CT_ID= ROUTER=281
 reject 'neither a CT ID' ROUTER_CT_ID= ROUTER=99
@@ -128,6 +134,10 @@ reject 'ROUTER_SSH_PORT' ROUTER_CT_ID= ROUTER=192.0.2.80 ROUTER_SSH_PORT=0
 reject 'ROUTER_SSH_USER' ROUTER_CT_ID= ROUTER=192.0.2.80 ROUTER_SSH_USER='Bad User'
 reject 'ROUTER_SSH_USER must be root' ROUTER_CT_ID= ROUTER=192.0.2.80 ROUTER_SSH_USER=admin
 reject 'TEMPLATE' TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+reject 'Set TEMPLATE for an unattended run' TEMPLATE=
+reject 'Set STORAGE for an unattended run' STORAGE=
+reject 'Set IP_CIDR for an unattended run' IP_CIDR=
+reject 'Set GATEWAY for an unattended run' GATEWAY=
 reject 'IP_CIDR' IP_CIDR=dhcp
 reject 'GATEWAY' GATEWAY=
 reject 'OPEN_TERMINAL_PORT' OPEN_TERMINAL_PORT=70000

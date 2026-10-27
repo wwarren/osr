@@ -66,8 +66,10 @@ OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.12.4}"
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
-TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-ant-hp-nfs-backups}"
+TEMPLATE_STORAGE_EXPLICIT="${TEMPLATE_STORAGE+x}"
+TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 TEMPLATE_NAME="${TEMPLATE_NAME:-}"
+TEMPLATE_REF="${TEMPLATE_REF:-}"
 # Minimum free space wanted on the storage that holds the container template.
 TEMPLATE_MIN_GIB="${TEMPLATE_MIN_GIB:-2}"
 FIREWALL="${FIREWALL:-1}"
@@ -580,6 +582,54 @@ template_storages() {
     pvesm status -content vztmpl 2>/dev/null | awk 'NR > 1 {print $1}'
   } | awk 'NF && !seen[$1]++'
 }
+prompt_template_storage() {
+  local -a names=() types=()
+  local name type available choice i default_idx=0
+  while IFS=$'\t' read -r name type available; do
+    [[ -n "$name" ]] || continue
+    names+=("$name"); types+=("$type")
+    [[ "$name" == "$TEMPLATE_STORAGE" ]] && default_idx=${#names[@]}
+  done < <(storage_candidates vztmpl)
+  if (( ${#names[@]} == 0 )); then
+    echo "No active storage accepts LXC templates (vztmpl)." >&2
+    diagnose_storage vztmpl
+    return 1
+  fi
+  if (( default_idx == 0 )); then
+    if [[ -n "$TEMPLATE_STORAGE_EXPLICIT" && "$NONINTERACTIVE" == true ]]; then
+      echo "Template storage '${TEMPLATE_STORAGE}' is not active or does not support vztmpl." >&2
+      return 1
+    fi
+    default_idx=1
+  fi
+  echo
+  echo "  Storage for the router's LXC template:"
+  for (( i=0; i<${#names[@]}; i++ )); do
+    printf '    %d) %s (%s)\n' "$((i + 1))" "${names[i]}" "${types[i]}"
+  done
+  if [[ "$NONINTERACTIVE" == true ]]; then
+    TEMPLATE_STORAGE="${names[default_idx - 1]}"
+  else
+    while true; do
+      read -r -p "  Select template storage [${default_idx}]: " choice || return 1
+      [[ -n "$choice" ]] || choice="$default_idx"
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+        TEMPLATE_STORAGE="${names[choice - 1]}"
+        break
+      fi
+      echo "    Enter a number from 1 to ${#names[@]}." >&2
+    done
+  fi
+  TEMPLATE_STORAGE_EXPLICIT=1
+  echo "  Using template storage: ${TEMPLATE_STORAGE}"
+}
+router_template_storages() {
+  if [[ -n "$TEMPLATE_STORAGE_EXPLICIT" ]]; then
+    printf '%s\n' "$TEMPLATE_STORAGE"
+  else
+    template_storages
+  fi
+}
 find_existing_debian_template() {
   local storage="" exact_ref="" template_list="" compatible_ref=""
   while IFS= read -r storage; do
@@ -594,6 +644,7 @@ find_existing_debian_template() {
       printf '%s\n' "$exact_ref"
       return 0
     fi
+    [[ -z "$TEMPLATE_NAME" ]] || continue
     compatible_ref="$(
       printf '%s\n' "$template_list" |
         awk -v storage="$storage" '
@@ -608,7 +659,7 @@ find_existing_debian_template() {
       printf '%s\n' "$compatible_ref"
       return 0
     fi
-  done < <(template_storages)
+  done < <(router_template_storages)
   return 1
 }
 select_available_debian_template() {
@@ -632,34 +683,74 @@ select_available_debian_template() {
   echo "Run 'pveam available --section system | grep debian-13-standard' to inspect available templates." >&2
   return 1
 }
-select_router_template() {
-  local n t a
-  DOWNLOAD_TEMPLATE_NAME=""
-  if TEMPLATE_REF="$(find_existing_debian_template)"; then
-    # The lookup runs in a subshell; keep the storage it actually selected.
-    TEMPLATE_STORAGE="${TEMPLATE_REF%%:*}"
-    echo "Using existing Debian container template: ${TEMPLATE_REF}"
-    return 0
-  fi
-  TEMPLATE_REF=""
-  if ! storage_supports_vztmpl "$TEMPLATE_STORAGE"; then
-    echo "Storage '${TEMPLATE_STORAGE}' does not support vztmpl content; cannot download a template there." >&2
-    echo "Set TEMPLATE_STORAGE to a storage that lists 'vztmpl' in 'pvesm status -content vztmpl'." >&2
-    echo "Candidates with free space:" >&2
-    storage_candidates vztmpl | while IFS=$'\t' read -r n t a; do
-      echo "  ${n} (${t}): $(kib_to_gib "$a") GiB free" >&2
-    done
+valid_router_template_ref() {
+  local ref="$1" storage name free_gib
+  [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-13-standard_[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || return 1
+  storage="${ref%%:*}"
+  name="${ref#*:vztmpl/}"
+  pveam list "$storage" 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq -- "$ref" && return 0
+  if ! storage_supports_vztmpl "$storage"; then
+    echo "    Storage '${storage}' cannot hold LXC templates." >&2
     return 1
   fi
-  local free_gib
-  free_gib="$(storage_free_gib "$TEMPLATE_STORAGE" vztmpl)"
-  if [[ "$free_gib" =~ ^[0-9]+$ ]] && (( free_gib < TEMPLATE_MIN_GIB )); then
-    echo "Storage '${TEMPLATE_STORAGE}' has only ${free_gib} GiB free;" >&2
-    echo "at least ${TEMPLATE_MIN_GIB} GiB is wanted for the container template." >&2
-    select_storage_with_space vztmpl "$TEMPLATE_MIN_GIB" TEMPLATE_STORAGE "$TEMPLATE_STORAGE" || return 1
+  if ! pveam available --section system 2>/dev/null | awk 'NR > 1 {print $2}' | grep -Fxq -- "$name"; then
+    echo "    Template '${name}' is neither downloaded nor available to download." >&2
+    return 1
   fi
-  DOWNLOAD_TEMPLATE_NAME="$(select_available_debian_template)" || return 1
-  TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${DOWNLOAD_TEMPLATE_NAME}"
+  free_gib="$(storage_free_gib "$storage" vztmpl)"
+  if [[ "$free_gib" =~ ^[0-9]+$ ]] && (( free_gib < TEMPLATE_MIN_GIB )); then
+    echo "    Storage '${storage}' has only ${free_gib} GiB free; ${TEMPLATE_MIN_GIB} GiB is needed." >&2
+    return 1
+  fi
+}
+show_router_template_alternatives() {
+  local selected="$1" storage ref shown=0
+  while IFS= read -r storage; do
+    while IFS= read -r ref; do
+      [[ "$ref" != "$selected" && "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-13-standard_[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || continue
+      if (( shown == 0 )); then
+        echo "  Other downloaded Debian 13 templates:"
+        shown=1
+      fi
+      printf '    %s\n' "$ref"
+    done < <(pveam list "$storage" 2>/dev/null | awk 'NR > 1 {print $1}' | sort -V -r)
+  done < <(template_storages)
+}
+select_router_template() {
+  local n t a suggested="${TEMPLATE_REF:-}" free_gib name
+  DOWNLOAD_TEMPLATE_NAME=""
+  if [[ -z "$suggested" ]]; then
+    if suggested="$(find_existing_debian_template)"; then
+      :
+    else
+      if ! storage_supports_vztmpl "$TEMPLATE_STORAGE"; then
+        echo "Storage '${TEMPLATE_STORAGE}' does not support vztmpl content; cannot download a template there." >&2
+        echo "Set TEMPLATE_STORAGE to a storage that lists 'vztmpl' in 'pvesm status -content vztmpl'." >&2
+        echo "Candidates with free space:" >&2
+        storage_candidates vztmpl | while IFS=$'\t' read -r n t a; do
+          echo "  ${n} (${t}): $(kib_to_gib "$a") GiB free" >&2
+        done
+        return 1
+      fi
+      free_gib="$(storage_free_gib "$TEMPLATE_STORAGE" vztmpl)"
+      if [[ "$free_gib" =~ ^[0-9]+$ ]] && (( free_gib < TEMPLATE_MIN_GIB )); then
+        echo "Storage '${TEMPLATE_STORAGE}' has only ${free_gib} GiB free;" >&2
+        echo "at least ${TEMPLATE_MIN_GIB} GiB is wanted for the container template." >&2
+        select_storage_with_space vztmpl "$TEMPLATE_MIN_GIB" TEMPLATE_STORAGE "$TEMPLATE_STORAGE" || return 1
+      fi
+      name="$(select_available_debian_template)" || return 1
+      suggested="${TEMPLATE_STORAGE}:vztmpl/${name}"
+    fi
+  fi
+  [[ "$NONINTERACTIVE" == true ]] || show_router_template_alternatives "$suggested"
+  prompt_until_valid "  Router template (storage:vztmpl/name)" TEMPLATE_REF "$suggested" valid_router_template_ref || return 1
+  TEMPLATE_STORAGE="${TEMPLATE_REF%%:*}"
+  name="${TEMPLATE_REF#*:vztmpl/}"
+  if pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq -- "$TEMPLATE_REF"; then
+    echo "Using existing Debian container template: ${TEMPLATE_REF}"
+  else
+    DOWNLOAD_TEMPLATE_NAME="$name"
+  fi
 }
 prompt_secret() {
   local prompt="$1" var_name="$2" first="" second=""
@@ -2724,6 +2815,7 @@ prompt_secret "Root password for container ${CT_ID}" ROOT_PASSWORD
 # offers a default (Enter accepts); NONINTERACTIVE=true takes all defaults.
 prompt_network_config
 prompt_storage_config
+prompt_template_storage || exit 1
 echo "Updating Proxmox appliance template index."
 pveam update
 select_router_template || exit 1

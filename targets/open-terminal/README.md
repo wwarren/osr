@@ -21,13 +21,14 @@ The Open WebUI connection is **admin-only** by default. All users granted access
 | `280` (a CT ID) | `pct exec` / `pct push` | the router CT on this Proxmox node |
 | `192.168.11.80` or `router.lan` | SSH as `root` (`ROUTER_SSH_PORT=22` by default) | a router LXC on another node, a VM, or any host root can log in to |
 
-If `ROUTER` is not set, the script asks for it:
+If `ROUTER` is not set, the script asks for the existing Open WebUI location. It then asks for the **new Open Terminal CT ID**, which must be an unused ID on this Proxmox host. These are separate values:
 
 ```text
 Existing ollama-smart-router Open WebUI:
   a CT ID on this Proxmox host (e.g. 280), or
   the IP address or hostname of its LXC/VM, reached as root over SSH
 Open WebUI CT ID or IP address:
+New Open Terminal CT ID on this Proxmox host (unused, at least 100):
 ```
 
 `ROUTER_CT_ID` or `ROUTER_SSH_HOST` force one kind. The older `ROUTER_CT_ID=280` form still works. Set only one of these or `ROUTER`. SSH login must be as `root`, since integration stages files under `/root` on the selected host.
@@ -53,22 +54,26 @@ Copy this `targets/open-terminal` directory to the Proxmox host that will host t
 
 ```bash
 cd /path/to/ollama-smart-router/targets/open-terminal
-CT_ID=281 \
-TEMPLATE='local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst' \
-STORAGE=local-lvm \
-IP_CIDR=192.168.11.81/24 \
-GATEWAY=192.168.11.1 \
-bash provision-lxc.sh --dry-run
-
-CT_ID=281 \
-TEMPLATE='local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst' \
-STORAGE=local-lvm \
-IP_CIDR=192.168.11.81/24 \
-GATEWAY=192.168.11.1 \
 bash provision-lxc.sh
 ```
 
-At the prompt, enter the router CT ID if it is on this Proxmox host, or the router LXC/VM's IP address if it is elsewhere. For unattended runs, set `ROUTER=280` or `ROUTER=192.168.11.80`.
+The script prompts for the existing Open WebUI CT ID or IP address, the new Open Terminal CT ID, the Debian template, storage, the new terminal's static IP/CIDR and gateway, and the Open WebUI admin key. To preview the plan without changing Proxmox, run `bash provision-lxc.sh --dry-run`; it asks for the same install settings but does not ask for the admin key.
+
+For an unattended run, supply the required values as environment variables:
+
+```bash
+cd /path/to/ollama-smart-router/targets/open-terminal
+CT_ID=281 \
+ROUTER=280 \
+TEMPLATE='local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst' \
+STORAGE=local-lvm \
+IP_CIDR=192.168.11.81/24 \
+GATEWAY=192.168.11.1 \
+OPENWEBUI_ADMIN_TOKEN='<admin API key>' \
+bash provision-lxc.sh
+```
+
+For a router that is a VM or a CT on another node, set `ROUTER=192.168.11.80` instead. Leave any required environment variable unset in an interactive run to be asked for it.
 
 `--dry-run` prints every command it would run, `pct` or `ssh`, with placeholders for the values a real run reads from the router. It never logs in. Replace the template ID, storage, CT IDs, and network values with your own. `ROUTER_IP` and `OPENWEBUI_PORT` are detected on the router; set them explicitly if detection does not fit your network. Set `OPEN_TERMINAL_PORT` to change the terminal port. `--help` lists all options.
 
