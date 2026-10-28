@@ -83,6 +83,7 @@ pass 'dashboard login changes trigger reconfiguration without recording the pass
 ROUTER_URL=http://r:8000 HERMES_MODEL=auto HERMES_CONTEXT_LENGTH=65536 HERMES_CHANNEL=stable HERMES_COMMIT=
 # shellcheck disable=SC2034
 HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent HERMES_DASHBOARD=true unit_sha256=u dashboard_auth_sha256=none
+# shellcheck disable=SC2034
 backend_keys_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
 record=$(settings_record)

@@ -336,7 +336,7 @@ probe_setup_help() {
 # cuda-toolkit-X-Y does not install a kernel driver.
 cuda_toolkit_target() {
     local ID VERSION_ID
-    # shellcheck disable=SC1091
+    # shellcheck disable=SC1090,SC1091
     . "${STRATA_OS_RELEASE:-/etc/os-release}"
     case $ID:$VERSION_ID in
         ubuntu:22.04) printf 'ubuntu2204 13.0\n' ;;

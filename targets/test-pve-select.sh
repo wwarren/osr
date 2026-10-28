@@ -51,6 +51,7 @@ pve_select_storage TEMPLATE_STORAGE vztmpl 0 <<< $'2\n' 2>/dev/null
 cfg=$(mktemp)
 trap 'rm -f -- "$cfg"' EXIT
 printf 'dir: local\n  content vztmpl,iso\nlvmthin: pool\n  content rootdir,images\n' > "$cfg"
+# shellcheck disable=SC2034  # read by the sourced pve-select.sh
 STORAGE_CFG=$cfg
 pvesm() {
     if [[ $* == 'status -content '* ]]; then printf 'Name Type Status Available (KiB)\n'; return 0; fi
@@ -61,6 +62,7 @@ pvesm() {
 [[ $(pve_select_storage_rows vztmpl) == $'local\tdir\t50000000' ]] || die 'template fallback failed'
 
 source "$here/pve-select.sh"
+# shellcheck disable=SC2034  # read by pve_select_available
 dry_run=1
 TEMPLATE=''
 pve_select_template TEMPLATE '^.*$' <<< ''

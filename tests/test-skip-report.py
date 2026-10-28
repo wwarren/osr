@@ -30,6 +30,11 @@ class SkipReportsTest(unittest.TestCase):
         output = "We skip ahead in the documentation\n0 skipped\nOK (skipped=0)\n42 passed\n"
         self.assertEqual(list(parser.skip_reports(output)), [])
 
+    def test_assert_summary_counts_only_its_skips(self):
+        output = ("ran 769   passed 765   failed 4   skipped 0\n"
+                  "\x1b[32mran 9   passed 7   failed 0   skipped 2\x1b[0m\n")
+        self.assertEqual(list(parser.skip_reports(output)), ["ran 9   passed 7   failed 0   skipped 2"])
+
     def test_ansi_colours_are_removed(self):
         self.assertEqual(list(parser.skip_reports("\x1b[33m  SKIP no root\x1b[0m\n")),
                          ["SKIP no root"])

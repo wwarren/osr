@@ -98,6 +98,7 @@ TABLE
 }
 check [ "$(storage_rows rootdir | wc -l | tr -d ' ')" = 3 ]
 check [ "$(downloaded_debian_templates | wc -l | tr -d ' ')" = 3 ]
+# shellcheck disable=SC2034  # read by the sourced selectors
 ROOTFS_GB=16
 TEMPLATE=''
 select_template <<< '' 2>/dev/null
@@ -110,6 +111,7 @@ select_storage <<< $'2\n\n' 2>/dev/null
 check [ "$STORAGE" = big ]
 fallback_cfg=$(mktemp)
 printf 'dir: local\n  content vztmpl,iso\nlvmthin: local-lvm\n  content rootdir,images\n' > "$fallback_cfg"
+# shellcheck disable=SC2034  # read by the sourced selectors
 STORAGE_CFG=$fallback_cfg
 pvesm() {
     if [[ $* == 'status -content '* ]]; then printf 'Name Type Status Available (KiB)\n'; return 0; fi

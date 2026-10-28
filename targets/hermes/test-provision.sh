@@ -592,7 +592,7 @@ rm -f "$fake/pve/firewall/282.fw"
 out=$(real --reconfigure) && fail 'an incomplete CT without a firewall was accepted'
 [[ $out == *'no completed Hermes installation'* ]] || fail "missing partial firewall message: $out"
 grep -q 'pct push' "$log" && fail 'an incomplete CT without a firewall was modified'
-pass 'partial recovery requires this target’s CT description and firewall file'
+pass "partial recovery requires this target's CT description and firewall file"
 
 reset_fake
 out=$(real FAKE_UID=1000) && fail 'a run without root was accepted'

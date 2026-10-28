@@ -238,6 +238,7 @@ prompt_required() {
   local name=$1 label=$2
   [[ -n ${!name} ]] && return 0
   [[ -t 0 ]] || die "Set ${name} for an unattended run (or run interactively to be prompted)."
+  # shellcheck disable=SC2229  # reads into the variable that $name names
   read -r -p "$label" "$name" || die "No ${name} was entered."
   [[ -n ${!name} ]] || die "${name} is required."
 }

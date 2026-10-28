@@ -584,8 +584,8 @@ template_storages() {
 }
 prompt_template_storage() {
   local -a names=() types=()
-  local name type available choice i default_idx=0
-  while IFS=$'\t' read -r name type available; do
+  local name type choice i default_idx=0
+  while IFS=$'\t' read -r name type _; do
     [[ -n "$name" ]] || continue
     names+=("$name"); types+=("$type")
     [[ "$name" == "$TEMPLATE_STORAGE" ]] && default_idx=${#names[@]}
@@ -5654,7 +5654,7 @@ normalize_addr() {
     base="$raw"
     rest="${raw#*://}"
     hostport="${rest%%/*}"
-    if [[ "$hostport" != *:* || "$hostport" == *\] ]]; then
+    if [[ "$hostport" != *:* || "$hostport" == *']' ]]; then
       if [[ "$raw" == https://* ]]; then k=443; else k=80; fi
       base="${raw%%://*}://${hostport}:${k}${rest:${#hostport}}"
     fi

@@ -556,7 +556,7 @@ assert_contains "the menu lists the model servers" "9) xolotl" "$(cat "$_out")"
 assert_contains "the menu lists the companions" "11) hermes" "$(cat "$_out")"
 assert_contains "ComfyUI among them" "12) comfyui" "$(cat "$_out")"
 assert_contains "and separates them from the model servers" "Companions:" "$(cat "$_out")"
-assert_contains "the services come first" "Services: created now, before the router" "$(cat "$_out")"
+assert_contains "the services come first" "Services: created now, before OSR" "$(cat "$_out")"
 assert_contains "starting with Gitea" "1) gitea" "$(cat "$_out")"
 INSTALL_TARGETS=""; INSTALL_GITEA=true; INSTALL_MATTERMOST=true
 prompt_target_selection > /dev/null 2>&1 <<< $'\n'
@@ -629,6 +629,7 @@ CT_ID=905
 assert_fail "NONINTERACTIVE refuses a taken preset" prompt_router_ct_id
 NONINTERACTIVE=false
 unset -f find_next_ct_id
+# shellcheck source=/dev/null
 source "$FUNCS"   # restore the real find_next_ct_id and ct_id_free
 CT_ID="$_saved_ct_id"; unset _saved_ct_id _out
 
@@ -790,6 +791,71 @@ assert_eq "an explicit TEMPLATE_STORAGE does not fall back to NFS" \
 assert_eq "it downloads to the requested storage" \
   debian-13-standard_13.1-2_amd64.tar.zst "$DOWNLOAD_TEMPLATE_NAME"
 TEMPLATE_STORAGE_EXPLICIT=""
+
+describe router_template_storages
+TEMPLATE_STORAGE=local; TEMPLATE_STORAGE_EXPLICIT=1
+assert_eq "an explicit TEMPLATE_STORAGE is the only one searched" local "$(router_template_storages)"
+TEMPLATE_STORAGE_EXPLICIT=""
+assert_eq "otherwise every template storage" "$(printf 'local\nnfs')" "$(router_template_storages)"
+
+describe valid_router_template_ref
+_saved_list_local=$_pveam_list_local; _saved_list_nfs=$_pveam_list_nfs
+_saved_supports="$(declare -f storage_supports_vztmpl)"; _saved_free="$(declare -f storage_free_gib)"
+_saved_min_gib=${TEMPLATE_MIN_GIB:-}
+TEMPLATE_MIN_GIB=2
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+_pveam_list_nfs='NAME SIZE'
+storage_supports_vztmpl() { [[ $1 == local || $1 == nfs ]]; }
+storage_free_gib() { echo "${FAKE_FREE_GIB:-10}"; }
+assert_ok "a downloaded Debian 13 template" \
+  valid_router_template_ref local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
+assert_ok "one pveam can download into a template storage" \
+  valid_router_template_ref nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
+assert_fail "another distribution" \
+  valid_router_template_ref local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_fail "a bare template name" valid_router_template_ref debian-13-standard_13.1-2_amd64.tar.zst
+assert_fail "a path in the name" valid_router_template_ref 'local:vztmpl/../debian-13-standard_13.1-2_amd64.tar.zst'
+assert_fail "a non-amd64 template" valid_router_template_ref local:vztmpl/debian-13-standard_13.1-2_arm64.tar.zst
+_out="$(valid_router_template_ref nfs:vztmpl/debian-13-standard_13.9-9_amd64.tar.zst 2>&1)"; _rc=$?
+assert_ne "neither downloaded nor downloadable" 0 "$_rc"
+assert_contains "and says so" "neither downloaded nor available to download" "$_out"
+storage_supports_vztmpl() { [[ $1 == local ]]; }
+_out="$(valid_router_template_ref nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 2>&1)"; _rc=$?
+assert_ne "a download into a storage without vztmpl content" 0 "$_rc"
+assert_contains "names the storage" "Storage 'nfs' cannot hold LXC templates" "$_out"
+storage_supports_vztmpl() { [[ $1 == local || $1 == nfs ]]; }
+_out="$(FAKE_FREE_GIB=1 valid_router_template_ref nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 2>&1)"; _rc=$?
+assert_ne "a download into a storage without the space" 0 "$_rc"
+assert_contains "gives the space needed" "only 1 GiB free; 2 GiB is needed" "$_out"
+FAKE_FREE_GIB=1 assert_ok "a downloaded template needs no free space" \
+  valid_router_template_ref local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
+unset _out _rc
+
+describe show_router_template_alternatives
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB
+local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst 125MB
+local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst 140MB'
+_pveam_list_nfs='NAME SIZE
+nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+out="$(show_router_template_alternatives local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst)"
+assert_contains "has a heading" "Other downloaded Debian 13 templates:" "$out"
+assert_contains "lists the same release on another storage" \
+  nfs:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst "$out"
+assert_contains "and an older release" local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst "$out"
+assert_not_contains "but not the selected template" \
+  "    local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst" "$out"
+assert_not_contains "nor another distribution" ubuntu-24.04 "$out"
+_pveam_list_local='NAME SIZE
+local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 130MB'
+_pveam_list_nfs='NAME SIZE'
+assert_eq "nothing, not even the heading, without an alternative" "" \
+  "$(show_router_template_alternatives local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst)"
+_pveam_list_local=$_saved_list_local; _pveam_list_nfs=$_saved_list_nfs
+eval "$_saved_supports"; eval "$_saved_free"
+TEMPLATE_MIN_GIB=$_saved_min_gib
+unset _saved_list_local _saved_list_nfs _saved_supports _saved_free _saved_min_gib
 
 describe ensure_target_template
 _pveam_list_local='NAME SIZE
@@ -1099,7 +1165,7 @@ assert_contains "the summary lists each target" "strata         CT 912    ok" "$
 mock_reset_log
 FAKE_APPLY_FAIL=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "a failed router key apply fails the run" 1 "$_rc"
-assert_contains "the target is marked incomplete" "strata         CT 912    failed (router key apply)" "$(cat "$_out")"
+assert_contains "the target is marked incomplete" "strata         CT 912    failed (OSR key apply)" "$(cat "$_out")"
 assert_contains "the summary gives the apply command" "pct exec 910 -- /usr/local/bin/manage-model-servers apply" "$(cat "$_out")"
 assert_contains "companions still run after an apply failure" "run hermes" "$(mock_calls)"
 mock_reset_log
@@ -1117,12 +1183,12 @@ assert_eq "no admin key fails the run" 1 "$_rc"
 assert_contains "and the companions are skipped, not run" "skipped (no Open WebUI admin key)" "$(cat "$_out")"
 FAKE_KEY_FAIL=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "a key the router did not get is a failure to fix" 1 "$_rc"
-assert_contains "named in the summary" "ok (router key not set)" "$(cat "$_out")"
+assert_contains "named in the summary" "ok (OSR key not set)" "$(cat "$_out")"
 TARGETS="gitea ollama"; SERVICES_DONE="gitea "
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "services done before the router are not run again" "run ollama" "$(mock_calls)"
-assert_contains "but are in the summary" "ok (created before the router)" "$(cat "$_out")"
+assert_contains "but are in the summary" "ok (created before OSR)" "$(cat "$_out")"
 TARGETS="ollama comfyui"; SERVICES_DONE=""
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?

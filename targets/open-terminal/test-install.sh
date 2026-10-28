@@ -169,6 +169,8 @@ out=$(FAKE_DOWN=1 run_target 2>&1) && fail 'an unhealthy first install was accep
 [[ ! -e $tree/etc/open-terminal/service.env && ! -e $tree/etc/systemd/system/open-terminal.service && ! -e $OT_OPT/venv ]] ||
     fail 'failed first install left active service configuration or venv symlink'
 [[ -f $default_venv/.install-complete ]] || fail 'failed first install lost its reusable built venv'
+contains "--require-hashes -r $deploy/requirements.lock" "$log"
+contains "--no-deps --no-build-isolation $OT_OPT/source" "$log"
 : > "$log"
 run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'fresh install'; }
 grep -q 'python3 -m venv' "$log" && fail 'retry rebuilt the complete venv'
@@ -181,8 +183,6 @@ envf=$tree/etc/open-terminal/service.env
 contains 'OPEN_TERMINAL_API_KEY=0123456789abcdef' "$envf"
 contains 'OPEN_TERMINAL_PORT=8000' "$envf"
 [[ $(readlink "$OT_OPT/venv") == "$default_venv" ]] || fail 'venv symlink'
-contains "--require-hashes -r $deploy/requirements.lock" "$log"
-contains "--no-deps --no-build-isolation $OT_OPT/source" "$log"
 contains "fetch -q --depth 1 origin +refs/tags/v0.14.0:refs/tags/v0.14.0" "$log"
 [[ $(grep -c '^systemctl restart open-terminal.service' "$log") == 1 ]] || fail 'the service must be started exactly once'
 grep -q 'enable --now' "$log" && fail 'enable --now plus restart starts it twice'

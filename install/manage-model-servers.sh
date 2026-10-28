@@ -302,7 +302,7 @@ normalize_addr() {
     base="$raw"
     rest="${raw#*://}"
     hostport="${rest%%/*}"
-    if [[ "$hostport" != *:* || "$hostport" == *\] ]]; then
+    if [[ "$hostport" != *:* || "$hostport" == *']' ]]; then
       if [[ "$raw" == https://* ]]; then k=443; else k=80; fi
       base="${raw%%://*}://${hostport}:${k}${rest:${#hostport}}"
     fi
