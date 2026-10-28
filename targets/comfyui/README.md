@@ -276,7 +276,7 @@ nvidia-smi                                            # NVIDIA: is the GPU visib
 * **Outputs** stay in `/var/lib/comfyui-target/output`; Open WebUI keeps its
   own copy of each image it shows.
 * **Settings** are in `/etc/comfyui-target/comfyui.env`: `COMFYUI_EXTRA_ARGS`
-  takes further ComfyUI options (`--lowvram`, `--reserve-vram 1.0`,
+  takes further ComfyUI options (`--disable-dynamic-vram --lowvram`,
   `--preview-method auto`). Changing `COMFYUI_PORT` also needs the firewall
   rule and Open WebUI's URL changed (`--integrate-only` does the latter).
 * **The web UI** (`http://<CT address>:8188`) is reachable from the addresses
@@ -288,6 +288,21 @@ nvidia-smi                                            # NVIDIA: is the GPU visib
   `uv pip install --python /opt/comfyui-target/current/venv/bin/python -r <node>/requirements.txt`.
   A later `--upgrade` builds a fresh venv without them. Only install nodes you
   trust: they run arbitrary code.
+
+### GPU memory errors
+
+`VRAM grow failed` from `comfy_aimdo` means a GPU allocation failed. The
+FLUX.2 Klein 4B workflow needs about 13 GB VRAM, so a 16 GB card has little
+room for other GPU workloads. Stop ComfyUI and run `nvidia-smi` on the Proxmox
+host to see what still occupies the shared GPU. Free that memory before retrying.
+
+If ComfyUI still runs out of VRAM while it has the GPU to itself, set
+`COMFYUI_EXTRA_ARGS=--disable-dynamic-vram --lowvram` in
+`/etc/comfyui-target/comfyui.env` and restart `comfyui.service`. On current
+ComfyUI, `--lowvram` alone has no effect while DynamicVRAM is enabled; the
+combination puts the text encoder on CPU and uses system RAM instead. Monitor
+the CT's RAM and swap when using it. See the
+[ComfyUI startup flags](https://github.com/Comfy-Org/docs/blob/main/development/comfyui-server/startup-flags.mdx).
 
 ## Upgrade
 
