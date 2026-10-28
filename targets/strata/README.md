@@ -87,13 +87,15 @@ To resume an interrupted install or upgrade Strata in the existing CT, run
 `280` with your Strata CT ID).
 
 If Strata has no ready-made engine for the selected GPU, setup compiles one.
-Upstream setup installs the CUDA toolkit automatically on Ubuntu 22.04/24.04,
-but stops on Debian. The guest installer recognizes that specific failure on
-Debian 12/13, installs NVIDIA's versioned `cuda-toolkit-13-0` or
-`cuda-toolkit-13-1` package respectively, and retries setup once. The package
-contains the toolkit, not a kernel driver; the guest's NVIDIA userspace must
-still match the PVE host driver. To resume an existing Debian 13 CT after this
-failure, sync the updated repository to the PVE host and run:
+Upstream setup tries `sudo` to install CUDA on Ubuntu, but setup runs under the
+unprivileged `strata` account and has no sudo password. On Debian, upstream
+stops without installing CUDA. The guest installer intercepts upstream's sudo
+attempt so no password prompt appears, recognizes either failure, installs NVIDIA's versioned
+toolkit package as root, and retries setup once: `cuda-toolkit-13-0` on Ubuntu
+22.04/24.04 or Debian 12, `cuda-toolkit-13-1` on Debian 13. The package contains
+the toolkit, not a kernel driver; the guest's NVIDIA userspace must still
+match the PVE host driver. To resume an existing CT after this failure, sync
+the updated repository to the PVE host and run:
 
 ```bash
 cd /path/to/ollama-smart-router
