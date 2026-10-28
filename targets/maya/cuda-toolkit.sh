@@ -3,7 +3,7 @@
 # Maya LXC, without any kernel module or driver. CUDA 12.8 supports Blackwell
 # while remaining on CUDA 12.x for Volta/V100 GPUs. The GPU's *driver* is a
 # separate thing (installed separately as host-matched NVIDIA user-space by
-# install_nvidia_580_173_02.sh), so this script must never install a driver.
+# install-nvidia-driver.sh), so this script must never install a driver.
 #
 # We use the NVIDIA CUDA apt repository: it ships only user-space packages
 # (cuda-nvcc, libcudart, ...) and therefore never touches the kernel,

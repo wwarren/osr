@@ -3,7 +3,7 @@
 # basalt LXC, without any kernel module or driver. basalt's CMake requires
 # CUDA 13.0 or newer and a CUDAToolkit it can find; the GPU's *driver* is a
 # separate thing (installed separately as host-matched NVIDIA user-space by
-# install_nvidia_580_173_02.sh), so this script must never install a driver.
+# install-nvidia-driver.sh), so this script must never install a driver.
 #
 # We use the NVIDIA CUDA apt repository: it ships only user-space packages
 # (cuda-nvcc, libcudart-13-0, ...) and therefore never touches the kernel,

@@ -86,7 +86,7 @@ with compute capability below 7.5 (such as V100) defaults to Ubuntu 24.04:
 CUDA 13 cannot build for that card. Debian 13's NVIDIA repository starts at
 CUDA 13.1 and Ubuntu 26.04's at 13.3; Basalt, Maya and Xolotl use those
 versions unless overridden. The CT's NVIDIA user-space libraries must match
-the host's 580.173.02 driver. Ubuntu 26.04 needs an available Proxmox template
+the loaded host driver version. Ubuntu 26.04 needs an available Proxmox template
 (`pveam update`, `pveam available`) and a current `pve-container`. See each
 target README for Python, CUDA and GPU requirements.
 
@@ -489,6 +489,68 @@ failure. Strata, Basalt, Maya and Xolotl need disk for one runtime snapshot;
 their existing installation settings carry forward unless explicitly
 overridden. See the target README and [architecture upgrade contract](ARCHITECTURE.md#16-inference-targets-targets)
 before upgrading.
+
+### GPU drivers
+
+To check the GPU drivers of the host and of every container a GPU is passed
+through to, and update them to the newest compatible release, run this as
+root on the Proxmox host:
+
+```bash
+bash /path/to/clone/tools/update-gpu-drivers.sh --check   # report only (exit 3: updates available)
+bash /path/to/clone/tools/update-gpu-drivers.sh           # shows the plan and asks before each change
+```
+
+It finds the GPU containers from their configs (`/dev/nvidia*`, `/dev/dri/*`,
+`/dev/kfd`) and checks each running one. Stopped ones are checked with
+`--include-stopped`, which starts them and stops them again afterwards.
+
+**NVIDIA.** The host driver and the libraries in every container must be the
+same release. The script offers the newest production release from NVIDIA's
+archive (recommended), the newest release of the installed branch, and the
+newest new-feature-branch release. Cards older than Turing (Maxwell, Pascal,
+Volta) stay on the 580 branch. Before anything stops, it downloads the chosen
+release, checks its SHA-256 and that its `supported-gpus.json` lists every
+NVIDIA card here (with the open kernel modules, when those are in use), and
+test-builds its kernel modules for the running kernel and any newer installed
+one. Then it stops the NVIDIA containers, unloads the old modules, installs the
+release with `tools/install-nvidia-driver.sh host`, builds it with DKMS for newer
+installed kernels, installs the same installer's libraries in each container
+(`tools/install-nvidia-driver.sh lxc`) and restarts them. A stopped NVIDIA
+container is started and checked before the host changes, then stopped again
+when the update finishes. Debian's apt NVIDIA packages in a container (`libcuda1`,
+`libnvidia-ml1`, `nvidia-smi` and the libraries that depend on
+`nvidia-alternative`) are replaced with the `.run` libraries, using the same
+cleanup as the provisioners. Every NVIDIA container is checked before anything
+is downloaded, including ones `--ct` leaves out. A container blocks the host
+update when it cannot be checked or started, does not see the host driver, or
+has apt NVIDIA packages that cleanup does not remove (Ubuntu's
+`libnvidia-compute-*`, the CUDA repository's `cuda-drivers`). It also blocks
+when removing its packages would take something else along, such as
+`nvidia-cuda-toolkit`. `--check` lists what blocks the update. If the new host install
+fails, the previous release is put back. If a host process still holds the GPU,
+nothing is installed. A container whose NVML or CUDA driver library does not
+match the host is offered the host's release. A host with an apt-installed
+driver is reported but not changed. `--nvidia <version>`
+also rolls back, but not below the branch a container's CUDA toolkit needs
+(CUDA 13: 580).
+
+**AMD and Intel.** `amdgpu`, `i915` and `xe` ship with the Proxmox kernel, so
+their newest compatible versions are the pending updates of `pve-firmware`
+and the running kernel series. A newer opt-in kernel series is reported but
+not installed. In containers, Mesa (Vulkan), Intel's compute runtime and
+apt-installed ROCm are upgraded from the container's own repositories. ROCm,
+CUDA and PyTorch bundled with Ollama or ComfyUI move with the target's
+`install-target.sh --upgrade`.
+
+`--yes` takes the recommended answers (`--nvidia production|branch|newest|keep|<version>`
+picks the NVIDIA release), `--ct 201,202` limits the containers (a new NVIDIA
+host release still updates every NVIDIA container), `--dry-run` shows the
+commands, `--no-probe` skips the test build. Checking a release needs about 2 GB
+free in `DOWNLOAD_DIR` (default `/root`), and each NVIDIA container about 1 GB
+while its libraries are installed. Exit status 2 means the host
+needs a reboot (new kernel, firmware, or a driver that could not be loaded
+live); run the script again afterwards to confirm.
 
 ## Troubleshooting
 

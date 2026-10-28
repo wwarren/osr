@@ -4,7 +4,7 @@
 # or 13.x; the default is 13.0, because Xolotl's RTX 50 (sm_120) engines built
 # with CUDA 12.8 crashed on long prompts (its issues #220/#224). The GPU's *driver* is a
 # separate thing (installed separately as host-matched NVIDIA user-space by
-# install_nvidia_580_173_02.sh), so this script must never install a driver.
+# install-nvidia-driver.sh), so this script must never install a driver.
 #
 # We use the NVIDIA CUDA apt repository: it ships only user-space packages
 # (cuda-nvcc, libcudart, ...) and therefore never touches the kernel,

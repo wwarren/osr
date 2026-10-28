@@ -40,6 +40,7 @@ has 'path=/dev/nvidiactl\,gid=44\,mode=0660'
 has 'path=/dev/nvidia-uvm\,gid=44\,mode=0660'
 lacks 'gid=0\,'
 has 'nvidia-guest-install.sh lxc'
+has 'DRIVER_VERSION='; has 'confirm CT 282 sees host NVIDIA driver'
 for file in install-target.sh cuda-toolkit.sh engram-index.py xolotl.service xolotl-weights.txt upstream-commit.txt; do
     has "$file /root/xolotl-target-deploy/$file"
 done

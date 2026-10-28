@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 usage() {
     cat <<'USAGE'
 Usage: GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' \
@@ -33,8 +34,8 @@ the card's render node: GPU_DEVICES=/dev/dri/renderD128, or chosen from the
 host's render nodes on a terminal. Set the host's driver up first with
 tools/setup-host-gpu.sh (the router installer does, and passes these settings).
 By default only the CT is created and deployment files are copied. No model
-settings are required. For CUDA guests, run the copied NVIDIA 580.173.02 helper
-before choosing the model with install-target.sh in the CT.
+settings are required. For CUDA guests, run the copied NVIDIA helper with the
+loaded host version before choosing the model with install-target.sh in the CT.
 LLAMA_CPP_REF is optional; omitted/empty uses install-target.sh's pinned release.
 Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
           CORES=4, MEMORY_MB=16384, SWAP_MB=0, ROOTFS_GB=64, ONBOOT=0,
@@ -50,8 +51,8 @@ Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
 INSTALL_TARGET=1 or --install-target. Prepare host-matched NVIDIA userspace
 libraries in the CT, then run install-target.sh there; it installs the CUDA
 toolkit when nvcc is missing (CUDA 13.0 on Debian 12, 13.1 on Debian 13).
---install-target (or INSTALL_TARGET=1) runs the NVIDIA 580.173.02 LXC user-space
-installer first for CUDA guests, then runs the guest installer. It requires
+--install-target (or INSTALL_TARGET=1) installs NVIDIA user-space matching the
+loaded host driver first for CUDA guests, then runs the guest installer. It requires
 explicit MODEL_ALIAS=<name[:tag]> (a bare name gets :latest) plus either
 MODEL_PATH or a direct public huggingface.co MODEL_DOWNLOAD_URL. A URL-only
 install uses the guest's default model store; set MODEL_PATH to choose its
@@ -526,17 +527,12 @@ fi
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 nvidia_installer=''
-for candidate in \
-    "$source_dir/../../tools/install_nvidia_580_173_02.sh" \
-    "$source_dir/../../install_nvidia_580_173_02.sh"; do
-    if [[ -r $candidate ]]; then
-        nvidia_installer=$(cd -- "$(dirname -- "$candidate")" && pwd)/$(basename -- "$candidate")
-        break
-    fi
-done
+if [[ -r $source_dir/../../tools/install-nvidia-driver.sh ]]; then
+    nvidia_installer=$(cd -- "$source_dir/../../tools" && pwd)/install-nvidia-driver.sh
+fi
 files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example)
 for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
-[[ -n $nvidia_installer ]] || die 'Missing install_nvidia_580_173_02.sh in the repository root or tools directory.'
+[[ -n $nvidia_installer ]] || die 'Missing tools/install-nvidia-driver.sh from the repository.'
 net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,firewall=1"
 [[ -z $GATEWAY ]] || net+=",gw=$GATEWAY"
 [[ -z $VLAN_TAG ]] || net+=",tag=$VLAN_TAG"
@@ -591,6 +587,17 @@ if (( ! dry_run )); then
     done < <(pvesm status --content rootdir 2>/dev/null || true)
     (( storage_ready )) || die "Storage is not active or does not support LXC root disks: $STORAGE"
 fi
+nvidia_host_version=''
+if [[ $BACKEND == cuda ]]; then
+    if (( dry_run )); then
+        nvidia_host_version='<host-nvidia-driver-version>'
+        printf '+ read loaded NVIDIA driver version from the Proxmox host\n'
+    else
+        nvidia_host_version=$(nvidia_lxc_host_version) ||
+            die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+        nvidia_lxc_require_series "$nvidia_host_version" 580 'llama.cpp CUDA 13'
+    fi
+fi
 
 trap 'printf "Provisioning stopped at line %s. Any newly created CT is retained for inspection; no CT is deleted automatically.\n" "$LINENO" >&2' ERR
 (umask 022; run "${create[@]}")
@@ -611,17 +618,17 @@ run pct exec "$CT_ID" -- install -d -m 0700 /root/llama-target-deploy
 for file in "${files[@]}"; do
     run pct push "$CT_ID" "$source_dir/$file" "/root/llama-target-deploy/$file" --perms 0644
 done
-run pct push "$CT_ID" "$nvidia_installer" /root/llama-target-deploy/install_nvidia_580_173_02.sh --perms 0755
+run pct push "$CT_ID" "$nvidia_installer" /root/llama-target-deploy/install-nvidia-driver.sh --perms 0755
 if (( INSTALL_TARGET )); then
     if [[ $BACKEND == cuda ]]; then
-        run pct exec "$CT_ID" -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc
+        nvidia_lxc_install_guest "$CT_ID" "$nvidia_host_version" /root/llama-target-deploy/install-nvidia-driver.sh
     fi
     run pct exec "$CT_ID" -- "${guest_env[@]}" bash /root/llama-target-deploy/install-target.sh
 else
     printf '\nGuest installation skipped. Enter the target CT: pct enter %s\n' "$CT_ID"
     if [[ $BACKEND == cuda ]]; then
-        printf 'Install the host-matched NVIDIA 580.173.02 user-space libraries inside the CT first:\n'
-        printf '  bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc\n'
+        printf 'Install NVIDIA user-space matching the host driver %s inside the CT first:\n' "$nvidia_host_version"
+        printf '  DRIVER_VERSION=%s bash /root/llama-target-deploy/install-nvidia-driver.sh lxc\n' "$nvidia_host_version"
     fi
     if [[ $BACKEND == vulkan ]]; then
         printf 'Then run this inside the CT to select the model/tag and directory; Mesa'"'"'s Vulkan driver and the build tools install automatically:\n'

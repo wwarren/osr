@@ -45,7 +45,8 @@ FLAGS=--install-target ok 'GPU devices pass through and the NVIDIA helper runs f
     AIRLLM_MODEL_ID=org/Small-7B GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'
 has '--dev0 path=/dev/nvidia0\,gid=993\,mode=0660'; has '--dev2 path=/dev/nvidia-uvm'
 has 'AIRLLM_DEVICE=cuda:0'
-[[ $out == *'install_nvidia_580_173_02.sh lxc'*'install-target.sh'* ]] || { echo 'FAIL: NVIDIA helper not before the installer' >&2; exit 1; }
+has 'DRIVER_VERSION='; has 'confirm CT 260 sees host NVIDIA driver'
+[[ $out == *'install-nvidia-driver.sh lxc'*'install-target.sh'* ]] || { echo 'FAIL: NVIDIA helper not before the installer' >&2; exit 1; }
 
 ok 'Ubuntu 26.04 LTS templates are accepted' TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
 has '--ostype ubuntu'

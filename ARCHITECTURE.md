@@ -576,6 +576,18 @@ the NVIDIA-only targets, so targets on one host can use different cards and
 vendors. Ollama and ComfyUI receive `GPU_CARD` and keep only that card's
 device nodes after their community scripts pass every card of the vendor;
 llama.cpp receives the card's nodes as `GPU_DEVICES`.
+`tools/update-gpu-drivers.sh` keeps those drivers current afterwards: it finds
+the GPU containers from their configs and offers the newest compatible NVIDIA
+release (checked against the cards' `supported-gpus.json` and test-built for
+the kernels before any container stops), verifies every NVIDIA container can
+be synchronized, then replaces the host driver and its containers' matching
+NVML and CUDA user-space libraries. Debian's apt NVIDIA packages in a guest
+are replaced with the `.run` libraries using the provisioners' cleanup
+(`targets/nvidia-lxc.sh`). A guest that cannot be checked, does not see the
+host driver, or has apt NVIDIA packages that cleanup does not remove blocks
+the host change before anything is downloaded. For AMD and Intel
+it offers the Proxmox kernel-series and `pve-firmware` updates on the host and
+the GPU packages from each container's own repositories.
 
 **Upgrade contract.** Sources and downloads are prepared and verified before
 service interruption. An unchanged healthy target is left alone. Successful

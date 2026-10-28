@@ -28,10 +28,10 @@ STUB
 printf '#!/usr/bin/env bash\n[[ -n ${FAKE_LSPCI:-} ]] && cat "$FAKE_LSPCI"\nexit 0\n' > "$stubs/lspci"
 printf '#!/usr/bin/env bash\necho "${FAKE_UID:-0}"\n' > "$stubs/id"
 chmod +x "$stubs/nvidia-smi" "$stubs/lspci" "$stubs/id"
-helper=$tmp/install_nvidia_580_173_02.sh
+helper=$tmp/install-nvidia-driver.sh
 cat > "$helper" <<STUB
 #!/usr/bin/env bash
-DRIVER_VERSION="580.173.02"
+DEFAULT_DRIVER_VERSION="580.173.02"
 echo "helper \$* KERNEL_MODULE_TYPE=\${KERNEL_MODULE_TYPE:-}" >> "$log"
 echo "helper output"
 [[ \${FAKE_NO_LOAD:-0} == 1 ]] || touch "$tmp/loaded"
@@ -76,7 +76,7 @@ for answer in rtx20:75 2080:75 3:89 40:89 'RTX 4070 Ti:89' 4090:89 rtx30:86 3090
     [[ $rc == 0 && $(field GPU_CUDA_ARCH) == "${answer##*:}" ]] || fail "$answer: $output"
 done
 has '+ env KERNEL_MODULE_TYPE=open bash'
-has 'install_nvidia_580_173_02.sh host --no-reboot'
+has 'install-nvidia-driver.sh host --no-reboot'
 [[ ! -s $log ]] || fail 'a dry run ran the helper'
 for bad in rtx60 1080 6 'gtx 1650'; do
     fresh; gpu "GPU_GENERATION=$bad" -- --dry-run
@@ -464,6 +464,15 @@ has 'The GPU at 0000:02:00.0 is bound to vfio-pci'
 [[ ! -s $log ]] || fail 'the helper ran with a driver already loaded'
 rm -f "$tmp/loaded"
 pass "NVIDIA --card: that card's compute capability and /dev/nvidia minor; one the driver does not list needs a reboot, a vfio-pci one is absent"
+
+# The real helper: its default release is read from its DEFAULT_DRIVER_VERSION
+# line, which every NVIDIA run needs (also one that only reports a loaded driver).
+touch "$tmp/loaded"; : > "$log"
+gpu NVIDIA_HELPER="$here/../tools/install-nvidia-driver.sh" -- --need required --for Strata
+[[ $rc == 0 && $(field GPU_STATE) == ready ]] || fail "real helper: $output"
+[[ ! -s $log ]] || fail 'the helper ran with a driver already loaded'
+rm -f "$tmp/loaded"
+pass "the real tools/install-nvidia-driver.sh's default release is readable"
 
 output=$(bash "$tool" --help)
 has 'Usage: bash tools/setup-host-gpu.sh'

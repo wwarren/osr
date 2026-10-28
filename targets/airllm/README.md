@@ -60,9 +60,9 @@ download afterwards, set `AIRLLM_DELETE_ORIGINAL=true`: AirLLM then deletes the
 original checkpoint once it has been split, but the peak usage is unchanged.
 
 For a GPU, pass `GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
-/dev/nvidia-uvm-tools'`. The CT gets those devices, the repository's NVIDIA
-580.173.02 user-space helper runs before the installer, and the model streams
-through `cuda:0`. torch comes from PyPI as its CUDA 13 build, which needs the
+/dev/nvidia-uvm-tools'`. The CT gets those devices, installs NVIDIA user-space
+matching the loaded Proxmox host driver before the installer, and streams the
+model through `cuda:0`. torch comes from PyPI as its CUDA 13 build, which needs the
 580-series driver on the host and also runs on CPU-only targets.
 
 Inside an existing CT or VM, run the installer directly as root:

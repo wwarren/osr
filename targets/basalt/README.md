@@ -27,10 +27,10 @@ toolkit that meets `CUDA_VERSION` is already installed in the CT.
 Run on the Proxmox GPU host as root. The host needs Proxmox VE 9, an unused CT
 ID, a downloaded Ubuntu 22.04/24.04/26.04 or Debian 12/13 amd64 LXC template,
 rootdir storage, network access, and `/dev/nvidia0`, `/dev/nvidiactl` and
-`/dev/nvidia-uvm`. The bundled NVIDIA guest helper matches host driver
-580.173.02. For a different host driver, supply a matching
-`NVIDIA_GUEST_INSTALLER` and `NVIDIA_DRIVER_VERSION`. The provisioner checks
-the host driver before creating the CT.
+`/dev/nvidia-uvm`. The provisioner reads the loaded host NVIDIA version,
+installs that release's user-space libraries in the CT, and verifies NVML and
+CUDA before installing Basalt. `NVIDIA_DRIVER_VERSION` may be set to require
+an exact host version; it defaults to `auto`.
 
 The GPU nodes are assigned `GPU_GID` (44, `video`, by default), and the service
 account joins their group. The provisioner also gives the CT unlimited

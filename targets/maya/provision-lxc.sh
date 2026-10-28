@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -19,8 +20,8 @@ take a long time. --dry-run validates settings and prints the PVE command plan.
 
 Required: CT_ID (unused, >=100), TEMPLATE (downloaded Ubuntu 22.04/24.04 or
 Debian 12/13 amd64), STORAGE (rootdir storage), IP_CIDR (a.b.c.d/nn or dhcp).
-GATEWAY is required for a static address. The host needs NVIDIA driver
-580.173.02 and the repository's matching LXC user-space installer by default.
+GATEWAY is required for a static address. The CT installs user-space matching
+the loaded host NVIDIA driver.
 An interactive run lists downloaded templates and eligible rootdir storage
 when TEMPLATE or STORAGE is unset.
 
@@ -30,7 +31,7 @@ Optional: CT_HOSTNAME=maya-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'
                       (plus /dev/nvidia-uvm-tools when the host has it),
           GPU_GID=44 (the CT group given the GPU nodes; 44 is "video"),
-          NVIDIA_DRIVER_VERSION=580.173.02,
+          NVIDIA_DRIVER_VERSION=auto (loaded host driver; or an exact-version check),
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
           MAYA_REF=latest (newest vX.Y.Z tag; or e.g. main),
           MAYA_COMMIT=<optional full SHA-1 pin>,
@@ -103,7 +104,7 @@ fi
 # The Maya service runs as an unprivileged account that joins this group, so
 # the nodes must not be root's group inside the CT.
 GPU_GID=${GPU_GID:-44}
-NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-580.173.02}
+NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-auto}
 MAYA_REF=${MAYA_REF:-latest}
 MAYA_COMMIT=${MAYA_COMMIT:-}
 MAYA_MODEL=${MAYA_MODEL:-Maya-S-v2-IQ2_XXS}
@@ -134,13 +135,16 @@ for name in CORES MEMORY_MB ROOTFS_GB MAYA_CONTEXT; do positive_int "$name" "${!
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi
 [[ -z $SSH_PUBLIC_KEY || -r $SSH_PUBLIC_KEY ]] || die 'SSH_PUBLIC_KEY must be a readable file.'
 [[ $GPU_GID =~ ^[1-9][0-9]{0,4}$ ]] && (( GPU_GID <= 65535 )) || die 'GPU_GID must be a non-root group ID (1..65535).'
-[[ $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
+[[ $NVIDIA_DRIVER_VERSION == auto || $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
 [[ $MAYA_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $MAYA_REF != HEAD && $MAYA_REF != *..* ]] || die 'MAYA_REF must be latest, a branch or a tag name.'
 [[ -z $MAYA_COMMIT || $MAYA_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'MAYA_COMMIT must be a full 40-digit SHA-1.'
 [[ $MAYA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid MAYA_MODEL.'
 [[ $MAYA_DRAFT =~ ^[a-z0-9]+$ ]] || die 'MAYA_DRAFT must be a setup.sh --draft choice (mtp or dflash2).'
 [[ $MAYA_NO_VISION =~ ^(true|false)$ ]] || die 'MAYA_NO_VISION must be true or false.'
 [[ $MAYA_CUDA_VERSION =~ ^(12\.(8|9)|1[3-9]\.[0-9]+)$ ]] || die 'MAYA_CUDA_VERSION must be 12.8 or newer.'
+maya_min_driver=570
+(( ${MAYA_CUDA_VERSION%%.*} < 13 )) || maya_min_driver=580
+[[ $NVIDIA_DRIVER_VERSION == auto ]] || nvidia_lxc_require_series "$NVIDIA_DRIVER_VERSION" "$maya_min_driver" "CUDA $MAYA_CUDA_VERSION"
 [[ $MAYA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( MAYA_PORT <= 65535 )) || die 'MAYA_PORT must be 1..65535.'
 [[ $MAYA_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'MAYA_READY_TIMEOUT must be a positive number of seconds.'
 
@@ -156,7 +160,7 @@ done
 template_dist=${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[4]}
 CUDA_DIST=$template_dist CUDA_VERSION=$MAYA_CUDA_VERSION bash "$source_dir/cuda-toolkit.sh" --check-repo ||
     die "MAYA_CUDA_VERSION=$MAYA_CUDA_VERSION cannot be installed in a $template_dist CT (see above)."
-NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../install_nvidia_580_173_02.sh}
+NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../tools/install-nvidia-driver.sh}
 [[ -r $NVIDIA_GUEST_INSTALLER ]] || die "Missing NVIDIA LXC user-space helper: $NVIDIA_GUEST_INSTALLER"
 
 read -r -a devices <<< "$GPU_DEVICES"
@@ -206,11 +210,13 @@ if (( ! dry_run )); then
         [[ $storage_name == "$STORAGE" && $status == active ]] && storage_ready=1
     done < <(pvesm status --content rootdir 2>/dev/null || true)
     (( storage_ready )) || die "Storage is not active or does not support rootdir: $STORAGE"
-    host_versions=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)
-    host_driver=${host_versions%%$'\n'*}
-    host_driver=${host_driver//[[:space:]]/}
-    [[ $host_driver == "$NVIDIA_DRIVER_VERSION" ]] || \
-        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION. Supply a matching NVIDIA_GUEST_INSTALLER and NVIDIA_DRIVER_VERSION."
+    host_driver=$(nvidia_lxc_host_version) || die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+    [[ $NVIDIA_DRIVER_VERSION == auto || $host_driver == "$NVIDIA_DRIVER_VERSION" ]] ||
+        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION."
+    NVIDIA_DRIVER_VERSION=$host_driver
+    nvidia_lxc_require_series "$NVIDIA_DRIVER_VERSION" "$maya_min_driver" "CUDA $MAYA_CUDA_VERSION"
+else
+    [[ $NVIDIA_DRIVER_VERSION != auto ]] || NVIDIA_DRIVER_VERSION='<host-nvidia-driver-version>'
 fi
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
@@ -253,7 +259,7 @@ run pct push "$CT_ID" "$source_dir/install-target.sh" /root/maya-target-deploy/i
 run pct push "$CT_ID" "$source_dir/maya.service" /root/maya-target-deploy/maya.service --perms 0644
 run pct push "$CT_ID" "$source_dir/cuda-toolkit.sh" /root/maya-target-deploy/cuda-toolkit.sh --perms 0755
 run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/maya-target-deploy/nvidia-guest-install.sh --perms 0755
-run pct exec "$CT_ID" -- bash /root/maya-target-deploy/nvidia-guest-install.sh lxc
+nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/maya-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "MAYA_REF=$MAYA_REF" "MAYA_COMMIT=$MAYA_COMMIT" \
     "MAYA_MODEL=$MAYA_MODEL" "MAYA_CONTEXT=$MAYA_CONTEXT" "MAYA_DRAFT=$MAYA_DRAFT" \
     "MAYA_NO_VISION=$MAYA_NO_VISION" "MAYA_CUDA_VERSION=$MAYA_CUDA_VERSION" "MAYA_PORT=$MAYA_PORT" \

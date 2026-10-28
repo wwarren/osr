@@ -76,7 +76,7 @@ should use and passes `GPU` and `GPU_CARD`.
 
 | GPU | Passed through | `install-target.sh` adds |
 |---|---|---|
-| NVIDIA | `/dev/nvidia*` | the repository's NVIDIA 580.173.02 user-space helper, when `nvidia-smi` is missing (before adoption) |
+| NVIDIA | `/dev/nvidia*` | NVIDIA user-space matching the loaded host driver, when NVML or CUDA is missing or mismatched (before adoption) |
 | AMD Radeon RX 7000/9000, PRO W7000 | `/dev/dri/renderD*`, `/dev/kfd` | Ollama's ROCm libraries for the installed release (`ollama-linux-amd64-rocm.tar.zst`, checksum-verified; they bundle ROCm, so nothing else is installed) |
 | Intel Arc A/B | `/dev/dri/renderD*` | Mesa's Vulkan driver (`mesa-vulkan-drivers libvulkan1`) for Ollama's built-in Vulkan backend; Arc B needs Mesa 24.2+ (Debian 13 has 25.0, Ubuntu 24.04 25.0 after `apt upgrade`, Ubuntu 26.04 26.0) |
 

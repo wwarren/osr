@@ -45,7 +45,8 @@ has "+ pct exec 270 -- env OLLAMA_GPU=none OLLAMA_PULL_MODELS=qwen3:8b\\ qwen3:1
 
 FLAGS=--install-target ok 'GPU passthrough adds the NVIDIA helper before adoption' GPU=yes
 has 'var_gpu=yes'
-[[ $out == *'install_nvidia_580_173_02.sh lxc'*'install-target.sh'* ]] || { echo 'FAIL: NVIDIA helper not before adoption' >&2; exit 1; }
+has 'DRIVER_VERSION='; has 'confirm CT 270 sees host NVIDIA driver'
+[[ $out == *'install-nvidia-driver.sh lxc'*'install-target.sh'* ]] || { echo 'FAIL: NVIDIA helper not before adoption' >&2; exit 1; }
 
 has 'OLLAMA_GPU=nvidia'
 

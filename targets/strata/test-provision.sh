@@ -40,10 +40,14 @@ has 'path=/dev/nvidia-uvm\,gid=44\,mode=0660'
 lacks 'gid=0\,'
 has 'STRATA_READY_TIMEOUT=900'
 has 'nvidia-guest-install.sh lxc'
+has 'DRIVER_VERSION='; has 'confirm CT 280 sees host NVIDIA driver'
 has 'bash /root/strata-target-deploy/install-target.sh'
 has 'STRATA_PORT=8080'
 has "STRATA_COMMIT=$pin"
 lacks 'https://github.com/Niko1221/Strata.git'  # cloning happens inside the CT
+plan NVIDIA_DRIVER_VERSION=590.48.01
+has 'DRIVER_VERSION=590.48.01'
+reject 'CUDA 13 needs NVIDIA driver 580 or newer' NVIDIA_DRIVER_VERSION=575.64.05
 
 plan STRATA_REF=v0.1.40
 has 'STRATA_REF=v0.1.40'

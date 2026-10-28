@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--install-target] [--dry-run]
@@ -27,8 +28,8 @@ ROOTFS_GB defaults to what the model needs (its weights twice, for the download
 and AirLLM's shards, plus 20 GB) and at least 64. A smaller explicit value is
 refused unless ALLOW_SMALL_DISK=true.
 No root password is set: use `pct enter <id>` or SSH_PUBLIC_KEY.
-With GPU_DEVICES the CT gets those devices, the NVIDIA 580.173.02 user-space
-helper runs before the installer, and the model streams through cuda:0.
+With GPU_DEVICES the CT gets those devices, installs NVIDIA user-space matching
+the loaded Proxmox host driver, and streams the model through cuda:0.
 --dry-run validates inputs and prints the commands without creating anything.
 USAGE
 }
@@ -190,9 +191,8 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 files=(install-target.sh server.py requirements.txt requirements.lock airllm.env.example airllm-ollama-api.service README.md)
 for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
 nvidia_installer=''
-for candidate in "$source_dir/../../tools/install_nvidia_580_173_02.sh" "$source_dir/../../install_nvidia_580_173_02.sh"; do
-    if [[ -r $candidate ]]; then nvidia_installer=$candidate; break; fi
-done
+nvidia_installer=$source_dir/../../tools/install-nvidia-driver.sh
+[[ -r $nvidia_installer ]] || nvidia_installer=''
 
 net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,firewall=1"
 [[ -z $GATEWAY ]] || net+=",gw=$GATEWAY"
@@ -218,7 +218,7 @@ done
 device=cpu
 if (( ${#devices[@]} )); then
     device=cuda:0
-    [[ -n $nvidia_installer ]] || die 'GPU_DEVICES needs install_nvidia_580_173_02.sh in the repository root or tools directory.'
+    [[ -n $nvidia_installer ]] || die 'GPU_DEVICES needs tools/install-nvidia-driver.sh from the repository.'
 fi
 guest_env=(env "AIRLLM_MODEL_ID=$AIRLLM_MODEL_ID" "AIRLLM_MODEL_ALIAS=$AIRLLM_MODEL_ALIAS" "AIRLLM_DEVICE=$device")
 run() {
@@ -236,6 +236,17 @@ if (( ! dry_run )); then
     [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge interface is not present: $BRIDGE"
     template_path=$(pvesm path "$TEMPLATE")
     [[ -f $template_path && -r $template_path ]] || die "Template is not readable on this node: $TEMPLATE"
+fi
+nvidia_host_version=''
+if (( ${#devices[@]} )); then
+    if (( dry_run )); then
+        nvidia_host_version='<host-nvidia-driver-version>'
+        printf '+ read loaded NVIDIA driver version from the Proxmox host\n'
+    else
+        nvidia_host_version=$(nvidia_lxc_host_version) ||
+            die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+        nvidia_lxc_require_series "$nvidia_host_version" 580 'AirLLM CUDA 13'
+    fi
 fi
 
 trap 'printf "Provisioning stopped at line %s. Any newly created CT is kept for inspection.\n" "$LINENO" >&2' ERR
@@ -264,17 +275,17 @@ for file in "${files[@]}"; do
     run pct push "$CT_ID" "$source_dir/$file" "/root/airllm-target-deploy/$file" --perms 0644
 done
 if (( ${#devices[@]} )); then
-    run pct push "$CT_ID" "$nvidia_installer" /root/airllm-target-deploy/install_nvidia_580_173_02.sh --perms 0755
+    run pct push "$CT_ID" "$nvidia_installer" /root/airllm-target-deploy/install-nvidia-driver.sh --perms 0755
 fi
 if (( INSTALL_TARGET )); then
     if (( ${#devices[@]} )); then
-        run pct exec "$CT_ID" -- bash /root/airllm-target-deploy/install_nvidia_580_173_02.sh lxc
+        nvidia_lxc_install_guest "$CT_ID" "$nvidia_host_version" /root/airllm-target-deploy/install-nvidia-driver.sh
     fi
     run pct exec "$CT_ID" -- "${guest_env[@]}" bash /root/airllm-target-deploy/install-target.sh
     printf '\nThe model is downloading in CT %s. Follow it with: pct exec %s -- journalctl -u airllm-ollama-api -f\n' "$CT_ID" "$CT_ID"
 else
     printf '\nGuest installation skipped. Inside the CT (pct enter %s) run:\n' "$CT_ID"
-    if (( ${#devices[@]} )); then printf '  bash /root/airllm-target-deploy/install_nvidia_580_173_02.sh lxc\n'; fi
+    if (( ${#devices[@]} )); then printf '  DRIVER_VERSION=%s bash /root/airllm-target-deploy/install-nvidia-driver.sh lxc\n' "$nvidia_host_version"; fi
     printf '  AIRLLM_MODEL_ID=%q bash /root/airllm-target-deploy/install-target.sh\n' "$AIRLLM_MODEL_ID"
 fi
 printf 'Gated models need HF_TOKEN in /etc/airllm-target/airllm.env inside the CT.\n'

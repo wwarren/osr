@@ -10,6 +10,7 @@ set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -29,8 +30,7 @@ the PVE command plan.
 Required: TEMPLATE (downloaded Ubuntu 22.04/24.04 or Debian 12/13 amd64),
           STORAGE (rootdir storage), IP_CIDR (a.b.c.d/nn or dhcp).
           GATEWAY is required for a static address.
-          The host needs NVIDIA driver 580.173.02 and the repository's
-          matching LXC user-space installer by default.
+          The CT installs user-space matching the loaded host NVIDIA driver.
 An interactive run lists downloaded templates and eligible rootdir storage
 when TEMPLATE or STORAGE is unset.
 
@@ -42,7 +42,7 @@ Optional: CT_HOSTNAME=basalt-target, BRIDGE=vmbr0, CORES=8,
           GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'
                       (plus /dev/nvidia-uvm-tools when the host has it),
           GPU_GID=44 (the CT group given the GPU nodes; 44 is "video"),
-          NVIDIA_DRIVER_VERSION=580.173.02,
+          NVIDIA_DRIVER_VERSION=auto (loaded host driver; or an exact-version check),
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
           CUDA_VERSION=13.0 (the toolkit floor; basalt's CMake hard-errors below),
           BASALT_URL=https://github.com/jesdga95/basalt.git,
@@ -116,7 +116,7 @@ fi
 # The Basalt service runs as an unprivileged account that joins this group, so
 # the nodes must not be root's group inside the CT.
 GPU_GID=${GPU_GID:-44}
-NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-580.173.02}
+NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-auto}
 CUDA_VERSION=${CUDA_VERSION:-13.0}
 BASALT_URL=${BASALT_URL:-https://github.com/jesdga95/basalt.git}
 BASALT_REF=${BASALT_REF:-main}
@@ -150,7 +150,8 @@ for name in CORES MEMORY_MB ROOTFS_GB BASALT_READY_TIMEOUT; do positive_int "$na
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi
 [[ -z $SSH_PUBLIC_KEY || -r $SSH_PUBLIC_KEY ]] || die 'SSH_PUBLIC_KEY must be a readable file.'
 [[ $GPU_GID =~ ^[1-9][0-9]{0,4}$ ]] && (( GPU_GID <= 65535 )) || die 'GPU_GID must be a non-root group ID (1..65535).'
-[[ $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
+[[ $NVIDIA_DRIVER_VERSION == auto || $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
+[[ $NVIDIA_DRIVER_VERSION == auto ]] || nvidia_lxc_require_series "$NVIDIA_DRIVER_VERSION" 580 'CUDA 13'
 [[ $CUDA_VERSION =~ ^[0-9]+\.[0-9]+$ ]] && (( ${CUDA_VERSION%%.*} >= 13 )) || die 'CUDA_VERSION must be 13.0 or newer (Basalt hard-errors below 13.0).'
 [[ $BASALT_URL =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_URL (must be an https URL).'
 [[ $BASALT_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $BASALT_REF != HEAD && $BASALT_REF != *..* ]] || die 'BASALT_REF must be a branch or tag name.'
@@ -177,7 +178,7 @@ template_dist=${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[4]}
 CUDA_DIST=$template_dist CUDA_VERSION=$CUDA_VERSION bash "$source_dir/cuda-toolkit.sh" --check-repo ||
     die "CUDA_VERSION=$CUDA_VERSION cannot be installed in a $template_dist CT (see above)."
 # The NVIDIA LXC user-space helper lives at the repository root, two levels up.
-NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../install_nvidia_580_173_02.sh}
+NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../tools/install-nvidia-driver.sh}
 [[ -r $NVIDIA_GUEST_INSTALLER ]] || die "Missing NVIDIA LXC user-space helper: $NVIDIA_GUEST_INSTALLER"
 
 read -r -a devices <<< "$GPU_DEVICES"
@@ -232,11 +233,13 @@ if (( ! dry_run )); then
         [[ $storage_name == "$STORAGE" && $status == active ]] && storage_ready=1
     done < <(pvesm status --content rootdir 2>/dev/null || true)
     (( storage_ready )) || die "Storage is not active or does not support rootdir: $STORAGE"
-    host_versions=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)
-    host_driver=${host_versions%%$'\n'*}
-    host_driver=${host_driver//[[:space:]]/}
-    [[ $host_driver == "$NVIDIA_DRIVER_VERSION" ]] || \
-        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION. Supply a matching NVIDIA_GUEST_INSTALLER and NVIDIA_DRIVER_VERSION."
+    host_driver=$(nvidia_lxc_host_version) || die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+    [[ $NVIDIA_DRIVER_VERSION == auto || $host_driver == "$NVIDIA_DRIVER_VERSION" ]] ||
+        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION."
+    NVIDIA_DRIVER_VERSION=$host_driver
+    nvidia_lxc_require_series "$NVIDIA_DRIVER_VERSION" 580 'CUDA 13'
+else
+    [[ $NVIDIA_DRIVER_VERSION != auto ]] || NVIDIA_DRIVER_VERSION='<host-nvidia-driver-version>'
 fi
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
@@ -280,7 +283,7 @@ run pct push "$CT_ID" "$source_dir/basalt.service" /root/basalt-target-deploy/ba
 run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/basalt-target-deploy/nvidia-guest-install.sh --perms 0755
 # Host-matched NVIDIA user-space first; the installer is invoked in LXC mode
 # (no driver, no kernel module -- just the user-space matched to the host driver).
-run pct exec "$CT_ID" -- bash /root/basalt-target-deploy/nvidia-guest-install.sh lxc
+nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/basalt-target-deploy/nvidia-guest-install.sh
 # Then the CUDA toolkit, build toolchain and engine build, the model download,
 # and the service start all happen inside install-target.sh (so a failed build
 # does not leave a half-configured service).

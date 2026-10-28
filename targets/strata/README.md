@@ -52,10 +52,10 @@ commit with `test-pinned-run-script.py` (see [Check without Proxmox](#check-with
 - The provisioner sets the new CT's `lxc.prlimit.memlock` to `unlimited` and
   the service's `LimitMEMLOCK` to infinity so Strata can pin model memory. This
   matches a [reported Proxmox LXC Strata configuration](https://github.com/Niko1221/Strata/issues/1217).
-- The bundled guest NVIDIA installer is for host driver **580.173.02**. If
-  your host has another driver, provide a matching LXC user-space installer
-  using `NVIDIA_GUEST_INSTALLER` and set `NVIDIA_DRIVER_VERSION` accordingly.
-  The provisioner checks the host driver before creating the CT.
+- The provisioner reads the loaded host NVIDIA version, installs matching
+  user-space libraries in the CT, and verifies NVML and CUDA before installing
+  Strata. `NVIDIA_DRIVER_VERSION` defaults to `auto`; set it to require an
+  exact host version.
 
 ## Create and launch
 

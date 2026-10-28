@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034  # globals of the sourced script, set by the tests
-# Unit tests for install_nvidia_580_173_02.sh. The script is sourced (its
+# Unit tests for install-nvidia-driver.sh. The script is sourced (its
 # main only runs when executed), every system command is stubbed, and nothing
 # is downloaded or installed.
 
 exec </dev/null
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="${1:-${HERE}/../install_nvidia_580_173_02.sh}"
+SCRIPT="${1:-${HERE}/../tools/install-nvidia-driver.sh}"
 # shellcheck source=lib/assert.sh
 source "${HERE}/lib/assert.sh"
 # shellcheck source=lib/mocks.sh
@@ -29,8 +29,18 @@ DEVICES_UNIT_DIR="${WORK}/systemd"
 describe usage
 out="$(bash "$SCRIPT" --help)"; rc=$?
 assert_eq "help works without root" "0" "$rc"
+default="$(sed -n 's/^DEFAULT_DRIVER_VERSION="\([0-9.]*\)"$/\1/p' "$SCRIPT")"
+assert_ne "the default release is a plain line (tools/setup-host-gpu.sh reads it)" "" "$default"
+assert_eq "and is what an install without DRIVER_VERSION uses" "$default" \
+  "$(env -u DRIVER_VERSION bash -c 'source "$1"; printf "%s" "$DRIVER_VERSION"' _ "$SCRIPT")"
 assert_contains "documents DRIVER_SHA256" "DRIVER_SHA256" "$out"
+assert_contains "documents DRIVER_VERSION override" "DRIVER_VERSION" "$out"
 assert_contains "no-arg prints usage too" "Usage:" "$(bash "$SCRIPT")"
+out="$(DRIVER_VERSION=575.64.05 bash -c 'source "$1"; printf "%s|%s" "$DRIVER_FILE" "$DRIVER_URL"' _ "$SCRIPT")"
+assert_eq "a different release changes the installer file and URL" \
+  "NVIDIA-Linux-x86_64-575.64.05.run|https://download.nvidia.com/XFree86/Linux-x86_64/575.64.05/NVIDIA-Linux-x86_64-575.64.05.run" "$out"
+out="$(DRIVER_VERSION='../bad' bash "$SCRIPT" --help 2>&1)"; rc=$?
+assert_ne "an invalid release is refused" "0" "$rc"
 
 describe main
 out="$(bash "$SCRIPT" lxc --no-reboot 2>&1)"; rc=$?
@@ -49,6 +59,12 @@ assert_eq "no driver -> empty" "" "$(host_driver_version)"
 describe installed_driver_version
 mock_command nvidia-smi 0 "580.173.02"
 assert_eq "reads nvidia-smi" "580.173.02" "$(installed_driver_version)"
+touch "$WORK/libcuda.so.580.173.02"
+mock_command ldconfig 0 "libcuda.so.1 (libc6,x86-64) => $WORK/libcuda.so.580.173.02"
+assert_eq "reads the resolved CUDA library release" "580.173.02" "$(installed_cuda_version)"
+mock_command ldconfig 0 ''
+assert_eq "missing CUDA library has no release" "" "$(installed_cuda_version)"
+mock_command ldconfig 0 "libcuda.so.1 (libc6,x86-64) => $WORK/libcuda.so.580.173.02"
 
 describe check_host_version_match
 printf 'NVIDIA UNIX x86_64 Kernel Module  575.64.05  x\n' > "$PROC_DRIVER_VERSION"
@@ -61,7 +77,12 @@ FORCE=false
 printf 'NVIDIA UNIX x86_64 Kernel Module  580.173.02  x\n' > "$PROC_DRIVER_VERSION"
 assert_ok "a match passes" check_host_version_match
 rm -f "$PROC_DRIVER_VERSION"
-assert_ok "an invisible host version is only a note" check_host_version_match
+out="$( (check_host_version_match) 2>&1)"; rc=$?
+assert_ne "an invisible host version is refused" "0" "$rc"
+assert_contains "missing version explains why" "cannot verify" "$out"
+FORCE=true
+assert_ok "FORCE=true also overrides a missing version" check_host_version_match
+FORCE=false
 
 describe headers_package
 mock_command pveversion 0 "pve-manager/9.0.3"

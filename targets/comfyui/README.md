@@ -113,8 +113,14 @@ workflow Open WebUI already has, and otherwise uses the variant whose files
 ComfyUI has (4B first). `COMFYUI_DOWNLOAD_WEIGHTS=0` skips the download.
 
 The GPU: `GPU=auto` (default) sets ComfyUI up for NVIDIA when the host has
-`/dev/nvidia0` and passes it through; when `nvidia-smi` is still missing in the
-CT afterwards, the repository's NVIDIA 580.173.02 user-space helper is run.
+`/dev/nvidia0` and passes it through. If the CT's NVML or `libcuda.so.1` does
+not match the loaded Proxmox host driver version afterwards,
+provisioning stops the community ComfyUI service, confirms that the CT sees the
+host's kernel driver version, purges known installed Debian NVIDIA driver
+packages (including `nvidia-installer-cleanup`, which blocks NVIDIA's `.run`
+installer), and passes the detected host release to the user-space helper. The
+CUDA repository keyring is kept. Provisioning verifies that both NVML and the
+resolved `libcuda.so.1` match the host before adopting the service.
 PyTorch's CUDA 13 build, which the community install picks, needs host driver
 580 or newer. `GPU=amd` and `GPU=intel` pass `/dev/dri` (and `/dev/kfd`) through
 and install ROCm or XPU PyTorch. `GPU=none` installs CPU-only operation

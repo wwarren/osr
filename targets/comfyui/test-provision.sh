@@ -40,7 +40,8 @@ refuse() {
 # shellcheck disable=SC1090
 source <(awk '/^# Provision helpers/ { capture=1; next } /^# End provision helpers/ { capture=0 } capture' "$tool")
 for helper in allow_list gpu_kind community_gpu_choice community_vars firewall_config net_with_firewall classify_router route_src \
-        normalize_pci_address card_vendor_kind card_device_nodes config_devices other_card_devices; do
+        normalize_pci_address card_vendor_kind card_device_nodes config_devices other_card_devices \
+        nvidia_guest_cleanup_script nvidia_kernel_version nvidia_guest_ready_script; do
     declare -F "$helper" >/dev/null || fail "helper extraction failed: $helper"
 done
 [[ $(allow_list '192.0.2.0/24, 198.51.100.7 203.0.113.0/28' | paste -sd' ') == '192.0.2.0/24 198.51.100.7 203.0.113.0/28' ]] || fail 'allow_list'
@@ -94,7 +95,10 @@ plan GPU=nvidia UI_ALLOW_CIDR=198.51.100.0/24 COMFYUI_PORT=8190 COMFYUI_MODEL_UR
     COMFYUI_IMAGE_SIZE=1024x1024 COMFYUI_IMAGE_STEPS=30
 has 'var_gpu=yes var_comfyui_gpu_type=2'
 has 'IN ACCEPT -source 198.51.100.0/24 -p tcp -dport 8190'
-has 'install_nvidia_580_173_02.sh lxc'
+has 'install-nvidia-driver.sh lxc'
+has 'DRIVER_VERSION='
+has 'nvidia-installer-cleanup'
+has 'libnvidia-ml1'
 has 'COMFYUI_DEVICE=gpu'; has 'COMFYUI_PORT=8190'
 lacks '--model sd_xl_base_1.0.safetensors'; has '--image-size 1024x1024'; has '--image-steps 30'
 pass 'NVIDIA, extra UI sources, a port, and a download that does not replace Klein in Open WebUI'
@@ -150,7 +154,55 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/comfyui-provision-test.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 bin=$tmp/bin; mkdir -p "$bin" "$tmp/pve/nodes" "$tmp/net/vmbr0"
 log=$tmp/calls.log
+printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.173.02  Release Build\n' > "$tmp/proc-version"
+common+=("NVIDIA_HOST_VERSION_FILE=$tmp/proc-version")
 stub() { printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n%s\n' "$1" "$log" "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
+# Exercise the cleanup inside a fake guest: only installed driver packages are
+# purged. A clean CT must not run apt, and cuda-keyring remains installed.
+cleanup_bin=$tmp/cleanup-bin; mkdir -p "$cleanup_bin"
+cat > "$cleanup_bin/dpkg" <<'EOF'
+#!/bin/sh
+case " ${FAKE_INSTALLED_NVIDIA:-} " in
+    *" $2 "*) printf 'Status: install ok installed\n' ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > "$cleanup_bin/apt-get" <<'EOF'
+#!/bin/sh
+printf '%s %s\n' "$DEBIAN_FRONTEND" "$*" >> "$CLEANUP_LOG"
+EOF
+chmod +x "$cleanup_bin/dpkg" "$cleanup_bin/apt-get"
+cleanup_log=$tmp/cleanup.log
+cleanup_script=$(nvidia_guest_cleanup_script)
+env PATH="$cleanup_bin:$PATH" CLEANUP_LOG="$cleanup_log" FAKE_INSTALLED_NVIDIA='' sh -c "$cleanup_script"
+[[ ! -e $cleanup_log ]] || fail 'clean guest ran apt purge'
+env PATH="$cleanup_bin:$PATH" CLEANUP_LOG="$cleanup_log" \
+    FAKE_INSTALLED_NVIDIA='nvidia-smi libnvidia-ml1 libcuda1 nvidia-alternative glx-alternative-nvidia nvidia-legacy-check nvidia-installer-cleanup cuda-keyring' \
+    sh -c "$cleanup_script"
+[[ $(cat "$cleanup_log") == 'noninteractive purge -y nvidia-smi libnvidia-ml1 libcuda1 nvidia-alternative glx-alternative-nvidia nvidia-legacy-check nvidia-installer-cleanup' ]] ||
+    fail "cleanup selected the wrong packages: $(cat "$cleanup_log")"
+pass 'NVIDIA guest cleanup purges installed Debian driver packages only, preserving cuda-keyring'
+cat > "$cleanup_bin/nvidia-smi" <<'EOF'
+#!/bin/sh
+printf '%s\n' "${FAKE_NVML_VERSION:-580.173.02}"
+EOF
+cat > "$cleanup_bin/ldconfig" <<'EOF'
+#!/bin/sh
+printf 'libcuda.so.1 (libc6,x86-64) => %s/libcuda.so.%s\n' "$FAKE_CUDA_DIR" "${FAKE_CUDA_VERSION:-580.173.02}"
+EOF
+chmod +x "$cleanup_bin/nvidia-smi" "$cleanup_bin/ldconfig"
+touch "$tmp/libcuda.so.580.173.02" "$tmp/libcuda.so.575.64.05"
+ready_script=$(nvidia_guest_ready_script)
+env PATH="$cleanup_bin:$PATH" FAKE_CUDA_DIR="$tmp" sh -c "$ready_script" sh 580.173.02 || fail 'matching NVML/CUDA userspace was refused'
+env PATH="$cleanup_bin:$PATH" FAKE_CUDA_DIR="$tmp" FAKE_NVML_VERSION=550.163.01 sh -c "$ready_script" sh 580.173.02 &&
+    fail 'older NVML userspace was accepted'
+env PATH="$cleanup_bin:$PATH" FAKE_CUDA_DIR="$tmp" FAKE_CUDA_VERSION=575.64.05 sh -c "$ready_script" sh 580.173.02 &&
+    fail 'older CUDA userspace was accepted'
+env PATH="$cleanup_bin:$PATH" FAKE_CUDA_DIR="$tmp" FAKE_CUDA_VERSION=580.173.03 sh -c "$ready_script" sh 580.173.02 &&
+    fail 'a missing CUDA library was accepted'
+env PATH="$cleanup_bin:$PATH" FAKE_CUDA_DIR="$tmp" FAKE_NVML_VERSION=575.64.05 FAKE_CUDA_VERSION=575.64.05 \
+    sh -c "$ready_script" sh 575.64.05 || fail 'matching alternate NVIDIA release was refused'
+pass 'NVIDIA readiness requires matching NVML and CUDA releases'
 # The "community script" the stubbed curl downloads records the presets it got.
 community=$tmp/community.sh
 printf '#!/usr/bin/env bash\necho "community var_ctid=$var_ctid var_gpu=$var_gpu var_comfyui_gpu_type=$var_comfyui_gpu_type var_os=$var_os" >> "%s"\necho "installer-umask $(umask)" >> "%s"\n' "$log" "$log" > "$community"
@@ -178,7 +230,16 @@ stub pct 'case "$*" in
     "exec 280 -- ip -4 route get "*) echo "192.0.2.86 dev eth0 src 192.0.2.80 uid 0" ;;
     "exec 280 -- mktemp "*) echo /root/comfyui-integration.AbC123 ;;
     "exec 280 -- python3 /root/comfyui-integration.AbC123/integrate-webui.py "*) exit "${FAKE_INTEGRATE_RC:-0}" ;;
-    "exec 286 -- nvidia-smi -L") exit "${FAKE_NO_NVIDIA_SMI:-0}" ;;
+    "exec 286 -- sh -c expected="*)
+        count=0; [[ ! -f "'"$tmp"'/ready-count" ]] || read -r count < "'"$tmp"'/ready-count"
+        count=$((count + 1)); printf "%s\n" "$count" > "'"$tmp"'/ready-count"
+        if (( count == 1 )); then
+            [[ -z ${FAKE_NO_NVIDIA_SMI:-}${FAKE_NO_LIBCUDA:-}${FAKE_WRONG_NVML:-}${FAKE_WRONG_CUDA:-} ]] || exit 1
+        else
+            exit "${FAKE_VERIFY_GPU:-0}"
+        fi ;;
+    "exec 286 -- cat /proc/driver/nvidia/version")
+        echo "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  ${FAKE_GUEST_HOST_VERSION:-580.173.02}  Release Build" ;;
     "exec 286 -- hostname -I") echo "192.0.2.86 fd00::86" ;;
     "exec 286 -- sed -n "*) echo 8191 ;;
     "config 286") echo "net0: name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:86,ip=192.0.2.86/24,gw=192.0.2.1,type=veth"
@@ -189,7 +250,7 @@ stub pct 'case "$*" in
 esac; exit 0'
 fw=$tmp/pve/firewall/286.fw
 real() {
-    rm -f "$fw"; : > "$log"
+    rm -f "$fw" "$tmp/ready-count"; : > "$log"
     split_args "$@"
     out=$(env -i "PATH=$bin:$PATH" "${common[@]}" PVE_ETC="$tmp/pve" SYS_NET_DIR="$tmp/net" "${vars[@]}" \
         "$bash_bin" "$tool" "${flags[@]}" 2>&1)
@@ -209,7 +270,16 @@ grep -qx 'installer-umask 0022' "$log" || fail 'community installer inherited a 
 [[ $(cat "$fw") == "$(firewall_config 8188 192.0.2.80 198.51.100.0/24)" ]] || fail "firewall file: $(cat "$fw")"
 grep -q 'pct set 286 --net0 name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:86,ip=192.0.2.86/24,gw=192.0.2.1,type=veth,firewall=1' "$log" ||
     fail "net0 not put behind the firewall: $(calls)"
-grep -q 'pct exec 286 -- bash /root/comfyui-target-deploy/install_nvidia_580_173_02.sh lxc' "$log" || fail 'NVIDIA helper not run'
+grep -q 'pct exec 286 -- env DRIVER_VERSION=580.173.02 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" || fail 'matching NVIDIA helper not run'
+grep -q 'pct exec 286 -- systemctl stop comfyui' "$log" || fail 'ComfyUI was not stopped before changing NVIDIA libraries'
+grep -q 'pct exec 286 -- cat /proc/driver/nvidia/version' "$log" || fail 'guest kernel driver version was not verified before cleanup'
+grep -q 'pct exec 286 -- sh -c set --; for package in nvidia-smi' "$log" || fail 'Debian driver cleanup not run in the CT'
+! grep -q '^apt-get purge' "$log" || fail 'the host ran apt purge'
+[[ $(grep -c 'pct exec 286 -- sh -c expected=' "$log") == 2 ]] || fail 'NVML and CUDA were not verified before and after the helper'
+stop_line=$(grep -n 'pct exec 286 -- systemctl stop comfyui' "$log" | head -n1 | cut -d: -f1)
+purge_line=$(grep -n 'pct exec 286 -- sh -c set --; for package' "$log" | head -n1 | cut -d: -f1)
+helper_line=$(grep -n 'pct exec 286 -- env DRIVER_VERSION=580.173.02 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" | head -n1 | cut -d: -f1)
+(( stop_line < purge_line && purge_line < helper_line )) || fail 'NVIDIA cleanup and install order'
 grep -q 'COMFYUI_DEVICE=gpu .*COMFYUI_MODEL_URL=https://huggingface.co/o/r/resolve/main/v1-5.safetensors' "$log" || fail 'guest install settings'
 grep -q -- '--comfyui-url http://192.0.2.86:8188 --admin-token-file /root/comfyui-integration.AbC123/admin-token' "$log" ||
     fail "integration call: $(calls)"
@@ -224,6 +294,50 @@ read -r a b c d e <<< "$order"
 (( a < b && b < c && c < d && d < e )) || fail "steps out of order ($order): $(calls)"
 grep -q 'pct exec 280 -- rm -rf -- /root/comfyui-integration.AbC123' "$log" || fail 'router staging not removed'
 pass 'a full run: Open WebUI checked, presets, firewall before adoption, NVIDIA helper, registration; token never in argv'
+
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_LIBCUDA=1 || fail 'missing libcuda run failed'
+grep -q 'pct exec 286 -- sh -c set --; for package in nvidia-smi' "$log" || fail 'missing libcuda did not trigger Debian cleanup'
+grep -q 'pct exec 286 -- env DRIVER_VERSION=580.173.02 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" || fail 'missing libcuda did not trigger helper'
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null || fail 'healthy NVIDIA run failed'
+! grep -q 'pct exec 286 -- systemctl stop comfyui' "$log" || fail 'healthy NVIDIA CT was stopped'
+! grep -q 'pct exec 286 -- env DRIVER_VERSION=.*install-nvidia-driver.sh lxc' "$log" || fail 'healthy NVIDIA CT reran helper'
+pass 'missing libcuda triggers repair; healthy NVIDIA userspace is left running'
+
+for mismatch in FAKE_WRONG_NVML FAKE_WRONG_CUDA; do
+    real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null "$mismatch=1" ||
+        fail "$mismatch did not trigger a successful NVIDIA repair"
+    grep -q 'pct exec 286 -- env DRIVER_VERSION=580.173.02 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" ||
+        fail "$mismatch skipped the matching NVIDIA installer"
+done
+pass 'either an NVML or CUDA release mismatch triggers repair'
+
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_NVIDIA_SMI=1 FAKE_VERIFY_GPU=1 &&
+    fail 'the guest install continued after NVIDIA verification failed'
+has 'still lacks NVIDIA NVML and CUDA userspace'
+! grep -q 'pct exec 286 -- env COMFYUI_PORT=' "$log" || fail 'adoption ran without a usable NVIDIA GPU'
+pass 'failed NVIDIA verification stops adoption with a diagnostic'
+
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_NVIDIA_SMI=1 FAKE_GUEST_HOST_VERSION=550.163.01 &&
+    fail 'a host driver mismatch was accepted'
+has 'leaving its Debian driver packages untouched'
+! grep -q 'pct exec 286 -- systemctl stop comfyui' "$log" || fail 'host mismatch stopped the CT service'
+! grep -q 'pct exec 286 -- sh -c set --; for package' "$log" || fail 'host mismatch purged Debian packages'
+pass 'a host driver mismatch is refused before guest packages change'
+
+printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  575.64.05  Release Build\n' > "$tmp/proc-version"
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_NVIDIA_SMI=1 FAKE_GUEST_HOST_VERSION=575.64.05 ||
+    fail 'a different host driver version was refused'
+grep -q 'pct exec 286 -- env DRIVER_VERSION=575.64.05 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" ||
+    fail 'the host driver version did not reach the NVIDIA helper'
+pass 'a different host NVIDIA driver version selects matching CT userspace'
+printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.173.02  Release Build\n' > "$tmp/proc-version"
+
+: > "$tmp/proc-version"
+real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null && fail 'an unreadable host driver version was accepted'
+has 'Cannot determine the loaded NVIDIA kernel driver version'
+! grep -q '^community' "$log" || fail 'the community script ran without a host driver version'
+pass 'missing host driver version stops before CT creation'
+printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.173.02  Release Build\n' > "$tmp/proc-version"
 
 mkdir -p "$tmp/pve/firewall"
 real_keep() { : > "$log"; split_args "$@"; out=$(env -i "PATH=$bin:$PATH" "${common[@]}" PVE_ETC="$tmp/pve" SYS_NET_DIR="$tmp/net" "${vars[@]}" "$bash_bin" "$tool" "${flags[@]}" 2>&1); }

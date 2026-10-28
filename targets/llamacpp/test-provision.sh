@@ -3,8 +3,7 @@
 set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 provision="$script_dir/provision-lxc.sh"
-nvidia_installer="$script_dir/../../tools/install_nvidia_580_173_02.sh"
-[[ -r $nvidia_installer ]] || nvidia_installer="$script_dir/../../install_nvidia_580_173_02.sh"
+nvidia_installer="$script_dir/../../tools/install-nvidia-driver.sh"
 bash_bin=$(command -v bash)
 common=(CT_ID=250 TEMPLATE=local:vztmpl/debian-12-standard_test_amd64.tar.zst STORAGE=local-lvm IP_CIDR=192.0.2.50/24 GATEWAY=192.0.2.1 GPU_DEVICES='/dev/nvidia99999 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools')
 passed=0
@@ -27,14 +26,14 @@ check() {
         if (( status != 0 )); then printf 'FAIL %s\n%s\n' "$label" "$output" >&2; exit 1; fi
         [[ $output == *'+ pct create 250 '* && $output == *'--unprivileged 1'* && $output == *'--features nesting=1'* && $output == *'+ pct push 250 '* ]] || { printf 'FAIL %s: incomplete command plan\n' "$label" >&2; exit 1; }
         [[ $output != *'huggingface.co/'*'/blob/'* ]] || { printf 'FAIL %s: Hugging Face browser URL was not normalized\n' "$label" >&2; exit 1; }
-        [[ $output == *'install_nvidia_580_173_02.sh /root/llama-target-deploy/install_nvidia_580_173_02.sh --perms 0755'* ]] || { printf 'FAIL %s: NVIDIA helper was not copied into the deployment directory\n' "$label" >&2; exit 1; }
+        [[ $output == *'install-nvidia-driver.sh /root/llama-target-deploy/install-nvidia-driver.sh --perms 0755'* ]] || { printf 'FAIL %s: NVIDIA helper was not copied into the deployment directory\n' "$label" >&2; exit 1; }
         [[ $output != *'CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc'* ]] || { printf 'FAIL %s: command plan injected a CUDA compiler path that was not configured\n' "$label" >&2; exit 1; }
         if [[ $mode == install || $mode == install-env || $mode == install-url ]]; then
             [[ $output != *'Guest installation skipped'* && $output == *'bash /root/llama-target-deploy/install-target.sh'* ]] || { printf 'FAIL %s: guest installation missing from command plan\n' "$label" >&2; exit 1; }
             if [[ $output == *'BACKEND=cpu'* ]]; then
-                [[ $output != *'+ pct exec 250 -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL %s: CPU install executed the NVIDIA helper\n' "$label" >&2; exit 1; }
+                [[ $output != *'+ pct exec 250 -- env DRIVER_VERSION='*'install-nvidia-driver.sh lxc'* ]] || { printf 'FAIL %s: CPU install executed the NVIDIA helper\n' "$label" >&2; exit 1; }
             else
-                [[ $output == *'+ pct exec 250 -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'*'+ pct exec 250 -- env '*'bash /root/llama-target-deploy/install-target.sh'* ]] || { printf 'FAIL %s: NVIDIA helper did not execute before the CUDA target installer\n' "$label" >&2; exit 1; }
+                [[ $output == *'+ pct exec 250 -- env DRIVER_VERSION='*'bash /root/llama-target-deploy/install-nvidia-driver.sh lxc'*'+ pct exec 250 -- env '*'bash /root/llama-target-deploy/install-target.sh'* ]] || { printf 'FAIL %s: NVIDIA helper did not execute before the CUDA target installer\n' "$label" >&2; exit 1; }
                 if [[ $output != *'GPU_LAYERS=all'* && $output != *'GPU_LAYERS='[0-9]* ]]; then
                     [[ $output == *'GPU_LAYERS=auto'* ]] || { printf 'FAIL %s: CUDA install did not preserve automatic GPU-layer fitting\n' "$label" >&2; exit 1; }
                 fi
@@ -45,11 +44,11 @@ check() {
         else
             [[ $output == *'Guest installation skipped'* ]] || { printf 'FAIL %s: create-only did not skip install\n' "$label" >&2; exit 1; }
             [[ $output != *'+ pct exec 250 -- env '* ]] || { printf 'FAIL %s: create-only executed the installer\n' "$label" >&2; exit 1; }
-            [[ $output != *'+ pct exec 250 -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL %s: create-only executed the NVIDIA helper\n' "$label" >&2; exit 1; }
+            [[ $output != *'+ pct exec 250 -- env DRIVER_VERSION='*'install-nvidia-driver.sh lxc'* ]] || { printf 'FAIL %s: create-only executed the NVIDIA helper\n' "$label" >&2; exit 1; }
             if [[ $output == *'BACKEND=cpu'* ]]; then
-                [[ $output != *$'\n  bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL %s: CPU create-only instructions included the NVIDIA helper\n' "$label" >&2; exit 1; }
+                [[ $output != *$'\n  DRIVER_VERSION='*'bash /root/llama-target-deploy/install-nvidia-driver.sh lxc'* ]] || { printf 'FAIL %s: CPU create-only instructions included the NVIDIA helper\n' "$label" >&2; exit 1; }
             else
-                [[ $output == *$'\n  bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL %s: CUDA create-only instructions omitted the NVIDIA helper\n' "$label" >&2; exit 1; }
+                [[ $output == *$'\n  DRIVER_VERSION='*'bash /root/llama-target-deploy/install-nvidia-driver.sh lxc'* ]] || { printf 'FAIL %s: CUDA create-only instructions omitted the NVIDIA helper\n' "$label" >&2; exit 1; }
             fi
         fi
     else
@@ -116,10 +115,10 @@ VFLAGS=--install-target vplan MODEL_ALIAS=qwen3:8b MODEL_PATH=/var/lib/llama-tar
    $out == *'+ pct create 250 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst '*'--dev0 path=/dev/dri/renderD128,gid=993,mode=0660'* ]] ||
     { printf 'FAIL vulkan device\n%s\n' "$out" >&2; exit 1; }
 [[ $out == *'BACKEND=vulkan'* && $out == *'GPU_LAYERS=auto'* ]] || { printf 'FAIL vulkan guest env\n%s\n' "$out" >&2; exit 1; }
-[[ $out != *'install_nvidia_580_173_02.sh lxc'* ]] || { printf 'FAIL vulkan ran the NVIDIA helper\n%s\n' "$out" >&2; exit 1; }
+[[ $out != *'install-nvidia-driver.sh lxc'* ]] || { printf 'FAIL vulkan ran the NVIDIA helper\n%s\n' "$out" >&2; exit 1; }
 vcheck 'Vulkan: a Debian 13 CT with the render node, GPU layers on, no NVIDIA helper'
 VFLAGS=--create-only vplan || { printf 'FAIL vulkan create-only\n%s\n' "$out" >&2; exit 1; }
-[[ $out == *"Mesa's Vulkan driver and the build tools install automatically"* && $out != *'install_nvidia_580_173_02.sh lxc'* ]] ||
+[[ $out == *"Mesa's Vulkan driver and the build tools install automatically"* && $out != *'install-nvidia-driver.sh lxc'* ]] ||
     { printf 'FAIL vulkan create-only instructions\n%s\n' "$out" >&2; exit 1; }
 vcheck 'Vulkan create-only: instructions without the NVIDIA helper'
 for bad in 'TEMPLATE=local:vztmpl/debian-12-standard_test_amd64.tar.zst|Debian 13' 'GPU_DEVICES=|Vulkan requires explicit GPU_DEVICES' \

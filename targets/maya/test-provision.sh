@@ -39,6 +39,7 @@ has 'path=/dev/nvidiactl\,gid=44\,mode=0660'
 has 'path=/dev/nvidia-uvm\,gid=44\,mode=0660'
 lacks 'gid=0\,'
 has 'nvidia-guest-install.sh lxc'
+has 'DRIVER_VERSION='; has 'confirm CT 281 sees host NVIDIA driver'
 has 'cuda-toolkit.sh /root/maya-target-deploy/cuda-toolkit.sh'
 has 'bash /root/maya-target-deploy/install-target.sh'
 has 'MAYA_REF=latest'
@@ -49,6 +50,10 @@ has 'MAYA_CUDA_VERSION=12.8'
 has 'MAYA_PORT=8080'
 has 'MAYA_READY_TIMEOUT=900'
 lacks 'https://github.com/mw00/project-maya.git'   # fetching happens inside the CT
+plan NVIDIA_DRIVER_VERSION=590.48.01
+has 'DRIVER_VERSION=590.48.01'
+reject 'CUDA 12.8 needs NVIDIA driver 570 or newer' NVIDIA_DRIVER_VERSION=560.35.03
+reject 'CUDA 13.1 needs NVIDIA driver 580 or newer' MAYA_CUDA_VERSION=13.1 NVIDIA_DRIVER_VERSION=575.64.05
 
 plan MAYA_PORT=11434 IP_CIDR=dhcp GATEWAY= MAYA_MODEL=Maya-S24 MAYA_DRAFT=dflash2
 has 'MAYA_PORT=11434'

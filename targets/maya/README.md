@@ -58,9 +58,9 @@ bash targets/maya/provision-lxc.sh
 ```
 
 Replace the template, storage and address with values from your node. The
-bundled guest NVIDIA installer requires host driver **580.173.02**. For another
-host driver, supply a matching `NVIDIA_GUEST_INSTALLER` and
-`NVIDIA_DRIVER_VERSION`. For more than one GPU, set `GPU_DEVICES` to every
+provisioner reads the loaded host NVIDIA version and installs matching
+user-space libraries in the CT. `NVIDIA_DRIVER_VERSION` may require an exact
+host version; it defaults to `auto`. For more than one GPU, set `GPU_DEVICES` to every
 `/dev/nvidiaN` you want, plus `/dev/nvidiactl` and `/dev/nvidia-uvm`.
 The script refuses an existing CT ID and keeps a newly created CT for
 inspection if setup fails.

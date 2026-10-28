@@ -46,6 +46,7 @@ add_suite() {
 add_suite repo          shell "${HERE}/test-repo.sh"
 add_suite nvidia        shell "${HERE}/test-nvidia.sh"
 add_suite host-gpu      shell "${HERE}/test-host-gpu.sh"
+add_suite gpu-drivers   shell "${HERE}/test-gpu-drivers.sh"
 add_suite update        shell "${HERE}/test-update.sh"
 add_suite remote-update shell "${HERE}/test-remote-update.sh"
 add_suite mattermost    shell "${HERE}/test-mattermost.sh"
@@ -57,6 +58,7 @@ for _t in "${ROOT}"/targets/*/test-*.sh; do
   add_suite "${_target}-$(basename "$_t" .sh | sed 's/^test-//')" shell "$_t"
 done
 add_suite pve-select shell "${ROOT}/targets/test-pve-select.sh"
+add_suite nvidia-lxc shell "${ROOT}/targets/test-nvidia-lxc.sh"
 # The router and the llama.cpp bridge pin different fastapi versions, so each
 # pytest suite can run under its own interpreter (CI builds one venv per
 # service from its requirements.txt). Both default to python3. The AirLLM

@@ -28,7 +28,7 @@ once confirmed, sets the driver up:
 Other NVIDIA cards (V100, A100, H100, GTX 10, ...) work with the same driver
 and are reported without a generation; only an --allow rule refuses them.
 
-NVIDIA: installs the repository's NVIDIA driver (install_nvidia_580_173_02.sh
+NVIDIA: installs the repository's NVIDIA driver (install-nvidia-driver.sh
 host, open kernel modules, DKMS), loaded at once and at every boot with the
 /dev/nvidia* nodes the containers pass through. If nouveau still holds the
 card, reboot and run this again.
@@ -700,9 +700,9 @@ fi
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 driver_version=''
 if vendor_allowed nvidia; then
-    NVIDIA_HELPER=${NVIDIA_HELPER:-$here/../install_nvidia_580_173_02.sh}
+    NVIDIA_HELPER=${NVIDIA_HELPER:-$here/install-nvidia-driver.sh}
     [[ -r $NVIDIA_HELPER ]] || die "Missing NVIDIA driver helper: $NVIDIA_HELPER"
-    driver_version=$(sed -n 's/^DRIVER_VERSION="\([0-9.]*\)"$/\1/p' "$NVIDIA_HELPER" | head -n1)
-    [[ -n $driver_version ]] || die "$NVIDIA_HELPER names no DRIVER_VERSION."
+    driver_version=$(sed -n 's/^DEFAULT_DRIVER_VERSION="\([0-9.]*\)"$/\1/p' "$NVIDIA_HELPER" | head -n1)
+    [[ -n $driver_version ]] || die "$NVIDIA_HELPER names no DEFAULT_DRIVER_VERSION."
 fi
 main

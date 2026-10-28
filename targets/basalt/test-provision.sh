@@ -28,10 +28,14 @@ has 'lxc.prlimit.memlock: unlimited'
 has 'path=/dev/nvidia0\,gid=44\,mode=0660'
 has 'cuda-toolkit.sh'
 has 'nvidia-guest-install.sh lxc'
+has 'DRIVER_VERSION='; has 'confirm CT 250 sees host NVIDIA driver'
 has 'bash /root/basalt-target-deploy/install-target.sh'
 has 'BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt'
 has 'BASALT_CONTEXT=32768'
 has 'current router does not accept basalt:// addresses'
+plan NVIDIA_DRIVER_VERSION=590.48.01
+has 'DRIVER_VERSION=590.48.01'
+reject 'CUDA 13 needs NVIDIA driver 580 or newer' NVIDIA_DRIVER_VERSION=575.64.05
 
 plan BASALT_PORT=11434 CUDA_VERSION=13.1 IP_CIDR=dhcp GATEWAY=
 has 'BASALT_PORT=11434'

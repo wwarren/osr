@@ -7,6 +7,7 @@ set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 readonly COMMUNITY_SCRIPT_DEFAULT_URL=https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/ollama.sh
 usage() {
     cat <<'USAGE'
@@ -45,8 +46,8 @@ Settings (environment; all optional):
                       runtimes, so the distribution only supplies Mesa for Arc)
   COMMUNITY_SCRIPT_URL=<url>      default: the ProxmoxVE main-branch ct/ollama.sh
   COMMUNITY_SCRIPT_SHA256=<hex>   refuse to run a script with any other checksum
-When the CT sees an NVIDIA GPU but nvidia-smi is missing inside it, the
-repository's NVIDIA 580.173.02 user-space helper is run before install-target.sh.
+When the CT's NVIDIA NVML or CUDA library does not match the host, the
+repository's LXC helper installs matching user-space before install-target.sh.
 AMD Radeon (RDNA 3/4): /dev/kfd and the render node are passed through and
 install-target.sh adds Ollama's ROCm libraries. Intel Arc (A/B): the render
 node is passed through and install-target.sh installs Mesa's Vulkan driver for
@@ -257,10 +258,9 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 files=(install-target.sh ollama.env.example ollama-target.conf README.md)
 for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
 nvidia_installer=''
-for candidate in "$source_dir/../../tools/install_nvidia_580_173_02.sh" "$source_dir/../../install_nvidia_580_173_02.sh"; do
-    if [[ -r $candidate ]]; then nvidia_installer=$candidate; break; fi
-done
-[[ $gpu != nvidia || -n $nvidia_installer ]] || die 'NVIDIA passthrough needs install_nvidia_580_173_02.sh in the repository root or tools directory.'
+nvidia_installer=$source_dir/../../tools/install-nvidia-driver.sh
+[[ -r $nvidia_installer ]] || nvidia_installer=''
+[[ $gpu != nvidia || -n $nvidia_installer ]] || die 'NVIDIA passthrough needs tools/install-nvidia-driver.sh from the repository.'
 
 run() {
     printf '+'
@@ -313,6 +313,16 @@ if (( ! dry_run )); then
     pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null || die "ID $CT_ID is unavailable in this cluster."
     [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge interface is not present: $BRIDGE"
 fi
+nvidia_host_version=''
+if [[ $gpu == nvidia ]]; then
+    if (( dry_run )); then
+        nvidia_host_version='<host-nvidia-driver-version>'
+        printf '+ read loaded NVIDIA driver version from the Proxmox host\n'
+    else
+        nvidia_host_version=$(nvidia_lxc_host_version) ||
+            die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+    fi
+fi
 
 script=${TMPDIR:-/tmp}/community-ollama.$$.sh
 trap 'rm -f -- "$script"' EXIT
@@ -355,19 +365,20 @@ for file in "${files[@]}"; do
     run pct push "$CT_ID" "$source_dir/$file" "/root/ollama-target-deploy/$file" --perms 0644
 done
 if [[ $gpu == nvidia ]]; then
-    run pct push "$CT_ID" "$nvidia_installer" /root/ollama-target-deploy/install_nvidia_580_173_02.sh --perms 0755
+    run pct push "$CT_ID" "$nvidia_installer" /root/ollama-target-deploy/install-nvidia-driver.sh --perms 0755
 fi
 if (( INSTALL_TARGET )); then
     if [[ $gpu == nvidia ]]; then
-        if (( dry_run )) || ! pct exec "$CT_ID" -- nvidia-smi -L >/dev/null 2>&1; then
-            run pct exec "$CT_ID" -- bash /root/ollama-target-deploy/install_nvidia_580_173_02.sh lxc
+        if (( dry_run )) || ! nvidia_lxc_guest_ready "$CT_ID" "$nvidia_host_version" >/dev/null 2>&1; then
+            run pct exec "$CT_ID" -- systemctl stop ollama
+            nvidia_lxc_install_guest "$CT_ID" "$nvidia_host_version" /root/ollama-target-deploy/install-nvidia-driver.sh
         fi
     fi
     run pct exec "$CT_ID" -- env "OLLAMA_GPU=$gpu" "OLLAMA_PULL_MODELS=$OLLAMA_PULL_MODELS" bash /root/ollama-target-deploy/install-target.sh
 else
     printf '\nOllama is installed as the community script left it (running as root).\n'
     printf 'To adopt it into the target layout, inside the CT (pct enter %s) run:\n' "$CT_ID"
-    if [[ $gpu == nvidia ]]; then printf '  bash /root/ollama-target-deploy/install_nvidia_580_173_02.sh lxc   # if nvidia-smi is missing\n'; fi
+    if [[ $gpu == nvidia ]]; then printf '  DRIVER_VERSION=%s bash /root/ollama-target-deploy/install-nvidia-driver.sh lxc   # if NVML or CUDA does not match the host\n' "$nvidia_host_version"; fi
     printf '  OLLAMA_GPU=%s bash /root/ollama-target-deploy/install-target.sh\n' "$gpu"
 fi
 printf 'Register it with the router: manage-model-servers add http://<CT %s address>:11434\n' "$CT_ID"

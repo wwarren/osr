@@ -46,8 +46,8 @@ Host: **PVE 9.2**, with the existing working NVIDIA kernel driver.
 Guest: **Debian 13 or 12 amd64**, unprivileged LXC, native systemd services.
 Build: CUDA toolkit **13.1** on Debian 13 (NVIDIA's Debian 13 repository starts
 there) or **13.0** on Debian 12, plus guest NVIDIA user-space libraries matching
-the host driver. The repository's `install_nvidia_580_173_02.sh lxc` mode can be
-reused when the host actually runs **580.173.02**. It does not install the CUDA
+the host driver. The provisioner reads the loaded host version and passes it
+as `DRIVER_VERSION` to the repository's NVIDIA LXC helper. It does not install the CUDA
 compiler. Do not run its `host` mode inside the guest.
 
 The guest release is independent of the host OS: NVIDIA's CUDA 13.0 support
@@ -80,7 +80,7 @@ and **Intel Arc A- and B-series** cards.
 | | CUDA | Vulkan |
 |---|---|---|
 | Guest | Debian 13 or 12 | **Debian 13** (Mesa 25.0, Vulkan 1.4, glslc from Debian) |
-| Host driver | NVIDIA 580.173.02 | the kernel's `amdgpu`, `i915` (Arc A) or `xe` (Arc B) |
+| Host driver | loaded NVIDIA driver compatible with the CUDA toolkit | the kernel's `amdgpu`, `i915` (Arc A) or `xe` (Arc B) |
 | Passed through | `/dev/nvidia<n>`, `nvidiactl`, `nvidia-uvm(-tools)` | the card's render node, `/dev/dri/renderD<n>` |
 | In the CT | NVIDIA user-space libraries, CUDA 13.0 toolkit | `mesa-vulkan-drivers libvulkan1 libvulkan-dev glslc spirv-headers vulkan-tools` |
 
@@ -182,12 +182,12 @@ bash targets/llamacpp/provision-lxc.sh
 The script refuses to reuse an existing guest ID, creates an unprivileged CT
 with nesting enabled, passes the listed devices using Proxmox `devN` entries
 with guest group 993 and mode 0660, starts the CT, and copies the deployment plus
-`install_nvidia_580_173_02.sh` to `/root/llama-target-deploy` inside it. It does not install host drivers, change
+`tools/install-nvidia-driver.sh` to `/root/llama-target-deploy` inside it. It does not install host drivers, change
 IOMMU/VFIO configuration, or disable LXC confinement.
 [Proxmox device options](https://github.com/proxmox/pve-docs/blob/master/generated/pct.conf.5-opts.adoc)
 
-`--install-target` (or `INSTALL_TARGET=1`) runs the copied NVIDIA helper in
-`lxc` mode for a CUDA target and then runs the guest installer. It requires explicit
+`--install-target` (or `INSTALL_TARGET=1`) installs NVML and CUDA user-space
+matching the host driver for a CUDA target, then runs the guest installer. It requires explicit
 `MODEL_ALIAS` plus either `MODEL_PATH` or a direct public
 `MODEL_DOWNLOAD_URL`, because the guest command is non-interactive. URL-only
 installation uses the default model store; combine a URL with `MODEL_PATH` to
@@ -203,12 +203,12 @@ inference network. Port 8081 stays on guest loopback.
 
 ## 2. Prepare NVIDIA user-space and CUDA inside the target
 
-Provisioning copies the driver helper into the target. Use it only when its
-version matches the PVE host driver. With the default create-only flow, run:
+Provisioning copies the driver helper into the target. With the default
+create-only flow, read the loaded host version and pass it to the helper:
 
 ```bash
-nvidia-smi --query-gpu=driver_version --format=csv,noheader
-pct exec "$CT_ID" -- bash /root/llama-target-deploy/install_nvidia_580_173_02.sh lxc
+HOST_NVIDIA_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1)
+pct exec "$CT_ID" -- env "DRIVER_VERSION=$HOST_NVIDIA_VERSION" bash /root/llama-target-deploy/install-nvidia-driver.sh lxc
 pct enter "$CT_ID"
 ```
 

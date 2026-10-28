@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -23,8 +24,8 @@ Required: CT_ID (unused, >=100), TEMPLATE (downloaded Ubuntu 22.04/24.04 or
 Debian 12/13 amd64), STORAGE (rootdir storage on a fast NVMe; not a hard
 drive), IP_CIDR (a.b.c.d/nn or dhcp). GATEWAY is required for a static address.
 The host needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 series
-and later) with 24 GB of VRAM (16 GB is untested upstream), NVIDIA driver
-580.173.02 and the repository's matching LXC user-space installer by default.
+and later) with 24 GB of VRAM (16 GB is untested upstream). The CT installs
+user-space matching the loaded host NVIDIA driver.
 An interactive run lists downloaded templates and eligible rootdir storage
 when TEMPLATE or STORAGE is unset.
 
@@ -39,7 +40,7 @@ Optional: CT_HOSTNAME=xolotl-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=98304,
           GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'
                       (plus /dev/nvidia-uvm-tools when the host has it),
           GPU_GID=44 (the CT group given the GPU nodes; 44 is "video"),
-          NVIDIA_DRIVER_VERSION=580.173.02,
+          NVIDIA_DRIVER_VERSION=auto (loaded host driver; or an exact-version check),
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
           XOLOTL_REF=<branch or tag>, XOLOTL_COMMIT=<full SHA-1 pin>
           (default: tested commit in upstream-commit.txt),
@@ -126,7 +127,7 @@ GPU_DEVICES=${GPU_DEVICES:-}
 # The Xolotl service runs as an unprivileged account that joins this group, so
 # the nodes must not be root's group inside the CT.
 GPU_GID=${GPU_GID:-44}
-NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-580.173.02}
+NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-auto}
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -r $source_dir/upstream-commit.txt ]] || die "Missing deployment file: $source_dir/upstream-commit.txt"
 default_commit=$(< "$source_dir/upstream-commit.txt")
@@ -168,7 +169,7 @@ for name in CORES MEMORY_MB ROOTFS_GB XOLOTL_CONTEXT XOLOTL_ARENA_GIB; do positi
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi
 [[ -z $SSH_PUBLIC_KEY || -r $SSH_PUBLIC_KEY ]] || die 'SSH_PUBLIC_KEY must be a readable file.'
 [[ $GPU_GID =~ ^[1-9][0-9]{0,4}$ ]] && (( GPU_GID <= 65535 )) || die 'GPU_GID must be a non-root group ID (1..65535).'
-[[ $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
+[[ $NVIDIA_DRIVER_VERSION == auto || $NVIDIA_DRIVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid NVIDIA_DRIVER_VERSION.'
 [[ $XOLOTL_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $XOLOTL_REF != HEAD && $XOLOTL_REF != *..* ]] || die 'XOLOTL_REF must be a branch or a tag name.'
 [[ -z $XOLOTL_COMMIT || $XOLOTL_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'XOLOTL_COMMIT must be a full 40-digit SHA-1.'
 [[ $XOLOTL_CUDA_VERSION =~ ^(12\.(8|9)|1[3-9]\.[0-9]+)$ ]] || die 'XOLOTL_CUDA_VERSION must be 12.8 or newer.'
@@ -182,8 +183,10 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 # The CT's CUDA runtime needs a host driver at least this new: CUDA 13.x needs
 # the 580 series, 12.8/12.9 the 570 series.
 if version_at_least "$XOLOTL_CUDA_VERSION" 13.0; then min_driver=580; else min_driver=570; fi
-version_at_least "$NVIDIA_DRIVER_VERSION" "$min_driver" ||
-    die "CUDA $XOLOTL_CUDA_VERSION needs NVIDIA driver $min_driver or newer; NVIDIA_DRIVER_VERSION is $NVIDIA_DRIVER_VERSION."
+if [[ $NVIDIA_DRIVER_VERSION != auto ]]; then
+    version_at_least "$NVIDIA_DRIVER_VERSION" "$min_driver" ||
+        die "CUDA $XOLOTL_CUDA_VERSION needs NVIDIA driver $min_driver or newer; NVIDIA_DRIVER_VERSION is $NVIDIA_DRIVER_VERSION."
+fi
 
 for file in install-target.sh xolotl.service cuda-toolkit.sh xolotl-weights.txt engram-index.py upstream-commit.txt; do
     [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
@@ -194,7 +197,7 @@ done
 template_dist=${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[4]}
 CUDA_DIST=$template_dist CUDA_VERSION=$XOLOTL_CUDA_VERSION bash "$source_dir/cuda-toolkit.sh" --check-repo ||
     die "XOLOTL_CUDA_VERSION=$XOLOTL_CUDA_VERSION cannot be installed in a $template_dist CT (see above)."
-NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../install_nvidia_580_173_02.sh}
+NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../tools/install-nvidia-driver.sh}
 [[ -r $NVIDIA_GUEST_INSTALLER ]] || die "Missing NVIDIA LXC user-space helper: $NVIDIA_GUEST_INSTALLER"
 
 if (( ! dry_run )); then
@@ -258,11 +261,14 @@ for i in "${!devices[@]}"; do create+=("--dev$i" "path=${devices[$i]},gid=$GPU_G
 
 if (( ! dry_run )); then
     command -v nvidia-smi >/dev/null || die 'Missing driver command: nvidia-smi'
-    host_versions=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)
-    host_driver=${host_versions%%$'\n'*}
-    host_driver=${host_driver//[[:space:]]/}
-    [[ $host_driver == "$NVIDIA_DRIVER_VERSION" ]] || \
-        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION. Supply a matching NVIDIA_GUEST_INSTALLER and NVIDIA_DRIVER_VERSION."
+    host_driver=$(nvidia_lxc_host_version) || die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
+    [[ $NVIDIA_DRIVER_VERSION == auto || $host_driver == "$NVIDIA_DRIVER_VERSION" ]] ||
+        die "Host NVIDIA driver is $host_driver; expected $NVIDIA_DRIVER_VERSION."
+    NVIDIA_DRIVER_VERSION=$host_driver
+    version_at_least "$NVIDIA_DRIVER_VERSION" "$min_driver" ||
+        die "CUDA $XOLOTL_CUDA_VERSION needs NVIDIA driver $min_driver or newer; host driver is $NVIDIA_DRIVER_VERSION."
+else
+    [[ $NVIDIA_DRIVER_VERSION != auto ]] || NVIDIA_DRIVER_VERSION='<host-nvidia-driver-version>'
 fi
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
@@ -308,7 +314,7 @@ for file in xolotl.service xolotl-weights.txt upstream-commit.txt; do
     run pct push "$CT_ID" "$source_dir/$file" "/root/xolotl-target-deploy/$file" --perms 0644
 done
 run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/xolotl-target-deploy/nvidia-guest-install.sh --perms 0755
-run pct exec "$CT_ID" -- bash /root/xolotl-target-deploy/nvidia-guest-install.sh lxc
+nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/xolotl-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "XOLOTL_REF=$XOLOTL_REF" "XOLOTL_COMMIT=$XOLOTL_COMMIT" \
     "XOLOTL_CUDA_VERSION=$XOLOTL_CUDA_VERSION" "XOLOTL_CUDA_ARCH=$XOLOTL_CUDA_ARCH" "XOLOTL_PORT=$XOLOTL_PORT" \
     "XOLOTL_CONTEXT=$XOLOTL_CONTEXT" "XOLOTL_ARENA_GIB=$XOLOTL_ARENA_GIB" "XOLOTL_DSPARK=$XOLOTL_DSPARK" \

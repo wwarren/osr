@@ -308,7 +308,7 @@ printf 'Installing the Python environment (torch is large; this takes a while)..
 install_server "$source_dir"
 if [[ $AIRLLM_DEVICE == cuda* ]]; then
     "$TARGET_ROOT/venv/bin/python" -c 'import torch; raise SystemExit(not torch.cuda.is_available())' || \
-        die 'AIRLLM_DEVICE is CUDA but torch cannot see a GPU. Install the host-matched NVIDIA user-space libraries in this CT (install_nvidia_580_173_02.sh lxc), or use AIRLLM_DEVICE=cpu.'
+        die 'AIRLLM_DEVICE is CUDA but torch cannot see a GPU. Install the host-matched NVIDIA user-space libraries in this CT (install-nvidia-driver.sh lxc), or use AIRLLM_DEVICE=cpu.'
 fi
 
 if [[ -f $TARGET_ENV ]]; then

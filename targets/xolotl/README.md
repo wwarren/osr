@@ -50,12 +50,12 @@ NVMe drive: about 26 tok/s decode and 290-400 tok/s prefill.
   (at least 380). Put it on **fast NVMe storage**: the engine reads ~48 random
   Engram rows and the missing experts from disk for every token. Not a hard
   drive, and not exFAT.
-- **Host:** Proxmox VE 9 with NVIDIA driver 580.173.02 for the bundled guest
-  user-space installer (or supply `NVIDIA_GUEST_INSTALLER` and
-  `NVIDIA_DRIVER_VERSION` for another driver), and the GPU nodes
+- **Host:** Proxmox VE 9 with a loaded NVIDIA driver and the GPU nodes
   `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`. A host without an
   NVIDIA driver gets one from `tools/setup-host-gpu.sh` (see
   [Hosts without an NVIDIA driver](#hosts-without-an-nvidia-driver)).
+  `NVIDIA_DRIVER_VERSION` defaults to `auto`; set it to require an exact host
+  version. CUDA 13 requires the 580 series or newer.
 - **Templates:** Debian 12/13 or Ubuntu 22.04/24.04/26.04 amd64 (the router
   installer picks Debian 13, then Ubuntu 26.04). Debian 13's NVIDIA repository
   starts at CUDA 13.1; Ubuntu 26.04's starts at CUDA 13.3. Set
@@ -91,7 +91,7 @@ suggesting the one its codename (TU1xx, GA10x, AD10x, GB20x) points to:
 | `rtx50` (4) | GeForce RTX 50, RTX PRO Blackwell (Blackwell) | 12.0 (`120`) | 13.0+ |
 
 and, after a yes, installs the repository's NVIDIA **580.173.02** driver on the
-host (`install_nvidia_580_173_02.sh host`): one release supports every RTX
+host (`tools/install-nvidia-driver.sh host`): one release supports every RTX
 generation, and it must be the release the CT's user-space libraries come
 from. It uses NVIDIA's **open kernel modules** (required by RTX 50, supported
 from RTX 20 on), built with DKMS against the running Proxmox kernel's headers.

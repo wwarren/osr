@@ -159,6 +159,29 @@ community_vars() {
     fi
     return 0
 }
+# The community installer can leave Debian's 550.x nvidia-smi/NVML packages in
+# the CT when it cannot find userspace matching the host. Debian's
+# nvidia-installer-cleanup then refuses the matching NVIDIA .run installer.
+# Select only installed driver packages; cuda-keyring is deliberately kept.
+nvidia_guest_cleanup_script() {
+    printf '%s' 'set --; for package in nvidia-smi libnvidia-ml1 libcuda1 '
+    printf '%s' 'nvidia-alternative glx-alternative-nvidia nvidia-legacy-check nvidia-installer-cleanup; do '
+    printf '%s' 'if dpkg -s "$package" 2>/dev/null | grep -q "^Status: install ok installed$"; '
+    printf '%s' 'then set -- "$@" "$package"; fi; done; '
+    printf '%s\n' 'if [ "$#" -gt 0 ]; then DEBIAN_FRONTEND=noninteractive apt-get purge -y "$@"; fi'
+}
+# Read the loaded kernel module version, which NVIDIA's LXC user-space
+# libraries must match exactly. Accept either the proprietary or open module.
+nvidia_kernel_version() {
+    sed -nE 's/.*Kernel Module( for x86_64)?[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)?).*/\2/p' | head -n1
+}
+# Require both NVML and CUDA userspace to be the exact host release.
+nvidia_guest_ready_script() {
+    printf '%s' 'expected=$1; nvml=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d "[:space:]"); '
+    printf '%s' '[ "$nvml" = "$expected" ] || exit 1; '
+    printf '%s' 'cuda=$(ldconfig -p | awk '\''$1 == "libcuda.so.1" && $2 ~ /x86-64/ { print $NF; exit }'\''); '
+    printf '%s\n' '[ -n "$cuda" ] && [ -r "$cuda" ] && [ "$(basename "$(readlink -f "$cuda")")" = "libcuda.so.$expected" ]'
+}
 # firewall_config PORT SOURCE...: the CT's /etc/pve/firewall/<id>.fw. Inbound
 # traffic is dropped except the ComfyUI port from each source (address or CIDR).
 firewall_config() {
@@ -453,10 +476,12 @@ done
 verify_webui=$source_dir/../open-terminal/verify-webui.py
 (( ! webui )) || [[ -r $verify_webui ]] || die "Missing $verify_webui."
 nvidia_installer=''
-for candidate in "$source_dir/../../tools/install_nvidia_580_173_02.sh" "$source_dir/../../install_nvidia_580_173_02.sh"; do
-    if [[ -r $candidate ]]; then nvidia_installer=$candidate; break; fi
-done
-[[ $gpu != nvidia || -n $nvidia_installer ]] || die 'An NVIDIA GPU needs install_nvidia_580_173_02.sh in the repository root or tools directory.'
+# Keep the helper's historical filename; DRIVER_VERSION selects the release
+# downloaded for the CT from this host's loaded kernel driver.
+nvidia_installer=$source_dir/../../tools/install-nvidia-driver.sh
+[[ -r $nvidia_installer ]] || nvidia_installer=''
+[[ $gpu != nvidia || -n $nvidia_installer ]] || die 'An NVIDIA GPU needs tools/install-nvidia-driver.sh from the repository.'
+nvidia_host_version=''
 firewall_file=$PVE_ETC/firewall/${CT_ID}.fw
 
 run() {
@@ -464,6 +489,9 @@ run() {
     printf ' %q' "$@"
     printf '\n'
     if (( ! dry_run )); then "$@"; fi
+}
+nvidia_guest_ready() {
+    pct exec "$CT_ID" -- sh -c "$(nvidia_guest_ready_script)" sh "$nvidia_host_version"
 }
 mapfile -t presets < <(community_vars)
 # narrow_gpu_devices: the community script passes every card of the chosen
@@ -571,6 +599,13 @@ if (( ! dry_run )); then
     [[ $(id -u) == 0 ]] || die 'Run as root on the intended PVE host.'
     for command_name in pveversion pct pvesh curl sha256sum; do command -v "$command_name" >/dev/null || die "Missing command: $command_name"; done
     [[ -d $PVE_ETC/nodes ]] || die '/etc/pve is unavailable; do not create a CT until the cluster filesystem is ready.'
+    if [[ $mode != integrate && $gpu == nvidia ]]; then
+        nvidia_host_version=$(nvidia_kernel_version < "${NVIDIA_HOST_VERSION_FILE:-/proc/driver/nvidia/version}") ||
+            die 'Cannot read the loaded NVIDIA kernel driver version on this Proxmox host.'
+        [[ $nvidia_host_version =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+            die 'Cannot determine the loaded NVIDIA kernel driver version on this Proxmox host.'
+        note "Host NVIDIA driver version: $nvidia_host_version"
+    fi
     if [[ $mode == integrate ]]; then
         pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "CT $CT_ID is not a running CT on this host."
     else
@@ -583,6 +618,10 @@ if (( ! dry_run )); then
         [[ -d $SYS_NET_DIR/$BRIDGE ]] || die "Bridge interface is not present: $BRIDGE"
         [[ $FIREWALL == 0 || ! -e $firewall_file ]] || die "Refusing to replace existing firewall file: $firewall_file"
     fi
+fi
+if (( dry_run )) && [[ $mode != integrate && $gpu == nvidia ]]; then
+    nvidia_host_version='<host-nvidia-driver-version>'
+    printf '+ read loaded NVIDIA driver version from the Proxmox host\n'
 fi
 if (( webui )); then
     if (( dry_run )); then
@@ -765,9 +804,29 @@ if [[ $mode != integrate ]]; then
         run pct push "$CT_ID" "$source_dir/$file" "$deploy/$file" --perms "$perms"
     done
     if [[ $gpu == nvidia ]]; then
-        run pct push "$CT_ID" "$nvidia_installer" "$deploy/install_nvidia_580_173_02.sh" --perms 0755
-        if (( dry_run )) || ! pct exec "$CT_ID" -- nvidia-smi -L >/dev/null 2>&1; then
-            run pct exec "$CT_ID" -- bash "$deploy/install_nvidia_580_173_02.sh" lxc
+        run pct push "$CT_ID" "$nvidia_installer" "$deploy/install-nvidia-driver.sh" --perms 0755
+        # A working nvidia-smi alone does not prove CUDA is present. The
+        # community installer may leave an older NVML or CUDA library behind.
+        if (( dry_run )) || ! nvidia_guest_ready >/dev/null 2>&1; then
+            # Confirm the CT sees this host's loaded module before changing
+            # its driver packages or installing the matching NVIDIA release.
+            if (( dry_run )); then
+                printf '+ confirm CT %s sees host NVIDIA driver %s\n' "$CT_ID" "$nvidia_host_version"
+            else
+                nvidia_guest_version=$(pct exec "$CT_ID" -- cat /proc/driver/nvidia/version | nvidia_kernel_version) ||
+                    die "CT $CT_ID cannot read the host NVIDIA driver version; leaving its Debian driver packages untouched."
+                [[ $nvidia_guest_version == "$nvidia_host_version" ]] ||
+                    die "CT $CT_ID sees NVIDIA driver '${nvidia_guest_version:-unknown}', expected $nvidia_host_version; leaving its Debian driver packages untouched."
+            fi
+            run pct exec "$CT_ID" -- systemctl stop comfyui
+            run pct exec "$CT_ID" -- sh -c "$(nvidia_guest_cleanup_script)"
+            run pct exec "$CT_ID" -- env "DRIVER_VERSION=$nvidia_host_version" bash "$deploy/install-nvidia-driver.sh" lxc
+            if (( dry_run )); then
+                printf '+ verify CT %s has NVIDIA NVML and CUDA userspace %s\n' "$CT_ID" "$nvidia_host_version"
+            else
+                nvidia_guest_ready ||
+                    die "CT $CT_ID still lacks NVIDIA NVML and CUDA userspace $nvidia_host_version after installation. Check nvidia-smi, libcuda.so.1, and /var/log/nvidia-installer.log inside it."
+            fi
         fi
     fi
     device=gpu
