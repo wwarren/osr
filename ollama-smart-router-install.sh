@@ -2293,44 +2293,6 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
-# install_host_command CT_ID: put manage-model-servers on the Proxmox host's
-# PATH (HOST_BIN_DIR, default /usr/local/bin). The command runs the tool that
-# is installed in the OSR CT, so it always matches the CT's version; OSR_CT_ID
-# in the environment points it at another CT. (Not CT_ID: the target
-# provisioners take that one, and it may still be set in the shell.) A file of
-# that name this installer did not write is left alone. Returns 0 when the
-# command is installed, 2 when another file was left in place, 1 on an error.
-install_host_command() {
-  local ct_id="$1" dir="${HOST_BIN_DIR:-/usr/local/bin}" path tmp
-  local mark='# Installed by ollama-smart-router-install.sh: manage-model-servers for the OSR CT.'
-  [[ "$ct_id" =~ ^[0-9]+$ ]] || { echo "install_host_command: invalid CT ID '${ct_id}'" >&2; return 1; }
-  path="${dir}/manage-model-servers"
-  if [[ -e "$path" || -L "$path" ]] && ! grep -qxF -- "$mark" "$path" 2>/dev/null; then
-    echo "Note: ${path} exists and was not written by this installer; it was left as it is." >&2
-    echo "      Run the tool with: pct exec ${ct_id} -- /usr/local/bin/manage-model-servers <command>" >&2
-    return 2
-  fi
-  mkdir -p "$dir" || return 1
-  tmp="$(mktemp "${dir}/.manage-model-servers.XXXXXX")" || return 1
-  cat > "$tmp" <<HOSTCMD || { rm -f -- "$tmp"; return 1; }
-#!/usr/bin/env bash
-${mark}
-# It runs /usr/local/bin/manage-model-servers inside the OSR CT. Set OSR_CT_ID
-# to use another CT; rerun the installer (or edit the ID below) if the CT is
-# recreated under a new ID.
-set -euo pipefail
-ct_id="\${OSR_CT_ID:-${ct_id}}"
-command -v pct >/dev/null 2>&1 || { echo "ERROR: pct not found; run this on the Proxmox host." >&2; exit 1; }
-if ! pct status "\$ct_id" >/dev/null 2>&1; then
-  echo "ERROR: CT \${ct_id}, the OSR CT, does not exist. Set OSR_CT_ID=<OSR CT ID> or rerun the installer." >&2
-  exit 1
-fi
-exec pct exec "\$ct_id" -- /usr/local/bin/manage-model-servers "\$@"
-HOSTCMD
-  chmod 0755 "$tmp" && mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
-  echo "Installed ${path} on this host; it runs manage-model-servers in CT ${ct_id}."
-}
-
 # Wait until the container's userspace is actually ready (systemd + DNS).
 wait_for_ct_ready() {
   local state
@@ -8325,16 +8287,9 @@ run_ct systemctl enable --now \
 CT_CREATED=""
 trap - ERR
 
-host_command_rc=0
-install_host_command "$CT_ID" || host_command_rc=$?
-if (( host_command_rc == 1 )); then
-  echo "Warning: could not install manage-model-servers on this host; use pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers." >&2
-fi
-
 echo "=============================================================================="
 echo "Provisioning complete."
 echo "Container ID: ${CT_ID}"
-(( host_command_rc != 0 )) || echo "Model servers: manage-model-servers (on this host and in the CT)"
 echo "Service IP: ${ROUTER_IP}"
 echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"

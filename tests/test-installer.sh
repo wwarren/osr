@@ -2327,53 +2327,6 @@ assert_file_contains "https remote gets an https credential" \
   "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 rm -f "$_cred_seen"
 
-describe install_host_command
-_hostbin="$(mktemp -d)"
-_out="$(HOST_BIN_DIR="$_hostbin" install_host_command 910 2>&1)"; _rc=$?
-_cmd="${_hostbin}/manage-model-servers"
-assert_eq "installs the host command" 0 "$_rc"
-assert_contains "and says where" "Installed ${_cmd} on this host; it runs manage-model-servers in CT 910." "$_out"
-assert_file_mode "executable by all" 755 "$_cmd"
-assert_ok "a bash script" bash -n "$_cmd"
-assert_eq "no temporary file is left" 1 "$(find "$_hostbin" -mindepth 1 | wc -l)"
-mock_reset_log
-mock_command pct 0
-"$_cmd" add 10.0.0.55 --tier large --apply >/dev/null 2>&1
-assert_contains "checks the OSR CT exists" "pct status 910" "$(mock_calls)"
-assert_contains "and runs the CT's tool with the arguments" \
-  "pct exec 910 -- /usr/local/bin/manage-model-servers add 10.0.0.55 --tier large --apply" "$(mock_calls)"
-mock_reset_log
-CT_ID=555 "$_cmd" list >/dev/null 2>&1
-assert_contains "a CT_ID left in the shell does not redirect it" "pct exec 910 --" "$(mock_calls)"
-mock_reset_log
-OSR_CT_ID=920 "$_cmd" list >/dev/null 2>&1
-assert_contains "OSR_CT_ID points it at another CT" "pct exec 920 -- /usr/local/bin/manage-model-servers list" "$(mock_calls)"
-mock_command pct 2
-_out="$("$_cmd" list 2>&1)"; _rc=$?
-assert_ne "a missing OSR CT is an error" 0 "$_rc"
-assert_contains "that says what to do" "CT 910, the OSR CT, does not exist. Set OSR_CT_ID=<OSR CT ID>" "$_out"
-_out="$(env PATH=/usr/bin:/bin "$_cmd" list 2>&1)"; _rc=$?
-assert_ne "without pct it is an error" 0 "$_rc"
-assert_contains "naming the host" "pct not found; run this on the Proxmox host" "$_out"
-mock_command pct 0
-HOST_BIN_DIR="$_hostbin" install_host_command 930 >/dev/null 2>&1; _rc=$?
-assert_eq "a rerun replaces its own command" 0 "$_rc"
-assert_file_contains "with the new CT ID" 'OSR_CT_ID:-930' "$_cmd"
-printf '#!/bin/sh\necho mine\n' > "$_cmd"
-_out="$(HOST_BIN_DIR="$_hostbin" install_host_command 940 2>&1)"; _rc=$?
-assert_eq "another file of that name is left alone (exit 2)" 2 "$_rc"
-assert_contains "with a note" "was not written by this installer; it was left as it is" "$_out"
-assert_eq "and unchanged" "$(printf '#!/bin/sh\necho mine')" "$(cat "$_cmd")"
-rm -f "$_cmd"; ln -s /nonexistent/manage-model-servers.sh "$_cmd"
-HOST_BIN_DIR="$_hostbin" install_host_command 940 >/dev/null 2>&1; _rc=$?
-assert_eq "so is a symlink, even a dangling one" 2 "$_rc"
-assert_eq "which stays a symlink" /nonexistent/manage-model-servers.sh "$(readlink "$_cmd")"
-rm -f "$_cmd"
-HOST_BIN_DIR="$_hostbin" install_host_command '9;rm -rf /' >/dev/null 2>&1; _rc=$?
-assert_eq "an invalid CT ID is refused" 1 "$_rc"
-assert_fail "and nothing is written" test -e "$_cmd"
-rm -rf "$_hostbin"; unset _hostbin _cmd _out _rc
-
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"
 summary
