@@ -22,6 +22,7 @@ reject() {
 
 plan
 has '--unprivileged 1'
+has '--features nesting=1'
 has '--memory 131072'
 has '--rootfs local-lvm:200'
 has 'lxc.prlimit.memlock: unlimited'

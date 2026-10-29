@@ -760,10 +760,6 @@ if [[ $mode == create ]]; then
   else
     printf '+ wait for systemd, a default route and DNS in CT %s\n' "$CT_ID"
   fi
-  # QEMU guest agent: Proxmox does not use it for an LXC (no virtio-serial port, so
-  # the service stays inactive), but every guest carries it. A failure is not fatal.
-  run pct exec "$CT_ID" -- sh -c 'export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3 4 5; do apt-get update -q && apt-get install -y -q qemu-guest-agent && exit 0; sleep 5; done; exit 1' ||
-      printf 'Warning: qemu-guest-agent did not install in CT %s; continuing.\n' "$CT_ID" >&2
   # Model servers given by host name: admitted now that the CT can resolve them.
   if (( ${#model_endpoints[@]} )); then
     if (( dry_run )); then

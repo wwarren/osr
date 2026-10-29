@@ -117,6 +117,32 @@ class BridgeTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 404)
         self.assertEqual(self.requests, [])
 
+    def test_bare_and_latest_names_match_like_ollama(self):
+        # The installer tags a bare alias with :latest; LiteLLM's ollama/<name>
+        # still sends the bare name. Both spellings must reach llama-server.
+        for alias, requested in [("qwen2.5-coder:latest", "qwen2.5-coder"),
+                                 ("qwen2.5-coder", "qwen2.5-coder:latest"),
+                                 ("qwen2.5-coder:latest", "qwen2.5-coder:latest")]:
+            with self.subTest(alias=alias, requested=requested):
+                self.config = Config("http://llama.invalid:8081", alias)
+                self.requests = []
+                self.response = httpx.Response(200, json=completion())
+                with self.client() as client:
+                    response = client.post("/api/chat", json={
+                        "model": requested, "stream": False,
+                        "messages": [{"role": "user", "content": "hi"}]})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["model"], alias)
+                    self.assertEqual(client.post("/api/show", json={"model": requested}).status_code, 200)
+        for alias, requested in [("qwen2.5-coder:latest", "qwen2.5-coder:7b"),
+                                 ("qwen2.5-coder:7b", "qwen2.5-coder"),
+                                 ("qwen2.5-coder:latest", "")]:
+            with self.subTest(alias=alias, requested=requested, expect=404):
+                self.config = Config("http://llama.invalid:8081", alias)
+                with self.client() as client:
+                    response = client.post("/api/chat", json={"model": requested, "messages": []})
+                    self.assertEqual(response.status_code, 404)
+
     def test_nonstream_chat_sampling_reasoning_and_tool_calls(self):
         self.response = httpx.Response(200, json=completion(None, "tool_calls", reasoning_content="Consider weather",
             tool_calls=[{"function": {"name": "weather", "arguments": '{"city":"Paris"}'}}]))

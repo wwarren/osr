@@ -576,10 +576,6 @@ else
   else
     printf '+ wait for systemd, a default route and DNS (deb.debian.org, github.com) in CT %s\n' "$CT_ID"
   fi
-  # QEMU guest agent: Proxmox does not use it for an LXC (no virtio-serial port, so
-  # the service stays inactive), but every guest carries it. A failure is not fatal.
-  run pct exec "$CT_ID" -- sh -c 'export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3 4 5; do apt-get update -q && apt-get install -y -q qemu-guest-agent && exit 0; sleep 5; done; exit 1' ||
-      printf 'Warning: qemu-guest-agent did not install in CT %s; continuing.\n' "$CT_ID" >&2
   run pct exec "$CT_ID" -- install -d -m 0711 /etc/open-terminal
   run pct exec "$CT_ID" -- install -d -m 0700 /root/open-terminal-deploy
   run pct push "$CT_ID" "$stage/api-key" /etc/open-terminal/api-key --perms 0600

@@ -2921,7 +2921,7 @@ unset ROOT_PASSWORD
 
 echo "Installing base packages inside container."
 apt_get update
-apt_get install -y python3 python3-pip python3-venv curl ca-certificates qemu-guest-agent
+apt_get install -y python3 python3-pip python3-venv curl ca-certificates
 
 echo "Creating application user and directories."
 run_ct groupadd --system ollama-router

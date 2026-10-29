@@ -208,7 +208,7 @@ net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,firewall=1"
 [[ -z $GATEWAY || $IP_CIDR == dhcp ]] || net+=",gw=$GATEWAY"
 [[ -z $VLAN_TAG ]] || net+=",tag=$VLAN_TAG"
 create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype "$ostype"
-    --unprivileged 1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
+    --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
     --description "Strata inference target; OpenAI API on TCP $STRATA_PORT")
 [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
@@ -290,10 +290,6 @@ if (( ! dry_run )); then
     done
     (( online )) || die "CT $CT_ID has no default route or DNS after 180 seconds; check network settings."
 fi
-# QEMU guest agent: Proxmox does not use it for an LXC (no virtio-serial port, so
-# the service stays inactive), but every guest carries it. A failure is not fatal.
-run pct exec "$CT_ID" -- sh -c 'export DEBIAN_FRONTEND=noninteractive; for i in 1 2 3 4 5; do apt-get update -q && apt-get install -y -q qemu-guest-agent && exit 0; sleep 5; done; exit 1' ||
-    printf 'Warning: qemu-guest-agent did not install in CT %s; continuing.\n' "$CT_ID" >&2
 run pct exec "$CT_ID" -- install -d -m 0700 /root/strata-target-deploy
 run pct push "$CT_ID" "$source_dir/install-target.sh" /root/strata-target-deploy/install-target.sh --perms 0755
 run pct push "$CT_ID" "$source_dir/strata.service" /root/strata-target-deploy/strata.service --perms 0644

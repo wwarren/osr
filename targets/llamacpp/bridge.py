@@ -66,6 +66,19 @@ class Config:
         )
 
 
+def tagged(name):
+    """Ollama's rule: a name without a tag means name:latest. Only the last
+    path segment can carry the tag (a registry host may have a port)."""
+    return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+
+
+def same_model(requested, alias):
+    """True when a request names the served model. Clients such as LiteLLM's
+    ollama/<name> send the bare name, while the installer always tags the
+    alias (qwen2.5-coder -> qwen2.5-coder:latest), so compare tagged forms."""
+    return isinstance(requested, str) and bool(requested) and tagged(requested) == tagged(alias)
+
+
 def fail(status, message):
     raise HTTPException(status, message)
 
@@ -240,7 +253,7 @@ def create_app(config=None, transport=None):
         return body
 
     def model(body):
-        if body.get("model") != cfg().alias:
+        if not same_model(body.get("model"), cfg().alias):
             fail(404, f"Model not found; this target serves {cfg().alias!r}")
 
     async def upstream(path, payload=None, stream=False):
