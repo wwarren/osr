@@ -280,10 +280,30 @@ the printed key in Open WebUI **Admin Settings > Connections > OpenAI**.
 
 ## Managing model servers
 
-`manage-model-servers` runs inside the CT or on the Proxmox host. On the host
-it finds the CT that holds the config and re-runs itself there; set `CT_ID` to
-skip the search. Commands that write take the config lock, and `--apply`
-validates, applies and health-checks (see [Applying changes](#applying-configuration-changes)).
+The installer puts `manage-model-servers` in the OSR CT only, as
+`/usr/local/bin/manage-model-servers`, a symlink to
+`/app/config-repo/install/manage-model-servers.sh`. Every `apply` makes the link
+again, so an update to the config repo updates the command. Nothing is
+installed on the Proxmox host. Run it as root in one of these ways; `<CT_ID>` is
+the OSR CT's ID, printed as `Container ID` at the end of the install and listed
+by `pct list` (named `ollama-smart-router` unless `CT_NAME` was set):
+
+```bash
+# In the OSR CT, where /usr/local/bin is on root's PATH:
+pct enter <CT_ID>
+manage-model-servers list
+
+# One command from the Proxmox host (the full path does not depend on pct's PATH):
+pct exec <CT_ID> -- /usr/local/bin/manage-model-servers list
+
+# From a clone of this repo on the Proxmox host: it finds the CT that holds the
+# config and re-runs itself there (CT_ID=<CT_ID> skips the search).
+bash /path/to/clone/manage-model-servers.sh list
+```
+
+The examples below use the command name, as inside the CT. Commands that write
+take the config lock, and `--apply` validates, applies and health-checks (see
+[Applying changes](#applying-configuration-changes)).
 
 ```bash
 manage-model-servers list | status | discover | models     # config, live probe, router inventory, tags per host

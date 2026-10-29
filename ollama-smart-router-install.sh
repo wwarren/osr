@@ -7775,7 +7775,7 @@ ensure_config_or_forward() {
   fi
   echo >&2
   echo "Or run it inside the container directly:" >&2
-  echo "  pct exec <CTID> -- manage-model-servers ${ORIG_ARGS[*]}" >&2
+  echo "  pct exec <CTID> -- /usr/local/bin/manage-model-servers ${ORIG_ARGS[*]}" >&2
   echo >&2
   echo "If your config lives elsewhere, set CONFIG_REPO_DIR." >&2
   exit 1
