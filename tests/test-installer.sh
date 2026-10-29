@@ -1706,6 +1706,21 @@ assert_contains "passes the method through" "-X GET" "$(mock_calls)"
 mock_reset_log
 gitea_api POST https://g/api '{"a":1}' >/dev/null 2>&1
 assert_contains "sends a JSON body on POST" "Content-Type: application/json" "$(mock_calls)"
+# A body over Linux's 128 KiB per-argument limit (a large file's base64) goes
+# on stdin; on the command line, curl would not even start.
+_body_seen="$(mktemp)"
+mock_script curl <<EOF
+cat > "${_body_seen}"
+echo '{}'; echo 201
+EOF
+mock_reset_log
+_big_body="{\"content\":\"$(head -c 150000 /dev/zero | tr '\0' 'A')\"}"
+out="$(gitea_api POST https://g/api "$_big_body" 2>&1)"
+assert_contains "a body over 128 KiB is sent" "201" "$out"
+assert_eq "complete, on stdin" "${#_big_body}" "$(wc -c < "$_body_seen" | tr -d ' ')"
+assert_contains "with --data-binary @-" "--data-binary @-" "$(mock_calls)"
+assert_not_contains "and not on the command line" "AAAAAAAAAA" "$(mock_calls)"
+rm -f "$_body_seen"; unset _body_seen _big_body
 
 describe resolve_gitea_repo
 GITEA_REPO_OWNER=""; GITEA_OWNER="mike"
@@ -2000,8 +2015,10 @@ assert_eq       "succeeds end to end"        "0" "$rc"
 assert_contains "reports the authenticated user" "tester" "$out"
 assert_contains "reports the test commit"        "test commit succeeded" "$out"
 
-# The marker file is deleted again after the successful write.
+# The marker file is deleted again after the successful write. Request bodies
+# reach curl on stdin (see gitea_api); log them so the sha can be checked.
 mock_script curl <<'EOF'
+case "$*" in *--data-binary*) { printf 'body: '; cat; echo; } >> "$MOCK_LOG";; esac
 case "$*" in
   *-X*) ;;
   *)    echo '{"login":"tester"}'; exit 0;;
@@ -2130,9 +2147,31 @@ case "$*" in
   *)                      echo '{}'; echo 404; exit 0;;
 esac
 EOF
-out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"; _rc=$?
 assert_contains "reports the failed file" "failed to seed" "$out"
 assert_contains "still seeds the others"  "1 created"      "$out"
+assert_contains "counts the failure"      "1 failed"       "$out"
+assert_eq "and returns failure, so the clone is checked" 1 "$_rc"
+unset _rc
+
+# A file whose base64 is over 128 KiB (install/manage-model-servers.sh is) is
+# seeded whole: its content never goes through a command-line argument.
+_seen="$(mktemp)"
+_bigtree="$(mktemp -d)"
+mkdir -p "${_bigtree}/install"
+head -c 110000 /dev/urandom | base64 -w 76 > "${_bigtree}/install/manage-model-servers.sh"
+mock_script curl <<EOF
+case "\$*" in
+  *"-X POST"*) cat > "${_seen}"; echo '{}'; echo 201; exit 0;;
+  *)           echo '{"message":"Not Found"}'; echo 404; exit 0;;
+esac
+EOF
+out="$(seed_gitea_repo "$_bigtree" TOKEN 2>&1)"; _rc=$?
+assert_eq "a file over the argument limit is seeded" 0 "$_rc"
+assert_contains "and counted" "1 created" "$out"
+assert_eq "with its exact content" "$(sha256sum < "${_bigtree}/install/manage-model-servers.sh" | cut -d' ' -f1)" \
+  "$(python3 -c 'import base64,json,sys,hashlib; print(hashlib.sha256(base64.b64decode(json.load(open(sys.argv[1]))["content"])).hexdigest())' "$_seen")"
+rm -rf "$_bigtree" "$_seen"; unset _bigtree _seen _rc
 
 # Installer-owned code that differs is UPDATED (PUT with the blob sha); the
 # user's config files are still never touched.
@@ -2140,6 +2179,7 @@ mkdir -p "${seedtree}/services/ollama-monitor"
 echo "new code" > "${seedtree}/services/ollama-monitor/monitor.py"
 _old_b64="$(printf 'old code\n' | base64 -w0)"
 mock_script curl <<EOF
+case "\$*" in *--data-binary*) { printf 'body: '; cat; echo; } >> "\$MOCK_LOG";; esac
 case "\$*" in
   *"-X PUT"*)    echo '{}'; echo 200; exit 0;;
   *monitor.py*)  echo '{"sha":"abc123","content":"${_old_b64}"}'; echo 200; exit 0;;
@@ -2224,6 +2264,37 @@ assert_eq "unparseable body -> empty" "" "$(echo 'not json' | gitea_sha_if_chang
 rm -f "$_f"
 
 # ── container clone ───────────────────────────────────────────────────────────
+describe verify_config_clone
+_vtree="$(mktemp -d)"; _vclone="$(mktemp -d)"
+mkdir -p "${_vtree}/install" "${_vtree}/services/ollama-router" "${_vclone}/install" "${_vclone}/services/ollama-router"
+echo "tool v2" > "${_vtree}/install/manage-model-servers.sh"
+echo "router v2" > "${_vtree}/services/ollama-router/router.py"
+echo "A=1" > "${_vtree}/router.env"        # not installer-owned: never checked
+cp "${_vtree}/install/manage-model-servers.sh" "${_vclone}/install/"
+cp "${_vtree}/services/ollama-router/router.py" "${_vclone}/services/ollama-router/"
+# pct exec <id> -- CMD...: run CMD here, against the fake clone.
+mock_script pct <<'EOF'
+[ "$1" = exec ] && { shift 3; exec "$@"; }
+exit 0
+EOF
+_saved_repo_dir=$CONFIG_REPO_DIR; CONFIG_REPO_DIR=$_vclone; CONFIG_UPDATE_CODE=true
+assert_ok "a complete, current clone passes" verify_config_clone "$_vtree"
+rm "${_vclone}/install/manage-model-servers.sh"
+out="$(verify_config_clone "$_vtree" 2>&1)"; _rc=$?
+assert_eq "a missing installer-owned file fails" 1 "$_rc"
+assert_contains "naming it" "missing: install/manage-model-servers.sh" "$out"
+assert_contains "and the cause" "Seeding them into" "$out"
+echo "tool v1" > "${_vclone}/install/manage-model-servers.sh"
+out="$(verify_config_clone "$_vtree" 2>&1)"; _rc=$?
+assert_eq "a stale one fails when code updates are on" 1 "$_rc"
+assert_contains "naming it" "not updated: install/manage-model-servers.sh" "$out"
+CONFIG_UPDATE_CODE=false
+assert_ok "but not when the repo's own version is kept on purpose" verify_config_clone "$_vtree"
+rm "${_vclone}/install/manage-model-servers.sh"
+assert_fail "a missing one fails either way" verify_config_clone "$_vtree"
+CONFIG_UPDATE_CODE=true; CONFIG_REPO_DIR=$_saved_repo_dir
+rm -rf "$_vtree" "$_vclone"; unset _vtree _vclone _saved_repo_dir _rc
+
 describe clone_config_repo
 CT_ID=910; CONFIG_REPO_DIR="/app/config-repo"
 GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
@@ -2255,6 +2326,53 @@ clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
 assert_file_contains "https remote gets an https credential" \
   "https://tester:SECRETTOKEN@git.example.net" "$_cred_seen"
 rm -f "$_cred_seen"
+
+describe install_host_command
+_hostbin="$(mktemp -d)"
+_out="$(HOST_BIN_DIR="$_hostbin" install_host_command 910 2>&1)"; _rc=$?
+_cmd="${_hostbin}/manage-model-servers"
+assert_eq "installs the host command" 0 "$_rc"
+assert_contains "and says where" "Installed ${_cmd} on this host; it runs manage-model-servers in CT 910." "$_out"
+assert_file_mode "executable by all" 755 "$_cmd"
+assert_ok "a bash script" bash -n "$_cmd"
+assert_eq "no temporary file is left" 1 "$(find "$_hostbin" -mindepth 1 | wc -l)"
+mock_reset_log
+mock_command pct 0
+"$_cmd" add 10.0.0.55 --tier large --apply >/dev/null 2>&1
+assert_contains "checks the OSR CT exists" "pct status 910" "$(mock_calls)"
+assert_contains "and runs the CT's tool with the arguments" \
+  "pct exec 910 -- /usr/local/bin/manage-model-servers add 10.0.0.55 --tier large --apply" "$(mock_calls)"
+mock_reset_log
+CT_ID=555 "$_cmd" list >/dev/null 2>&1
+assert_contains "a CT_ID left in the shell does not redirect it" "pct exec 910 --" "$(mock_calls)"
+mock_reset_log
+OSR_CT_ID=920 "$_cmd" list >/dev/null 2>&1
+assert_contains "OSR_CT_ID points it at another CT" "pct exec 920 -- /usr/local/bin/manage-model-servers list" "$(mock_calls)"
+mock_command pct 2
+_out="$("$_cmd" list 2>&1)"; _rc=$?
+assert_ne "a missing OSR CT is an error" 0 "$_rc"
+assert_contains "that says what to do" "CT 910, the OSR CT, does not exist. Set OSR_CT_ID=<OSR CT ID>" "$_out"
+_out="$(env PATH=/usr/bin:/bin "$_cmd" list 2>&1)"; _rc=$?
+assert_ne "without pct it is an error" 0 "$_rc"
+assert_contains "naming the host" "pct not found; run this on the Proxmox host" "$_out"
+mock_command pct 0
+HOST_BIN_DIR="$_hostbin" install_host_command 930 >/dev/null 2>&1; _rc=$?
+assert_eq "a rerun replaces its own command" 0 "$_rc"
+assert_file_contains "with the new CT ID" 'OSR_CT_ID:-930' "$_cmd"
+printf '#!/bin/sh\necho mine\n' > "$_cmd"
+_out="$(HOST_BIN_DIR="$_hostbin" install_host_command 940 2>&1)"; _rc=$?
+assert_eq "another file of that name is left alone (exit 2)" 2 "$_rc"
+assert_contains "with a note" "was not written by this installer; it was left as it is" "$_out"
+assert_eq "and unchanged" "$(printf '#!/bin/sh\necho mine')" "$(cat "$_cmd")"
+rm -f "$_cmd"; ln -s /nonexistent/manage-model-servers.sh "$_cmd"
+HOST_BIN_DIR="$_hostbin" install_host_command 940 >/dev/null 2>&1; _rc=$?
+assert_eq "so is a symlink, even a dangling one" 2 "$_rc"
+assert_eq "which stays a symlink" /nonexistent/manage-model-servers.sh "$(readlink "$_cmd")"
+rm -f "$_cmd"
+HOST_BIN_DIR="$_hostbin" install_host_command '9;rm -rf /' >/dev/null 2>&1; _rc=$?
+assert_eq "an invalid CT ID is refused" 1 "$_rc"
+assert_fail "and nothing is written" test -e "$_cmd"
+rm -rf "$_hostbin"; unset _hostbin _cmd _out _rc
 
 # ── summary ───────────────────────────────────────────────────────────────────
 rm -rf "$cfgdir"

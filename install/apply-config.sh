@@ -36,6 +36,8 @@ chmod 0755 "${REPO_DIR}"/install/*.sh 2>/dev/null || true
 # `git pull` in the repo updates the command too.
 if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
   ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" /usr/local/bin/manage-model-servers
+else
+  echo "WARNING: ${REPO_DIR}/install/manage-model-servers.sh is missing, so manage-model-servers is not on PATH." >&2
 fi
 
 echo "Configuration applied from ${REPO_DIR}."

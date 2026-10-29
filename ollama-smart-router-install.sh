@@ -2293,6 +2293,44 @@ push_local_config_tree() {
 # Run a command inside the container.
 run_ct() { pct exec "$CT_ID" -- "$@"; }
 
+# install_host_command CT_ID: put manage-model-servers on the Proxmox host's
+# PATH (HOST_BIN_DIR, default /usr/local/bin). The command runs the tool that
+# is installed in the OSR CT, so it always matches the CT's version; OSR_CT_ID
+# in the environment points it at another CT. (Not CT_ID: the target
+# provisioners take that one, and it may still be set in the shell.) A file of
+# that name this installer did not write is left alone. Returns 0 when the
+# command is installed, 2 when another file was left in place, 1 on an error.
+install_host_command() {
+  local ct_id="$1" dir="${HOST_BIN_DIR:-/usr/local/bin}" path tmp
+  local mark='# Installed by ollama-smart-router-install.sh: manage-model-servers for the OSR CT.'
+  [[ "$ct_id" =~ ^[0-9]+$ ]] || { echo "install_host_command: invalid CT ID '${ct_id}'" >&2; return 1; }
+  path="${dir}/manage-model-servers"
+  if [[ -e "$path" || -L "$path" ]] && ! grep -qxF -- "$mark" "$path" 2>/dev/null; then
+    echo "Note: ${path} exists and was not written by this installer; it was left as it is." >&2
+    echo "      Run the tool with: pct exec ${ct_id} -- /usr/local/bin/manage-model-servers <command>" >&2
+    return 2
+  fi
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "${dir}/.manage-model-servers.XXXXXX")" || return 1
+  cat > "$tmp" <<HOSTCMD || { rm -f -- "$tmp"; return 1; }
+#!/usr/bin/env bash
+${mark}
+# It runs /usr/local/bin/manage-model-servers inside the OSR CT. Set OSR_CT_ID
+# to use another CT; rerun the installer (or edit the ID below) if the CT is
+# recreated under a new ID.
+set -euo pipefail
+ct_id="\${OSR_CT_ID:-${ct_id}}"
+command -v pct >/dev/null 2>&1 || { echo "ERROR: pct not found; run this on the Proxmox host." >&2; exit 1; }
+if ! pct status "\$ct_id" >/dev/null 2>&1; then
+  echo "ERROR: CT \${ct_id}, the OSR CT, does not exist. Set OSR_CT_ID=<OSR CT ID> or rerun the installer." >&2
+  exit 1
+fi
+exec pct exec "\$ct_id" -- /usr/local/bin/manage-model-servers "\$@"
+HOSTCMD
+  chmod 0755 "$tmp" && mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
+  echo "Installed ${path} on this host; it runs manage-model-servers in CT ${ct_id}."
+}
+
 # Wait until the container's userspace is actually ready (systemd + DNS).
 wait_for_ct_ready() {
   local state
@@ -2467,9 +2505,12 @@ gitea_probe_user() {
 # Uses $auth from the calling scope.
 gitea_api() {
   local method="$1" url="$2" data="${3:-}"
+  # The body goes to curl on stdin, never on its command line: Linux limits a
+  # single argument to 128 KiB, which a large file's base64 content exceeds.
   if [[ -n "$data" ]]; then
-    curl -sS "${GITEA_CURL_OPTS[@]}" -X "$method" -H "$auth" -H 'Content-Type: application/json' \
-      --data "$data" -w $'\n%{http_code}' "$url" 2>/dev/null || true
+    printf '%s' "$data" |
+      curl -sS "${GITEA_CURL_OPTS[@]}" -X "$method" -H "$auth" -H 'Content-Type: application/json' \
+        --data-binary @- -w $'\n%{http_code}' "$url" 2>/dev/null || true
   else
     curl -sS "${GITEA_CURL_OPTS[@]}" -X "$method" -H "$auth" -w $'\n%{http_code}' "$url" 2>/dev/null || true
   fi
@@ -2506,8 +2547,8 @@ if remote != local and meta.get("sha"):
 # $2 is the deploy token.
 seed_gitea_repo() {
   local tree="$1" token="$2"
-  local base api auth owner resp http body sha rel content_b64 payload
-  local created=0 skipped=0 updated=0
+  local base api auth owner resp http body sha rel payload
+  local created=0 skipped=0 updated=0 failed=0
   if [[ -z "$token" ]]; then
     echo "No Gitea token; skipping repo seeding (using local config only)." >&2
     return 1
@@ -2524,7 +2565,6 @@ seed_gitea_repo() {
   while IFS= read -r rel; do
     resp="$(gitea_api GET "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}")"
     http="${resp##*$'\n'}"
-    content_b64="$(base64 -w0 < "${tree}/${rel}")"
     if [[ "$http" == "200" ]]; then
       sha=""
       if [[ "$CONFIG_UPDATE_CODE" == "true" ]] && is_installer_owned "$rel"; then
@@ -2535,10 +2575,11 @@ seed_gitea_repo() {
         skipped=$((skipped + 1))
         continue
       fi
-      payload="$(python3 -c '
+      # The content reaches python on stdin, not as an argument (see gitea_api).
+      payload="$(base64 -w0 < "${tree}/${rel}" | python3 -c '
 import json,sys
 print(json.dumps({"message": "Update %s from installer" % sys.argv[1],
-                  "content": sys.argv[2], "sha": sys.argv[3]}))' "$rel" "$content_b64" "$sha")"
+                  "content": sys.stdin.read(), "sha": sys.argv[2]}))' "$rel" "$sha")"
       resp="$(gitea_api PUT "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}" "$payload")"
       http="${resp##*$'\n'}"
       if [[ "$http" == "200" ]]; then
@@ -2546,13 +2587,14 @@ print(json.dumps({"message": "Update %s from installer" % sys.argv[1],
         echo "  updated: ${rel}" >&2
       else
         echo "  WARNING: failed to update ${rel} (HTTP ${http})" >&2
+        failed=$((failed + 1))
       fi
       continue
     fi
-    payload="$(python3 -c '
+    payload="$(base64 -w0 < "${tree}/${rel}" | python3 -c '
 import json,sys
 print(json.dumps({"message": "Seed %s from installer" % sys.argv[1],
-                  "content": sys.argv[2]}))' "$rel" "$content_b64")"
+                  "content": sys.stdin.read()}))' "$rel")"
     resp="$(gitea_api POST "${api}/repos/${owner}/${GITEA_REPO_NAME}/contents/${rel}" "$payload")"
     http="${resp##*$'\n'}"
     if [[ "$http" == "201" ]]; then
@@ -2560,11 +2602,43 @@ print(json.dumps({"message": "Seed %s from installer" % sys.argv[1],
       echo "  seeded: ${rel}" >&2
     else
       echo "  WARNING: failed to seed ${rel} (HTTP ${http})" >&2
+      failed=$((failed + 1))
     fi
   done < <(cd "$tree" && find . -type f -printf '%P\n' | sort)
 
-  echo "Repo seeding complete: ${created} created, ${updated} updated, ${skipped} already present." >&2
-  return 0
+  echo "Repo seeding complete: ${created} created, ${updated} updated, ${skipped} already present, ${failed} failed." >&2
+  (( failed == 0 ))
+}
+
+# verify_config_clone TREE: the installer-owned files in the CT's clone must be
+# the ones this installer generated in TREE. Seeding can fail file by file, and
+# a clone without them would install without the management tool (no
+# manage-model-servers on PATH) or without LiteLLM's hash lock. A file that
+# differs only counts when CONFIG_UPDATE_CODE=true, since otherwise the repo's
+# own version is kept on purpose.
+verify_config_clone() {
+  local tree="$1" rel want hash
+  local -a missing=() stale=()
+  local -A remote=()
+  while read -r hash rel; do
+    [[ -n "$rel" ]] && remote["$rel"]="$hash"
+  done < <(run_ct bash -c 'cd "$1" || exit 0; shift; for f; do [ -f "$f" ] && sha256sum -- "$f"; done; exit 0' \
+             _ "$CONFIG_REPO_DIR" "${INSTALLER_OWNED_CODE[@]}")
+  for rel in "${INSTALLER_OWNED_CODE[@]}"; do
+    [[ -f "${tree}/${rel}" ]] || continue
+    want="$(sha256sum < "${tree}/${rel}" | cut -d' ' -f1)"
+    if [[ -z "${remote[$rel]:-}" ]]; then
+      missing+=("$rel")
+    elif [[ "${remote[$rel]}" != "$want" && "$CONFIG_UPDATE_CODE" == "true" ]]; then
+      stale+=("$rel")
+    fi
+  done
+  (( ${#missing[@]} + ${#stale[@]} )) || return 0
+  echo "ERROR: the config repository clone in ${CONFIG_REPO_DIR} is incomplete." >&2
+  (( ${#missing[@]} == 0 )) || printf '  missing: %s\n' "${missing[@]}" >&2
+  (( ${#stale[@]} == 0 )) || printf '  not updated: %s\n' "${stale[@]}" >&2
+  echo "Seeding them into ${GITEA_OWNER}/${GITEA_REPO_NAME} failed; see the warnings above." >&2
+  return 1
 }
 
 # Clone the config repo into the container. The token is written to a file and
@@ -5340,6 +5414,8 @@ chmod 0755 "${REPO_DIR}"/install/*.sh 2>/dev/null || true
 # `git pull` in the repo updates the command too.
 if [ -f "${REPO_DIR}/install/manage-model-servers.sh" ]; then
   ln -sfn "${REPO_DIR}/install/manage-model-servers.sh" /usr/local/bin/manage-model-servers
+else
+  echo "WARNING: ${REPO_DIR}/install/manage-model-servers.sh is missing, so manage-model-servers is not on PATH." >&2
 fi
 
 echo "Configuration applied from ${REPO_DIR}."
@@ -8087,6 +8163,7 @@ if [[ "$CONFIG_SOURCE" == "repo" ]]; then
 
   echo "Cloning the config repository into the container."
   clone_config_repo "$GITEA_DEPLOY_TOKEN_KEEP"
+  verify_config_clone "$REPO_DIR"
 else
   echo "Installing the generated configuration directly (no Gitea repo)."
   push_local_config_tree "$REPO_DIR"
@@ -8248,9 +8325,16 @@ run_ct systemctl enable --now \
 CT_CREATED=""
 trap - ERR
 
+host_command_rc=0
+install_host_command "$CT_ID" || host_command_rc=$?
+if (( host_command_rc == 1 )); then
+  echo "Warning: could not install manage-model-servers on this host; use pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers." >&2
+fi
+
 echo "=============================================================================="
 echo "Provisioning complete."
 echo "Container ID: ${CT_ID}"
+(( host_command_rc != 0 )) || echo "Model servers: manage-model-servers (on this host and in the CT)"
 echo "Service IP: ${ROUTER_IP}"
 echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"

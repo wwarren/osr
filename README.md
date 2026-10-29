@@ -280,28 +280,30 @@ the printed key in Open WebUI **Admin Settings > Connections > OpenAI**.
 
 ## Managing model servers
 
-The installer puts `manage-model-servers` in the OSR CT only, as
-`/usr/local/bin/manage-model-servers`, a symlink to
-`/app/config-repo/install/manage-model-servers.sh`. Every `apply` makes the link
-again, so an update to the config repo updates the command. Nothing is
-installed on the Proxmox host. Run it as root in one of these ways; `<CT_ID>` is
-the OSR CT's ID, printed as `Container ID` at the end of the install and listed
-by `pct list` (named `ollama-smart-router` unless `CT_NAME` was set):
+The installer puts `manage-model-servers` on root's PATH in two places, both
+as `/usr/local/bin/manage-model-servers`:
+
+- **In the OSR CT:** a symlink to `/app/config-repo/install/manage-model-servers.sh`.
+  Every `apply` makes the link again, so an update to the config repo updates
+  the command.
+- **On the Proxmox host:** a small script that runs the CT's copy through
+  `pct exec`, so the host always uses the CT's version. It holds the OSR CT's ID;
+  set `OSR_CT_ID` to point it at another CT, or rerun the installer after
+  recreating the CT. A file of that name the installer did not write (your own
+  script or symlink) is left alone, with a note.
+
+`<CT_ID>` is the OSR CT's ID, printed as `Container ID` at the end of the
+install and listed by `pct list` (named `ollama-smart-router` unless `CT_NAME`
+was set). As root:
 
 ```bash
-# In the OSR CT, where /usr/local/bin is on root's PATH:
-pct enter <CT_ID>
-manage-model-servers list
-
-# One command from the Proxmox host (the full path does not depend on pct's PATH):
-pct exec <CT_ID> -- /usr/local/bin/manage-model-servers list
-
-# From a clone of this repo on the Proxmox host: it finds the CT that holds the
-# config and re-runs itself there (CT_ID=<CT_ID> skips the search).
-bash /path/to/clone/manage-model-servers.sh list
+manage-model-servers list                                       # on the host or in the CT (pct enter <CT_ID>)
+pct exec <CT_ID> -- /usr/local/bin/manage-model-servers list    # the same, without the host command
+bash /path/to/clone/manage-model-servers.sh list                # from a repo clone on the host: finds the
+                                                                # CT that holds the config (CT_ID=<CT_ID> skips the search)
 ```
 
-The examples below use the command name, as inside the CT. Commands that write
+The examples below work the same on the host and in the CT. Commands that write
 take the config lock, and `--apply` validates, applies and health-checks (see
 [Applying changes](#applying-configuration-changes)).
 

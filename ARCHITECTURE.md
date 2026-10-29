@@ -287,8 +287,12 @@ explicit act: `git pull` followed by `manage-model-servers apply`.
 ### 6.1 `manage-model-servers`
 
 Seeded at `install/manage-model-servers.sh` and symlinked to
-`/usr/local/bin/manage-model-servers`, so a `git pull` updates the command (the
-command list is in the README). It rewrites `MODEL_SERVERS` and `BACKEND_*` in
+`/usr/local/bin/manage-model-servers` in the router CT, so a `git pull` updates
+the command (the command list is in the README). The installer also writes
+`/usr/local/bin/manage-model-servers` on the Proxmox host: a forwarder that runs
+the CT's copy through `pct exec` (`OSR_CT_ID` overrides the recorded CT), so
+the host never runs a stale copy. It leaves a file of that name it did not
+write alone. It rewrites `MODEL_SERVERS` and `BACKEND_*` in
 `env/router.env` and regenerates `litellm_config.yaml`. Design points:
 
 * **Servers are keyed by URL, never by index.** Non-Ollama servers carry a kind
@@ -690,6 +694,12 @@ Router CT:
 | `/var/lib/ollama-monitor/` | Monitor state and notice timestamp |
 | `/var/backups/ollama-smart-router/` | Root-only `apply` snapshots |
 | `/run/lock/ollama-smart-router-config.lock` | Configuration write lock |
+
+Proxmox host:
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/manage-model-servers` | Runs the router CT's management tool through `pct exec` |
 
 Target paths vary by engine. Strata-style CTs use `/opt/<target>/` for code,
 `/var/lib/<target>/` for models and `/etc/<target>-target/` for private
