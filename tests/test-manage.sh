@@ -235,6 +235,17 @@ describe is_secret_key
 assert_ok   "token"            is_secret_key GITEA_DEPLOY_TOKEN
 assert_fail "ordinary key"     is_secret_key MODEL_SERVERS
 assert_fail "no prefix match"  is_secret_key GITEA_DEPLOY_TOKEN_OLD
+# pct exec runs commands with SIGPIPE ignored, and the script sets pipefail.
+# A "secret_keys | grep -q" test failed there when grep matched and exited
+# while the list was still being written. A slow server_kinds makes the list
+# arrive late, as it does on a loaded CT.
+_pipe_strict() {
+  ( trap '' PIPE; set -o pipefail
+    server_kinds() { printf 'lmstudio\n'; sleep 0.3; printf '%s\n' strata basalt maya xolotl; }
+    "$@" ) 2>&1
+}
+assert_eq "token under pipefail without SIGPIPE" "yes" \
+  "$(_pipe_strict is_secret_key GITEA_DEPLOY_TOKEN && echo yes || echo no)"
 
 describe kv_has
 kvf="${WORK}/kv.env"; printf 'A=1\nEMPTY=\n' > "$kvf"
@@ -1401,6 +1412,8 @@ describe is_server_kind
 assert_ok "maya is a kind" is_server_kind maya
 assert_fail "ollama is the default, not a table entry" is_server_kind ollama
 assert_fail "empty is not a kind" is_server_kind ""
+assert_eq "first kind under pipefail without SIGPIPE" "yes" \
+  "$(_pipe_strict is_server_kind lmstudio && echo yes || echo no)"
 
 describe is_openai_kind
 assert_ok "basalt is OpenAI-style" is_openai_kind basalt

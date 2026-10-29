@@ -5591,7 +5591,16 @@ kind_field() {
     *) return 1 ;;
   esac
 }
-is_server_kind() { [[ -n "$1" ]] && server_kinds | grep -qx -- "$1"; }
+# Membership tests read the whole list before comparing. "list | grep -q" lets
+# grep exit at the first match while the list is still being written; under
+# pipefail the writer's SIGPIPE (or EPIPE, when SIGPIPE is ignored, as under
+# pct exec) then fails the test even though the key matched.
+is_server_kind() {
+  local k
+  [[ -n "$1" ]] || return 1
+  for k in $(server_kinds); do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
 # "Ollama, LM Studio, Strata, Basalt, Maya or Xolotl"
@@ -5820,7 +5829,11 @@ secret_keys() {
   printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS
   for k in $(server_kinds); do kind_field "$k" key; done
 }
-is_secret_key() { secret_keys | grep -qx -- "$1"; }
+is_secret_key() {
+  local k
+  for k in $(secret_keys); do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
 
 # Raw KEY=value access to one file. kv_get prints nothing for a missing key;
 # kv_has distinguishes "absent" from "present but empty".
@@ -6008,10 +6021,10 @@ model_present_on() {
   local url="$1" tag="$2" names
   names="$(server_models "$url")" || return 2
   [[ -n "$names" ]] || return 2
-  printf '%s\n' "$names" | grep -Fxq "$tag" && return 0
+  grep -Fxq -- "$tag" <<< "$names" && return 0
   # Ollama treats a bare name as ":latest", so accept that spelling too.
   if [[ "$(server_kind "$url")" == ollama && "$tag" != *:* ]]; then
-    printf '%s\n' "$names" | grep -Fxq "${tag}:latest" && return 0
+    grep -Fxq -- "${tag}:latest" <<< "$names" && return 0
   fi
   return 1
 }
