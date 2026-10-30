@@ -44,7 +44,8 @@ Optional: CT_HOSTNAME=llama-target, BRIDGE=vmbr0, GATEWAY, NAMESERVER, VLAN_TAG,
           CONTEXT_SIZE=8192, PARALLEL_SLOTS=1, THREADS=4, LLAMA_EXTRA_ARGS=,
            MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
            MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
-           CUDA_ARCHITECTURES=native, CUDA_COMPILER=<optional-path-inside-CT>,
+           CUDA_ARCHITECTURES=auto, CUDA_COMPILER=<optional-path-inside-CT>,
+           CPU_TARGET=auto|native|portable (see install-target.sh --help),
            MODEL_DOWNLOAD_URL=<direct-public-Hugging-Face-GGUF-URL>.
 
 --create-only explicitly skips the guest installer (the default), overriding
@@ -490,15 +491,17 @@ MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
 MODEL_CAPABILITIES=${MODEL_CAPABILITIES:-completion}
-CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-native}
+CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-auto}
 CUDA_COMPILER=${CUDA_COMPILER:-}
 LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
+CPU_TARGET=${CPU_TARGET:-auto}
 
 configure_gpu_devices
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
 [[ $SWAP_MB =~ ^(0|[1-9][0-9]{0,8})$ ]] || die 'SWAP_MB must be a nonnegative integer.'
 [[ $GPU_LAYERS == auto || $GPU_LAYERS == all || $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'GPU_LAYERS must be auto, all, or a nonnegative integer.'
 [[ $ONBOOT =~ ^[01]$ ]] || die 'ONBOOT must be 0 or 1.'
+[[ $CPU_TARGET == auto || $CPU_TARGET == native || $CPU_TARGET == portable ]] || die 'CPU_TARGET must be auto, native or portable.'
 [[ -z $NAMESERVER ]] || ipv4 "$NAMESERVER" || die 'NAMESERVER must be one IPv4 address.'
 if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 4094 )) || die 'VLAN_TAG must be 1..4094.'; fi
 [[ -z $SSH_PUBLIC_KEY || ( -f $SSH_PUBLIC_KEY && -s $SSH_PUBLIC_KEY && -r $SSH_PUBLIC_KEY ) ]] || die 'SSH_PUBLIC_KEY must refer to a readable, nonempty public-key file.'
@@ -521,7 +524,7 @@ if (( INSTALL_TARGET )); then
     fi
     for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION; do [[ ${!name} =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid $name."; done
     [[ $MODEL_CAPABILITIES =~ ^(completion|tools|vision|embedding)(,(completion|tools|vision|embedding))*$ ]] || die 'MODEL_CAPABILITIES may contain completion,tools,vision,embedding.'
-    [[ $CUDA_ARCHITECTURES == native || $CUDA_ARCHITECTURES =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]] || die 'Invalid CUDA_ARCHITECTURES (use native or e.g. 86;89;120).'
+    [[ $CUDA_ARCHITECTURES == auto || $CUDA_ARCHITECTURES == native || $CUDA_ARCHITECTURES =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]] || die 'Invalid CUDA_ARCHITECTURES (use auto, native or e.g. 86;89;120).'
     [[ -z $CUDA_COMPILER || $CUDA_COMPILER =~ ^/[A-Za-z0-9_./-]+$ ]] || die 'CUDA_COMPILER must be an absolute path without spaces.'
 fi
 
@@ -560,7 +563,7 @@ for i in "${!devices[@]}"; do
     if (( ! dry_run )); then [[ -c $device ]] || die "Not an existing character device on this host: $device"; fi
     create+=("--dev$i" "path=$device,gid=993,mode=0660")
 done
-guest_env=(env "NONINTERACTIVE=true" "LLAMA_CPP_REF=$LLAMA_CPP_REF" "MODEL_ALIAS=$MODEL_ALIAS" "MODEL_PATH=$MODEL_PATH" "MODEL_DOWNLOAD_URL=$MODEL_DOWNLOAD_URL" "BACKEND=$BACKEND" "BUILD_JOBS=$BUILD_JOBS" "CONTEXT_SIZE=$CONTEXT_SIZE" "PARALLEL_SLOTS=$PARALLEL_SLOTS" "THREADS=$THREADS" "GPU_LAYERS=$GPU_LAYERS" "MODEL_PARAMETER_SIZE=$MODEL_PARAMETER_SIZE" "MODEL_FAMILY=$MODEL_FAMILY" "MODEL_QUANTIZATION=$MODEL_QUANTIZATION" "MODEL_CAPABILITIES=$MODEL_CAPABILITIES" "CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" "CUDA_COMPILER=$CUDA_COMPILER" "LLAMA_EXTRA_ARGS=$LLAMA_EXTRA_ARGS")
+guest_env=(env "NONINTERACTIVE=true" "LLAMA_CPP_REF=$LLAMA_CPP_REF" "MODEL_ALIAS=$MODEL_ALIAS" "MODEL_PATH=$MODEL_PATH" "MODEL_DOWNLOAD_URL=$MODEL_DOWNLOAD_URL" "BACKEND=$BACKEND" "BUILD_JOBS=$BUILD_JOBS" "CONTEXT_SIZE=$CONTEXT_SIZE" "PARALLEL_SLOTS=$PARALLEL_SLOTS" "THREADS=$THREADS" "GPU_LAYERS=$GPU_LAYERS" "MODEL_PARAMETER_SIZE=$MODEL_PARAMETER_SIZE" "MODEL_FAMILY=$MODEL_FAMILY" "MODEL_QUANTIZATION=$MODEL_QUANTIZATION" "MODEL_CAPABILITIES=$MODEL_CAPABILITIES" "CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" "CUDA_COMPILER=$CUDA_COMPILER" "LLAMA_EXTRA_ARGS=$LLAMA_EXTRA_ARGS" "CPU_TARGET=$CPU_TARGET")
 run() {
     printf '+'
     printf ' %q' "$@"

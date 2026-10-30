@@ -95,6 +95,8 @@ passed=$((passed + 1)); printf 'PASS bare alias is passed on as name:latest\n'
 check failure 'guest install rejects an invalid alias' install 'MODEL_ALIAS=bad name' MODEL_PATH=/var/lib/llama-target/models/model.gguf
 check success 'LLAMA_EXTRA_ARGS is passed to the guest' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf 'LLAMA_EXTRA_ARGS=--flash-attn on'
 check failure 'LLAMA_EXTRA_ARGS rejects shell metacharacters' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf 'LLAMA_EXTRA_ARGS=--x;reboot'
+check success 'CPU_TARGET is passed to the guest' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf CPU_TARGET=portable
+check failure 'CPU_TARGET rejects unknown values' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/var/lib/llama-target/models/model.gguf CPU_TARGET=fast
 check failure 'guest install rejects model traversal' install MODEL_ALIAS=llama3.1:8b MODEL_PATH=/models/../model.gguf
 check failure 'guest install rejects a non-file Hugging Face URL' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/tree/main/model.gguf
 check failure 'guest install rejects a noncanonical Hugging Face host' install MODEL_ALIAS=llama3.1:8b MODEL_DOWNLOAD_URL=https://huggingface.com/org/repo/resolve/main/model.gguf

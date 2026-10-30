@@ -36,8 +36,27 @@ Optional: LLAMA_CPP_REF=<release-tag-or-full-commit> ($LLAMA_CPP_DEFAULT_REF),
           PARALLEL_SLOTS=1, THREADS=4, GPU_LAYERS=auto (0 for cpu),
           MODEL_PARAMETER_SIZE=unknown, MODEL_FAMILY=unknown,
           MODEL_QUANTIZATION=unknown, MODEL_CAPABILITIES=completion,
-          CUDA_ARCHITECTURES=native (or 86;89;120), CUDA_COMPILER=<nvcc-path>
-          (auto-detected when unset), LLAMA_EXTRA_ARGS="<extra llama-server flags>".
+          CUDA_ARCHITECTURES=auto (or native, or 86;89;120), CUDA_COMPILER=<nvcc-path>
+          (auto-detected when unset), LLAMA_EXTRA_ARGS="<extra llama-server flags>",
+          CPU_TARGET=auto|native|portable (auto).
+
+CPU_TARGET sets the x86 instruction sets llama-server is built for. native
+tunes for this CPU (llama.cpp's default). portable uses only the AVX, F16C,
+FMA, AVX2 and BMI2 that this CPU reports, and nothing newer. auto, the
+default, is native on a CPU with all five and portable otherwise: a native
+build on an AVX-only CPU (e.g. Xeon E3 v2) dies with SIGILL at start.
+CUDA_ARCHITECTURES=auto, the default, builds for the compute capability of
+each GPU nvidia-smi sees in this CT (8.9 -> 89). Every CUDA build is checked
+for code this CT's GPU can run.
+
+Rebuild for this host after moving the CT to other hardware (offline, same
+llama.cpp commit, model and settings):
+       bash install-target.sh --rebuild
+Detects this host's CPU and GPU again, and rebuilds llama-server only when
+they need a different build than the installed one (FORCE_REBUILD=true to
+force). Checks the GPU first and says what to fix on the host when the CT
+cannot use it. Running services are restarted and health-checked; on failure
+the previous llama-server is restored.
 
 Upgrade an installed target in place (same model and settings):
        LLAMA_CPP_REF=<tag-or-commit> bash install-target.sh --upgrade
@@ -406,6 +425,115 @@ build_info() {
     [[ -f $TARGET_ROOT/build-info.txt ]] || return 0
     sed -n "s/^$1=//p" "$TARGET_ROOT/build-info.txt" | head -n1
 }
+# x86 instruction sets a portable build may use, each only when the CPU has it.
+readonly CPU_ISA_FLAGS='avx f16c fma avx2 bmi2'
+valid_cpu_target() {
+    [[ $1 == auto || $1 == native || $1 == portable ]]
+}
+# cpu_build TARGET: what CPU_TARGET means on this machine, "native" or
+# "portable:<flags>" (the CPU_ISA_FLAGS that ${CPUINFO_FILE:-/proc/cpuinfo}
+# lists). auto is portable whenever one of them is missing: llama.cpp's
+# native build on an AVX-only Xeon E3 v2 died with SIGILL at start.
+cpu_build() {
+    local target=$1 file=${CPUINFO_FILE:-/proc/cpuinfo} line flag have=() missing=false
+    valid_cpu_target "$target" || { printf 'CPU_TARGET must be auto, native or portable.\n' >&2; return 1; }
+    if [[ $(uname -m) != x86_64 ]]; then
+        if [[ $target == portable ]]; then
+            printf 'CPU_TARGET=portable applies to x86_64 CPUs only.\n' >&2
+            return 1
+        fi
+        printf 'native\n'
+        return 0
+    fi
+    [[ -r $file ]] || { printf 'Cannot read %s to choose the CPU build.\n' "$file" >&2; return 1; }
+    line=$(sed -n 's/^flags[[:space:]]*:[[:space:]]*//p' "$file" | head -n1)
+    for flag in $CPU_ISA_FLAGS; do
+        if [[ " $line " == *" $flag "* ]]; then have+=("$flag"); else missing=true; fi
+    done
+    if [[ $target == native ]] || [[ $target == auto && $missing == false ]]; then
+        printf 'native\n'
+        return 0
+    fi
+    (IFS=,; printf 'portable:%s\n' "${have[*]}")
+}
+# The CMake options for a cpu_build result, one per line. Native is set
+# explicitly so that reconfiguring an existing build tree switches back.
+cpu_cmake_args() {
+    local spec=$1 flag
+    [[ $spec == portable:* ]] || { printf '%s\n' -DGGML_NATIVE=ON; return 0; }
+    printf '%s\n' -DGGML_NATIVE=OFF
+    for flag in $CPU_ISA_FLAGS; do
+        if [[ ,${spec#portable:}, == *",$flag,"* ]]; then
+            printf -- '-DGGML_%s=ON\n' "${flag^^}"
+        else
+            printf -- '-DGGML_%s=OFF\n' "${flag^^}"
+        fi
+    done
+    printf '%s\n' -DGGML_AVX_VNNI=OFF -DGGML_AVX512=OFF
+}
+valid_cuda_architectures() {
+    [[ $1 == auto || $1 == native || $1 =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]]
+}
+# The compute capabilities of the GPUs nvidia-smi sees here, as a CMake list
+# (8.9 -> 89, several GPUs -> 86;89). Fails when no GPU answers.
+detected_cuda_architectures() {
+    local caps
+    caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || return 1
+    caps=$(printf '%s\n' "$caps" | tr -d ' .\r' | grep -E '^[0-9]{2,3}$' | sort -un | paste -sd ';') || true
+    [[ -n $caps ]] || return 1
+    printf '%s\n' "$caps"
+}
+# resolve_cuda_architectures SETTING: the CMake list to build for. auto is the
+# detected GPUs; native leaves detection to CMake, which on this target has
+# produced builds with no code for the GPU ("no kernel image is available").
+resolve_cuda_architectures() {
+    if [[ $1 == auto ]]; then
+        detected_cuda_architectures && return 0
+        printf 'CUDA_ARCHITECTURES=auto: nvidia-smi reports no GPU in this CT.\n' >&2
+        return 1
+    fi
+    printf '%s\n' "$1"
+}
+# cuda_build_covers BINARY CAPS: print each GPU in CAPS (e.g. 89;120) that
+# BINARY has no code for, and fail if there is one. Native code runs on the
+# same major version with an equal or newer minor; PTX on any newer GPU.
+# Unchecked when cuobjdump (next to nvcc) or the GPU list is missing.
+cuda_build_covers() {
+    local bin=$1 caps=$2 tool cap code elf ptx ok missing=''
+    tool=$(dirname -- "${CUDA_COMPILER:-/usr/local/cuda/bin/nvcc}")/cuobjdump
+    [[ -x $tool && -n $caps ]] || return 0
+    elf=$("$tool" --list-elf "$bin" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u) || true
+    ptx=$("$tool" --list-ptx "$bin" 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u) || true
+    for cap in ${caps//;/ }; do
+        ok=false
+        for code in $elf; do
+            code=${code#sm_}
+            if (( code / 10 == cap / 10 && code <= cap )); then ok=true; fi
+        done
+        for code in $ptx; do
+            code=${code#sm_}
+            if (( code <= cap )); then ok=true; fi
+        done
+        if [[ $ok == false ]]; then missing+="${missing:+ }sm_$cap"; fi
+    done
+    [[ -z $missing ]] && return 0
+    printf '%s\n' "$missing"
+    return 1
+}
+# The GPU architectures recorded for the installed CUDA build. Installs from
+# before this record was kept were built with CMake's native detection.
+installed_cuda_architectures() {
+    local value
+    value=$(build_info cuda_architectures)
+    printf '%s\n' "${value:-native}"
+}
+# The CPU build recorded for the installed llama-server. Installs from before
+# CPU_TARGET existed were built native.
+installed_cpu_build() {
+    local value
+    value=$(build_info cpu_build)
+    printf '%s\n' "${value:-native}"
+}
 # backend_debian_ok BACKEND: does this guest's Debian release suit BACKEND?
 backend_debian_ok() {
     [[ ${ID:-} == debian ]] || return 1
@@ -462,6 +590,7 @@ fetch_llama_source() {
 # Build llama-server from the clone at $1 and install it as $2, verified.
 build_llama_server() {
     local repo=$1 dest=$2 dependencies
+    local -a cpu_args=()
     local -a cmake_args=(-S "$repo" -B "$repo/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
         -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF
         -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_OPENSSL=ON
@@ -469,9 +598,12 @@ build_llama_server() {
     if [[ $LLAMA_CPP_REF =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         cmake_args+=(-DLLAMA_BUILD_IS_DEV=OFF)
     fi
+    mapfile -t cpu_args < <(cpu_cmake_args "${CPU_BUILD:-native}")
+    cmake_args+=(${cpu_args[@]+"${cpu_args[@]}"})
     if [[ $BACKEND == cuda ]]; then
         cmake_args+=(-DGGML_CUDA=ON "-DCMAKE_CUDA_COMPILER=$CUDA_COMPILER")
-        [[ -z $CUDA_ARCHITECTURES ]] || cmake_args+=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES")
+        [[ -z ${CUDA_ARCH_BUILD:-$CUDA_ARCHITECTURES} ]] ||
+            cmake_args+=("-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH_BUILD:-$CUDA_ARCHITECTURES}")
     elif [[ $BACKEND == vulkan ]]; then
         cmake_args+=(-DGGML_CUDA=OFF -DGGML_VULKAN=ON)
     else
@@ -484,6 +616,12 @@ build_llama_server() {
     printf '%s\n' "$dependencies"
     [[ $dependencies != *'not found'* ]] || die 'The built llama-server is missing a shared library. Check CUDA or Vulkan userspace paths/ldconfig inside this CT.'
     "$dest" --version
+    if [[ $BACKEND == cuda ]]; then
+        local gpus missing
+        gpus=$(detected_cuda_architectures) || gpus=''
+        missing=$(cuda_build_covers "$dest" "$gpus") ||
+            die "The build has no GPU code this CT's GPU can run (needs $missing). Use CUDA_ARCHITECTURES=auto or include it."
+    fi
 }
 # (Re)create the bridge venv and install bridge.py from $1.
 install_bridge() {
@@ -503,18 +641,25 @@ llama.cpp repository=https://github.com/ggml-org/llama.cpp.git
 requested_ref=$LLAMA_CPP_REF
 resolved_commit=$1
 backend=$BACKEND
+cpu_target=${CPU_TARGET:-auto}
+cpu_build=${CPU_BUILD:-native}
 BUILDINFO
+      if [[ $BACKEND == cuda ]]; then
+          printf 'cuda_target=%s\ncuda_architectures=%s\n' "${CUDA_ARCHITECTURES:-auto}" \
+              "${CUDA_ARCH_BUILD:-$CUDA_ARCHITECTURES}" >> "$TARGET_ROOT/build-info.txt"
+      fi
     )
 }
 # upgrade_unchanged COMMIT SOURCE_DIR: would --upgrade change nothing? The
-# same llama.cpp commit, requested ref and backend, the same bridge,
+# same llama.cpp commit, requested ref, backend and CPU build, the same bridge,
 # requirements and unit files, a venv, and every setting the upgrade adds
 # already present. FORCE_REBUILD=true always counts as a change.
 upgrade_unchanged() {
     local commit=$1 src=$2 unit
     [[ ${FORCE_REBUILD:-false} != true ]] || return 1
     [[ $commit == "$(build_info resolved_commit)" && $LLAMA_CPP_REF == "$(build_info requested_ref)" &&
-       $BACKEND == "$(build_info backend)" ]] || return 1
+       $BACKEND == "$(build_info backend)" && ${CPU_BUILD:-native} == "$(installed_cpu_build)" ]] || return 1
+    [[ $BACKEND != cuda || ${CUDA_ARCH_BUILD:-} == "$(installed_cuda_architectures)" ]] || return 1
     cmp -s "$src/bridge.py" "$TARGET_ROOT/bridge.py" || return 1
     cmp -s "$src/requirements.txt" "$TARGET_ROOT/requirements.txt" || return 1
     [[ -x $TARGET_ROOT/venv/bin/python ]] || return 1
@@ -586,6 +731,7 @@ case "${1:-}" in
     '') ;;
     --help) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; usage; exit 0 ;;
     --upgrade) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; MODE=upgrade ;;
+    --rebuild) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; MODE=rebuild ;;
     *) usage >&2; exit 2 ;;
 esac
 [[ ${EUID} -eq 0 ]] || die 'Run as root inside the dedicated target CT.'
@@ -601,8 +747,9 @@ source "${OS_RELEASE_FILE:-/etc/os-release}"
 [[ $(systemctl show ollama-router.service -p LoadState --value) == not-found ]] || die 'The smart-router service is present. Install this stack in a separate inference-target CT.'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# A rebuild uses only what is installed, so it also runs from a lone copy of this script.
 for file in bridge.py requirements.txt llama-server.service llama-ollama-bridge.service; do
-    [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
+    [[ $MODE == rebuild || -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
 
 if [[ $MODE == upgrade ]]; then
@@ -615,9 +762,14 @@ if [[ $MODE == upgrade ]]; then
     BACKEND=${BACKEND:-$(build_info backend)}
     BACKEND=${BACKEND:-cuda}
     BUILD_JOBS=${BUILD_JOBS:-4}
-    CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-native}
+    CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-$(build_info cuda_target)}
+    CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-auto}
     CUDA_COMPILER=${CUDA_COMPILER:-}
     FORCE_REBUILD=${FORCE_REBUILD:-false}
+    CPU_TARGET=${CPU_TARGET:-$(build_info cpu_target)}
+    CPU_TARGET=${CPU_TARGET:-auto}
+    valid_cpu_target "$CPU_TARGET" || die 'CPU_TARGET must be auto, native or portable.'
+    CPU_BUILD=$(cpu_build "$CPU_TARGET") || die 'Cannot choose the CPU build; see the message above.'
     [[ $BACKEND == cpu || $BACKEND == cuda || $BACKEND == vulkan ]] || die 'BACKEND must be cpu, cuda or vulkan.'
     require_backend_debian "$BACKEND"
     # A backend switch also switches GPU_LAYERS, which the upgrade otherwise
@@ -638,12 +790,14 @@ if [[ $MODE == upgrade ]]; then
     [[ $BUILD_JOBS =~ ^[1-9][0-9]{0,8}$ ]] || die 'BUILD_JOBS must be a positive integer.'
     [[ $LLAMA_CPP_REF =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Use a release tag or full 40-character commit, without a refs/ prefix.'
     [[ $LLAMA_CPP_REF != HEAD && $LLAMA_CPP_REF != master && $LLAMA_CPP_REF != main ]] || die 'Choose a pinned release tag or commit, not a branch.'
-    [[ $CUDA_ARCHITECTURES == native || $CUDA_ARCHITECTURES =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]] || die 'Invalid CUDA_ARCHITECTURES.'
+    valid_cuda_architectures "$CUDA_ARCHITECTURES" || die 'Invalid CUDA_ARCHITECTURES.'
     [[ -z $CUDA_COMPILER || $CUDA_COMPILER =~ ^/[A-Za-z0-9_./-]+$ ]] || die 'CUDA_COMPILER must be an absolute executable path without spaces.'
     export DEBIAN_FRONTEND=noninteractive
     if [[ $BACKEND == cuda ]]; then
         ensure_cuda_compiler
         printf 'Using CUDA compiler: %s\n' "$CUDA_COMPILER"
+        CUDA_ARCH_BUILD=$(resolve_cuda_architectures "$CUDA_ARCHITECTURES") || die 'Cannot choose the CUDA architectures; see the message above.'
+        printf 'CUDA architectures: %s (installed: %s)\n' "$CUDA_ARCH_BUILD" "$(installed_cuda_architectures)"
     elif [[ $BACKEND == vulkan && $previous_backend != vulkan ]]; then
         apt-get -o Acquire::Retries=3 update
         install_vulkan_packages
@@ -652,6 +806,7 @@ if [[ $MODE == upgrade ]]; then
 
     current_commit=$(build_info resolved_commit)
     printf 'Installed llama.cpp: %s (%s)\nRequested ref: %s\n' "${current_commit:-unknown}" "$(build_info requested_ref)" "$LLAMA_CPP_REF"
+    printf 'CPU build: %s (installed: %s)\n' "$CPU_BUILD" "$(installed_cpu_build)"
     new_repo=$TARGET_ROOT/src/llama.cpp.new
     new_commit=$(fetch_llama_source "$new_repo")
     # Nothing to change: leave a healthy (or deliberately stopped) target alone.
@@ -668,7 +823,9 @@ if [[ $MODE == upgrade ]]; then
         printf 'Nothing changed, but the target is not healthy; re-applying.\n'
     fi
     rebuild=false
-    [[ $new_commit != "$current_commit" || $BACKEND != "$(build_info backend)" || $FORCE_REBUILD == true ]] && rebuild=true
+    [[ $new_commit != "$current_commit" || $BACKEND != "$(build_info backend)" ||
+       $CPU_BUILD != "$(installed_cpu_build)" || $FORCE_REBUILD == true ]] && rebuild=true
+    [[ $BACKEND != cuda || $CUDA_ARCH_BUILD == "$(installed_cuda_architectures)" ]] || rebuild=true
 
     was_active=false
     [[ $(systemctl show llama-server.service -p ActiveState --value) != inactive ]] && was_active=true
@@ -747,6 +904,140 @@ if [[ $MODE == upgrade ]]; then
     exit 0
 fi
 
+if [[ $MODE == rebuild ]]; then
+    # Rebuild the installed llama.cpp commit for the CPU and GPU of the host
+    # this CT runs on now (after a move to other hardware). Offline unless the
+    # source tree or the CUDA compiler is missing. The model, settings, bridge
+    # and units stay as they are.
+    [[ -x $TARGET_ROOT/bin/llama-server && -f $TARGET_ETC/llama-server.env ]] ||
+        die "No existing installation under $TARGET_ROOT and $TARGET_ETC; install first."
+    getent passwd llama-target >/dev/null || die 'The llama-target user is missing; this is not an installed target.'
+    BACKEND=$(build_info backend)
+    BACKEND=${BACKEND:-cuda}
+    LLAMA_CPP_REF=$(build_info requested_ref)
+    LLAMA_CPP_REF=${LLAMA_CPP_REF:-$LLAMA_CPP_DEFAULT_REF}
+    installed_commit=$(build_info resolved_commit)
+    BUILD_JOBS=${BUILD_JOBS:-4}
+    FORCE_REBUILD=${FORCE_REBUILD:-false}
+    CPU_TARGET=${CPU_TARGET:-$(build_info cpu_target)}
+    CPU_TARGET=${CPU_TARGET:-auto}
+    CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-$(build_info cuda_target)}
+    CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-auto}
+    CUDA_COMPILER=${CUDA_COMPILER:-}
+    [[ $BACKEND == cpu || $BACKEND == cuda || $BACKEND == vulkan ]] || die "Unknown backend in build-info.txt: $BACKEND"
+    [[ $BUILD_JOBS =~ ^[1-9][0-9]{0,8}$ ]] || die 'BUILD_JOBS must be a positive integer.'
+    valid_cpu_target "$CPU_TARGET" || die 'CPU_TARGET must be auto, native or portable.'
+    valid_cuda_architectures "$CUDA_ARCHITECTURES" || die 'Invalid CUDA_ARCHITECTURES.'
+    [[ -z $CUDA_COMPILER || $CUDA_COMPILER =~ ^/[A-Za-z0-9_./-]+$ ]] || die 'CUDA_COMPILER must be an absolute executable path without spaces.'
+    require_backend_debian "$BACKEND"
+    export DEBIAN_FRONTEND=noninteractive
+
+    # The GPU must work in this CT before anything is built for it.
+    host_driver=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' "${NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}" 2>/dev/null | head -n1) || host_driver=''
+    nvidia_fix="On the Proxmox host, run tools/update-gpu-drivers.sh (it brings every GPU CT to the host driver), or in this CT: DRIVER_VERSION=${host_driver:-<host driver version>} bash install-nvidia-driver.sh lxc"
+    case $BACKEND in
+        cuda)
+            [[ -n $host_driver ]] || die 'This CT sees no NVIDIA driver on its host. Pass the NVIDIA devices into the CT on this host (provision-lxc.sh shows the devN entries), or switch backends with BACKEND=vulkan|cpu bash install-target.sh --upgrade.'
+            command -v nvidia-smi >/dev/null || die "nvidia-smi is missing in this CT. $nvidia_fix"
+            nvidia-smi -L >/dev/null 2>&1 ||
+                die "nvidia-smi cannot use the GPU; the NVIDIA user-space in this CT probably does not match the host driver ${host_driver}. $nvidia_fix"
+            runuser -u llama-target -- nvidia-smi -L >/dev/null 2>&1 ||
+                die 'llama-target cannot open the GPU. On the Proxmox host, pass each /dev/nvidia* node into the CT with gid=993,mode=0660.'
+            ensure_cuda_compiler
+            driver_cuda=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\)\..*/\1/p' | head -n1) || driver_cuda=''
+            toolkit_cuda=$("$CUDA_COMPILER" --version | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | head -n1) || toolkit_cuda=''
+            if [[ -n $driver_cuda && -n $toolkit_cuda ]] && (( toolkit_cuda > driver_cuda )); then
+                die "The CUDA ${toolkit_cuda} toolkit in this CT needs a host driver for CUDA ${toolkit_cuda}; driver ${host_driver} supports CUDA ${driver_cuda}. Update the host driver with tools/update-gpu-drivers.sh."
+            fi
+            CUDA_ARCH_BUILD=$(resolve_cuda_architectures "$CUDA_ARCHITECTURES") || die 'Cannot choose the CUDA architectures; see the message above.'
+            ;;
+        vulkan)
+            vulkan_gpu_check llama-target
+            ;;
+    esac
+    CPU_BUILD=$(cpu_build "$CPU_TARGET") || die 'Cannot choose the CPU build; see the message above.'
+
+    installed_gpu='' needed_gpu=''
+    if [[ $BACKEND == cuda ]]; then
+        installed_gpu=", CUDA $(installed_cuda_architectures)"
+        needed_gpu=", CUDA $CUDA_ARCH_BUILD"
+    fi
+    printf 'Installed build: llama.cpp %s (%s), CPU %s%s\n' "${installed_commit:-unknown}" "$BACKEND" "$(installed_cpu_build)" "$installed_gpu"
+    printf 'This host needs: CPU %s%s\n' "$CPU_BUILD" "$needed_gpu"
+    needed=false
+    [[ $CPU_BUILD == "$(installed_cpu_build)" ]] || needed=true
+    [[ $BACKEND != cuda || $CUDA_ARCH_BUILD == "$(installed_cuda_architectures)" ]] || needed=true
+    [[ $FORCE_REBUILD != true ]] || needed=true
+    state=$(systemctl show llama-server.service -p ActiveState --value)
+    if ! $needed; then
+        if [[ $state == inactive ]]; then
+            printf 'The installed build already suits this host; nothing to do (the services stay stopped).\n'
+            exit 0
+        fi
+        if [[ $state == active ]] && target_healthy 5; then
+            printf 'The installed build already suits this host and the target is healthy; nothing to do.\n'
+            exit 0
+        fi
+        printf 'The installed build already suits this host; restarting the services.\n'
+        systemctl reset-failed llama-server.service llama-ollama-bridge.service 2>/dev/null || true
+        systemctl restart llama-server.service llama-ollama-bridge.service
+        target_healthy "${UPGRADE_HEALTH_TIMEOUT:-300}" ||
+            die 'The target is still not healthy, and the build is not the cause; see journalctl -u llama-server. FORCE_REBUILD=true rebuilds anyway.'
+        printf 'Target is healthy.\n'
+        exit 0
+    fi
+
+    repo=$TARGET_ROOT/src/llama.cpp
+    if [[ ! -f $repo/CMakeLists.txt ]]; then
+        [[ $installed_commit =~ ^[0-9a-f]{40}$ ]] || die 'The llama.cpp source is missing and build-info.txt names no commit; use --upgrade.'
+        printf 'The llama.cpp source is missing; fetching %s (needs network).\n' "$installed_commit"
+        LLAMA_CPP_REF=$installed_commit fetch_llama_source "$repo" >/dev/null
+    fi
+    was_active=false
+    [[ $state != inactive ]] && was_active=true
+    aside=()
+    stash() { set_aside "$1"; aside+=("$1"); }
+    # A failed build changed nothing; after the swap, put the previous
+    # llama-server and build-info.txt back and start them as they were.
+    rollback() {
+        local path
+        rm -f -- "$TARGET_ROOT/bin/llama-server.new"
+        if (( ${#aside[@]} == 0 )); then
+            printf 'Rebuild failed; the installed llama-server was not changed.\n' >&2
+            return
+        fi
+        printf 'Rebuild failed; restoring the previous llama-server...\n' >&2
+        systemctl stop llama-ollama-bridge.service llama-server.service 2>/dev/null || true
+        for path in "${aside[@]}"; do restore_aside "$path"; done
+        if $was_active; then
+            systemctl start llama-server.service llama-ollama-bridge.service 2>/dev/null || true
+            printf 'The previous llama-server is back and started; it was not built for this host, so it may fail again.\n' >&2
+        else
+            printf 'The previous llama-server is back; the services stay stopped.\n' >&2
+        fi
+    }
+    trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
+    printf 'Rebuilding llama.cpp %s for this host; this can take a long time.\n' "${installed_commit:-$LLAMA_CPP_REF}"
+    build_llama_server "$repo" "$TARGET_ROOT/bin/llama-server.new"
+    if $was_active; then systemctl stop llama-ollama-bridge.service llama-server.service; fi
+    stash "$TARGET_ROOT/bin/llama-server"
+    mv -- "$TARGET_ROOT/bin/llama-server.new" "$TARGET_ROOT/bin/llama-server"
+    stash "$TARGET_ROOT/build-info.txt"
+    write_build_info "$installed_commit"
+    if $was_active; then
+        systemctl reset-failed llama-server.service llama-ollama-bridge.service 2>/dev/null || true
+        systemctl start llama-server.service llama-ollama-bridge.service
+        printf 'Waiting for the target to report ready...\n'
+        target_healthy "${UPGRADE_HEALTH_TIMEOUT:-300}" || false
+        printf 'Target is healthy on the rebuilt llama-server.\n'
+    else
+        printf 'Services were stopped before the rebuild and are left stopped.\n'
+    fi
+    trap - ERR
+    printf 'Rebuild complete for this host. The previous llama-server is kept as llama-server.prev.\n'
+    exit 0
+fi
+
 configure_model
 BACKEND=${BACKEND:-cuda}
 BUILD_JOBS=${BUILD_JOBS:-4}
@@ -758,9 +1049,10 @@ MODEL_PARAMETER_SIZE=${MODEL_PARAMETER_SIZE:-unknown}
 MODEL_FAMILY=${MODEL_FAMILY:-unknown}
 MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-unknown}
 MODEL_CAPABILITIES=${MODEL_CAPABILITIES:-completion}
-CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-native}
+CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-auto}
 CUDA_COMPILER=${CUDA_COMPILER:-}
 LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
+CPU_TARGET=${CPU_TARGET:-auto}
 
 positive_int() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
 for name in BUILD_JOBS CONTEXT_SIZE PARALLEL_SLOTS THREADS; do positive_int "$name" "${!name}"; done
@@ -774,9 +1066,11 @@ for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION; do
     [[ ${!name} =~ ^[A-Za-z0-9._-]+$ ]] || die "$name contains unsupported characters."
 done
 [[ $MODEL_CAPABILITIES =~ ^(completion|tools|vision|embedding)(,(completion|tools|vision|embedding))*$ ]] || die 'MODEL_CAPABILITIES may contain completion,tools,vision,embedding.'
-[[ $CUDA_ARCHITECTURES == native || $CUDA_ARCHITECTURES =~ ^[0-9]+(-real|-virtual)?(\;[0-9]+(-real|-virtual)?)*$ ]] || die 'CUDA_ARCHITECTURES must be native or a semicolon-separated CMake architecture list, e.g. 89 or 86;89;120.'
+valid_cuda_architectures "$CUDA_ARCHITECTURES" || die 'CUDA_ARCHITECTURES must be auto, native or a semicolon-separated CMake architecture list, e.g. 89 or 86;89;120.'
 [[ -z $CUDA_COMPILER || $CUDA_COMPILER =~ ^/[A-Za-z0-9_./-]+$ ]] || die 'CUDA_COMPILER must be an absolute executable path without spaces.'
 valid_extra_args "$LLAMA_EXTRA_ARGS" || die 'LLAMA_EXTRA_ARGS may contain only letters, digits, spaces and . _ , : = / + -'
+valid_cpu_target "$CPU_TARGET" || die 'CPU_TARGET must be auto, native or portable.'
+CPU_BUILD=$(cpu_build "$CPU_TARGET") || die 'Cannot choose the CPU build; see the message above.'
 
 for path in /opt/llama-target /etc/llama-target /etc/systemd/system/llama-server.service /etc/systemd/system/llama-ollama-bridge.service; do
     [[ ! -e $path && ! -L $path ]] || die "Refusing to overwrite $path. Inspect the existing installation before a manual update."
@@ -796,6 +1090,8 @@ if [[ $BACKEND == cuda ]]; then
     ensure_cuda_compiler
     printf 'Using CUDA compiler: %s\n' "$CUDA_COMPILER"
     "$CUDA_COMPILER" --version || die "CUDA compiler could not run: $CUDA_COMPILER"
+    CUDA_ARCH_BUILD=$(resolve_cuda_architectures "$CUDA_ARCHITECTURES") || die 'Cannot choose the CUDA architectures; see the message above.'
+    printf 'CUDA architectures: %s\n' "$CUDA_ARCH_BUILD"
 fi
 
 apt-get -o Acquire::Retries=3 update
@@ -824,7 +1120,7 @@ if [[ -f $MODEL_PATH ]]; then
 fi
 download_requested_gguf
 
-printf 'Building llama.cpp from pinned ref: %s\n' "$LLAMA_CPP_REF"
+printf 'Building llama.cpp from pinned ref: %s (CPU build: %s)\n' "$LLAMA_CPP_REF" "$CPU_BUILD"
 resolved_commit=$(fetch_llama_source "$TARGET_ROOT/src/llama.cpp")
 build_llama_server "$TARGET_ROOT/src/llama.cpp" "$TARGET_ROOT/bin/llama-server"
 install_bridge "$source_dir"

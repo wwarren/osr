@@ -64,8 +64,13 @@ because the build targets the card's own architecture); toolkit 13.0 on Debian
 | RTX 2000 Ada | `89` |
 | RTX PRO 2000 / 4000 Blackwell | `120` |
 
-`native` builds for visible GPUs. An explicit architecture makes the intended
-hardware clear; a portable fleet build may use `86;89;120` (longer build).
+The default, `auto`, builds for the compute capability of each GPU that
+`nvidia-smi` sees in the CT (8.9 becomes `89`) and records it in
+`build-info.txt`. `native` leaves detection to CMake; on an RTX 2000 Ada that
+produced a build with no code for the card ("no kernel image is available for
+execution on the device"). A fleet build may list several, e.g. `86;89;120`
+(longer build). Every CUDA build is checked with `cuobjdump` for code the CT's
+GPU can run, and the install or upgrade fails if there is none.
 These are CUDA compute capabilities, not VRAM sizes. Size the GGUF, KV cache,
 context, and parallel slots against the actual card's available VRAM.
 [NVIDIA compute capabilities](https://developer.nvidia.com/cuda/gpus),
@@ -334,7 +339,7 @@ export MODEL_FAMILY=llama
 export MODEL_QUANTIZATION=Q4_K_M
 export BACKEND=cuda
 unset CUDA_COMPILER  # Let the installer discover the installed nvcc.
-export CUDA_ARCHITECTURES=89  # use the table above for this target
+export CUDA_ARCHITECTURES=auto  # or a value from the table above
 export CONTEXT_SIZE=8192 PARALLEL_SLOTS=1 THREADS=8 BUILD_JOBS=4
 export GPU_LAYERS=auto  # preserve llama.cpp VRAM auto-fitting
 bash install-target.sh
@@ -492,12 +497,12 @@ LLAMA_CPP_REF=<new-release-tag-or-commit> bash install-target.sh --upgrade
 account. It only adds settings that are new (for example `LLAMA_EXTRA_ARGS=`)
 and never rewrites existing ones. When nothing would change (the same commit,
 requested ref and backend, the same `bridge.py`, requirements and unit files,
-and no new settings) and the target is healthy, or its services are stopped,
+and no new settings, and the same CPU build) and the target is healthy, or its services are stopped,
 it prints "nothing to do" and leaves everything as it is, including the kept
 `*.prev`. Otherwise it does the following:
 
-1. Rebuilds llama.cpp when the resolved commit or backend differs from
-   `build-info.txt` (`FORCE_REBUILD=true` also forces a rebuild). The
+1. Rebuilds llama.cpp when the resolved commit, the backend, the CPU build or
+   the CUDA architectures differ from `build-info.txt` (`FORCE_REBUILD=true` also forces a rebuild). The
    backend comes from `build-info.txt` unless `BACKEND` is set. A backend
    change also sets `GPU_LAYERS` for the new backend (`auto` for cuda or
    vulkan, `0` for cpu), unless `GPU_LAYERS` is given on the command line; a
@@ -517,6 +522,67 @@ it prints "nothing to do" and leaves everything as it is, including the kept
 
 Snapshot the CT first if you want a fallback that covers the GGUF too. The
 fresh-install path still refuses to overwrite an existing install.
+
+## CPU build (`CPU_TARGET`)
+
+llama.cpp's default build tunes llama-server for the CPU it is built on. On an
+AVX-only CPU, such as the Xeon E3 v2 (Ivy Bridge, no AVX2, FMA or BMI2), that
+build compiled and answered `--version` but died with `SIGILL` ("invalid
+opcode" in the host's `dmesg`) as soon as the service started. `CPU_TARGET`
+chooses the build:
+
+| `CPU_TARGET` | Build |
+|---|---|
+| `auto` (default) | `native` when the CPU reports AVX, F16C, FMA, AVX2 and BMI2; `portable` otherwise |
+| `native` | llama.cpp's default (`GGML_NATIVE`), tuned for this CPU |
+| `portable` | `GGML_NATIVE=OFF`, with only those five instruction sets that this CPU reports; no AVX-VNNI or AVX-512 |
+
+Pass it to `install-target.sh`, `install-target.sh --upgrade` or
+`provision-lxc.sh`. The choice and its result (for example
+`cpu_build=portable:avx,f16c`) are recorded in `build-info.txt`, and
+`--upgrade` keeps the recorded `CPU_TARGET` unless you give another. An
+install from before this setting counts as `native`, so on an AVX-only CPU the
+next `--upgrade` rebuilds it portable once. With the model fully on the GPU,
+the portable build costs no noticeable speed.
+
+## Moving the CT to other hardware
+
+llama-server is compiled for the host's CPU and GPU, so after moving the CT to
+a host with a different CPU or GPU, rebuild it there:
+
+```bash
+# inside the target CT on its new host
+bash /root/llama-target-deploy/install-target.sh --rebuild
+```
+
+`--rebuild` keeps the installed llama.cpp commit, the model, both settings
+files, the bridge and the units. It:
+
+1. Checks the GPU first, and stops with what to fix on the host when the CT
+   cannot use it: no NVIDIA driver on the host (pass the devices in, or switch
+   backends with `BACKEND=vulkan|cpu bash install-target.sh --upgrade`), the
+   CT's NVIDIA user-space not matching the host driver (run
+   `tools/update-gpu-drivers.sh` on the host, or
+   `DRIVER_VERSION=<host version> bash install-nvidia-driver.sh lxc` in the
+   CT), `llama-target` unable to open the device nodes (`gid=993,mode=0660`),
+   or a host driver too old for the CT's CUDA toolkit.
+2. Works out the CPU build (`CPU_TARGET`) and CUDA architectures
+   (`CUDA_ARCHITECTURES`) this host needs, keeping the recorded settings unless
+   you give others, and compares them with `build-info.txt`.
+3. If they match, does nothing (restarting a failed service). Otherwise it
+   rebuilds from the source in `/opt/llama-target/src/llama.cpp` without
+   network, reusing its build tree, so only what changed recompiles. A GPU
+   change recompiles every CUDA kernel, which takes a long time on a small
+   CPU. The source is fetched again only if it is missing.
+4. Replaces llama-server (the old one is kept as `llama-server.prev`),
+   restarts services that were not deliberately stopped, and waits up to
+   `UPGRADE_HEALTH_TIMEOUT` seconds for `/healthz`. A failed build changes
+   nothing; a build that does not become healthy is replaced by the previous
+   one again.
+
+`FORCE_REBUILD=true` rebuilds even when the build already suits the host. The
+script needs only itself for `--rebuild`, so a lone copy of
+`install-target.sh` in the CT is enough.
 
 ## Extra llama-server flags
 
