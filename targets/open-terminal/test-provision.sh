@@ -146,6 +146,7 @@ reject() {
 plan
 has '+ pct create 281 local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst'
 has '--unprivileged 1'
+has '--features nesting=1'
 has 'ip=192.0.2.81/24\,gw=192.0.2.1\,firewall=1'
 has 'policy_in: DROP'
 has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8000'
