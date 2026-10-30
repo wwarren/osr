@@ -65,6 +65,14 @@ matching the loaded Proxmox host driver before the installer, and streams the
 model through `cuda:0`. torch comes from PyPI as its CUDA 13 build, which needs the
 580-series driver on the host and also runs on CPU-only targets.
 
+The devices are mapped as `gid=993,mode=0660`. The installer adds
+`airllm-target` to the group that owns each GPU node (gid 993 has no name in
+a fresh CT, so it is created as `airllm-gpu`), and checks the GPU as
+`airllm-target`, not as root. Nodes in group root that the account can already
+use (mode 0666) are accepted with a warning, and the account joins gid 993
+anyway, so the service keeps its GPU if the mapping is later tightened.
+`--upgrade` repairs the membership on a CUDA install made before this check.
+
 Inside an existing CT or VM, run the installer directly as root:
 
 ```bash

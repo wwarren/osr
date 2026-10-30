@@ -167,14 +167,15 @@ gpu_access_case() (
     ensure_service_user
 )
 out=$(gpu_access_case 0 yes yes) || fail 'accessible root-group GPU node was rejected'
-[[ $out == *'group root'* && $out != *'joined'* ]] || fail "root-group access decision: $out"
+[[ $out == *'group root'* && $out == *'joined video'* && $out != *'joined root'* ]] ||
+    fail "root-group access decision: $out"
 out=$(gpu_access_case 0 no yes 2>&1) && fail 'inaccessible root-group GPU node was accepted'
 [[ $out == *'gid=44,mode=0660'* ]] || fail "root-group repair message: $out"
 out=$(gpu_access_case 44 yes yes) || fail 'video-group GPU node was rejected'
 [[ $out == *'joined video'* ]] || fail "video-group membership: $out"
 out=$(gpu_access_case 44 yes no 2>&1) && fail 'service-user nvidia-smi failure was ignored'
 [[ $out == *'cannot use the NVIDIA GPU'* ]] || fail "GPU probe message: $out"
-pass 'GPU access is checked as the service user without joining group root'
+pass 'GPU access is checked as the service user; world-writable root-group nodes still join video, never root'
 
 # A checkout can need a locally compiled engine. Upstream setup runs as an
 # unprivileged user, so the target installs only NVIDIA's versioned toolkit

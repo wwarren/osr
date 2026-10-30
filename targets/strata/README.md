@@ -49,6 +49,11 @@ commit with `test-pinned-run-script.py` (see [Check without Proxmox](#check-with
   `GPU_DEVICES` to select another GPU or to list the nodes explicitly.
 - The nodes are given group `GPU_GID` (default 44, `video`) inside the CT, and
   the `strata` account joins that group. It is never added to group root.
+  When the nodes are in group root but usable by `strata` (mode 0666, from an
+  older mapping), the installer warns and still adds `strata` to `video`, so
+  the service keeps its GPU after the mapping is changed to
+  `gid=44,mode=0660` and the CT restarts. An install from before this check
+  needs `usermod -aG video strata` in the CT, or a rerun of the installer.
 - The provisioner sets the new CT's `lxc.prlimit.memlock` to `unlimited` and
   the service's `LimitMEMLOCK` to infinity so Strata can pin model memory. This
   matches a [reported Proxmox LXC Strata configuration](https://github.com/Niko1221/Strata/issues/1217).

@@ -76,7 +76,11 @@ bin=$tmp_root/bin; mkdir -p "$bin"
 log=$tmp_root/calls.log
 stub() { printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n%s\n' "$1" "$log" "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
 stub apt-get 'exit 0'
-stub getent 'exit 0'
+# Numeric gids and airllm-gpu have no group, so the GPU group is created.
+stub getent 'case $2 in [0-9]*|airllm-gpu) exit 2;; esac; exit 0'
+stub usermod 'exit 0'
+# Fake GPU nodes live under $tmp_root/dev; FAKE_GPU_GID is their group.
+stub stat 'if [[ $1 == -c && $2 == %g && $3 == */dev/nvidia* ]]; then echo "${FAKE_GPU_GID:-993}"; else exec /usr/bin/stat "$@"; fi'
 stub groupadd 'exit 0'
 stub useradd 'exit 0'
 stub sleep 'exit 0'
@@ -106,7 +110,7 @@ target() {
         TARGET_STATE="$tmp_root/state" TARGET_UNITS="$tmp_root/units" TARGET_USER=root \
         LEGACY_ROOT="$tmp_root/legacy" SYSTEMD_RUN_DIR="$tmp_root/run" OS_RELEASE_FILE="$tmp_root/os-release" \
         FAKE_HEALTH="${FAKE_HEALTH:-ok}" FAKE_PIP="${FAKE_PIP:-ok}" FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" \
-        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
+        FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" GPU_NODES="$tmp_root/dev/nvidia0 $tmp_root/dev/nvidiactl" FAKE_GPU_GID="${FAKE_GPU_GID:-993}" \
         UPGRADE_HEALTH_TIMEOUT=10 "$@" bash "$script_dir/install-target.sh" ${ARGS:-}
 }
 
@@ -142,6 +146,42 @@ out=$(target AIRLLM_MODEL_ID=org/Tiny START_SERVICE=false 2>&1) || die "GPU inst
 ! grep -q 'systemctl restart' "$log" || die 'START_SERVICE=false started the service'
 stub nvidia-smi 'exit 1'
 pass 'GPU hosts default to cuda:0; START_SERVICE=false leaves it stopped'
+
+# GPU nodes as provision-lxc.sh maps them (gid 993, which has no name in the CT).
+mkdir -p "$tmp_root/dev"; touch "$tmp_root/dev/nvidia0" "$tmp_root/dev/nvidiactl"
+reset_tree
+stub nvidia-smi 'exit 0'
+out=$(target AIRLLM_MODEL_ID=org/Tiny START_SERVICE=false 2>&1) || die "GPU group install failed: $out"
+grep -q 'groupadd --system --gid 993 airllm-gpu' "$log" || die 'gid 993 did not get the airllm-gpu group'
+grep -q 'usermod -aG airllm-gpu root' "$log" || die 'service account did not join the GPU group'
+! grep -q 'usermod -aG root' "$log" || die 'service account joined group root'
+pass 'the service account joins the GPU nodes group (gid 993 named airllm-gpu)'
+
+# World-writable root-group nodes: usable now, and gid 993 is joined anyway.
+reset_tree
+out=$(FAKE_GPU_GID=0 target AIRLLM_MODEL_ID=org/Tiny START_SERVICE=false 2>&1) || die "0666 GPU install failed: $out"
+[[ $out == *'group root and world-writable'* ]] || die "no 0666 warning: $out"
+grep -q 'usermod -aG airllm-gpu root' "$log" || die '0666 nodes did not also join gid 993'
+pass 'world-writable root-group GPU nodes warn and still join gid 993'
+
+# The GPU check runs as the service account, so a missing group cannot pass.
+reset_tree
+stub nvidia-smi 'exit 1'
+out=$(target AIRLLM_MODEL_ID=org/Tiny AIRLLM_DEVICE=cuda:0 START_SERVICE=false 2>&1) && die 'an unusable GPU was accepted'
+[[ $out == *'cannot use the NVIDIA GPU'* ]] || die "GPU access message: $out"
+[[ ! -e $tmp_root/opt/venv ]] || die 'GPU access was checked after installing the venv'
+pass 'CUDA installs stop early when the service account cannot use the GPU'
+
+# --upgrade repairs an install from before the GPU group was joined.
+reset_tree
+stub nvidia-smi 'exit 0'
+target AIRLLM_MODEL_ID=org/Tiny START_SERVICE=false >/dev/null 2>&1 || die 'GPU install for the upgrade case failed'
+: > "$log"
+ARGS=--upgrade target >/dev/null 2>&1 || die 'GPU upgrade failed'
+grep -q 'usermod -aG airllm-gpu root' "$log" || die '--upgrade did not repair GPU group membership'
+stub nvidia-smi 'exit 1'
+rm -rf "${tmp_root:?}/dev"
+pass '--upgrade joins the GPU group on an existing CUDA install'
 
 reset_tree
 mkdir -p "$tmp_root/legacy/hf-cache/hub" "$tmp_root/legacy/shards/layer0"

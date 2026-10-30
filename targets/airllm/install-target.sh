@@ -71,6 +71,54 @@ ensure_env_key() {
     grep -Eq "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null || printf '%s=%s\n' "$2" "$3" >> "$1"
 }
 gpu_present() { command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; }
+# GPU nodes provision-lxc.sh passes through, as gid 993 mode 0660.
+GPU_NODES=${GPU_NODES:-'/dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools'}
+GPU_GID=${GPU_GID:-993}
+GPU_GROUP=${GPU_GROUP:-airllm-gpu}
+as_target() {
+    if [[ $(id -un) == "$TARGET_USER" ]]; then "$@"; else runuser -u "$TARGET_USER" -- "$@"; fi
+}
+# Add TARGET_USER to the group with this gid, naming it GPU_GROUP when the CT
+# has no group for it (993 usually has none). Never group root.
+join_gpu_gid() {
+    local gid=$1 group
+    [[ $gid != 0 ]] || die 'refusing to add the service account to group root'
+    # getent exits 2 for a gid with no group; that is the case handled below.
+    group=$(getent group "$gid" | cut -d: -f1) || group=''
+    if [[ -z $group ]]; then
+        if getent group "$GPU_GROUP" >/dev/null; then
+            die "Group $GPU_GROUP exists with a gid other than $gid; remove it or set GPU_GROUP to another name."
+        fi
+        groupadd --system --gid "$gid" "$GPU_GROUP"
+        group=$GPU_GROUP
+    fi
+    usermod -aG "$group" "$TARGET_USER"
+}
+# The service account joins the group of each passed-through GPU node, then
+# must be able to use the GPU itself (a root check would not show a missing
+# group). World-writable root-group nodes (mode 0666) work without a group;
+# the account still joins GPU_GID so a later gid=993,mode=0660 mapping keeps
+# working after the CT restarts.
+ensure_gpu_access() {
+    local node gid
+    # shellcheck disable=SC2086  # GPU_NODES is a glob list by design
+    for node in $GPU_NODES; do
+        [[ -e $node ]] || continue
+        gid=$(stat -c %g "$node")
+        if [[ $gid == 0 ]]; then
+            as_target test -r "$node" && as_target test -w "$node" ||
+                die "$node is group root and $TARGET_USER cannot read and write it. On the PVE host run pct set <CT_ID> --devN path=$node,gid=$GPU_GID,mode=0660, restart the CT and rerun."
+            printf 'Warning: %s is group root and world-writable (mode 0666 exposes the GPU to every CT user); joining gid %s anyway.\n' "$node" "$GPU_GID" >&2
+            join_gpu_gid "$GPU_GID"
+            continue
+        fi
+        join_gpu_gid "$gid"
+        as_target test -r "$node" && as_target test -w "$node" ||
+            die "$TARGET_USER cannot read and write $node after joining gid $gid; check its CT mode and the Proxmox --devN mapping."
+    done
+    as_target nvidia-smi -L >/dev/null 2>&1 ||
+        die "$TARGET_USER cannot use the NVIDIA GPU; check the CT's --devN mappings (gid=$GPU_GID,mode=0660) and its NVIDIA user-space libraries."
+}
 # Parameter count in billions parsed from a repo id ("Qwen2.5-72B" -> 72); empty when unknown.
 model_billions() {
     local name=${1//[-_]/ }
@@ -196,6 +244,8 @@ if [[ $MODE == upgrade ]]; then
     [[ -x $TARGET_ROOT/venv/bin/python && -f $TARGET_ENV && -f $TARGET_UNITS/$SERVICE ]] || \
         die "No installation under $TARGET_ROOT and $TARGET_ETC; run without --upgrade to install."
     getent passwd "$TARGET_USER" >/dev/null || die "The $TARGET_USER user is missing; this is not an installed target."
+    # Installs from before ensure_gpu_access never joined the GPU nodes' group.
+    [[ $(env_value "$TARGET_ENV" AIRLLM_DEVICE) != cuda* ]] || ensure_gpu_access
     was_active=false
     [[ $(systemctl show "$SERVICE" -p ActiveState --value) != inactive ]] && was_active=true
     # Nothing to change: leave a healthy (or deliberately stopped) target alone.
@@ -300,6 +350,7 @@ python_ok "${PYTHON:-python3}" || die 'Python 3.11 or newer is required (Debian 
 getent group "$TARGET_USER" >/dev/null || groupadd --system "$TARGET_USER"
 getent passwd "$TARGET_USER" >/dev/null || \
     useradd --system --gid "$TARGET_USER" --home-dir "$TARGET_STATE" --no-create-home --shell /usr/sbin/nologin "$TARGET_USER"
+[[ $AIRLLM_DEVICE != cuda* ]] || ensure_gpu_access
 install -d -o root -g root -m 0755 "$TARGET_ROOT"
 install -d -o root -g "$TARGET_USER" -m 0750 "$TARGET_ETC"
 install -d -o "$TARGET_USER" -g "$TARGET_USER" -m 0750 "$TARGET_STATE" "$TARGET_STATE/hf-cache" "$TARGET_STATE/shards"
@@ -307,7 +358,7 @@ install -d -o "$TARGET_USER" -g "$TARGET_USER" -m 0750 "$TARGET_STATE" "$TARGET_
 printf 'Installing the Python environment (torch is large; this takes a while)...\n'
 install_server "$source_dir"
 if [[ $AIRLLM_DEVICE == cuda* ]]; then
-    "$TARGET_ROOT/venv/bin/python" -c 'import torch; raise SystemExit(not torch.cuda.is_available())' || \
+    as_target "$TARGET_ROOT/venv/bin/python" -c 'import torch; raise SystemExit(not torch.cuda.is_available())' || \
         die 'AIRLLM_DEVICE is CUDA but torch cannot see a GPU. Install the host-matched NVIDIA user-space libraries in this CT (install-nvidia-driver.sh lxc), or use AIRLLM_DEVICE=cpu.'
 fi
 

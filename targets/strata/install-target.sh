@@ -576,6 +576,9 @@ ensure_service_user() {
     # GPU access: join each passed-through node's non-root group. A root-group
     # node may still be usable when the service account itself has read/write
     # access (for example mode 0666); never add the account to group root.
+    # The account joins video (gid 44, provision-lxc.sh's GPU_GID default)
+    # anyway, so the service keeps its GPU when the mapping is later tightened
+    # to gid=44,mode=0660 and the CT restarts.
     # shellcheck disable=SC2086  # GPU_NODES is a glob list by design
     for node in $GPU_NODES; do
         [[ -e $node ]] || continue
@@ -583,6 +586,9 @@ ensure_service_user() {
         if [[ $gid == 0 ]]; then
             if as_service test -r "$node" && as_service test -w "$node"; then
                 note "WARNING: $node is group root, but $SERVICE_USER can read and write it. Check its actual permissions against the PVE --devN setting; mode 0666 exposes the GPU to all CT users."
+                if getent group video >/dev/null; then
+                    usermod -aG video "$SERVICE_USER"
+                fi
                 continue
             fi
             die "$node is group root and $SERVICE_USER cannot read and write it. On the PVE host compare 'pct config <CT_ID>' with the node's actual CT permissions. If its --devN mapping is missing or wrong, set path=$node,gid=44,mode=0660 (44 is video), reboot the CT, and retry; otherwise investigate the device mount and NVIDIA setup."
