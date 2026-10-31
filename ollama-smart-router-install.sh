@@ -3139,6 +3139,11 @@ _DEFAULTS = {
     "model_sizes": {
         "strata": "125B",               # Strata's default id: Qwen3.8-Flash-Next
         "qwen3.8-flash-next": "125B",   # Basalt's default alias
+        # Strata's qwen family ids, qwen3.8-flash-next-<quant>: one 125B model.
+        "qwen3.8-flash-next-q2_0": "125B",
+        "qwen3.8-flash-next-iq2_xs": "125B",
+        "qwen3.8-flash-next-iq3_xxs": "125B",
+        "qwen3.8-flash-next-iq3_s": "125B",
         "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
         "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
     },
@@ -5277,6 +5282,12 @@ tool_match = 0.3
 # a blank value removes one of these built-in entries.
 strata = 125B
 qwen3.8-flash-next = 125B
+# Strata serves the qwen family as qwen3.8-flash-next-<quant>; every quant is
+# the same 125B model (Coder is a different, smaller model and stays unlisted).
+qwen3.8-flash-next-q2_0 = 125B
+qwen3.8-flash-next-iq2_xs = 125B
+qwen3.8-flash-next-iq3_xxs = 125B
+qwen3.8-flash-next-iq3_s = 125B
 glm-5.3-flash = 321B
 deepseek-v4.1-flash = 552B
 INIEOF

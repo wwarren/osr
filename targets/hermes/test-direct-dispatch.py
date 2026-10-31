@@ -1,12 +1,16 @@
 """Integration checks for Hermes's loopback dispatcher; no real router/GPU."""
 
+import contextlib
 import http.client
 import importlib.util
+import io
 import json
 import pathlib
 import socket
+import struct
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -590,13 +594,13 @@ class TestDirect(unittest.TestCase):
             (home / ".env").write_text("ROUTER_API_KEY=k\n")
             env = {"HERMES_ETC": str(etc), "HERMES_HOME": str(home)}
             with mock.patch.dict("os.environ", env), \
-                    mock.patch.object(direct, "ThreadingHTTPServer"), \
+                    mock.patch.object(direct, "DispatchServer"), \
                     mock.patch.object(direct.logging, "basicConfig"):
                 direct.main()
             self.assertEqual(direct.Handler.dispatcher.min_context, 65536)
             (etc / "settings").write_text("ROUTER_URL=http://r:8000\nHERMES_CONTEXT_LENGTH=lots\n")
             with mock.patch.dict("os.environ", env), \
-                    mock.patch.object(direct, "ThreadingHTTPServer"), \
+                    mock.patch.object(direct, "DispatchServer"), \
                     mock.patch.object(direct.logging, "basicConfig"), \
                     self.assertRaises(SystemExit):
                 direct.main()
@@ -627,6 +631,48 @@ class TestDirect(unittest.TestCase):
             self.assertEqual(response.readline(), b'data: {"chunk":1}\n')
             Backend.stream_gate.set()
             self.assertIn(b"[DONE]", response.read())
+
+
+class TestServerErrors(unittest.TestCase):
+    def setUp(self):
+        self.server = direct.DispatchServer(("127.0.0.1", 0), Quiet)
+        self.addCleanup(self.server.server_close)
+
+    def report(self, exc):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertLogs(direct.LOG, "DEBUG") as logs:
+            direct.LOG.debug("start")
+            try:
+                raise exc
+            except Exception:
+                self.server.handle_error(None, ("127.0.0.1", 1))
+        return stderr.getvalue(), logs.output
+
+    def test_a_dropped_client_connection_is_one_debug_line(self):
+        for exc in (ConnectionResetError(104, "Connection reset by peer"), BrokenPipeError()):
+            stderr, logs = self.report(exc)
+            self.assertEqual(stderr, "")
+            self.assertIn("closed the connection", logs[-1])
+
+    def test_other_errors_keep_the_traceback(self):
+        stderr, _ = self.report(ValueError("boom"))
+        self.assertIn("Traceback", stderr)
+        self.assertIn("ValueError: boom", stderr)
+
+    def test_a_real_reset_between_requests_prints_no_traceback(self):
+        server = direct.DispatchServer(("127.0.0.1", 0), Quiet)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            client = socket.create_connection(("127.0.0.1", server.server_port))
+            # SO_LINGER 0: close() sends a reset, as Hermes's pool does.
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            time.sleep(0.2)
+            client.close()
+            time.sleep(0.3)
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

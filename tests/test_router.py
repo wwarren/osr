@@ -779,9 +779,30 @@ def test_model_sizes_are_configurable(monkeypatch, tmp_path):
     assert sizes == {"my-basalt": 125, "qwen3.8-flash-next": 125}
 
 
+
+def test_strata_quant_ids_are_sized_but_coder_is_not(monkeypatch, tmp_path):
+    """Strata names its qwen models qwen3.8-flash-next-<quant>; every quant is
+    the 125B model, so each is size-banded. The Coder is smaller and unlisted."""
+    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    ids = ["qwen3.8-flash-next-q2_0", "qwen3.8-flash-next-iq2_xs",
+           "qwen3.8-flash-next-iq3_xxs", "qwen3.8-flash-next-iq3_s",
+           "qwen3.8-flash-next-coder-iq1_m"]
+    sizes = _sizes_router(monkeypatch, tmp_path, ini, STRATA, ids)
+    assert sizes == {**dict.fromkeys(ids[:4], 125), ids[4]: 0}
+    # router.ini lists them too, so an operator sees (and can blank) each one.
+    assert all(f"\n{i} = 125B\n" in ini for i in ids[:4])
+    # The built-in defaults agree, for a router.ini without these lines.
+    defaults = load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini")).MODEL_SIZES
+    assert all(defaults[i] == "125B" for i in ids[:4]) and ids[4] not in defaults
+
+
 def test_model_sizes_default_without_a_router_ini(monkeypatch, tmp_path):
     router = load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini"))
     assert router.MODEL_SIZES == {"strata": "125B", "qwen3.8-flash-next": "125B",
+                                  "qwen3.8-flash-next-q2_0": "125B",
+                                  "qwen3.8-flash-next-iq2_xs": "125B",
+                                  "qwen3.8-flash-next-iq3_xxs": "125B",
+                                  "qwen3.8-flash-next-iq3_s": "125B",
                                   "glm-5.3-flash": "321B", "deepseek-v4.1-flash": "552B"}
 
 
@@ -793,7 +814,8 @@ def test_legacy_per_kind_size_keys_still_apply(monkeypatch, tmp_path):
     custom = tmp_path / "router.ini"
     custom.write_text(legacy)
     router = load_router(monkeypatch, ROUTER_INI=str(custom))
-    assert router.MODEL_SIZES == {"qwen3.8-flash-next": "125B", "my-basalt": "100B",
+    quants = {f"qwen3.8-flash-next-{q}": "125B" for q in ("q2_0", "iq2_xs", "iq3_xxs", "iq3_s")}
+    assert router.MODEL_SIZES == {"qwen3.8-flash-next": "125B", "my-basalt": "100B", **quants,
                                   "glm-5.3-flash": "300B", "deepseek-v4.1-flash": "552B"}
 
 

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -515,6 +516,22 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
 
+# A client closing an idle keep-alive connection is routine: Hermes's HTTP
+# pool does it with a reset while the server waits for the next request line.
+CLIENT_GONE = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+
+
+class DispatchServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        """Log a dropped client connection in one line; other errors keep the
+        standard traceback."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE):
+            LOG.debug("client %s closed the connection (%s)", client_address[0], type(exc).__name__)
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     home = os.environ.get("HERMES_HOME", "/home/hermes/.hermes")
     etc = os.environ.get("HERMES_ETC", "/etc/hermes-target")
@@ -531,7 +548,7 @@ def main():
     Handler.dispatcher = Dispatcher(router_url, secrets.get("ROUTER_API_KEY", ""), keys, min_context)
     port = int(os.environ.get("HERMES_DIRECT_PORT", "8765"))
     logging.basicConfig(level=logging.INFO)
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    DispatchServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
