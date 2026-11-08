@@ -668,6 +668,8 @@ if [[ $mode == create ]]; then
   pct start "$CT_ID"
 else
   pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "Honcho CT $CT_ID is not running."
+  # The preflight required the honcho tag; add the rest tools/upgrade-all.sh uses.
+  pve_ensure_tags "$CT_ID" ai ai-tools osr-target honcho
 fi
 
 rules=$(honcho_rules "$router_ip" $HONCHO_CLIENT_IPS)

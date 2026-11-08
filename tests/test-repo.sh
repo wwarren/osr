@@ -360,4 +360,35 @@ assert_ok "the runner registers the retry test" grep -q 'test-litellm-retries.py
 assert_ok "CI checks Honcho's model-client timeout at the pinned release" \
   grep -q 'targets/honcho/test-pinned-upstream.py' "$ci"
 
+describe target_tags
+# tools/upgrade-all.sh finds the router by its osr-router tag and each target by
+# osr-target plus the target's name. Every tag list a provisioner sets (pct
+# create --tags, a community script's var_tags, pve_ensure_tags) must say the
+# same, and a community-script target must re-apply its tags after the script.
+eval "$(sed -n '/^TARGET_ORDER=(/,/)/p' "${ROOT}/tools/upgrade-all.sh")"
+assert_ok "upgrade-all.sh lists its targets" test "${#TARGET_ORDER[@]}" -gt 0
+for dir in "${ROOT}"/targets/*/; do
+  name=$(basename "$dir")
+  [[ -f ${dir}provision-lxc.sh && $name != hcom ]] || continue
+  assert_contains "upgrade-all.sh upgrades the ${name} target" " ${name} " " ${TARGET_ORDER[*]} "
+done
+for name in "${TARGET_ORDER[@]}"; do
+  provisioner="${ROOT}/targets/${name}/provision-lxc.sh"
+  lists="$( { grep -oE -- "--tags '[^']*'" "$provisioner" | sed -E "s/^--tags '(.*)'$/\1/"
+              grep -oE 'var_tags=[^" ]*' "$provisioner" | sed 's/^var_tags=//'
+              grep -oE 'pve_ensure_tags "\$CT_ID" [a-z0-9 -]*' "$provisioner" |
+                sed -E 's/^pve_ensure_tags "\$CT_ID" //; s/ +$//; s/ /;/g'; } | sort -u)"
+  assert_ok "${name} tags its CT" test -n "$lists"
+  if [[ $lists != "ai;ai-model;osr-target;${name}" && $lists != "ai;ai-tools;osr-target;${name}" ]]; then
+    _fail "${name} tags its CT with osr-target and ${name}, the same everywhere" \
+      "ai;ai-model;osr-target;${name} or ai;ai-tools;osr-target;${name}" "$(tr '\n' ' ' <<< "$lists")"
+  else
+    _pass "${name} tags its CT with osr-target and ${name}, the same everywhere"
+  fi
+  if grep -q 'var_tags=' "$provisioner"; then
+    assert_ok "${name} re-applies its tags after the community script" grep -q '^ *pve_ensure_tags "\$CT_ID"' "$provisioner"
+  fi
+done
+assert_ok "the router CT is tagged osr-router" grep -qE -- '-tags "([^"]*;)?osr-router(;[^"]*)?"' "$INSTALLER"
+
 summary

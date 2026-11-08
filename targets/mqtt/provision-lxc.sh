@@ -58,6 +58,8 @@ command -v pct >/dev/null || die 'pct is required.'
 if (( reconfigure )); then
   pct config "$CT_ID" | grep -q '^description: MQTT relay for Ollama Smart Router' || die 'Selected CT is not the OSR MQTT target.'
   pct status "$CT_ID" | grep -q running || die 'Broker CT must be running.'
+  # A broker made by an older version gets the tags tools/upgrade-all.sh finds it by.
+  pve_ensure_tags "$CT_ID" ai ai-tools osr-target mqtt
 else
   if pct config "$CT_ID" >/dev/null 2>&1 || qm config "$CT_ID" >/dev/null 2>&1; then die 'CT_ID is already in use.'; fi
   ( umask 022; pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --unprivileged 1 \

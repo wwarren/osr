@@ -300,10 +300,24 @@ alongside the router; the last tag is the target's directory name under
 | Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | `ai`, `ai-model`, `osr-target`, `<target>` |
 | Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
 
-Community-script CTs (Ollama, ComfyUI, Gitea, Mattermost) also get
-`community-script`. Tags are set only at creation (`pct set <id> --tags
-'<a>;<b>'` for existing CTs); hcom creates no CT. The lists live in each
-`provision-lxc.sh` and the router installer; keep this table in step.
+`tools/upgrade-all.sh` finds CTs only by these tags (`osr-router`, and
+`osr-target` plus the target's name), so every provisioner makes sure they are
+there:
+
+- A CT made with `pct create` gets them at creation.
+- Community-script CTs (Ollama, ComfyUI, Gitea, Mattermost) also get
+  `community-script`. Because the script's menus can change or drop the tags it
+  was given, the provisioner adds any that are missing once the script is done.
+- `--reconfigure` (Gitea, Mattermost, Honcho, Hermes, OpenClaw, DeepSeek Harness,
+  MQTT) adds any missing tags to the existing CT, so a CT made by hand or by an
+  older version becomes visible to the upgrade.
+
+Missing tags are added and the CT's other tags are kept (`pve_ensure_tags` in
+`targets/pve-select.sh`). `--integrate-only` leaves the CT as it is. For any
+other CT, add the tags yourself: `pct set <id> --tags 'ai;ai-model;osr-target;ollama'`.
+hcom creates no CT. The lists live in each `provision-lxc.sh` and the router
+installer; `tests/test-repo.sh` checks that they match `upgrade-all.sh`'s
+targets. Keep this table in step with them.
 
 ### Provisioner questions
 

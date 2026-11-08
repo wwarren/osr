@@ -967,6 +967,9 @@ if [[ $mode == create ]]; then
     fi
   fi
 fi
+# A reconfigured CT made by hand or by an older version gets the tags
+# tools/upgrade-all.sh finds it by (--integrate-only leaves the CT as it is).
+if [[ $mode == reconfigure ]]; then pve_ensure_tags "$CT_ID" ai ai-tools osr-target hermes; fi
 
 # --reconfigure: the CT's owned firewall rules follow the new settings (router
 # address, API port, CLI-only). Before anything in the CT changes, the file

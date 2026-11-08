@@ -898,6 +898,9 @@ if [[ $mode == create ]]; then
     fi
   fi
 fi
+# A reconfigured CT made by hand or by an older version gets the tags
+# tools/upgrade-all.sh finds it by (--integrate-only leaves the CT as it is).
+if [[ $mode == reconfigure ]]; then pve_ensure_tags "$CT_ID" ai ai-tools osr-target openclaw; fi
 
 # --reconfigure: the CT's owned firewall rules follow the new settings (router
 # address, port, Open WebUI, Control UI). Before anything in the CT changes,

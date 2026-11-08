@@ -764,6 +764,9 @@ if [[ $mode != integrate ]]; then
         created=1
     fi
     narrow_gpu_devices
+    # tools/upgrade-all.sh finds the CT by its tags; the community script's menus
+    # can change them.
+    pve_ensure_tags "$CT_ID" ai ai-model osr-target comfyui
 fi
 if [[ -z $comfyui_ip ]]; then
     if (( dry_run )); then

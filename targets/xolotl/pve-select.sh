@@ -300,6 +300,36 @@ pve_tagged_ct() {
     [[ -z $found ]] || printf '%s\n' "$found"
 }
 
+# pve_ensure_tags ID TAG...: add each TAG the CT lacks to its tags, keeping the
+# ones it has. tools/upgrade-all.sh finds the router by its osr-router tag and a
+# target by osr-target plus the target's name, so a provisioner runs this on
+# the CT it created or reconfigured: a community script's menus can change or
+# drop the tags it was given, and a CT made by hand or by an older version may
+# have none. A failure is reported, not fatal: the target works untagged.
+pve_ensure_tags() {
+    local id=$1 current tag
+    local -a have=() missing=() merged=()
+    shift
+    if [[ ${dry_run:-0} != 0 ]]; then
+        printf '+ tag CT %s %s (pct set --tags, keeping its other tags)\n' "$id" "$(IFS=';'; printf '%s' "$*")"
+        return 0
+    fi
+    current=$(pct config "$id" 2>/dev/null | sed -n 's/^tags:[[:space:]]*//p' | head -n 1) || current=''
+    read -r -a have <<< "${current//[;,]/ }"
+    for tag in "$@"; do
+        [[ " ${have[*]} " == *" $tag "* ]] || missing+=("$tag")
+    done
+    (( ${#missing[@]} )) || return 0
+    merged=("${have[@]}" "${missing[@]}")
+    if pct set "$id" --tags "$(IFS=';'; printf '%s' "${merged[*]}")" >/dev/null; then
+        printf 'Tagged CT %s %s.\n' "$id" "$(IFS=';'; printf '%s' "${missing[*]}")" >&2
+    else
+        printf 'Warning: could not tag CT %s; tools/upgrade-all.sh does not find it until: pct set %s --tags %q\n' \
+            "$id" "$id" "$(IFS=';'; printf '%s' "${merged[*]}")" >&2
+    fi
+    return 0
+}
+
 # pve_ct_with_ip IP: the ID of the CT on this node whose net0 has IP, or nothing.
 pve_ct_with_ip() {
     local dir=${PVE_LXC_DIR:-/etc/pve/lxc} file

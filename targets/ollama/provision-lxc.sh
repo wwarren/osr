@@ -372,6 +372,8 @@ if (( ! dry_run )); then
     fi
 fi
 narrow_gpu_devices
+# The community script's menus can change the tags it was given.
+pve_ensure_tags "$CT_ID" ai ai-model osr-target ollama
 
 trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2; rm -f -- "$script"' ERR
 run pct exec "$CT_ID" -- install -d -m 0700 /root/ollama-target-deploy

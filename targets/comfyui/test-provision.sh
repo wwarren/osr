@@ -287,9 +287,11 @@ grep -q 'flux2-klein-9b-api.json' "$log" || fail 'the API workflow was not stage
 grep -q 'flux2-klein-4b-api.json' "$log" || fail 'the 4B API workflow was not staged on the router'
 [[ $(cat "$tmp/pushed-token") == owui-secret ]] || fail 'the admin token was not staged on the router'
 ! grep -q owui-secret "$log" || fail 'the admin token appeared in a command line'
+grep -qx 'pct set 286 --tags ai;ai-model;osr-target;comfyui' "$log" ||
+    fail "tags upgrade-all.sh finds the CT by were not re-applied after the community script: $(calls)"
 # Order: router checks and the token before the CT; firewall before the guest install.
-order=$(grep -nE 'python3 -c |^community |pct set 286|install-target.sh$|integrate-webui.py --webui' "$log" | cut -d: -f1 | paste -sd' ')
-[[ $order =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] || fail "unexpected steps ($order): $(grep -nE 'python3 -c |^community |pct set 286|install-target.sh$|integrate-webui.py --webui' "$log")"
+order=$(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|integrate-webui.py --webui' "$log" | cut -d: -f1 | paste -sd' ')
+[[ $order =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] || fail "unexpected steps ($order): $(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|integrate-webui.py --webui' "$log")"
 read -r a b c d e <<< "$order"
 (( a < b && b < c && c < d && d < e )) || fail "steps out of order ($order): $(calls)"
 grep -q 'pct exec 280 -- rm -rf -- /root/comfyui-integration.AbC123' "$log" || fail 'router staging not removed'

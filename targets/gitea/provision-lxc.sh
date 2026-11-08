@@ -254,6 +254,9 @@ if [[ $mode != reconfigure ]]; then
     fi
 
 fi
+# tools/upgrade-all.sh finds the CT by its tags: the community script's menus
+# can change them, and a reconfigured CT may predate them.
+pve_ensure_tags "$CT_ID" ai ai-tools osr-target gitea
 
 if [[ $mode == create ]]; then
     exit_after_steps=1

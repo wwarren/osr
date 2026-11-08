@@ -484,6 +484,8 @@ else
     firewall_file="$FW_DIR/${CT_ID}.fw"
     grep -q '# osr-deepseek-harness$' "$firewall_file" || die 'Refusing to replace an unrecognized CT firewall.'
     grep -qx '\[RULES\]' "$firewall_file" || die 'The CT firewall has no [RULES] section.'
+    # A CT made by an older version gets the tags tools/upgrade-all.sh finds it by.
+    pve_ensure_tags "$CT_ID" ai ai-tools osr-target deepseek-harness
     router_fw=$FW_DIR/${ROUTER_CT_ID}.fw
     ct_fw_before=$stage/harness.fw.before
     cp -- "$firewall_file" "$ct_fw_before"

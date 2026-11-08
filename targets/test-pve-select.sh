@@ -195,4 +195,33 @@ for d in "$want 2" "Not $want" 'DeepSeek Harness' "x%0A$want" ''; do
     if FAKE_DESCRIPTION=$d pve_ct_described 159 "$want"; then die "wrong description accepted: $d"; fi
 done
 unset -f pct
-printf 'Template, storage, required-input and guided-prompt and CT description tests passed.\n'
+
+# pve_ensure_tags adds only the missing tags, keeps the others and their order,
+# and changes nothing when every tag is there.
+pct() {
+    case $1 in
+        config) [[ -z $FAKE_TAGS ]] || printf 'hostname: x\ntags: %s\n' "$FAKE_TAGS" ;;
+        set) printf '%s\n' "$*" >> "$tag_log"; [[ ${FAKE_SET_FAILS:-0} == 0 ]] ;;
+    esac
+}
+tag_log=$(mktemp); trap 'rm -f -- "$tag_log"' EXIT
+FAKE_TAGS='community-script;ai' pve_ensure_tags 286 ai ai-model osr-target comfyui 2>/dev/null
+[[ $(cat "$tag_log") == 'set 286 --tags community-script;ai;ai-model;osr-target;comfyui' ]] ||
+    die "missing tags were not merged: $(cat "$tag_log")"
+: > "$tag_log"
+FAKE_TAGS='' pve_ensure_tags 286 osr-target comfyui 2>/dev/null
+[[ $(cat "$tag_log") == 'set 286 --tags osr-target;comfyui' ]] || die "an untagged CT was not tagged: $(cat "$tag_log")"
+: > "$tag_log"
+FAKE_TAGS='mine, osr-target ;comfyui' pve_ensure_tags 286 osr-target comfyui 2>/dev/null
+[[ ! -s $tag_log ]] || die "a fully tagged CT was changed: $(cat "$tag_log")"
+FAKE_TAGS='osr-target-old' pve_ensure_tags 286 osr-target 2>/dev/null
+[[ $(cat "$tag_log") == 'set 286 --tags osr-target-old;osr-target' ]] || die "a tag prefix counted as the tag: $(cat "$tag_log")"
+: > "$tag_log"
+out=$(FAKE_TAGS='' FAKE_SET_FAILS=1 pve_ensure_tags 286 osr-target comfyui 2>&1) || die 'a failed pct set was fatal'
+[[ $out == *'pct set 286 --tags osr-target\;comfyui'* ]] || die "a failed pct set gave no fix: $out"
+: > "$tag_log"
+out=$(dry_run=1 FAKE_TAGS='' pve_ensure_tags 286 osr-target comfyui)
+[[ $out == '+ tag CT 286 osr-target;comfyui (pct set --tags, keeping its other tags)' && ! -s $tag_log ]] ||
+    die "a dry run changed or misreported tags: $out"
+unset -f pct
+printf 'Template, storage, required-input and guided-prompt, CT description and tag tests passed.\n'
