@@ -179,7 +179,7 @@ and is kept.
 pct exec 282 -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes          # CLI
 pct exec 282 -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env
 pct exec 282 -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update
-pct exec 282 -- systemctl restart hermes-gateway
+pct exec 282 -- systemctl try-restart hermes-gateway.service hermes-dashboard.service
 journalctl -u hermes-direct -f     # in the CT: "direct dispatch MODEL -> SERVER"
 ```
 

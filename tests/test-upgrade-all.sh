@@ -142,7 +142,8 @@ case $cmd in
                     *service.env*) [[ ! -e $MOCK/$id.port ]] || cat "$MOCK/$id.port" ;;
                     *requirements.txt*) [[ ! -e $MOCK/$id.ctpin ]] || cat "$MOCK/$id.ctpin" ;;
                     *DSH_VERSION*) [[ ! -e $MOCK/$id.dsh ]] || cat "$MOCK/$id.dsh" ;;
-                    *HERMES_COMMIT*) [[ ! -e $MOCK/$id.hermes-pin ]] || cat "$MOCK/$id.hermes-pin" ;;
+                    *HERMES_COMMIT*) [[ ! -e $MOCK/$id.hermes-pin-read-fails ]] || exit 1
+                                     [[ ! -e $MOCK/$id.hermes-pin ]] || cat "$MOCK/$id.hermes-pin" ;;
                 esac ;;
             # Hermes's checkout, hermes update (moves it to <id>.hermes-next)
             # and the restart after it.
@@ -260,6 +261,13 @@ assert_eq 'ollama left broken' broken "$(summary_line ollama 252)"
 assert_contains 'keeps the snapshot' 'snapshot osr-upg-' "$(grep '^ollama' "$tmp"/logs/*/summary.txt)"
 assert_eq 'snapshot not deleted' '' "$(grep 'delsnapshot 252' "$tmp/mock/pct.log")"
 assert_eq 'continues with strata' upgraded "$(summary_line strata 251)"
+reset_mock
+echo fail-break > "$tmp/mock/252.upgrade"
+run_tool 'y\ns\n'
+line=$(grep '^ollama' "$tmp"/logs/*/summary.txt)
+assert_contains 'failed and broken: the exit status is in the summary' 'exit 1' "$line"
+assert_contains 'and the snapshot recovery command' 'pct rollback 252 osr-upg-' "$line"
+assert_contains 'and the snapshot removal command' 'pct delsnapshot 252 osr-upg-' "$line"
 
 describe 'failed upgrade that rolled itself back'
 reset_mock
@@ -563,8 +571,11 @@ if [ -z "$out" ]; then cat "$f"; fi
 MOCK
 chmod +x "$tmp/probe-bin/curl"
 hermes_probe() {
-    CURL_DIR=$tmp/curl OSR_PROBE_ROOT=$probe_root PATH="${PROBE_PATH:-$tmp/probe-bin:$PATH}" \
-        sh -c "$(tables eval 'printf "%s" "$HERMES_HTTP_PROBE"')"
+    local probe
+    probe=$(tables eval 'printf "%s" "$HERMES_HTTP_PROBE"')
+    # Simulate a CT without curl without relying on Windows-executable symlinks.
+    [[ ${PROBE_NO_CURL:-} != true ]] || probe=$'command() { return 1; }\n'"$probe"
+    CURL_DIR=$tmp/curl OSR_PROBE_ROOT=$probe_root PATH="$tmp/probe-bin:$PATH" sh -c "$probe"
 }
 assert_eq 'nothing answers: nothing reported' '' "$(hermes_probe)"
 echo '{"status": "ok", "platform": "hermes-agent"}' > "$tmp/curl/8642_health"
@@ -581,9 +592,7 @@ printf 'API_SERVER_KEY=x\nAPI_SERVER_PORT="8650"\n' > "$probe_root/home/hermes/.
 assert_contains 'the port from the agent .env' 'http:hermes-gateway' "$(hermes_probe)"
 rm -- "$tmp/curl/8650_health"
 assert_not_contains 'and only that port' 'http:hermes-gateway' "$(hermes_probe)"
-mkdir -p "$tmp/no-curl-bin"
-for c in sh sed tail tr grep; do ln -sf "$(command -v "$c")" "$tmp/no-curl-bin/$c"; done
-rc=0; out=$(PROBE_PATH=$tmp/no-curl-bin hermes_probe) || rc=$?
+rc=0; out=$(PROBE_NO_CURL=true hermes_probe) || rc=$?
 assert_eq 'no curl in the CT: no HTTP checks' '' "$out"
 assert_eq 'and no failure' 0 "$rc"
 reset_mock
@@ -607,7 +616,10 @@ hermes_case() {
     SNAPSHOTS=false KEEP_SNAPSHOTS=false NOTIFY=false ON_FAILURE=skip HEALTH_TIMEOUT=0 POLL_INTERVAL=0 \
         INCLUDE_STOPPED=false UPDATE_HERMES=$1
     # shellcheck disable=SC2317  # called by run_item
-    run_reconfigure() { printf '%s\n' "$item_output"; }
+    run_reconfigure() {
+        printf '%s\n' "$item_output"
+        [[ ! -e $MOCK/282.hermes-pin-after ]] || cp "$MOCK/282.hermes-pin-after" "$MOCK/282.hermes-pin"
+    }
     item_output=$2
     add_item hermes 282
     prepare 2>/dev/null
@@ -648,6 +660,22 @@ printf '%040d\n' 3 > "$tmp/mock/282.hermes-pin"  # what sed prints from the sett
 out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
 assert_eq 'a HERMES_COMMIT pin is kept' 'current|Hermes stays at its HERMES_COMMIT pin 000000000000' "$out"
 assert_eq 'and hermes update is not run under a pin' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+printf '%040d\n' 3 > "$tmp/mock/282.hermes-pin-after"
+out=$(in_tool hermes_case true 'Hermes reconfigured')
+assert_eq 'a pin recorded during reconfigure also prevents the update' \
+    'upgraded|integration upgraded; Hermes stays at its HERMES_COMMIT pin 000000000000' "$out"
+assert_eq 'and does not run hermes update' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+touch "$tmp/mock/282.hermes-pin-read-fails"
+out=$(in_tool hermes_case true 'Hermes reconfigured')
+assert_contains 'an unreadable pin stops the update' 'skipped|upgrade failed (exit 1)' "$out"
+assert_eq 'before running hermes update' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+rm "$tmp/mock/282.hermes-commit"
+out=$(in_tool hermes_case true 'Hermes reconfigured')
+assert_contains 'an unreadable installed commit stops the update' 'skipped|upgrade failed (exit 1)' "$out"
+assert_eq 'before running it' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
 hermes_reset
 touch "$tmp/mock/282.hermes-update-fails"
 out=$(in_tool hermes_case true 'Hermes reconfigured')

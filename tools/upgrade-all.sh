@@ -891,7 +891,12 @@ run_hcom() {
 # targets/hermes/README.md); --update-hermes runs it after the reconfigure.
 HERMES_CHECKOUT=/home/hermes/.hermes/hermes-agent
 hermes_commit() {  # hermes_commit CT: the checkout's commit, or empty
-    pct exec "$1" -- git -c "safe.directory=$HERMES_CHECKOUT" -C "$HERMES_CHECKOUT" rev-parse HEAD </dev/null 2>/dev/null || true
+    pct exec "$1" -- git -c "safe.directory=$HERMES_CHECKOUT" -C "$HERMES_CHECKOUT" rev-parse HEAD </dev/null 2>/dev/null
+}
+
+hermes_recorded_pin() {  # hermes_recorded_pin CT: the recorded pin, or empty
+    pct exec "$1" -- sed -n 's/^HERMES_COMMIT=//p' /etc/hermes-target/settings 2>/dev/null |
+        tail -n 1 | tr -d "\"'\r "
 }
 
 # hermes_update_wanted ITEM: will this run update Hermes itself?
@@ -902,8 +907,23 @@ hermes_update_wanted() {
 # update_hermes ITEM: hermes update, then restart what runs Hermes's code. The
 # OSR-HERMES line tells process_item what happened.
 update_hermes() {
-    local id=${I_CT[$1]} before after
-    before=$(hermes_commit "$id")
+    local id=${I_CT[$1]} before after pin
+    if ! pin=$(hermes_recorded_pin "$id"); then
+        note 'Cannot verify HERMES_COMMIT in the CT settings; Hermes itself was not updated.'
+        return 1
+    fi
+    if [[ -n $pin ]]; then
+        if [[ ! $pin =~ ^[0-9a-f]{40}$ ]]; then
+            note 'The CT has an invalid HERMES_COMMIT; Hermes itself was not updated.'
+            return 1
+        fi
+        echo "OSR-HERMES: pin ${pin:0:12}"
+        return 0
+    fi
+    if ! before=$(hermes_commit "$id") || [[ ! $before =~ ^[0-9a-f]{40}$ ]]; then
+        note 'Cannot read the installed Hermes commit; Hermes itself was not updated.'
+        return 1
+    fi
     note "Updating Hermes itself (--update-hermes): hermes update as the hermes user."
     if ! pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update </dev/null; then
         note 'hermes update failed.'
@@ -913,12 +933,14 @@ update_hermes() {
         note 'Restarting hermes-gateway and hermes-dashboard after hermes update failed.'
         return 1
     fi
-    after=$(hermes_commit "$id")
-    if [[ -n $after && $after == "$before" ]]; then
+    if ! after=$(hermes_commit "$id") || [[ ! $after =~ ^[0-9a-f]{40}$ ]]; then
+        note 'Hermes update finished, but its new commit could not be verified.'
+        return 1
+    fi
+    if [[ $after == "$before" ]]; then
         echo "OSR-HERMES: same ${after:0:12}"
     else
-        after=${after:0:12}
-        echo "OSR-HERMES: moved ${before:0:12}${before:+ }to ${after:-an unknown commit}"
+        echo "OSR-HERMES: moved ${before:0:12} to ${after:0:12}"
     fi
 }
 
@@ -979,6 +1001,7 @@ hermes_outcome() {
     case $line in
         moved\ *) echo "Hermes updated: ${line#moved }" ;;
         same\ *) echo "hermes update found nothing newer (${line#same })" ;;
+        pin\ *) echo "Hermes stays at its HERMES_COMMIT pin ${line#pin }" ;;
         *) if [[ -n $pin ]]; then echo "Hermes stays at its HERMES_COMMIT pin ${pin:0:12}"
            else echo 'Hermes itself stays at its installed version (--update-hermes updates it)'; fi ;;
     esac
@@ -1078,7 +1101,7 @@ prepare() {
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" ;;
             hermes)
                 # Its reconfigure keeps the pin; --update-hermes must not move past it.
-                recorded=$(pct exec "$id" -- sed -n 's/^HERMES_COMMIT=//p' /etc/hermes-target/settings 2>/dev/null | tail -n 1 | tr -d '"'\''\r ')
+                recorded=$(hermes_recorded_pin "$id")
                 [[ ! $recorded =~ ^[0-9a-f]{40}$ ]] || I_INFO[i]+=" hermes_pin=$recorded" ;;
             hcom)
                 if [[ -z $HCOM_MQTT_CT ]]; then
@@ -1334,7 +1357,12 @@ process_item() {
             i) mode=interactive; continue ;;
             s)
                 if [[ $broken == yes ]]; then
-                    I_RESULT[i]=broken; I_NOTE[i]="left as it is${SNAP:+; snapshot $SNAP kept}"
+                    I_RESULT[i]=broken
+                    if (( status != 0 )); then
+                        I_NOTE[i]="upgrade failed (exit $status); health checks failed; CT left as it is"
+                    else
+                        I_NOTE[i]='health checks failed after the upgrade; CT left as it is'
+                    fi
                 else
                     # A failed command keeps the snapshot: what it left behind
                     # is only known from its log.
@@ -1344,11 +1372,11 @@ process_item() {
                     else
                         I_NOTE[i]="upgrade failed (exit $status); its own rollback should have restored it (see the log); it passes the checks"
                     fi
-                    if [[ -n $SNAP ]]; then
-                        I_NOTE[i]+="; snapshot $SNAP kept (back: pct rollback $id $SNAP; drop: pct delsnapshot $id $SNAP)"
-                    else
-                        I_NOTE[i]+='; no snapshot was taken'
-                    fi
+                fi
+                if [[ -n $SNAP ]]; then
+                    I_NOTE[i]+="; snapshot $SNAP kept (back: pct rollback $id $SNAP; drop: pct delsnapshot $id $SNAP)"
+                else
+                    I_NOTE[i]+='; no snapshot was taken'
                 fi
                 undo_webui_pin "$i"
                 break ;;

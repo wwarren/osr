@@ -724,9 +724,10 @@ installations share a cluster, set `ROUTER_CT_ID` or use `--node` to say
 which router is meant. Only one run at a time is allowed in the cluster:
 `/etc/pve/priv/osr-upgrade-all.lock` names the holder. A lock left by a run on
 this node that has ended is taken over; delete one from another node by hand
-once that run is gone. If the lock cannot be created at all, the cluster
-filesystem is read-only, as Proxmox keeps it on a node without quorum (check
-`pvecm status`), and the run stops. The wrapper also works directly, for example
+once that run is gone. If the lock cannot be created at all, check quorum with
+`pvecm status`, then check the cluster filesystem and path permissions. A node
+without quorum usually has a read-only cluster filesystem. The wrapper also
+works directly, for example
 `bash tools/pct-cluster.sh exec 205 -- uptime` on any node.
 
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`) is offered the
@@ -766,11 +767,10 @@ MQTT, hcom) can stop after it has changed the CT, so after its failure rolling
 back is the default, and `--on-failure rollback` rolls back even when every
 check still passes. A failed upgrade that is skipped keeps its snapshot, and
 the summary gives the `pct rollback` and `pct delsnapshot` commands for it.
-The Proxmox snapshot can restore the CT when a service or other functional
-check fails. Without one, recovery may need manual work. A snapshot covers the CT only: host firewall
-rules and Open WebUI registrations a provisioner changed are not rolled back
-with it. Snapshots are deleted after success unless `--keep-snapshots`, and
-kept after any failure.
+The Proxmox snapshot can restore the CT when a functional check fails. Without
+one, recovery may need manual work. A snapshot covers only the CT: it cannot
+restore host firewall rules or Open WebUI registrations. Snapshots are deleted
+after success unless `--keep-snapshots`, and after a verified rollback.
 
 `--yes` runs unattended: provisioners get `NONINTERACTIVE=true`, and failures
 are handled with `--on-failure rollback` (default), `skip` or `abort`.
