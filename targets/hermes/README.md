@@ -94,12 +94,12 @@ connection by URL, keeping all others.
 | `HERMES_MODEL` | `auto` | Default model of provider `custom:osr`. `auto` uses `/routing/explain`, prefers loaded models and pins an agent task to one model while a server for it works; if all its servers fail, the router ranks afresh. Name a model for a fixed choice |
 | `HERMES_CONTEXT_LENGTH` | `65536` | Context the host really serves (≥ 64000). The dispatcher never uses a model the inventory reports with less, or without tool support; AirLLM is excluded |
 | `HERMES_CHANNEL` | `stable` | Upstream channel (`stable` or `main`) |
-| `HERMES_COMMIT` | — | Pin the checkout; a changed pin applies on the next run (the installer reports the installed commit) |
+| `HERMES_COMMIT` | — | Pin the checkout; a changed pin applies on the next run (the installer reports the installed commit). Kept by `--reconfigure`; `HERMES_COMMIT=` clears it |
 | `HERMES_INSTALLER_SHA256` | — | Refuse another `install.sh`; every run prints its checksum |
 | `OPENWEBUI` | `true` | `false`: no Open WebUI connection or API server, no admin token |
 | `HERMES_DASHBOARD` | `true` | `false` stops the dashboard and closes TCP 9119 |
 | `TASK_MODEL` | `fast` | Open WebUI's Task Model (External) for titles, tags, follow-ups; set only when unset or pointing at Hermes; blank leaves it alone |
-| `HERMES_API_PORT` / `HERMES_API_MODEL_NAME` | `8642` / `hermes-agent` | API port (8644–8646 are reserved by Hermes) and model name in Open WebUI |
+| `HERMES_API_PORT` / `HERMES_API_MODEL_NAME` | `8642` / `hermes-agent` | API port (8644–8646 are reserved by Hermes) and model name in Open WebUI. Kept by `--reconfigure` and `--integrate-only`, like `HERMES_CHANNEL` |
 | `EGRESS` | `restricted` | See [Network](#network) |
 | `ROUTER_URL`, `ROUTER_IP`, `OPENWEBUI_PORT` | Detected | Overrides |
 | `BRIDGE`, `CT_HOSTNAME`, `CORES`, `MEMORY_MB`, `SWAP_MB`, `ROOTFS_GB`, `ONBOOT`, `NAMESERVER`, `VLAN_TAG` | 2 cores, 4096 MB, 1024 MB swap, 32 GB | CT settings |
@@ -186,9 +186,9 @@ journalctl -u hermes-direct -f     # in the CT: "direct dispatch MODEL -> SERVER
 The install is non-interactive and skips browser and computer-use downloads.
 Code and profile live under `/home/hermes/.hermes`; the hardened gateway can
 write only `/home/hermes` and a private `/tmp`. The dashboard password, session
-secret and any OAuth dashboard credentials are kept on reconfigure. With
-`HERMES_COMMIT` set, a rerun moves the checkout back to the pin, so update or
-clear it when upgrading. `tools/upgrade-all.sh` upgrades the integration and
+secret and any OAuth dashboard credentials are kept on reconfigure. A
+recorded `HERMES_COMMIT` pin is kept too, and a rerun moves the checkout back
+to it: change the pin, or clear it with `HERMES_COMMIT=`, to upgrade. `tools/upgrade-all.sh` upgrades the integration and
 leaves Hermes at its version; with `--update-hermes` it also runs `hermes
 update` and restarts the gateway and dashboard, unless `HERMES_COMMIT` is set.
 

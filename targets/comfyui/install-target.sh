@@ -45,6 +45,13 @@ trap 'on_signal 129' HUP
 # release has been reviewed; never resolve "latest".
 readonly COMFYUI_DEFAULT_VERSION=v0.42.1
 readonly COMFYUI_DEFAULT_COMMIT=63be2f9b82ad0dac88a7ceaa28a9cf3154125a18
+# uv for --upgrade builds when the CT has none (the community script puts it in
+# /usr/local/bin, but not every CT still has it): this release from PyPI,
+# installed only with one of these wheel hashes (manylinux x86_64 and aarch64).
+readonly UV_PIP_REQUIREMENT=uv==0.13.7
+readonly UV_PIP_HASHES='2c9bdc4a872b60a93c5f26c0791089ea11585a4f9d3b3c017d78eb8487505e25
+a90f5d95716ab83091f0f73a8e7ec64e557abf2a28537fcd719b2ac88e6f725a
+08f16fd463926786b702b497473511deae4b3e17a2fa6d22180950d6059a120d'
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -65,7 +72,8 @@ Settings (environment; all optional):
   HF_TOKEN_FILE=<file>       a Hugging Face token for klein-9b (gated: its account must
                              have accepted the FLUX Non-Commercial License)
   COMFYUI_KLEIN_9B_SHA256=<hex>  pin the gated 9B file (default: Hugging Face's own hash)
-  COMFYUI_VERSION=$COMFYUI_DEFAULT_VERSION    release for --upgrade
+  COMFYUI_VERSION=$COMFYUI_DEFAULT_VERSION    release for --upgrade; unset, a newer installed
+                             release is kept (set it to move to an older one)
   COMFYUI_COMMIT=<sha1>      the reviewed commit of that tag (required for a non-default version)
   COMFYUI_TORCH=<build>      PyTorch build for --upgrade: cu130, cu128, rocm7.2, xpu, cpu or
                              pypi (default: the build the current release uses)
@@ -94,6 +102,9 @@ TORCH_INDEX_BASE=${TORCH_INDEX_BASE:-https://download.pytorch.org/whl}
 LOCK_FILE=${LOCK_FILE:-/etc/comfyui-target.lock}
 # Home directories: an interpreter there is out of the service account's reach.
 PRIVATE_PREFIXES=${PRIVATE_PREFIXES:-/root /home}
+# Where a uv may be when it is not on PATH, and where --upgrade installs one.
+UV_CANDIDATES=${UV_CANDIDATES:-/usr/local/bin/uv /root/.local/bin/uv /root/.cargo/bin/uv}
+UV_HOME=${UV_HOME:-$TARGET_OPT/uv}
 SERVICE=comfyui.service
 DROPIN=$TARGET_UNITS/$SERVICE.d/10-comfyui-target.conf
 TARGET_ENV=$TARGET_ETC/comfyui.env
@@ -146,6 +157,70 @@ wait_for_version() {
         waited=$((waited + 2))
     done
     return 1
+}
+# version_newer A B: is release A (0.43.0) newer than B?
+version_newer() {
+    [[ $1 =~ ^[0-9]+(\.[0-9]+)*$ && $2 =~ ^[0-9]+(\.[0-9]+)*$ && $1 != "$2" ]] || return 1
+    [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]
+}
+# find_uv: the uv to build with: on PATH, where installs put it, or the copy an
+# earlier --upgrade installed in $UV_HOME.
+find_uv() {
+    local candidate
+    for candidate in "$(command -v uv 2>/dev/null || true)" $UV_CANDIDATES "$UV_HOME/bin/uv"; do
+        if [[ -n $candidate && -x $candidate ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+# install_uv PYTHON: install $UV_PIP_REQUIREMENT, hash-checked, into a venv at
+# $UV_HOME made with PYTHON. Returns non-zero (with a message) on failure.
+install_uv() {
+    local python=$1 reqs hash line
+    line=$UV_PIP_REQUIREMENT
+    for hash in $UV_PIP_HASHES; do line+=" --hash=sha256:$hash"; done
+    rm -rf -- "$UV_HOME.part"
+    reqs=$(mktemp "${TMPDIR:-/tmp}/comfyui-target-uv.XXXXXX") || return 1
+    printf '%s\n' "$line" > "$reqs"
+    if "$python" -m venv "$UV_HOME.part" &&
+       "$UV_HOME.part/bin/python" -m pip install --quiet --disable-pip-version-check --no-deps --require-hashes -r "$reqs" &&
+       [[ -x $UV_HOME.part/bin/uv ]]; then
+        rm -f -- "$reqs"
+        rm -rf -- "$UV_HOME"
+        mv -- "$UV_HOME.part" "$UV_HOME"
+        return 0
+    fi
+    rm -f -- "$reqs"
+    rm -rf -- "$UV_HOME.part"
+    printf 'Error: installing %s from PyPI with %s failed.\n' "$UV_PIP_REQUIREMENT" "$python" >&2
+    return 1
+}
+# apply_dropin: install this repository's service drop-in for the release that
+# is running, restart it and check it answers as before; put the old drop-in
+# back when it does not.
+apply_dropin() {
+    local was_active=false version=''
+    if systemctl is-active --quiet "$SERVICE"; then
+        was_active=true
+        version=$(served_version || true)
+    fi
+    cp -p -- "$DROPIN" "$DROPIN.prev"
+    install -m 0644 "$source_dir/comfyui-target.conf" "$DROPIN"
+    systemctl daemon-reload
+    if $was_active && ! { systemctl restart "$SERVICE" && wait_for_version "$version" "$UPGRADE_HEALTH_TIMEOUT"; }; then
+        mv -f -- "$DROPIN.prev" "$DROPIN"
+        systemctl daemon-reload || true
+        systemctl restart "$SERVICE" || true
+        die "ComfyUI did not answer with this repository's service drop-in; the previous drop-in is back."
+    fi
+    rm -f -- "$DROPIN.prev"
+    if $was_active; then
+        printf 'Installed the service drop-in from this repository; ComfyUI restarted and answers again.\n'
+    else
+        printf 'Installed the service drop-in from this repository (the service stays stopped).\n'
+    fi
 }
 # The ComfyUI version of the release in directory $1 (from comfyui_version.py).
 release_version() {
@@ -317,9 +392,9 @@ build_release() {
         printf 'Error: %s reports version %s, not %s.\n' "$tag" "${got:-none}" "${tag#v}" >&2
         return 1
     fi
-    uv venv --quiet --python "$python" "$dir/venv" || return 1
-    uv pip install --quiet --python "$dir/venv/bin/python" torch torchvision torchaudio "${index[@]}" || return 1
-    uv pip install --quiet --python "$dir/venv/bin/python" -r "$dir/requirements.txt" || return 1
+    "$UV" venv --quiet --python "$python" "$dir/venv" || return 1
+    "$UV" pip install --quiet --python "$dir/venv/bin/python" torch torchvision torchaudio "${index[@]}" || return 1
+    "$UV" pip install --quiet --python "$dir/venv/bin/python" -r "$dir/requirements.txt" || return 1
     "$dir/venv/bin/python" -c 'import torch, torchvision, aiohttp, sqlalchemy, yaml, safetensors' || {
         printf 'Error: the new venv cannot import ComfyUI'"'"'s dependencies.\n' >&2
         return 1
@@ -500,6 +575,9 @@ valid_model_folder "$COMFYUI_MODEL_FOLDER" || die 'COMFYUI_MODEL_FOLDER must be 
 if [[ -n $COMFYUI_MODEL_URL && -z $COMFYUI_MODEL_NAME ]]; then COMFYUI_MODEL_NAME=$(model_file_name "$COMFYUI_MODEL_URL"); fi
 [[ -z $COMFYUI_MODEL_URL ]] || valid_file_name "$COMFYUI_MODEL_NAME" ||
     die "Cannot use '$COMFYUI_MODEL_NAME' as the model's file name; set COMFYUI_MODEL_NAME."
+# Given, COMFYUI_VERSION may move to an older release; unset, a newer one is kept.
+version_given=false
+[[ -z ${COMFYUI_VERSION:-} ]] || version_given=true
 COMFYUI_VERSION=${COMFYUI_VERSION:-$COMFYUI_DEFAULT_VERSION}
 valid_version "$COMFYUI_VERSION" || die 'COMFYUI_VERSION must be a release tag such as v0.42.1.'
 COMFYUI_COMMIT=${COMFYUI_COMMIT:-}
@@ -564,6 +642,18 @@ if [[ $MODE == upgrade ]]; then
     state=$(systemctl show "$SERVICE" -p ActiveState --value)
     dropin_same=false
     if cmp -s -- "$source_dir/comfyui-target.conf" "$DROPIN"; then dropin_same=true; fi
+    # Never a downgrade unless asked for: the community script installs the
+    # newest ComfyUI, which can be newer than the release reviewed here.
+    installed=$(release_version "$previous")
+    if ! $version_given && version_newer "$installed" "$want"; then
+        if $dropin_same; then
+            printf 'ComfyUI %s is newer than the reviewed %s and is kept; nothing to do. To move to another release, set COMFYUI_VERSION and COMFYUI_COMMIT.\n' "$installed" "$want"
+            exit 0
+        fi
+        printf 'ComfyUI %s is newer than the reviewed %s and is kept (to move to another release, set COMFYUI_VERSION and COMFYUI_COMMIT).\n' "$installed" "$want"
+        apply_dropin
+        exit 0
+    fi
     # The requested release is the running one: nothing to build or restart,
     # unless the server does not answer as that version.
     if [[ $(release_commit "$previous") == "$COMFYUI_COMMIT" ]] && $dropin_same && [[ $FORCE_REBUILD == false ]]; then
@@ -583,16 +673,20 @@ if [[ $MODE == upgrade ]]; then
         { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates; } ||
             die 'Could not install git; ComfyUI was not stopped or changed.'
     fi
-    command -v uv >/dev/null || die 'uv is missing (the community install provides /usr/local/bin/uv); ComfyUI was not stopped or changed.'
     build=${COMFYUI_TORCH:-$(torch_build "$previous/venv")}
     [[ -n $build ]] || die "Cannot tell which PyTorch build $previous/venv uses; set COMFYUI_TORCH (e.g. cu130, rocm7.2, xpu, cpu, pypi)."
     valid_torch_build "$build" || die "Unexpected PyTorch build '$build' in $previous/venv; set COMFYUI_TORCH."
     python=$(venv_interpreter "$previous/venv")
     [[ -x $python ]] && ! private_interpreter "$python" ||
         die "The current release's Python ($python) is not usable for a new build; run install-target.sh without --upgrade first."
+    if ! UV=$(find_uv); then
+        printf 'uv is not installed (looked on PATH and in %s); installing %s into %s...\n' "${UV_CANDIDATES// /, }" "$UV_PIP_REQUIREMENT" "$UV_HOME"
+        install_uv "$python" || die "uv is missing and could not be installed; ComfyUI was not stopped or changed."
+        UV=$UV_HOME/bin/uv
+    fi
     new=$RELEASES/${COMFYUI_VERSION}-${COMFYUI_COMMIT:0:12}-$(date +%Y%m%d%H%M%S)
     install -d -m 0755 "$RELEASES"
-    printf 'Building ComfyUI %s with PyTorch %s in %s while the current release keeps running...\n' "$COMFYUI_VERSION" "$build" "$new"
+    printf 'Building ComfyUI %s with PyTorch %s (uv: %s) in %s while the current release keeps running...\n' "$COMFYUI_VERSION" "$build" "$UV" "$new"
     if ! ( umask 022; build_release "$COMFYUI_VERSION" "$COMFYUI_COMMIT" "$new.part" "$build" "$python" ); then
         rm -rf -- "$new.part"
         die "Preparing ComfyUI $COMFYUI_VERSION failed; ComfyUI was not stopped or changed."

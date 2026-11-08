@@ -36,7 +36,9 @@ separate from the existing router CT ID or IP address.
 Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=65536 (>=64000; the model's
           host must serve it), HERMES_CHANNEL=stable, HERMES_COMMIT,
           HERMES_INSTALLER_SHA256, HERMES_API_PORT=8642,
-          HERMES_API_MODEL_NAME=hermes-agent.
+          HERMES_API_MODEL_NAME=hermes-agent. --reconfigure and
+          --integrate-only keep the recorded channel, pin, API port and model
+          name unless one is set; HERMES_COMMIT= clears the pin.
 Dashboard: HERMES_DASHBOARD=true (authenticated web UI on all CT IPv4 addresses,
            port 9119); false disables it.
 Router:   ROUTER_URL (default http://<router address>:<router port>),
@@ -455,6 +457,12 @@ OPENWEBUI_PORT=${OPENWEBUI_PORT:-}
 TASK_MODEL=${TASK_MODEL-fast}
 HERMES_MODEL=${HERMES_MODEL:-}
 HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-}
+# Which of these were given, even empty: a reconfigure keeps the CT's recorded
+# value of the others (see below).
+hermes_given=' '
+for name in HERMES_CHANNEL HERMES_COMMIT HERMES_API_PORT HERMES_API_MODEL_NAME; do
+  [[ -z ${!name+set} ]] || hermes_given+="$name "
+done
 HERMES_CHANNEL=${HERMES_CHANNEL:-stable}
 HERMES_COMMIT=${HERMES_COMMIT:-}
 HERMES_INSTALLER_SHA256=${HERMES_INSTALLER_SHA256:-}
@@ -580,6 +588,18 @@ OPENWEBUI=${OPENWEBUI:-true}
 HERMES_MODEL=${HERMES_MODEL:-auto}
 HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-65536}
 HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
+# A reconfigure keeps the recorded channel, pin, API port and model name unless
+# they are given (HERMES_COMMIT= clears the pin). Otherwise a plain
+# --reconfigure, which is what tools/upgrade-all.sh runs, would drop a pin and
+# move the port and Open WebUI model name back to their defaults.
+if [[ $mode != create && -n $hermes_recorded ]]; then
+  for name in HERMES_CHANNEL HERMES_COMMIT HERMES_API_PORT HERMES_API_MODEL_NAME; do
+    [[ $hermes_given != *" $name "* ]] || continue
+    printf -v "$name" '%s' "$(recorded_or "$name" "${!name}")"
+  done
+  [[ -z $HERMES_COMMIT || $hermes_given == *' HERMES_COMMIT '* ]] ||
+    note "Keeping the recorded HERMES_COMMIT=$HERMES_COMMIT (set HERMES_COMMIT= to clear the pin)."
+fi
 for name in CORES MEMORY_MB ROOTFS_GB HERMES_API_PORT; do positive "$name" "${!name}"; done
 (( HERMES_API_PORT <= 65535 )) || die 'HERMES_API_PORT must be <=65535.'
 (( HERMES_API_PORT < 8644 || HERMES_API_PORT > 8646 )) || die 'HERMES_API_PORT 8644-8646 are reserved by Hermes.'

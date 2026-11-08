@@ -341,7 +341,10 @@ case $cmd in
         'cat /etc/hermes-target/settings')
           [[ -e $FAKE_DIR/ct$id/installed ]] || exit 1
           printf 'HERMES_API_SERVER=%s\nHERMES_API_PORT=%s\n' \
-            "$(cat "$FAKE_DIR/ct$id/api-state")" "$(cat "$FAKE_DIR/ct$id/api-port")" ;;
+            "$(cat "$FAKE_DIR/ct$id/api-state")" "$(cat "$FAKE_DIR/ct$id/api-port")"
+          for key in HERMES_CHANNEL HERMES_COMMIT HERMES_API_MODEL_NAME; do
+            [[ ! -e $FAKE_DIR/ct$id/$key ]] || printf '%s=%s\n' "$key" "$(cat "$FAKE_DIR/ct$id/$key")"
+          done ;;
         'test -s /etc/hermes-target/api-key') [[ -e $FAKE_DIR/ct$id/api-server ]] ;;
         sh\ -c\ *ip\ -4\ -o\ addr*) echo 192.0.2.82 ;;
         getent\ ahostsv4\ *)
@@ -368,6 +371,10 @@ case $cmd in
           [[ ${FAKE_GUEST_RC:-0} == 0 ]] || exit "$FAKE_GUEST_RC"
           touch "$FAKE_DIR/ct$id/installed"
           if [[ $all =~ HONCHO_URL=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[1]}" > "$FAKE_DIR/ct$id/honcho-url"; fi
+          # What the guest records (install-target.sh's settings record).
+          for key in HERMES_CHANNEL HERMES_COMMIT HERMES_API_MODEL_NAME; do
+            if [[ $all =~ (^|\ )$key=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[2]}" > "$FAKE_DIR/ct$id/$key"; fi
+          done
           [[ $all =~ HERMES_API_SERVER=(true|false) ]] && server=${BASH_REMATCH[1]}
           [[ $all =~ HERMES_API_PORT=([0-9]+) ]] && port=${BASH_REMATCH[1]}
           printf '%s\n' "${server:-false}" > "$FAKE_DIR/ct$id/api-state"
@@ -525,6 +532,39 @@ out=$(real --reconfigure) || fail "reconfigure after Honcho off: $out"
 [[ $out != *'Keeping Honcho memory'* ]] || fail 'Honcho came back after it was turned off'
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 pass 'Honcho: the osr key as a file and an egress rule; kept by a plain --reconfigure; HONCHO_URL= turns it off'
+
+# The pin, channel, API port and Open WebUI model name: given once, kept by a
+# plain --reconfigure (what tools/upgrade-all.sh runs) and --integrate-only.
+reset_fake
+pin=0123456789abcdef0123456789abcdef01234567
+out=$(real HERMES_COMMIT=$pin HERMES_CHANNEL=main HERMES_API_PORT=8643 HERMES_API_MODEL_NAME=hermes-lab) ||
+  fail "pinned install: $out"
+: > "$log"
+out=$(real --reconfigure) || fail "plain reconfigure of a pinned CT: $out"
+grep -q "HERMES_COMMIT=$pin " "$log" || fail 'a plain reconfigure dropped the HERMES_COMMIT pin'
+grep -q 'HERMES_CHANNEL=main ' "$log" || fail 'a plain reconfigure reset HERMES_CHANNEL'
+grep -q 'HERMES_API_PORT=8643 ' "$log" || fail 'a plain reconfigure moved the API port'
+grep -q 'HERMES_API_MODEL_NAME=hermes-lab ' "$log" || fail 'a plain reconfigure renamed the Open WebUI model'
+grep -q -- '--hermes-url http://192.0.2.82:8643/v1 --model-name hermes-lab' "$log" ||
+  fail "registered with another port or name: $(grep integrate-webui "$log")"
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # ollama-smart-router hermes-api' "$fwfile" ||
+  fail "the API rule moved: $(cat "$fwfile")"
+[[ $out == *"Keeping the recorded HERMES_COMMIT=$pin"* ]] || fail "the kept pin is not reported: $out"
+: > "$log"
+out=$(real --integrate-only) || fail "integrate-only of a CT on 8643: $out"
+grep -q -- '--hermes-url http://192.0.2.82:8643/v1 --model-name hermes-lab' "$log" ||
+  fail "--integrate-only registered another port or name: $(grep integrate-webui "$log")"
+: > "$log"
+out=$(real --reconfigure HERMES_COMMIT= HERMES_API_PORT=8650) || fail "clearing the pin: $out"
+grep -Eq 'HERMES_COMMIT=( |$)' "$log" || fail 'HERMES_COMMIT= did not clear the pin'
+grep -q 'HERMES_API_PORT=8650 ' "$log" || fail 'a given port was not used'
+grep -q 'HERMES_CHANNEL=main ' "$log" || fail 'clearing the pin reset the channel'
+[[ $out != *'Keeping the recorded HERMES_COMMIT'* ]] || fail "a cleared pin was reported as kept: $out"
+: > "$log"
+out=$(real --reconfigure) || fail "reconfigure after clearing the pin: $out"
+grep -Eq 'HERMES_COMMIT=( |$)' "$log" || fail 'a cleared pin came back'
+grep -q 'HERMES_API_PORT=8650 ' "$log" || fail 'the new port was not kept'
+pass 'a plain --reconfigure and --integrate-only keep the recorded pin, channel, API port and model name; HERMES_COMMIT= clears the pin'
 : > "$log"
 out=$(real --integrate-only) || fail "integrate-only: $out"
 grep -q 'install-target.sh' "$log" && fail '--integrate-only ran the installer'

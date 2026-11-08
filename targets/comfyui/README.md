@@ -105,7 +105,8 @@ an interrupted guest install, run `install-target.sh` in the CT.
 its SHA-256 (`COMMUNITY_SCRIPT_SHA256` pins it, `COMMUNITY_SCRIPT_URL` uses a
 reviewed copy). The checksum covers `ct/comfyui.sh` only, which installs the
 **latest** ComfyUI unverified: run `install-target.sh --upgrade` to move to the
-pinned, commit-verified release. **Exposure window:** the community install
+pinned, commit-verified release once that is newer (a newer community install
+is kept, see [Upgrade](#upgrade)). **Exposure window:** the community install
 starts ComfyUI as root on all addresses before the firewall is written, so
 create the CT on a trusted segment.
 
@@ -216,7 +217,8 @@ nvidia-smi                                      # NVIDIA: GPU visible?
   sources as rules in `/etc/pve/firewall/<id>.fw`.
 * **Custom nodes** go in `/var/lib/comfyui-target/custom_nodes`. The service
   cannot write its venv, so install their packages as root with
-  `uv pip install --python /opt/comfyui-target/current/venv/bin/python -r <node>/requirements.txt`;
+  `uv pip install --python /opt/comfyui-target/current/venv/bin/python -r <node>/requirements.txt`
+  (`/opt/comfyui-target/uv/bin/uv` when `--upgrade` had to install uv);
   `--upgrade` builds a fresh venv without them. Nodes run arbitrary code:
   install only trusted ones.
 
@@ -238,6 +240,11 @@ COMFYUI_VERSION=v0.42.5 COMFYUI_COMMIT=<reviewed sha1> bash install-target.sh --
 
 If the running release is the requested commit, the drop-in is unchanged and
 ComfyUI answers as that version (or is stopped), it prints "nothing to do".
+It never downgrades by itself: when the running release is newer than the pin
+(the community script installs the newest), it is kept, and only a changed
+drop-in is installed (with a restart, and the old drop-in back if ComfyUI then
+does not answer). Set `COMFYUI_VERSION` and `COMFYUI_COMMIT` to move to an
+older release on purpose.
 Otherwise:
 
 1. **Prepare** while the current release runs: `git clone --depth 1 --branch
@@ -245,6 +252,10 @@ Otherwise:
    matches, build a venv with the current Python and PyTorch build
    (`torch-<ver>+cu130` → the cu130 index; `COMFYUI_TORCH` overrides) plus
    `requirements.txt`, and check it imports. A failure leaves ComfyUI as it was.
+   The build uses uv from `PATH`, `/usr/local/bin`, `/root/.local/bin` or
+   `/root/.cargo/bin`; without one it installs a pinned uv from PyPI
+   (wheel hashes checked) into `/opt/comfyui-target/uv` with the current
+   Python, and uses that one from then on.
 2. **Switch:** stop, repoint `/opt/comfyui-target/current` (one rename), start.
 3. **Check** `/system_stats` reports the new version within
    `UPGRADE_HEALTH_TIMEOUT` (300 s).

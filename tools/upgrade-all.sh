@@ -58,8 +58,8 @@ litellm_config.yaml, router.ini, monitor.ini or secrets; target installers
 reuse their settings records; provisioners take their recorded answers. Only
 versions move to this repository's pins; an interactive run asks before moving
 a Honcho or DeepSeek Harness release you pinned, and --yes accepts the move.
-Open WebUI is never
-downgraded. Gitea and Mattermost releases are not pinned here: their setup
+Open WebUI and ComfyUI are
+never downgraded. Gitea and Mattermost releases are not pinned here: their setup
 is re-applied (accounts, token and webhook kept) and their version stays.
 Hermes Agent itself is not pinned either: its integration (units, dispatcher,
 settings) is upgraded and Hermes stays at its installed version unless
@@ -1272,6 +1272,16 @@ choose_action() {
     done
 }
 
+# snapshot_kept_note CT: the end of a result note when a CT is left as it is
+# after a failure, with the commands for the snapshot ($SNAP) it keeps.
+snapshot_kept_note() {
+    if [[ -n $SNAP ]]; then
+        printf '; snapshot %s kept (back: pct rollback %s %s; drop: pct delsnapshot %s %s)' "$SNAP" "$1" "$SNAP" "$1" "$SNAP"
+    else
+        printf '; no snapshot was taken'
+    fi
+}
+
 ABORTED=false
 CURRENT_ITEM=''
 process_item() {
@@ -1373,11 +1383,7 @@ process_item() {
                         I_NOTE[i]="upgrade failed (exit $status); its own rollback should have restored it (see the log); it passes the checks"
                     fi
                 fi
-                if [[ -n $SNAP ]]; then
-                    I_NOTE[i]+="; snapshot $SNAP kept (back: pct rollback $id $SNAP; drop: pct delsnapshot $id $SNAP)"
-                else
-                    I_NOTE[i]+='; no snapshot was taken'
-                fi
+                I_NOTE[i]+=$(snapshot_kept_note "$id")
                 undo_webui_pin "$i"
                 break ;;
             b)
@@ -1393,7 +1399,9 @@ process_item() {
                 break ;;
             a)
                 if [[ $broken == yes ]]; then I_RESULT[i]=broken; else I_RESULT[i]=skipped; fi
-                I_NOTE[i]="aborted here${SNAP:+; snapshot $SNAP kept}"
+                I_NOTE[i]='aborted here'
+                (( status == 0 )) || I_NOTE[i]+=" after the upgrade failed (exit $status)"
+                I_NOTE[i]+=$(snapshot_kept_note "$id")
                 undo_webui_pin "$i"
                 ABORTED=true
                 break ;;

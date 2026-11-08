@@ -295,6 +295,10 @@ run_tool 'y\na\n'
 assert_eq 'ollama broken' broken "$(summary_line ollama 252)"
 assert_eq 'strata not run' not-run "$(summary_line strata 251)"
 assert_eq 'strata untouched' '' "$(grep '^INSTALL 251' "$tmp/mock/installs.log" 2>/dev/null)"
+line=$(grep '^ollama' "$tmp"/logs/*/summary.txt)
+assert_contains 'the aborted one gives its exit status' 'failed (exit 1)' "$line"
+assert_contains 'and how to roll back' 'pct rollback 252 osr-upg-' "$line"
+assert_contains 'and how to drop the snapshot' 'pct delsnapshot 252 osr-upg-' "$line"
 
 describe 'unattended'
 reset_mock
@@ -551,6 +555,9 @@ assert_eq 'not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secr
 assert_contains 'the export ends with the provisioner' 'AFTER 0' "$out"
 out=$(in_tool reconf_case gitea 2>&1)
 assert_contains 'Gitea does not get it' $'GOT \nAFTER' "$out"
+out=$(in_tool reconf_case hermes 2>&1)
+assert_eq 'Hermes gets no pin, channel, port or name, so it keeps what the CT records' '' \
+    "$(grep '^ARGS' <<< "$out" | grep -E 'HERMES_(COMMIT|CHANNEL|API_PORT|API_MODEL_NAME)=')"
 
 describe 'the Hermes HTTP checks'
 reset_probe

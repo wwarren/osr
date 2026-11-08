@@ -393,7 +393,7 @@ cluster in dependency order through their own update paths (§16), with a
 before/after functional check and a Proxmox snapshot around each, then prompts
 or follows `--on-failure` when one fails
 ([README](README.md#everything-at-once)). Snapshots are deleted after success
-or a verified rollback; skipped failures keep them for recovery. A provisioner's
+or a verified rollback; any other failure keeps its snapshot for recovery. A provisioner's
 failure defaults to rolling back, because a
 provisioner can stop after changing the CT. Hermes Agent's own code is not
 pinned: it moves only with `--update-hermes` (`hermes update`), never past a
@@ -973,7 +973,7 @@ files on every TLS broker reconfigure.
   GitHub outage cannot hide the main results.
 * `tests/test-upgrade-all.sh` keeps `upgrade-all.sh`'s deploy file lists equal
   to what each provisioner copies and its service lists complete, and runs it
-  against a mocked `pct`: order, filters, snapshots (kept after a skipped failure),
+  against a mocked `pct`: order, filters, snapshots (kept after a failure that is not rolled back),
   retry, rollback, skip, abort, unattended policies, recorded MQTT and Open
   Terminal settings, the Hermes HTTP checks and `--update-hermes`, and a
   three-node cluster (a CT on another node, offline and unreachable nodes,

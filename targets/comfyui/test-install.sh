@@ -214,6 +214,19 @@ py=""; index=""; prev=""; for a in "$@"; do
 venv=${py%/bin/python}
 if [[ $* == *" torch torchvision torchaudio"* ]]; then mkdir -p "$venv/lib/python3.12/site-packages/torch-2.9.0${index:++$index}.dist-info"; fi
 exit 0'
+# uv lives apart, so a run can go without it (FAKE_NO_UV).
+uvbin=$tmp_root/uvbin; mkdir -p "$uvbin"; mv -- "$bin/uv" "$uvbin/uv"
+# What `python -m venv` makes: a python whose `-m pip install` of the
+# hash-pinned uv requirement puts the uv stub beside it.
+pip_python=$tmp_root/pip-python
+cat > "$pip_python" <<PIP
+#!/usr/bin/env bash
+echo "venv-python \$*" >> "$log"
+[[ \$1 == -m && \$2 == pip && " \$* " == *' --require-hashes '* ]] || exit 1
+grep -Eq '^uv==[0-9.]+( --hash=sha256:[0-9a-f]{64}){3}\$' "\${@: -1}" || exit 1
+cp "$uvbin/uv" "\$(dirname "\$0")/uv"
+PIP
+chmod +x "$pip_python"
 
 commit_a=63be2f9b82ad0dac88a7ceaa28a9cf3154125a18     # the default pin, v0.42.1
 commit_b=$(printf 'b%.0s' {1..40})
@@ -232,7 +245,8 @@ community_ct() {
     local py=$tmp_root/rh/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu
     mkdir -p "$py/bin" "$py/lib/python3.12" "$community/venv/bin" "$community/venv/lib/python3.12/site-packages/torch-2.9.0+cu130.dist-info" \
         "$community/models/checkpoints" "$community/models/configs" "$community/custom_nodes" "$community/input" "$tmp_root/units"
-    printf '#!/bin/sh\n[ "$2" = "import sys" ] && exit 0\nexit "${FAKE_IMPORT_RC:-0}"\n' > "$py/bin/python3.12"; chmod 0700 "$py/bin/python3.12"
+    printf '#!/bin/sh\n[ "$2" = "import sys" ] && exit 0\nif [ "$1" = -m ] && [ "$2" = venv ]; then\n  [ -z "$FAKE_VENV_FAIL" ] || exit 1\n  mkdir -p "$3/bin" && cp %s "$3/bin/python" && exit 0\nfi\nexit "${FAKE_IMPORT_RC:-0}"\n' \
+        "$pip_python" > "$py/bin/python3.12"; chmod 0700 "$py/bin/python3.12"
     ln -s cpython-3.12.12-linux-x86_64-gnu "$tmp_root/rh/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu"
     ln -s "$tmp_root/rh/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12" "$community/venv/bin/python"
     printf 'home = %s/rh/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin\n' "$tmp_root" > "$community/venv/pyvenv.cfg"
@@ -245,7 +259,10 @@ community_ct() {
     : > "$log"
 }
 target() {
-    env -i "PATH=$bin:/usr/bin:/bin" TARGET_ETC="$tmp_root/etc" TARGET_STATE="$tmp_root/state" TARGET_OPT="$optt" \
+    local uvpath=$uvbin:
+    [[ -z ${FAKE_NO_UV:-} ]] || uvpath=''
+    env -i "PATH=$bin:$uvpath/usr/bin:/bin" UV_CANDIDATES="$tmp_root/no-uv" FAKE_VENV_FAIL="${FAKE_VENV_FAIL:-}" \
+        TARGET_ETC="$tmp_root/etc" TARGET_STATE="$tmp_root/state" TARGET_OPT="$optt" \
         TARGET_UNITS="$tmp_root/units" TARGET_USER=root COMMUNITY_DIR="$community" PRIVATE_PREFIXES="$tmp_root/rh" \
         COMFYUI_REPO=https://github.test/Comfy-Org/ComfyUI.git TORCH_INDEX_BASE=https://torch.test/whl \
         LOCK_FILE="$tmp_root/lock" SYSTEMD_RUN_DIR="$tmp_root/run" READY_TIMEOUT=6 UPGRADE_HEALTH_TIMEOUT=6 \
@@ -499,5 +516,43 @@ make_upstream v0.42.6 "$commit_a"
 out=$(upgrade COMFYUI_VERSION=v0.42.6 COMFYUI_COMMIT="$commit_a" 2>&1) || die "third upgrade failed: $out"
 [[ ! -e $first && -d $second && ! -e $community/venv && -f $community/main.py ]] || die 'old builds not pruned'
 pass 'only the current and the previous release are kept; the community venv goes once it is older'
+
+# A newer release than the pin (the community script installs the newest).
+newer_ct() { adopted; sed -i 's/"0.41.0"/"0.43.0"/' "$community/comfyui_version.py"; : > "$log"; }
+newer_ct; make_upstream v0.42.1 "$commit_a"
+out=$(upgrade 2>&1) || die "upgrade of a newer release failed: $out"
+[[ $out == *'ComfyUI 0.43.0 is newer than the reviewed 0.42.1 and is kept; nothing to do'* ]] || die "newer release not kept: $out"
+[[ $(current) == "$community" ]] && ! grep -qE 'systemctl (stop|start|restart)|^git |^uv ' "$log" || die "a newer release was touched: $(cat "$log")"
+sed -i 's/^TimeoutStopSec=60$/TimeoutStopSec=30/' "$dropin"; old_dropin=$(cat "$dropin")
+out=$(FAKE_BROKEN=0.43.0 upgrade 2>&1) && die 'a drop-in that broke ComfyUI was kept'
+[[ $(cat "$dropin") == "$old_dropin" && ! -e $dropin.prev && $(current) == "$community" ]] || die "the old drop-in is not back: $out"
+[[ $out == *'the previous drop-in is back'* ]] || die "drop-in failure report: $out"
+: > "$log"
+out=$(upgrade 2>&1) || die "drop-in update of a newer release failed: $out"
+cmp -s "$script_dir/comfyui-target.conf" "$dropin" && [[ ! -e $dropin.prev && $(current) == "$community" ]] || die 'the drop-in was not updated'
+grep -q 'systemctl restart' "$log" && ! grep -qE '^git |^uv ' "$log" || die "drop-in update did more: $(cat "$log")"
+[[ $out == *'is kept'* && $out == *'Installed the service drop-in'* && $out != *'nothing to do'* ]] || die "drop-in update report: $out"
+out=$(upgrade COMFYUI_VERSION=v0.42.1 2>&1) || die "requested downgrade failed: $out"
+[[ $(release_version "$(current)") == 0.42.1 && $(release_commit "$(current)") == "$commit_a" ]] || die 'COMFYUI_VERSION did not move to 0.42.1'
+pass 'a newer release is kept (only a changed drop-in goes in, undone if ComfyUI stops answering); COMFYUI_VERSION moves back on purpose'
+
+# uv: not on PATH -> a known location, else the pinned one from PyPI into UV_HOME.
+adopted; make_upstream v0.42.1 "$commit_a"
+mkdir -p "$tmp_root/alt"; cp "$uvbin/uv" "$tmp_root/alt/uv"
+out=$(FAKE_NO_UV=1 upgrade UV_CANDIDATES="$tmp_root/missing/uv $tmp_root/alt/uv" 2>&1) || die "upgrade with uv in a known place failed: $out"
+[[ $(release_commit "$(current)") == "$commit_a" ]] && ! grep -q venv-python "$log" || die "uv outside PATH not used: $out"
+adopted; make_upstream v0.42.1 "$commit_a"
+out=$(FAKE_NO_UV=1 FAKE_VENV_FAIL=1 upgrade 2>&1) && die 'an upgrade without uv succeeded'
+[[ $out == *'uv is missing and could not be installed; ComfyUI was not stopped or changed'* ]] || die "uv install failure: $out"
+[[ $(current) == "$community" && ! -e $optt/uv && ! -e $optt/uv.part ]] && ! grep -qE 'systemctl stop|^git ' "$log" || die 'a failed uv install changed something'
+: > "$log"
+out=$(FAKE_NO_UV=1 upgrade 2>&1) || die "upgrade that installs uv failed: $out"
+[[ -x $optt/uv/bin/uv && $(release_commit "$(current)") == "$commit_a" ]] || die "uv not installed or not used: $out"
+grep -q 'venv-python -m pip install --quiet --disable-pip-version-check --no-deps --require-hashes -r ' "$log" || die 'uv not installed hash-checked'
+[[ $out == *'installing uv==0.13.7 into'* ]] || die "uv install not reported: $out"
+make_upstream v0.42.5 "$commit_b"; : > "$log"
+out=$(FAKE_NO_UV=1 upgrade COMFYUI_VERSION=v0.42.5 COMFYUI_COMMIT="$commit_b" 2>&1) || die "second upgrade without uv failed: $out"
+[[ $(release_version "$(current)") == 0.42.5 ]] && ! grep -q venv-python "$log" || die 'the installed uv was not reused'
+pass 'uv comes from PATH, a known location or a hash-checked PyPI install into UV_HOME (reused); a failed install stops nothing'
 
 printf '%s install cases passed. No system files, packages or services were touched.\n' "$passed"
