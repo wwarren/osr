@@ -1,0 +1,45 @@
+[Unit]
+Description=Avalon inference API (Qwen3.8-Flash-Next, llama-server)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=avalon
+Group=avalon
+WorkingDirectory=/var/lib/avalon
+# Written by install-target.sh: AVALON_ARGS, llama-server's arguments (model
+# paths, context, MTP draft head, port, key file). The key is in
+# /etc/avalon/api-key, which only root and the avalon group can read; it is
+# never on a command line.
+EnvironmentFile=/etc/avalon-target/avalon.env
+ExecStart=/opt/avalon/build/bin/llama-server $AVALON_ARGS
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+# The ~90 GiB model is memory-mapped and the expert cache uses pinned host
+# memory; the CT's lxc.prlimit.memlock is unlimited too (provision-lxc.sh).
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/avalon
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The checkout (code and build) stays read-only for the service; models and
+# the GPU compilers' caches live in the data directory.
+ReadWritePaths=/var/lib/avalon /dev/shm
+PrivateTmp=true
+# Keep passed-through GPU devices visible (/dev/kfd and the render node, or
+# the NVIDIA nodes). Access is restricted by the CT's devN entries and by the
+# device group the avalon account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

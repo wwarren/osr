@@ -1,0 +1,47 @@
+[Unit]
+Description=Maya inference API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=maya
+Group=maya
+WorkingDirectory=/opt/maya
+# Written by install-target.sh after setup.sh generates run-maya-<model>.sh.
+EnvironmentFile=/etc/maya-target/maya.env
+ExecStart=/bin/sh ${MAYA_RUN_SCRIPT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+# Maya pins model memory; the CT's lxc.prlimit.memlock must allow it too.
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/maya
+Environment=PYTHONUNBUFFERED=1
+# Keep this. The run script starts maya.py, which marks the server as
+# supervised, so the dashboard's About > Updates could otherwise fast-forward
+# /opt/maya to a newer release behind install-target.sh's pinned commit and
+# rollback ref. Upgrades go through install-target.sh --upgrade instead.
+# tests/test-repo.sh fails without this line.
+Environment=MAYA_UPDATE_CHECK=0
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Maya keeps its venv, engine and model configs in its checkout, and models
+# in the data directory.
+ReadWritePaths=/opt/maya /var/lib/maya /dev/shm
+PrivateTmp=true
+# Keep passed-through GPU devices visible. Access is restricted by CT devN
+# entries and by the device group the maya account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

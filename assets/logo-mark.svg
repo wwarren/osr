@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Ollama Smart Router icon</title>
+  <desc id="desc">One signal enters a luminous routing hub and branches toward three model destinations.</desc>
+  <defs>
+    <radialGradient id="surface" cx="52%" cy="44%" r="75%">
+      <stop stop-color="#172C4A"/>
+      <stop offset="1" stop-color="#081321"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="159" y1="348" x2="334" y2="159" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#30D9ED"/>
+      <stop offset=".51" stop-color="#4EA9FF"/>
+      <stop offset="1" stop-color="#A477FF"/>
+    </linearGradient>
+    <linearGradient id="active" x1="82" y1="256" x2="424" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#25DBE6"/>
+      <stop offset=".6" stop-color="#53B6FF"/>
+      <stop offset="1" stop-color="#7CF7E2"/>
+    </linearGradient>
+    <linearGradient id="topRoute" x1="320" y1="218" x2="410" y2="132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6E9FFF"/>
+      <stop offset="1" stop-color="#B581FF"/>
+    </linearGradient>
+    <linearGradient id="bottomRoute" x1="320" y1="294" x2="410" y2="380" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3A8AD0"/>
+      <stop offset="1" stop-color="#8665E4"/>
+    </linearGradient>
+    <linearGradient id="core" x1="221" y1="224" x2="282" y2="286" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#89FFF0"/>
+      <stop offset="1" stop-color="#5095FF"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+  <rect x="4" y="4" width="504" height="504" rx="108" fill="url(#surface)"/>
+  <rect x="4.75" y="4.75" width="502.5" height="502.5" rx="107.25" fill="none" stroke="#31516B" stroke-opacity=".62" stroke-width="1.5"/>
+  <circle cx="249" cy="256" r="89" fill="#0A1B30" stroke="#23415F" stroke-width="23"/>
+  <circle cx="249" cy="256" r="89" fill="none" stroke="url(#ring)" stroke-width="10"/>
+  <path d="M87 256H168" fill="none" stroke="#2DE5F0" stroke-opacity=".55" stroke-width="27" stroke-linecap="round" filter="url(#glow)"/>
+  <path d="M329 256H421" fill="none" stroke="#68DAF4" stroke-opacity=".6" stroke-width="25" stroke-linecap="round" filter="url(#glow)"/>
+  <path d="M86 256H168M330 256H416" fill="none" stroke="url(#active)" stroke-width="14" stroke-linecap="round"/>
+  <path d="M320 203L390 133H412" fill="none" stroke="url(#topRoute)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M320 309L390 379H412" fill="none" stroke="url(#bottomRoute)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="86" cy="256" r="17" fill="#33E2EA"/>
+  <circle cx="416" cy="133" r="16" fill="#AE84FF"/>
+  <circle cx="416" cy="256" r="18" fill="#78F2E6"/>
+  <circle cx="416" cy="379" r="16" fill="#8C71E8"/>
+  <circle cx="249" cy="256" r="53" fill="#091829" stroke="#537BA5" stroke-width="3"/>
+  <path d="M249 221L284 256L249 291L214 256Z" fill="url(#core)"/>
+  <path d="M249 237L268 256L249 275L230 256Z" fill="#0D2540"/>
+  <circle cx="249" cy="256" r="6" fill="#A4FFF0"/>
+</svg>

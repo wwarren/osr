@@ -1,0 +1,213 @@
+# Runs every test suite, shellcheck and ruff on each push and pull request.
+# Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image.
+# The "test" job talks to nothing beyond PyPI. The "strata-upstream",
+# "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
+# GitHub; they are separate jobs so a GitHub outage cannot hide the results of
+# the main suites.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The router container runs Debian 13's Python 3.13.
+          python-version: "3.13"
+
+      - name: Tooling (pytest, ruff, shellcheck, PyYAML)
+        run: python -m pip install -r tests/requirements-dev.txt
+
+      # The router and the llama.cpp bridge pin different fastapi versions,
+      # so each gets its own venv built from its real requirements file. The
+      # AirLLM server tests stub airllm/torch and reuse the bridge venv.
+      - name: Router + monitor venv
+        run: |
+          python -m venv .venv-router
+          .venv-router/bin/pip install -r services/ollama-router/requirements.txt \
+            -r services/ollama-monitor/requirements.txt -r tests/requirements-dev.txt
+
+      - name: Bridge venv
+        run: |
+          python -m venv .venv-bridge
+          .venv-bridge/bin/pip install -r targets/llamacpp/requirements.txt \
+            -r tests/requirements-dev.txt
+
+      # The LiteLLM release the router CT runs, from its hash lock, for the
+      # Kindi retry test (tests/test-litellm-retries.py).
+      - name: LiteLLM venv
+        run: |
+          python -m venv .venv-litellm
+          .venv-litellm/bin/pip install --require-hashes -r services/litellm-proxy/requirements.lock
+
+      - name: Test suites
+        env:
+          ROUTER_PYTHON: ${{ github.workspace }}/.venv-router/bin/python
+          BRIDGE_PYTHON: ${{ github.workspace }}/.venv-bridge/bin/python
+          LITELLM_PYTHON: ${{ github.workspace }}/.venv-litellm/bin/python
+        # --strict: a suite that skips cases (most end-to-end cases need root)
+        # fails the job, so a green run means they all ran. The runner's
+        # job container must therefore run as root, as act_runner's do.
+        run: bash tests/run-tests.sh --strict </dev/null
+
+      - name: shellcheck
+        run: |
+          mapfile -d '' -t scripts < <(git ls-files -z --cached --others --exclude-standard -- '*.sh')
+          shellcheck -S warning "${scripts[@]}"
+
+      - name: ruff
+        run: ruff check --select E,F,W,B --ignore E501 services targets tools tests
+
+  # Runs Strata's real run-script generator at the commit the Strata target is
+  # tested against (PIN in targets/strata/test-pinned-run-script.py), so an
+  # upstream change to the launcher format is caught before the pin moves.
+  strata-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Strata commit
+        run: |
+          pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' targets/strata/test-pinned-run-script.py)
+          test -n "$pin" || { echo "no PIN in test-pinned-run-script.py" >&2; exit 1; }
+          git init -q "$RUNNER_TEMP/strata"
+          git -C "$RUNNER_TEMP/strata" fetch -q --depth 1 https://github.com/Niko1221/Strata.git "$pin"
+
+      - name: Pinned launcher check
+        run: python targets/strata/test-pinned-run-script.py "$RUNNER_TEMP/strata"
+
+  # Checks targets/maya/install-target.sh and maya.service against Project
+  # Maya's real code at the pinned release (PIN in
+  # targets/maya/test-pinned-run-script.py): the launcher line setup prints,
+  # the setup options, the dashboard update switch and the empty model list.
+  maya-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Maya commit
+        run: |
+          pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)".*$/\1/p' targets/maya/test-pinned-run-script.py)
+          test -n "$pin" || { echo "no PIN in test-pinned-run-script.py" >&2; exit 1; }
+          git init -q "$RUNNER_TEMP/maya"
+          git -C "$RUNNER_TEMP/maya" fetch -q --depth 1 https://github.com/mw00/project-maya.git "$pin"
+
+      - name: Pinned upstream check
+        run: python targets/maya/test-pinned-run-script.py "$RUNNER_TEMP/maya"
+
+  # Sends the server config targets/xolotl/install-target.sh writes through
+  # Xolotl's real server code at the commit the target is tested against (PIN
+  # in targets/xolotl/test-pinned-upstream.py), and checks the engine flags,
+  # STRATA_* settings, /health contract and Engram index the target relies on.
+  xolotl-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Xolotl commit
+        run: |
+          pin=$(cat targets/xolotl/upstream-commit.txt)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/xolotl"
+          git -C "$RUNNER_TEMP/xolotl" fetch -q --depth 1 https://github.com/Indras-Mirror/Xolotl.git "$pin"
+          git -C "$RUNNER_TEMP/xolotl" checkout -q FETCH_HEAD
+
+      # The server imports Xolotl's own pinned packages (numpy, jinja2, regex, ...).
+      - name: Xolotl's Python packages
+        run: python -m pip install -r "$RUNNER_TEMP/xolotl/requirements.txt"
+
+      - name: Pinned upstream check
+        run: python targets/xolotl/test-pinned-upstream.py "$RUNNER_TEMP/xolotl"
+
+  # Checks the pinned Avalon commit (targets/avalon/upstream-commit.txt) with the
+  # installer's own validate_checkout, compares the llama-server arguments the
+  # unit passes with upstream's avalon-server launcher, and checks the API
+  # behaviour the readiness probe, the router and the manager rely on.
+  avalon-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Avalon commit
+        run: |
+          pin=$(cat targets/avalon/upstream-commit.txt)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/avalon"
+          git -C "$RUNNER_TEMP/avalon" fetch -q --depth 1 https://github.com/freriadoc/Avalon.git "$pin"
+          git -C "$RUNNER_TEMP/avalon" checkout -q FETCH_HEAD
+
+      - name: Pinned upstream check
+        run: python targets/avalon/test-pinned-upstream.py "$RUNNER_TEMP/avalon"
+
+  # Checks the pinned Kindi commit (targets/kindi/upstream-commit.txt) with the
+  # installer's own validate_checkout, reads the kindi.conf the target writes
+  # with Kindi's own config loader, and checks the unit's engine settings, the
+  # weights (Kindi's catalog), the venv pins (its Dockerfile), the profiles
+  # (its install.sh) and the API the probe, the router and the manager rely on.
+  kindi-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Kindi commit
+        run: |
+          pin=$(cat targets/kindi/upstream-commit.txt)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/kindi"
+          git -C "$RUNNER_TEMP/kindi" fetch -q --depth 1 https://github.com/ahtx/kindi.git "$pin"
+          git -C "$RUNNER_TEMP/kindi" checkout -q FETCH_HEAD
+
+      - name: Pinned upstream check
+        run: python targets/kindi/test-pinned-upstream.py "$RUNNER_TEMP/kindi"
+
+  # Runs Honcho's own settings loader and request builder, at the release the
+  # Honcho target installs, against the honcho.env block it writes: every model
+  # config must hand the OpenAI client the Kindi-sized timeout. Needs GitHub
+  # and PyPI, so it is a separate job like the other upstream checks.
+  honcho-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned Honcho release
+        run: |
+          ref=$(sed -n 's/^ref=${HONCHO_REF:-\(v[0-9][A-Za-z0-9._-]*\)}$/\1/p' targets/honcho/install-target.sh)
+          [[ -n $ref ]]
+          git clone -q --depth 1 --branch "$ref" https://github.com/plastic-labs/honcho.git "$RUNNER_TEMP/honcho"
+
+      - name: Pinned upstream check
+        run: |
+          python -m pip install uv
+          uv --directory "$RUNNER_TEMP/honcho" sync --frozen --no-dev --python 3.13
+          uv --directory "$RUNNER_TEMP/honcho" run --frozen --no-dev \
+            python "$PWD/targets/honcho/test-pinned-upstream.py" "$RUNNER_TEMP/honcho"

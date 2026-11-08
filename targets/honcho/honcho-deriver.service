@@ -1,0 +1,24 @@
+[Unit]
+Description=Honcho memory deriver
+After=honcho-api.service
+Requires=honcho-api.service
+
+[Service]
+User=honcho
+Group=honcho
+WorkingDirectory=/opt/honcho
+Environment=HOME=/var/lib/honcho
+EnvironmentFile=/etc/honcho-target/honcho.env
+ExecStart=/opt/honcho-uv/bin/uv run --frozen --no-dev python -m src.deriver
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/honcho /opt/honcho
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

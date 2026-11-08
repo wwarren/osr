@@ -1,0 +1,1832 @@
+import asyncio
+import configparser
+import hmac
+import ipaddress
+import json
+import logging
+import os
+import re
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from starlette.background import BackgroundTask
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("router")
+# httpx logs every request at INFO; the router logs its own decisions instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# The router is a drop-in OpenAI endpoint in front of the LiteLLM proxy.
+# /v1/chat/completions has its model chosen by complexity analysis; every other
+# /v1/* path (notably /v1/models, which Open WebUI calls to populate its model
+# list) is proxied through unchanged unless the caller explicitly selects the
+# optional subscription gateway.
+LITELLM_BASE = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:4000").rstrip("/")
+LITELLM_URL = os.getenv("LITELLM_URL", f"{LITELLM_BASE}/v1/chat/completions")
+
+# Optional newer LiteLLM gateway for per-client subscription logins. The
+# built-in pinned LiteLLM remains the local/API-key path.
+SUBSCRIPTION_GATEWAY_BASE = (os.getenv("SUBSCRIPTION_GATEWAY_BASE_URL") or "").rstrip("/")
+if SUBSCRIPTION_GATEWAY_BASE:
+    try:
+        _subscription_url = urlsplit(SUBSCRIPTION_GATEWAY_BASE)
+        _subscription_valid = (
+            (_subscription_url.scheme == "https" or
+             (_subscription_url.scheme == "http" and _subscription_url.hostname in
+              ("localhost", "127.0.0.1", "::1")))
+            and bool(_subscription_url.hostname)
+            and (_subscription_url.port is None or _subscription_url.port > 0)
+            and not (_subscription_url.path or _subscription_url.username or
+                     _subscription_url.password or _subscription_url.query or
+                     _subscription_url.fragment))
+    except ValueError:
+        _subscription_valid = False
+    if not _subscription_valid:
+        log.error("invalid SUBSCRIPTION_GATEWAY_BASE_URL: use HTTPS or loopback HTTP root URL")
+        SUBSCRIPTION_GATEWAY_BASE = ""
+
+# Routing behaviour lives in router.ini (version controlled) so thresholds,
+# keyword lists and discovery heuristics can change without editing this file.
+# Built-in defaults keep the service working if the ini is missing or partial.
+# Code signals. Bare "class " / "import " / "def " matched prose ("first class
+# ticket", "import my contacts"), so those are regexes for their code shapes.
+CODE_KEYWORD_DEFAULTS = [
+    r"re:\bdef\s+\w+\s*\(", r"re:\bfn\s+\w+\s*\(", r"re:\bclass\s+\w+\s*[:({]",
+    r"re:^\s*(?:from\s+\S+\s+)?import\s+[\w.]+", r"re:```", "function", "sql",
+    "script", "code", "bug", "error", "compile", "stack trace", "regex",
+]
+_DEFAULTS = {
+    "thresholds": {"xlarge": "2000", "large": "800", "medium": "250"},
+    "keywords": {
+        "code_first": "true",
+        "code": json.dumps(CODE_KEYWORD_DEFAULTS),
+        "large": json.dumps(["analyze", "evaluate", "optimise", "optimize",
+                             "architecture", "mathematics", "calculate",
+                             "summarise this article"]),
+        "xlarge": json.dumps(["prove", "derive", "rigorous", "comprehensive",
+                              "exhaustive", "step by step proof",
+                              "entire codebase", "whole repository",
+                              "research report", "literature review"]),
+    },
+    "tiers": {"fast": "fast", "medium": "medium", "large": "large",
+              "xlarge": "xlarge"},
+    "classification": {
+        # What the keyword and length heuristics look at:
+        #   last_user    -- the newest user message only (default). A system
+        #                   prompt or an old turn can no longer pin every
+        #                   request of a conversation to one tier.
+        #   conversation -- every message, the pre-2026-09 behaviour.
+        "scope": "last_user",
+        # true: a request carrying an image fails with HTTP 400 when no
+        # discovered model looks vision-capable. false: route it anyway and
+        # flag it with an X-Router-Warning header.
+        "vision_strict": "false",
+        # Requests that carry tools (agents, function calling) are raised to at
+        # least this class: small models are poor at tool use. Blank: no floor.
+        # A tier alias named by the client still pins the class.
+        "tools_min_class": "large",
+        # true: a tool request fails with HTTP 400 when every discovered model
+        # is known to lack tool support. false: route it anyway, flagged with
+        # an X-Router-Warning header.
+        "tools_strict": "false",
+        # Server kinds listed at /v1/models whose text models are reported
+        # tool-capable. Their APIs say nothing per model, but each of these
+        # servers parses "tools" and returns OpenAI tool_calls. A kind left
+        # out is reported unknown. Blank: none.
+        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi",
+    },
+    "http": {
+        # Seconds to establish a TCP connection to a backend. Short on purpose:
+        # this is how long a dead host delays failover to the next candidate.
+        "connect_timeout_seconds": "3",
+        # Seconds allowed between bytes of a response (generation can be slow).
+        "read_timeout_seconds": "300",
+        # The same for Kindi, which serves one request at a time and reads a
+        # long prompt slowly on a small card (its agent guide: 30-60 minutes).
+        # Never below read_timeout_seconds.
+        "kindi_read_timeout_seconds": "3600",
+    },
+    "discovery": {
+        "enabled": "true",
+        "refresh_seconds": "60",
+        "timeout_seconds": "5",
+        # Comma-separated Ollama base URLs. Blank -> derive from BACKEND_* env.
+        "servers": "",
+        # Ask each server's /api/show for a model's real capabilities (vision,
+        # embedding). Name matching below is the fallback.
+        "capability_probe": "true",
+        # LM Studio servers (MODEL_SERVERS entries written lmstudio+http://...)
+        # load models on demand. true: only route to models already loaded
+        # there (no multi-second JIT load on the request path).
+        "lmstudio_loaded_only": "false",
+        # Parameter-count bands (in billions) each request class prefers.
+        "fast_params": "0:9",
+        "medium_params": "9:20",
+        "large_params": "20:70",
+        "xlarge_params": "70:999",
+        # How quickly score decays per billion parameters outside the band.
+        "band_falloff": "12",
+        # Substrings marking a model as code-specialised / vision / embedding.
+        "code_models": json.dumps(["coder", "code", "starcoder", "codellama",
+                                   "deepseek-coder", "codegemma", "codestral"]),
+        "vision_models": json.dumps(["llava", "vision", "-vl", "minicpm-v",
+                                     "moondream", "bakllava"]),
+        "embedding_models": json.dumps(["embed", "embedding", "bge-", "gte-",
+                                        "nomic-embed", "mxbai-embed"]),
+        "vision_families": json.dumps(["clip", "mllama", "llava"]),
+        "embedding_families": json.dumps(["bert", "nomic-bert"]),
+    },
+    "weights": {
+        "band_fit": "1.0",
+        "code_match": "0.6",
+        "vision_match": "1.5",
+        "prefer_larger": "0.15",
+        "prefer_smaller": "0.15",
+        "unknown_params": "0.3",
+        # Fraction of the specialist weight applied as a penalty when a
+        # specialised model (code/vision) is used for an off-task request.
+        "offtask_penalty": "0.25",
+        # Candidates within this score of the best are treated as equivalent and
+        # rotated through, so identical models on several hosts share load.
+        "tie_epsilon": "0.05",
+        # Bonus for a model that is already resident in memory (LM Studio
+        # reports this per model; Ollama entries are neutral).
+        "loaded_bonus": "0.1",
+        # Bonus, on a tool request, for a model the server reports as
+        # tool-capable over one whose tool support is unknown.
+        "tool_match": "0.3",
+    },
+    # Sizes for exact model ids that an OpenAI-compatible server (Strata,
+    # Basalt, Maya, Xolotl, Avalon) lists without a parameter count. Matching is by the whole
+    # id, case-insensitive, so variants and aliases stay unknown-size unless
+    # given a line of their own. A blank value removes a built-in entry.
+    "model_sizes": {
+        "strata": "125B",               # Strata's default id: Qwen3.8-Flash-Next
+        "qwen3.8-flash-next": "125B",   # Basalt's default alias
+        # Strata's qwen family ids, qwen3.8-flash-next-<quant>: one 125B model.
+        "qwen3.8-flash-next-q2_0": "125B",
+        "qwen3.8-flash-next-iq2_xs": "125B",
+        "qwen3.8-flash-next-iq3_xxs": "125B",
+        "qwen3.8-flash-next-iq3_s": "125B",
+        "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
+        "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
+        "qwen3.8-flash-next-avalon": "125B",  # Avalon's default alias (Qwen3.8-Flash-Next)
+    },
+}
+ROUTER_INI = os.getenv(
+    "ROUTER_INI",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "router.ini"),
+)
+
+
+def _load_config(path: str) -> configparser.ConfigParser:
+    cp = configparser.ConfigParser()
+    cp.read_dict(_DEFAULTS)
+    if os.path.exists(path):
+        cp.read(path)
+    return cp
+
+
+def _json_list(cp: configparser.ConfigParser, section: str, option: str) -> list:
+    # JSON array keeps exact spacing ("def " must not match "default").
+    raw = cp.get(section, option)
+
+    def norm(k):
+        k = str(k)
+        # Regex entries keep their case: lowering "\S" would turn it into "\s".
+        return k if k.startswith("re:") else k.lower()
+    try:
+        return [norm(k) for k in json.loads(raw)]
+    except (ValueError, TypeError):
+        return [norm(k.strip()) for k in raw.split(",") if k.strip()]
+
+
+def keyword_pattern(keywords: list):
+    """Compile keywords into one case-insensitive, word-bounded regex.
+
+    Plain substring matching misrouted ordinary prose: "script" matched
+    "description"/"subscription", "code" matched "encode", "prove" matched
+    "improve". Each keyword now has to start at a word boundary and end at one,
+    allowing only a simple plural/past suffix ("bugs", "compiled"). A keyword
+    written with a trailing space ("def ") must be followed by whitespace,
+    preserving the old meaning of that convention. Spaces inside a phrase match
+    any run of whitespace. An entry starting with "re:" is a regular expression
+    (matched case-insensitively), for code shapes such as "class Foo:".
+    """
+    parts = []
+    for raw in keywords:
+        word = str(raw)
+        if word.startswith("re:"):
+            # A regular expression, for shapes a word list cannot express
+            # (e.g. "class Foo:" as code but not "first class ticket").
+            try:
+                re.compile(word[3:])
+            except re.error as exc:
+                log.warning("ignoring invalid keyword regex %r: %s", raw, exc)
+                continue
+            parts.append("(?:%s)" % word[3:])
+            continue
+        word = word.lower()
+        core = word.strip()
+        if not core:
+            continue
+        body = r"\s+".join(re.escape(piece) for piece in core.split())
+        tail = r"\s" if word.endswith(" ") else r"(?:s|es|d|ed)?(?![\w])"
+        parts.append(r"(?<![\w])" + body + tail)
+    if not parts:
+        return None
+    return re.compile("|".join(parts), re.IGNORECASE | re.MULTILINE)
+
+
+def matches_keywords(pattern, text: str) -> bool:
+    return bool(pattern and pattern.search(text))
+
+
+def _band(cp: configparser.ConfigParser, option: str) -> tuple:
+    raw = cp.get("discovery", option)
+    try:
+        low, high = raw.split(":", 1)
+        return (float(low), float(high))
+    except (ValueError, AttributeError):
+        return (0.0, 999.0)
+
+
+_cfg = _load_config(ROUTER_INI)
+TOKEN_THRESHOLD_XLARGE = _cfg.getint("thresholds", "xlarge")
+TOKEN_THRESHOLD_LARGE = _cfg.getint("thresholds", "large")
+TOKEN_THRESHOLD_MEDIUM = _cfg.getint("thresholds", "medium")
+CODE_FIRST = _cfg.getboolean("keywords", "code_first")
+CODE_KEYWORDS = _json_list(_cfg, "keywords", "code")
+LARGE_KEYWORDS = _json_list(_cfg, "keywords", "large")
+XLARGE_KEYWORDS = _json_list(_cfg, "keywords", "xlarge")
+CODE_RE = keyword_pattern(CODE_KEYWORDS)
+LARGE_RE = keyword_pattern(LARGE_KEYWORDS)
+XLARGE_RE = keyword_pattern(XLARGE_KEYWORDS)
+TIER_FAST = _cfg.get("tiers", "fast")
+TIER_MEDIUM = _cfg.get("tiers", "medium")
+TIER_LARGE = _cfg.get("tiers", "large")
+TIER_XLARGE = _cfg.get("tiers", "xlarge")
+TIER_NAMES = {TIER_FAST: "fast", TIER_MEDIUM: "medium", TIER_LARGE: "large",
+              TIER_XLARGE: "xlarge"}
+
+# Cloud models are explicit choices. They are never mixed into local discovery
+# or automatic routing, which could otherwise incur API charges unexpectedly.
+CLOUD_PROVIDERS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+CLOUD_MODELS = {
+    f"{provider}/{model.strip()}": provider
+    for provider, key in CLOUD_PROVIDERS.items()
+    if (os.getenv(key) or "").strip()
+    for model in (os.getenv(f"CLOUD_{provider.upper()}_MODELS") or "").split(",")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", model.strip())
+}
+
+DISCOVERY_ENABLED = _cfg.getboolean("discovery", "enabled")
+DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
+DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
+CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
+LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
+
+
+def _model_sizes(cp: configparser.ConfigParser) -> dict:
+    """[model_sizes] as {lowercase id: size}, blank entries dropped. The
+    per-kind keys of earlier router.ini files ([discovery]
+    strata_default_params, basalt_/maya_default_id + _params) still apply when
+    a committed router.ini sets them."""
+    sizes = {k.strip().lower(): v.strip() for k, v in cp.items("model_sizes")}
+    if cp.has_option("discovery", "strata_default_params"):
+        sizes["strata"] = cp.get("discovery", "strata_default_params").strip()
+    for kind in ("basalt", "maya"):
+        id_key, size_key = f"{kind}_default_id", f"{kind}_default_params"
+        if cp.has_option("discovery", id_key) and cp.has_option("discovery", size_key):
+            sizes[cp.get("discovery", id_key).strip().lower()] = \
+                cp.get("discovery", size_key).strip()
+    return {k: v for k, v in sizes.items() if k and v}
+
+
+MODEL_SIZES = _model_sizes(_cfg)
+BANDS = {
+    "fast": _band(_cfg, "fast_params"),
+    "medium": _band(_cfg, "medium_params"),
+    "large": _band(_cfg, "large_params"),
+    "xlarge": _band(_cfg, "xlarge_params"),
+}
+# Highest ceiling across all bands — the one band whose upper bound stays
+# inclusive, so a model above every other band still scores a perfect fit.
+TOP_BAND_HIGH = max(high for _, high in BANDS.values())
+BAND_FALLOFF = _cfg.getfloat("discovery", "band_falloff")
+CODE_MODELS = _json_list(_cfg, "discovery", "code_models")
+VISION_MODELS = _json_list(_cfg, "discovery", "vision_models")
+EMBEDDING_MODELS = _json_list(_cfg, "discovery", "embedding_models")
+VISION_FAMILIES = _json_list(_cfg, "discovery", "vision_families")
+EMBEDDING_FAMILIES = _json_list(_cfg, "discovery", "embedding_families")
+
+W_BAND = _cfg.getfloat("weights", "band_fit")
+W_CODE = _cfg.getfloat("weights", "code_match")
+W_VISION = _cfg.getfloat("weights", "vision_match")
+W_LARGER = _cfg.getfloat("weights", "prefer_larger")
+W_SMALLER = _cfg.getfloat("weights", "prefer_smaller")
+W_UNKNOWN = _cfg.getfloat("weights", "unknown_params")
+W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
+TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
+W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
+W_TOOLS = _cfg.getfloat("weights", "tool_match")
+
+# --- server kinds -----------------------------------------------------------------
+# A server entry is a base URL. Entries for servers that are not Ollama carry a
+# kind prefix (lmstudio+http://host:1234, maya+http://host:8080, ...), so
+# MODEL_SERVERS / BACKEND_* can mix APIs. This table is the one place a kind is
+# described; monitor.py and manage-model-servers.sh keep matching tables, and
+# tests/test_router.py checks that all three agree.
+#   prefix   -- the entry prefix
+#   key_env  -- the secrets.env variable holding the router's bearer token
+#   label    -- the name used in logs and alerts
+#   openai   -- models are listed at <base>/v1/models (Strata-style servers)
+SERVER_KINDS = {
+    "lmstudio": {"prefix": "lmstudio+", "key_env": "LMSTUDIO_API_TOKEN",
+                 "label": "LM Studio", "openai": False},
+    "strata": {"prefix": "strata+", "key_env": "STRATA_API_KEY",
+               "label": "Strata", "openai": True},
+    "basalt": {"prefix": "basalt+", "key_env": "BASALT_API_KEY",
+               "label": "Basalt", "openai": True},
+    "maya": {"prefix": "maya+", "key_env": "MAYA_API_KEY",
+             "label": "Maya", "openai": True},
+    "xolotl": {"prefix": "xolotl+", "key_env": "XOLOTL_API_KEY",
+               "label": "Xolotl", "openai": True},
+    "avalon": {"prefix": "avalon+", "key_env": "AVALON_API_KEY",
+               "label": "Avalon", "openai": True},
+    "kindi": {"prefix": "kindi+", "key_env": "KINDI_API_KEY",
+              "label": "Kindi", "openai": True},
+}
+OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
+# Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
+# servers with "Require authentication" (0.4+).
+KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
+             for kind, spec in SERVER_KINDS.items()}
+
+
+def server_kind(server: str) -> str:
+    for kind, spec in SERVER_KINDS.items():
+        if server.startswith(spec["prefix"]):
+            return kind
+    return "ollama"
+
+
+def server_base(server: str) -> str:
+    """The plain http(s) base URL of a server entry."""
+    kind = server_kind(server)
+    return server.removeprefix(SERVER_KINDS[kind]["prefix"]) if kind != "ollama" else server
+
+
+def backend_headers(server: str) -> dict:
+    """Credentials the ROUTER adds for a backend (never the client's own)."""
+    token = KIND_KEYS.get(server_kind(server), "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+CLASSIFY_SCOPE = _cfg.get("classification", "scope").strip().lower()
+VISION_STRICT = _cfg.getboolean("classification", "vision_strict")
+CLASS_ORDER = ("fast", "medium", "large", "xlarge")
+TOOLS_MIN_CLASS = _cfg.get("classification", "tools_min_class").strip().lower()
+if TOOLS_MIN_CLASS and TOOLS_MIN_CLASS not in CLASS_ORDER:
+    log.warning("ignoring [classification] tools_min_class = %r (use one of %s, "
+                "or blank)", TOOLS_MIN_CLASS, ", ".join(CLASS_ORDER))
+    TOOLS_MIN_CLASS = ""
+TOOLS_STRICT = _cfg.getboolean("classification", "tools_strict")
+TOOL_KINDS = frozenset(k for k in _json_list(_cfg, "classification", "tool_kinds")
+                       if k in OPENAI_KINDS)
+for _kind in sorted(set(_json_list(_cfg, "classification", "tool_kinds")) - TOOL_KINDS):
+    log.warning("ignoring [classification] tool_kinds entry %r (use %s)",
+                _kind, ", ".join(sorted(OPENAI_KINDS)))
+CONNECT_TIMEOUT = _cfg.getfloat("http", "connect_timeout_seconds")
+READ_TIMEOUT = _cfg.getfloat("http", "read_timeout_seconds")
+KINDI_READ_TIMEOUT = max(READ_TIMEOUT, _cfg.getfloat("http", "kindi_read_timeout_seconds"))
+
+# Request headers never forwarded upstream.
+HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
+              "transfer-encoding", "upgrade", "proxy-connection", "te",
+              "trailer", "proxy-authorization", "proxy-authenticate"}
+# Response headers never copied onto our own (re-framed) streaming response.
+# The body is re-chunked by the ASGI server, so the upstream framing headers
+# would contradict what is actually sent. content-encoding is kept because the
+# raw (still-encoded) bytes are passed through unchanged.
+RESPONSE_HOP_BY_HOP = HOP_BY_HOP | {"date", "server"}
+
+# Optional bearer token. When set, every endpoint except /healthz requires
+# "Authorization: Bearer <key>". Lives in /app/router/secrets.env.
+ROUTER_API_KEY = (os.getenv("ROUTER_API_KEY") or "").strip()
+ROUTER_HOST = os.getenv("ROUTER_HOST", "0.0.0.0")
+ROUTER_PORT = int(os.getenv("ROUTER_PORT", "8000"))
+
+
+# Historical names for each tier's backend env key, newest first. The keys
+# dropped their QWEN_ infix when the router stopped being Qwen-specific, and
+# "heavy" was then renamed "large" when the xlarge tier was added. A service
+# can start against a router.env that manage-model-servers.sh has not migrated
+# yet -- without these fallbacks such a start looks healthy while resolving no
+# backends at all.
+_TIER_ENV_ALIASES = {
+    "fast": ("BACKEND_FAST", "BACKEND_QWEN_FAST"),
+    "medium": ("BACKEND_MEDIUM", "BACKEND_QWEN_MEDIUM"),
+    "large": ("BACKEND_LARGE", "BACKEND_HEAVY", "BACKEND_QWEN_HEAVY"),
+    "xlarge": ("BACKEND_XLARGE",),
+}
+
+
+def _tier_env(tier: str) -> str:
+    for name in _TIER_ENV_ALIASES.get(tier, ("BACKEND_%s" % tier.upper(),)):
+        value = os.getenv(name)
+        if value:
+            return value
+    return ""
+
+
+def _discovery_servers() -> list:
+    """Model server entries to poll, in order of preference:
+      1. an explicit list in router.ini
+      2. MODEL_SERVERS - every configured host, including any not assigned to a
+         tier (those are absent from BACKEND_*, so relying on those alone would
+         leave such a host permanently undiscovered)
+      3. the per-tier BACKEND_* vars, as a fallback for older env files."""
+    def _split(value: str) -> list:
+        seen, out = set(), []
+        for url in (value or "").split(","):
+            url = url.strip().rstrip("/")
+            if url and url not in seen:
+                seen.add(url)
+                out.append(url)
+        return out
+
+    configured = _cfg.get("discovery", "servers").strip()
+    if configured:
+        return _split(configured)
+    every_host = _split(os.getenv("MODEL_SERVERS", ""))
+    if every_host:
+        return every_host
+    return _split(",".join(
+        _tier_env(t) for t in ("fast", "medium", "large", "xlarge")))
+
+
+SERVERS = _discovery_servers()
+
+
+def litellm_read_timeout(tier: str | None = None) -> float:
+    """Read gap for this LiteLLM request; passthrough keeps the normal limit."""
+    return KINDI_READ_TIMEOUT if tier and tier_has_kindi(tier) else READ_TIMEOUT
+
+
+def tier_has_kindi(tier: str) -> bool:
+    """Whether LiteLLM can select a Kindi deployment for this tier."""
+    return any(server_kind(entry.strip()) == "kindi"
+               for entry in _tier_env(tier).split(",") if entry.strip())
+
+
+# --- live inventory -----------------------------------------------------------
+# Replaced wholesale on each refresh, so readers never see a half-built dict.
+INVENTORY = {"models": [], "servers": {}, "updated_at": 0.0, "errors": {}}
+_rotation = {}
+
+
+def parse_params_billions(text) -> float:
+    """'7.6B' -> 7.6, '134M' -> 0.134. A mixture-of-experts label such as
+    LM Studio's '26B-A4B' counts its total size (26). 0.0 when unparseable."""
+    if not text:
+        return 0.0
+    match = re.match(r"^\s*([0-9.]+)\s*([bBmM])(?:\s*$|[-_ ])", str(text))
+    if not match:
+        return 0.0
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return 0.0
+    return value if match.group(2).lower() == "b" else value / 1000.0
+
+
+def params_from_name(name: str) -> float:
+    """Fall back to the tag: 'qwen3:14b' -> 14.0, 'phi3:3.8b' -> 3.8."""
+    match = re.search(r"[:\-]([0-9.]+)\s*b\b", (name or "").lower())
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _matches_any(haystack: str, needles: list) -> bool:
+    return any(n in haystack for n in needles)
+
+
+def build_entry(server: str, raw: dict, capabilities=None) -> dict:
+    """One discovered (server, model). `capabilities` is Ollama's own list from
+    /api/show ("completion", "vision", "embedding", "tools", ...). When known it
+    decides vision/embedding outright; the name heuristics are the fallback
+    for servers that do not report it, and still drive is_code (Ollama has no
+    "code" capability)."""
+    name = raw.get("name") or raw.get("model") or ""
+    details = raw.get("details") or {}
+    families = [str(f).lower() for f in (details.get("families") or [])]
+    family = str(details.get("family") or "").lower()
+    if family and family not in families:
+        families.append(family)
+    params = parse_params_billions(details.get("parameter_size"))
+    if params <= 0:
+        params = params_from_name(name)
+    lowered = name.lower()
+    is_vision = (_matches_any(lowered, VISION_MODELS)
+                 or any(f in VISION_FAMILIES for f in families))
+    is_embedding = (_matches_any(lowered, EMBEDDING_MODELS)
+                    or any(f in EMBEDDING_FAMILIES for f in families))
+    caps = [str(c).lower() for c in capabilities] if capabilities else []
+    if caps:
+        is_vision = "vision" in caps
+        is_embedding = "embedding" in caps and "completion" not in caps
+    # Tool support: True, False, or None (unknown). Ollama's /api/show list is
+    # authoritative (the llama.cpp bridge and AirLLM answer it too). Other
+    # kinds say so explicitly in raw["tools"] or not at all.
+    if "tools" in raw:
+        tools = raw["tools"]
+    elif caps and server_kind(server) == "ollama":
+        tools = "tools" in caps
+    else:
+        tools = None
+    return {
+        "server": server,
+        "name": name,
+        "params_b": params,
+        "quantization": details.get("quantization_level") or "",
+        "families": families,
+        "size_bytes": raw.get("size") or 0,
+        "capabilities": caps,
+        "is_code": _matches_any(lowered, CODE_MODELS),
+        "is_vision": is_vision,
+        "is_embedding": is_embedding,
+        "tools": tools,
+        # The largest context the server reports for this model (tokens), or
+        # None when it reports none. A ceiling, not a guarantee: Ollama, for
+        # one, may serve less than the model's own limit unless num_ctx says.
+        "context_length": positive_int(raw.get("context_length")),
+        # True/False when the server reports residency; None otherwise.
+        "loaded": raw.get("loaded"),
+        "kind": server_kind(server),
+    }
+
+
+# (server, model name, digest) -> capability list, or None when the server
+# does not report one. Keyed by digest so a re-pulled model is re-probed.
+_CAPABILITIES = {}
+# The same key -> context length from the same /api/show answer, or None.
+_CONTEXTS = {}
+# Runtime settings can change without changing a model digest (for example a
+# llama.cpp context size). Cached probes expire after one minute.
+SHOW_CACHE_SECONDS = 60
+_SHOW_TIMES = {}
+
+
+def positive_int(value):
+    """value if it is a positive int (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def show_context_length(show: dict):
+    """The context Ollama's /api/show says a model is served with, or None.
+    model_info's "<arch>.context_length" is the model's own limit; a num_ctx
+    parameter (a Modelfile's, or AirLLM's window) is what the server uses.
+    The smaller known value wins."""
+    values = []
+    info = show.get("model_info")
+    if isinstance(info, dict):
+        values += [positive_int(v) for k, v in info.items()
+                   if isinstance(k, str) and k.endswith(".context_length")]
+    parameters = show.get("parameters")
+    if isinstance(parameters, str):
+        for line in parameters.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+                values.append(positive_int(int(parts[1])))
+    values = [v for v in values if v]
+    return min(values) if values else None
+
+
+def _show_key(server: str, raw: dict) -> tuple:
+    name = raw.get("name") or raw.get("model") or ""
+    return (server, name, raw.get("digest") or raw.get("modified_at") or "")
+
+
+async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
+                             limit: asyncio.Semaphore = None, force: bool = False):
+    """Ollama's capability list for one model via POST /api/show, cached.
+    The context length from the same answer is cached in _CONTEXTS."""
+    name = raw.get("name") or raw.get("model") or ""
+    key = _show_key(server, raw)
+    if (not force and key in _CAPABILITIES and key in _SHOW_TIMES
+            and time.monotonic() - _SHOW_TIMES[key] < SHOW_CACHE_SECONDS):
+        return _CAPABILITIES[key]
+    caps = context = None
+    try:
+        async with (limit or asyncio.Semaphore(1)):
+            response = await client.post(f"{server}/api/show", json={"model": name},
+                                         timeout=DISCOVERY_TIMEOUT)
+        if response.status_code == 200:
+            payload = response.json()
+            if isinstance(payload, dict):
+                found = payload.get("capabilities")
+                if isinstance(found, list):
+                    caps = [str(c) for c in found]
+                context = show_context_length(payload)
+        # Only a definite answer is cached; a transient failure is retried
+        # on the next poll.
+        if response.status_code in (200, 400, 404, 405, 501):
+            _CONTEXTS[key] = context
+            _CAPABILITIES[key] = caps
+            _SHOW_TIMES[key] = time.monotonic()
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return _CAPABILITIES.get(key, caps)
+
+
+def lmstudio_context(model: dict):
+    """LM Studio's context for a model: the smallest loaded instance's
+    configured context_length, else max_context_length; None if neither."""
+    loaded = []
+    for instance in model.get("loaded_instances") or []:
+        config = instance.get("config") if isinstance(instance, dict) else None
+        if isinstance(config, dict) and positive_int(config.get("context_length")):
+            loaded.append(config["context_length"])
+    return min(loaded) if loaded else positive_int(model.get("max_context_length"))
+
+
+def _lmstudio_v1_models(payload: dict) -> list:
+    """LM Studio 0.4+ GET /api/v1/models -> raw entries build_entry accepts."""
+    out = []
+    for m in payload.get("models") or []:
+        if not isinstance(m, dict) or not m.get("key"):
+            continue
+        caps = ["embedding"] if m.get("type") == "embedding" else ["completion"]
+        features = m.get("capabilities") or {}
+        if features.get("vision"):
+            caps.append("vision")
+        # LM Studio gives untrained models its default tool format, so
+        # "not trained for tool use" is not "no tools": leave that unknown.
+        trained = bool(features.get("trained_for_tool_use"))
+        if trained:
+            caps.append("tools")
+        quant = m.get("quantization") or {}
+        out.append({
+            "name": m["key"],
+            "size": m.get("size_bytes") or 0,
+            "details": {"parameter_size": m.get("params_string") or "",
+                        "family": m.get("architecture") or "",
+                        "quantization_level": quant.get("name") if isinstance(quant, dict) else quant},
+            "capabilities": caps,
+            "tools": True if trained else None,
+            "loaded": bool(m.get("loaded_instances")),
+            "context_length": lmstudio_context(m),
+        })
+    return out
+
+
+def _lmstudio_v0_models(payload: dict) -> list:
+    """LM Studio 0.3.x GET /api/v0/models -> raw entries (type llm|vlm|embeddings)."""
+    out = []
+    for m in payload.get("data") or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        kind = m.get("type")
+        caps = (["embedding"] if kind in ("embeddings", "embedding")
+                else ["completion", "vision"] if kind == "vlm" else ["completion"])
+        out.append({
+            "name": m["id"],
+            "details": {"family": m.get("arch") or "",
+                        "quantization_level": m.get("quantization") or ""},
+            "capabilities": caps,
+            "loaded": m.get("state") == "loaded",
+            "context_length": positive_int(m.get("max_context_length")),
+        })
+    return out
+
+
+async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple:
+    """Newest native API first; the OpenAI-compatible /v1/models (names only)
+    is the last resort, e.g. for an older LM Studio."""
+    base, headers = server_base(server), backend_headers(server)
+    last_error = None
+    for path, convert in (("/api/v1/models", _lmstudio_v1_models),
+                          ("/api/v0/models", _lmstudio_v0_models),
+                          ("/v1/models", None)):
+        try:
+            response = await client.get(f"{base}{path}", headers=headers,
+                                        timeout=DISCOVERY_TIMEOUT)
+            if response.status_code in (404, 405):
+                continue
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            return server, None, f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - try the next API flavour
+            last_error = f"{path}: {type(exc).__name__}: {exc}"
+            continue
+        if convert is None:
+            raws = [{"name": m.get("id")} for m in (payload.get("data") or [])
+                    if isinstance(m, dict) and m.get("id")]
+        else:
+            raws = convert(payload)
+        entries = [build_entry(server, raw, raw.get("capabilities")) for raw in raws]
+        return server, [e for e in entries if e["name"]], None
+    return server, None, last_error or "no LM Studio model API answered"
+
+
+async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
+    """Read Strata, Basalt, Maya, Xolotl, Avalon or Kindi model IDs and capabilities at /v1/models."""
+    try:
+        response = await client.get(f"{server_base(server)}/v1/models",
+                                    headers=backend_headers(server),
+                                    timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        models = payload["data"]
+        if not isinstance(models, list):
+            raise ValueError("data is not a list")
+        entries = []
+        for model in models:
+            if not isinstance(model, dict) or not model.get("id"):
+                continue
+            architecture = model.get("architecture") or {}
+            modalities = model.get("input_modalities") or []
+            if not modalities and isinstance(architecture, dict):
+                modalities = architecture.get("input_modalities") or []
+            caps = ["completion"] + (["vision"] if "image" in modalities else [])
+            outputs = architecture.get("output_modalities") if isinstance(architecture, dict) else None
+            meta = model.get("meta") if isinstance(model.get("meta"), dict) else {}
+            state = model.get("status", model.get("state"))
+            if isinstance(state, dict):
+                state = state.get("value")
+            size = model.get("parameter_size") or model.get("params_string")
+            # Only ids listed in [model_sizes] inherit a size. Other aliases
+            # and variants stay unknown unless the API or the id gives one.
+            if not size:
+                size = MODEL_SIZES.get(str(model["id"]).lower())
+            raw = {"name": model["id"], "capabilities": caps,
+                   "details": {"parameter_size": size},
+                   "loaded": state == "loaded" if state is not None else None,
+                   # Field names used by OpenAI-style servers (vLLM-style
+                   # max_model_len included), then the served context that
+                   # llama-server and Strata-style servers give as meta.n_ctx
+                   # (not n_ctx_train, the model's own limit). None required.
+                   "context_length": next(filter(None, (
+                       *(positive_int(model.get(k)) for k in
+                         ("context_length", "max_model_len", "context_window")),
+                       positive_int(meta.get("n_ctx")))), None)}
+            # An image generator listed beside the chat model (Strata's
+            # /v1/images model) outputs no text, so it takes no tools.
+            if server_kind(server) in TOOL_KINDS:
+                raw["tools"] = True if not isinstance(outputs, list) or "text" in outputs else None
+            entries.append(build_entry(server, raw, caps))
+        return server, entries, None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        return server, None, f"{type(exc).__name__}: {exc}"
+
+
+fetch_strata_models = fetch_openai_models  # preserve the existing callable
+
+
+async def fetch_server_models(client: httpx.AsyncClient, server: str,
+                              force_probe: bool = False) -> tuple:
+    if server_kind(server) == "lmstudio":
+        return await fetch_lmstudio_models(client, server)
+    if server_kind(server) in OPENAI_KINDS:
+        return await fetch_openai_models(client, server)
+    try:
+        response = await client.get(f"{server}/api/tags", timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - any failure means "server is down"
+        return server, None, f"{type(exc).__name__}: {exc}"
+    raws = [m for m in (payload.get("models") or []) if isinstance(m, dict)]
+    # Ollama's /api/tags lists installed models; /api/ps reports the ones
+    # resident in memory right now. Older bridges may lack /api/ps, in which
+    # case residency remains unknown rather than marking everything cold.
+    try:
+        running = await client.get(f"{server}/api/ps", timeout=DISCOVERY_TIMEOUT)
+        running.raise_for_status()
+        running_models = [m for m in running.json().get("models", []) if isinstance(m, dict)]
+        loaded = {name for m in running_models for name in (m.get("name"), m.get("model"))
+                  if isinstance(name, str)}
+        loaded.update(f"{name}:latest" for name in tuple(loaded) if ":" not in name)
+        loaded_digests = {m["digest"] for m in running_models if m.get("digest")}
+        for raw in raws:
+            raw["loaded"] = ((raw.get("name") or raw.get("model")) in loaded
+                             or bool(raw.get("digest") and raw["digest"] in loaded_digests))
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        pass
+    if CAPABILITY_PROBE:
+        limit = asyncio.Semaphore(8)   # per poll, so no cross-event-loop state
+        caps = await asyncio.gather(*[model_capabilities(client, server, m, limit, force_probe)
+                                      for m in raws])
+        for raw in raws:
+            raw["context_length"] = _CONTEXTS.get(_show_key(server, raw))
+    else:
+        caps = [None] * len(raws)
+    entries = [build_entry(server, m, c) for m, c in zip(raws, caps, strict=True)]
+    return server, [e for e in entries if e["name"]], None
+
+
+async def refresh_inventory(force_probe: bool = False) -> dict:
+    """Poll every target for the models it is currently serving."""
+    global INVENTORY
+    if not SERVERS:
+        INVENTORY = {"models": [], "servers": {}, "updated_at": time.time(),
+                     "errors": {"config": "no servers configured"}}
+        return INVENTORY
+    results = await asyncio.gather(
+        *[fetch_server_models(http_client(), s, force_probe) for s in SERVERS],
+        return_exceptions=True,
+    )
+    models, servers, errors = [], {}, {}
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        server, entries, error = result
+        if error is not None:
+            servers[server] = {"up": False, "model_count": 0}
+            errors[server] = error
+            if INVENTORY.get("servers", {}).get(server, {}).get("up", True):
+                log.warning("discovery: %s is down (%s)", server, error)
+            continue
+        if not INVENTORY.get("servers", {}).get(server, {}).get("up", True):
+            log.info("discovery: %s is back (%d models)", server, len(entries))
+        servers[server] = {"up": True, "model_count": len(entries)}
+        models.extend(entries)
+    INVENTORY = {"models": models, "servers": servers,
+                 "updated_at": time.time(), "errors": errors}
+    return INVENTORY
+
+
+def mark_server_down(server: str, reason: str) -> None:
+    """Take a host out of rotation right now, instead of waiting up to
+    refresh_seconds for the next poll. The next successful poll restores it."""
+    global INVENTORY
+    servers = dict(INVENTORY.get("servers", {}))
+    previous = servers.get(server, {})
+    if not previous.get("up", True):
+        return
+    servers[server] = dict(previous, up=False)
+    errors = dict(INVENTORY.get("errors", {}), **{server: reason})
+    INVENTORY = dict(INVENTORY, servers=servers, errors=errors)
+    log.warning("dispatch: %s marked down until the next discovery poll (%s)",
+                server, reason)
+
+
+async def _discovery_loop() -> None:
+    while True:
+        await asyncio.sleep(max(5, DISCOVERY_REFRESH))
+        try:
+            await refresh_inventory()
+        except Exception:  # noqa: BLE001 - never let the loop die
+            log.exception("discovery: refresh failed")
+
+
+# --- shared HTTP client + lifespan ---------------------------------------------
+# One pooled client for every upstream call. Tests swap the transport.
+_HTTP = {"client": None, "transport": None, "task": None}
+
+
+def http_client() -> httpx.AsyncClient:
+    if _HTTP["client"] is None:
+        _HTTP["client"] = httpx.AsyncClient(
+            timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=40),
+            transport=_HTTP["transport"],
+        )
+    return _HTTP["client"]
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ("localhost", ""):
+        return host == "localhost"
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    http_client()
+    if not ROUTER_API_KEY and not _is_loopback(ROUTER_HOST):
+        log.warning("ROUTER_API_KEY is not set and the router listens on %s: "
+                    "anyone who can reach port %d can use every backend. Set "
+                    "it with `manage-model-servers set-api-key`.",
+                    ROUTER_HOST, ROUTER_PORT)
+    if DISCOVERY_ENABLED and SERVERS:
+        await refresh_inventory()
+        # Keep the reference: a bare create_task() can be garbage-collected.
+        _HTTP["task"] = asyncio.create_task(_discovery_loop())
+    log.info("router ready: discovery=%s servers=%d scope=%s auth=%s",
+             DISCOVERY_ENABLED, len(SERVERS), CLASSIFY_SCOPE,
+             "on" if ROUTER_API_KEY else "off")
+    try:
+        yield
+    finally:
+        task = _HTTP.get("task")
+        if task:
+            task.cancel()
+        if _HTTP["client"] is not None:
+            await _HTTP["client"].aclose()
+            _HTTP["client"] = None
+
+
+app = FastAPI(title="Ollama Smart Router", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if request.url.path != "/healthz" and request.headers.get("x-router-subscription") == "1" \
+            and not ROUTER_API_KEY:
+        return _error(503, "Subscription pass through requires ROUTER_API_KEY.",
+                      "subscription_auth_not_configured")
+    if ROUTER_API_KEY and request.url.path != "/healthz":
+        if request.headers.get("x-router-subscription") == "1":
+            # Keep Authorization free for the signed-in Codex/Claude client.
+            token = request.headers.get("x-router-api-key", "")
+        else:
+            supplied = request.headers.get("authorization", "")
+            token = supplied[7:].strip() if supplied.lower().startswith("bearer ") else ""
+        if not hmac.compare_digest(token.encode(), ROUTER_API_KEY.encode()):
+            return JSONResponse(
+                {"error": {"message": "Missing or invalid router API key.",
+                           "type": "invalid_request_error",
+                           "code": "invalid_api_key"}},
+                status_code=401)
+    return await call_next(request)
+
+
+# --- request analysis ---------------------------------------------------------
+_CLASS_TO_TIER = {"fast": "TIER_FAST", "medium": "TIER_MEDIUM",
+                  "large": "TIER_LARGE", "xlarge": "TIER_XLARGE"}
+
+
+def classify_text(text: str) -> dict:
+    """Request class for one block of text. The single source of the keyword
+    and length heuristics, shared by discovery routing and the LiteLLM path."""
+    approx_tokens = len(text.split()) * 1.3
+    is_code = matches_keywords(CODE_RE, text)
+    if CODE_FIRST and is_code:
+        request_class = "fast"
+    elif approx_tokens > TOKEN_THRESHOLD_XLARGE or matches_keywords(XLARGE_RE, text):
+        request_class = "xlarge"
+    elif approx_tokens > TOKEN_THRESHOLD_LARGE or matches_keywords(LARGE_RE, text):
+        request_class = "large"
+    elif approx_tokens > TOKEN_THRESHOLD_MEDIUM:
+        request_class = "medium"
+    else:
+        request_class = "fast"
+    return {"class": request_class, "code": is_code,
+            "approx_tokens": round(approx_tokens)}
+
+
+def analyze_complexity(prompt: str) -> str:
+    """Tier alias (a LiteLLM model_name) for a prompt -- the LiteLLM path."""
+    return globals()[_CLASS_TO_TIER[classify_text(prompt)["class"]]]
+
+
+def _message_parts(message) -> tuple:
+    """(text, has_image) for one OpenAI chat message."""
+    if not isinstance(message, dict):
+        return "", False
+    content = message.get("content")
+    if isinstance(content, str):
+        return content, False
+    texts, has_image = [], False
+    if isinstance(content, list):
+        # OpenAI multimodal form: [{"type":"text"...},{"type":"image_url"...}]
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif part.get("type") in ("image_url", "input_image", "image"):
+                has_image = True
+    return " ".join(texts), has_image
+
+
+def routing_text(messages: list) -> str:
+    """The text the heuristics judge, per [classification] scope."""
+    messages = [m for m in (messages or []) if isinstance(m, dict)]
+    if CLASSIFY_SCOPE != "conversation":
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return _message_parts(message)[0]
+    # Scope "conversation", or no user turn at all (then judge everything).
+    return " ".join(_message_parts(m)[0] for m in messages)
+
+
+def classify_request(messages: list) -> dict:
+    """Turn the conversation into routing requirements.
+
+    Images are looked for in EVERY message: a follow-up question about an
+    image sent earlier still needs a vision model to see it."""
+    need = classify_text(routing_text(messages))
+    need["vision"] = any(_message_parts(m)[1] for m in (messages or []))
+    need["tools"] = False
+    return need
+
+
+def wants_tools(body: dict) -> bool:
+    """Does the request offer the model tools it may call? An empty list, or
+    tool_choice "none", asks for none."""
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools") or body.get("functions")
+    if not isinstance(tools, list) or not tools:
+        return False
+    return body.get("tool_choice") != "none" and body.get("function_call") != "none"
+
+
+def apply_tool_needs(need: dict, body: dict) -> dict:
+    """Mark a tool request, and raise its class to tools_min_class."""
+    need = dict(need, tools=wants_tools(body))
+    if need["tools"] and TOOLS_MIN_CLASS and \
+            CLASS_ORDER.index(need["class"]) < CLASS_ORDER.index(TOOLS_MIN_CLASS):
+        need["class"] = TOOLS_MIN_CLASS
+    return need
+
+
+def _in_band(params: float, low: float, high: float) -> bool:
+    """Is a parameter count inside a band?
+
+    The upper bound is EXCLUSIVE so adjacent bands are disjoint. With the
+    defaults (large 20:70, xlarge 70:999) an inclusive bound would place a 70B
+    model in both, and the size bias in score_entry would then let large take
+    the very model that defines xlarge. The topmost band keeps an inclusive
+    ceiling so the biggest model in the pool still lands somewhere.
+    """
+    return low <= params < high or params == high == TOP_BAND_HIGH
+
+
+def band_distance(entry: dict, need: dict) -> float:
+    """How far outside the requested band a model sits, in billions (0 = in).
+
+    Used to order candidates when nothing is in band at all -- see
+    rank_candidates. A model of unknown size sorts after known out-of-band
+    models, but remains eligible when no known-size model exists.
+    """
+    low, high = BANDS.get(need["class"], (0.0, 999.0))
+    params = entry["params_b"]
+    if params <= 0:
+        return float("inf")
+    if _in_band(params, low, high):
+        return 0.0
+    return (low - params) if params < low else (params - high)
+
+
+def in_requested_band(entry: dict, need: dict) -> bool:
+    """Does this model's size genuinely fall inside the requested band?
+
+    Distinct from `band_distance(...) == 0.0`, which means a known model is
+    inside the requested band. Keeping them separate matters: one unknown-size
+    model in the pool must not switch off distance ranking for every other
+    candidate.
+    """
+    low, high = BANDS.get(need["class"], (0.0, 999.0))
+    return entry["params_b"] > 0 and _in_band(entry["params_b"], low, high)
+
+
+def score_entry(entry: dict, need: dict) -> float:
+    """Heuristic fit of one discovered (server, model) pair to one request."""
+    low, high = BANDS.get(need["class"], (0.0, 999.0))
+    params = entry["params_b"]
+    in_band = _in_band(params, low, high)
+    if params <= 0:
+        fit = W_UNKNOWN
+    elif in_band:
+        fit = 1.0
+    else:
+        distance = (low - params) if params < low else (params - high)
+        fit = max(0.0, 1.0 - (distance / BAND_FALLOFF))
+    score = W_BAND * fit
+
+    if need["code"]:
+        score += W_CODE if entry["is_code"] else 0.0
+    elif entry["is_code"]:
+        # A code model on a general request is usable but not preferred.
+        score -= W_CODE * W_OFFTASK
+
+    if need["vision"]:
+        score += W_VISION if entry["is_vision"] else -W_VISION
+    elif entry["is_vision"]:
+        # A vision model answers text fine, but it is tuned for something else
+        # and is usually the wrong pick when an equal-sized text model exists.
+        score -= W_VISION * W_OFFTASK
+
+    # Within a band, bias toward the extreme the class actually wants. The bias
+    # is a position WITHIN the band (0 at the floor, 1 at the ceiling) and is
+    # applied only to in-band models. Rewarding absolute size instead would let
+    # an out-of-band giant outscore a perfect in-band fit: a 70B model sits at
+    # large's exclusive ceiling, so the gentle falloff still scores it ~1.0, and
+    # an unbounded size bonus would push it past the 32B that actually belongs
+    # to the tier.
+    if params > 0 and in_band:
+        span = high - low
+        position = (params - low) / span if span > 0 else 1.0
+        position = max(0.0, min(position, 1.0))
+        if need["class"] in ("large", "xlarge"):
+            score += W_LARGER * position
+        elif need["class"] == "fast":
+            score += W_SMALLER * (1.0 - position)
+    if entry.get("loaded"):
+        score += W_LOADED
+    if need.get("tools") and entry.get("tools"):
+        score += W_TOOLS
+    return score
+
+
+def rank_candidates(need: dict, inventory: dict = None) -> list:
+    """All usable (server, model) pairs, best first."""
+    inv = inventory if inventory is not None else INVENTORY
+    scored = []
+    for entry in inv.get("models", []):
+        if entry["is_embedding"]:
+            continue  # embedding models cannot serve chat completions
+        if not inv.get("servers", {}).get(entry["server"], {}).get("up", True):
+            continue
+        if LMSTUDIO_LOADED_ONLY and entry["kind"] == "lmstudio" and entry.get("loaded") is False:
+            continue  # would trigger a just-in-time load on LM Studio
+        scored.append((score_entry(entry, need), entry))
+    if need.get("tools"):
+        # A model known to lack tools answers a tool request with an error.
+        # Keep the full list only when nothing else is left (the caller warns).
+        capable = [pair for pair in scored if pair[1].get("tools") is not False]
+        scored = capable or scored
+    if not scored:
+        return []
+
+    # Ordinarily score alone orders the list. But when NOTHING is in band it
+    # cannot: the falloff floors at zero once a model is band_falloff billions
+    # outside, so for an xlarge request (70:999) against a 14B/27B pool every
+    # candidate flattens to exactly 0.0. They then look tied, and the rotation
+    # below hands the prompt to the smallest model half the time while the
+    # largest sits idle. In that case rank by how far each model is from the
+    # band, so the closest wins, and let score break ties only among models
+    # that are equally far out.
+    use_distance = not any(in_requested_band(e, need) for _, e in scored)
+
+    def _distance(entry):
+        return band_distance(entry, need) if use_distance else 0.0
+
+    # Sorting on (distance asc, score desc) is identical to the previous
+    # score-only sort whenever use_distance is False.
+    scored.sort(key=lambda pair: (_distance(pair[1]), -pair[0]))
+
+    # Rotate through candidates that score within tie_epsilon of the best, so
+    # the same model on several hosts shares load instead of always hitting the
+    # first one. (LiteLLM does this for the static path; direct dispatch needs
+    # its own.) Equal distance is part of "tied": without it the rotation would
+    # spread load across models of visibly different size.
+    best_score = scored[0][0]
+    best_distance = _distance(scored[0][1])
+    tied, rest = [], []
+    for s_val, e in scored:
+        if _distance(e) == best_distance and best_score - s_val <= TIE_EPSILON:
+            tied.append(e)
+        else:
+            rest.append(e)
+    if need.get("tools") and len(tied) > 1:
+        # An agent loop sends many requests for one task. Rotating between
+        # DIFFERENT models would change the model mid-task and discard the
+        # backend's prompt cache, so only the same model on several hosts
+        # shares the load.
+        best_name = tied[0]["name"]
+        rest = [e for e in tied if e["name"] != best_name] + rest
+        tied = [e for e in tied if e["name"] == best_name]
+    if len(tied) > 1:
+        key = f"{need['class']}|{need['code']}|{need['vision']}|{need.get('tools', False)}"
+        index = _rotation.get(key, 0) % len(tied)
+        _rotation[key] = index + 1
+        tied = tied[index:] + tied[:index]
+    return tied + rest
+
+
+def find_named_model(model_name: str) -> list:
+    """Servers hosting an explicitly requested model, best first."""
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return []
+    matches = [e for e in INVENTORY.get("models", [])
+               if e["name"].lower() == wanted
+               and not e["is_embedding"]
+               and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
+    if not matches:
+        # Allow the bare name without its tag, e.g. "qwen3" -> "qwen3:14b".
+        matches = [e for e in INVENTORY.get("models", [])
+                   if e["name"].lower().split(":", 1)[0] == wanted
+                   and not e["is_embedding"]
+                   and INVENTORY.get("servers", {}).get(e["server"], {}).get("up", True)]
+    if len(matches) > 1:
+        index = _rotation.get(wanted, 0) % len(matches)
+        _rotation[wanted] = index + 1
+        matches = matches[index:] + matches[:index]
+    return matches
+
+
+def embedding_only_match(model_name: str):
+    """The inventory name when an explicitly requested model exists ONLY as an
+    embedding model (exact name first, then the bare name without its tag);
+    None when it is unknown or any host serves it for chat.
+
+    Such a request cannot be answered by the chat endpoint. Rerouting it to
+    some other chat model would silently answer with a model the client did
+    not ask for, so the caller rejects it instead.
+
+    Host state is deliberately ignored: when the chat copy of a name is only on
+    a host that is down, the model is not embedding-only, and the request takes
+    the same path as any explicitly named model that is currently unavailable
+    (routed by its content, flagged with X-Router-Warning: model-unavailable).
+    """
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return None
+    models = INVENTORY.get("models", [])
+    matches = [e for e in models if e["name"].lower() == wanted]
+    if not matches:
+        matches = [e for e in models if e["name"].lower().split(":", 1)[0] == wanted]
+    if matches and all(e["is_embedding"] for e in matches):
+        return matches[0]["name"]
+    return None
+
+
+def known_chat_model(model_name: str) -> bool:
+    """Is this name (exact, or without its tag) a chat model on ANY host, up or
+    down? Distinguishes "named model temporarily unavailable" from a name the
+    router has never seen."""
+    wanted = (model_name or "").strip().lower()
+    if not wanted:
+        return False
+    return any(not e["is_embedding"]
+               and wanted in (e["name"].lower(), e["name"].lower().split(":", 1)[0])
+               for e in INVENTORY.get("models", []))
+
+
+# --- proxying -----------------------------------------------------------------
+def _forward_headers(request: Request, drop_auth: bool = False) -> dict:
+    """Request headers to send upstream. drop_auth strips Authorization, so the
+    router's own API key is never handed to an Ollama host."""
+    return {k: v for k, v in request.headers.items()
+            if k.lower() not in HOP_BY_HOP
+            and k.lower() not in ("x-router-api-key", "x-router-subscription")
+            and not (drop_auth and k.lower() == "authorization")}
+
+
+async def _proxy_subscription(request: Request) -> Response:
+    if not SUBSCRIPTION_GATEWAY_BASE:
+        return _error(503, "Subscription gateway is not configured.",
+                      "subscription_gateway_not_configured")
+    url = f"{SUBSCRIPTION_GATEWAY_BASE}{request.url.path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    raw = await request.body()
+    return await _stream_upstream(
+        request.method, url, _forward_headers(request), content=raw or None,
+        extra_headers={"X-Router-Mode": "subscription"})
+
+
+def _response_headers(upstream: httpx.Response, extra: dict = None) -> dict:
+    headers = {k: v for k, v in upstream.headers.items()
+               if k.lower() not in RESPONSE_HOP_BY_HOP}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+async def close_upstream(response: httpx.Response) -> None:
+    await response.aclose()
+
+
+async def _stream_upstream(method: str, url: str, headers: dict,
+                           json_body=None, content=None,
+                           extra_headers: dict = None,
+                           read_timeout: float = READ_TIMEOUT,
+                           kindi_tier: bool = False) -> Response:
+    client = http_client()
+    try:
+        upstream_request = client.build_request(
+            method, url, headers=headers, json=json_body, content=content,
+            timeout=httpx.Timeout(read_timeout, connect=CONNECT_TIMEOUT),
+        )
+        upstream_response = await client.send(upstream_request, stream=True)
+    except httpx.ReadTimeout as exc:
+        if kindi_tier:
+            return kindi_no_reply("LiteLLM did not answer for a tier with Kindi.")
+        raise HTTPException(status_code=502, detail=f"OSR core disconnect: {exc}") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"OSR core disconnect: {exc}") from exc
+    if kindi_tier and upstream_response.status_code == 408:
+        # LiteLLM answers its own timeout with 408, which an SDK retries.
+        await upstream_response.aclose()
+        return kindi_no_reply("LiteLLM gave up on a tier with Kindi.")
+    if (kindi_tier and isinstance(json_body, dict) and json_body.get("stream") is not True
+            and 200 <= upstream_response.status_code < 300):
+        # LiteLLM can send 200 headers before a Kindi-backed completion body.
+        # Finish the non-streaming response before committing our own 200.
+        try:
+            buffered = b"".join([chunk async for chunk in upstream_response.aiter_raw()])
+        except httpx.ReadTimeout:
+            await upstream_response.aclose()
+            return kindi_no_reply("LiteLLM did not finish a tier with Kindi.")
+        except httpx.RequestError as exc:
+            await upstream_response.aclose()
+            raise HTTPException(status_code=502, detail=f"OSR core disconnect: {exc}") from exc
+        await upstream_response.aclose()
+        return Response(content=buffered, status_code=upstream_response.status_code,
+                        headers=_response_headers(upstream_response, extra_headers))
+    return StreamingResponse(
+        upstream_response.aiter_raw(),
+        status_code=upstream_response.status_code,
+        headers=_response_headers(upstream_response, extra_headers),
+        background=BackgroundTask(close_upstream, upstream_response),
+    )
+
+
+# Upstream statuses that mean "try the next candidate": the host is failing
+# (5xx) or no longer has the model (404, e.g. removed since the last poll).
+RETRYABLE_STATUS = {404} | set(range(500, 600))
+CLIENT_RETRYABLE_STATUS = {408, 409, 429} | set(range(500, 600))
+
+# A Kindi request that got no reply after it was sent may still be running:
+# Kindi serves one request at a time, and an OpenAI SDK retries a 5xx (a 408
+# too), so the retry would queue behind it. Such a failure is answered 424 with
+# x-should-retry: false; the message avoids the words clients match as a
+# timeout. The router hung up, so Kindi stops the request at its next prompt
+# batch or token; until its /health confirms it is idle, nothing more is sent
+# to it and callers get a retryable 503. A newer busy request does not prove
+# the unanswered one has finished: it could still be waiting in Kindi's queue.
+KINDI_HEALTH_CACHE_SECONDS = 5
+_KINDI_DRAINING: dict = {}  # server -> [last /health check, busy]
+
+
+def kindi_no_reply(prefix: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": prefix + " No complete reply arrived within the read budget; the request "
+                   "was not sent again, because Kindi may still be working on it.",
+                   "type": "upstream_no_reply", "code": "kindi_no_reply"}},
+        status_code=424, headers={"x-should-retry": "false"})
+
+
+def mark_kindi_draining(server: str) -> None:
+    _KINDI_DRAINING[server] = [float("-inf"), True]
+
+
+async def kindi_busy(server: str) -> bool:
+    """True while a Kindi server that left a request unanswered still reports
+    work in progress on /health (checked at most every 5 s)."""
+    state = _KINDI_DRAINING.get(server)
+    if state is None:
+        return False
+    now = time.monotonic()
+    if now - state[0] < KINDI_HEALTH_CACHE_SECONDS:
+        return state[1]
+    try:
+        response = await http_client().get(f"{server_base(server)}/health", timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        health = response.json()
+        if not isinstance(health, dict) or "busy" not in health:
+            raise ValueError("Kindi health response has no busy field")
+        busy = health["busy"] is not None and health["busy"] is not False
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("dispatch: cannot confirm Kindi %s is idle (%s)", server, exc)
+        busy = True
+    # A concurrent request may have recorded a newer unanswered POST while
+    # this probe was in flight. Its drain state takes precedence.
+    current = _KINDI_DRAINING.get(server)
+    if current is not state:
+        return current[1] if current is not None else False
+    if busy:
+        _KINDI_DRAINING[server] = [now, True]
+    else:
+        _KINDI_DRAINING.pop(server, None)
+    return busy
+
+
+# Only a capability rejection warrants trying another model and temporarily
+# excluding this one from tool requests. A malformed tools payload can also
+# mention "tools" in a 400, but every candidate would receive that same error.
+TOOL_REJECTION_RE = re.compile(
+    rb"\b(?:does not|doesn't|do not|don't)\s+support\s+"
+    rb"(?:tools?|tool\s+(?:calls?|calling|use)|function\s+(?:calls?|calling))\b"
+    rb"|\b(?:tools?|tool\s+(?:calls?|calling|use)|function\s+(?:calls?|calling))"
+    rb"\s+(?:is|are)\s+not\s+supported\b",
+    re.IGNORECASE,
+)
+# Error bodies are small; never buffer more than this to inspect one.
+ERROR_PEEK_BYTES = 65536
+
+
+async def _read_raw(response: httpx.Response, limit: int = ERROR_PEEK_BYTES) -> bytes:
+    """The raw (still encoded) body of an error response, up to limit bytes."""
+    chunks, size = [], 0
+    async for chunk in response.aiter_raw():
+        chunks.append(chunk)
+        size += len(chunk)
+        if size >= limit:
+            break
+    return b"".join(chunks)
+
+
+async def _relay_kindi_stream(server: str, response: httpx.Response, first_chunk: bytes,
+                              remaining: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Relay SSE after its first chunk; keep Kindi gated if it later stalls."""
+    try:
+        if first_chunk:
+            yield first_chunk
+        async for chunk in remaining:
+            yield chunk
+    except httpx.ReadTimeout:
+        mark_kindi_draining(server)
+        raise
+    finally:
+        await response.aclose()
+
+
+async def _dispatch_direct(candidates: list, body: dict, headers: dict,
+                           need: dict, extra_headers: dict = None) -> Response:
+    """Send to the best candidate, falling forward through the ranked list on
+    connection errors, 404 or 5xx. Retrying is only safe before any body has
+    been streamed, which is why the status is checked before returning. A host
+    that refuses or times out the CONNECTION is marked down immediately so the
+    next request skips it too."""
+    client = http_client()
+    last_error = None
+    no_reply = kindi_was_busy = False
+    for position, entry in enumerate(candidates):
+        if not INVENTORY.get("servers", {}).get(entry["server"], {}).get("up", True):
+            last_error = f"{entry['server']}: marked down"
+            continue
+        if entry["kind"] == "kindi" and await kindi_busy(entry["server"]):
+            last_error = (f"{entry['server']} is still busy after an earlier request got no reply; "
+                          "nothing was sent to it")
+            kindi_was_busy = True
+            continue
+        attempt_body = dict(body)
+        attempt_body["model"] = entry["name"]
+        url = f"{server_base(entry['server'])}/v1/chat/completions"
+        try:
+            upstream_request = client.build_request(
+                "POST", url, headers=dict(headers, **backend_headers(entry["server"])),
+                json=attempt_body,
+                timeout=httpx.Timeout(
+                    KINDI_READ_TIMEOUT if entry["kind"] == "kindi" else READ_TIMEOUT,
+                    connect=CONNECT_TIMEOUT,
+                ),
+            )
+            upstream_response = await client.send(upstream_request, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+            mark_server_down(entry["server"], last_error)
+            continue
+        except httpx.RequestError as exc:
+            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+            if entry["kind"] == "kindi" and isinstance(exc, httpx.ReadTimeout):
+                # Sent, but no reply: Kindi may still be working on it.
+                no_reply = True
+                mark_kindi_draining(entry["server"])
+                log.warning("dispatch: Kindi %s sent no reply; not sending it again", entry["server"])
+                continue
+            log.warning("dispatch: %s", last_error)
+            continue
+        is_last = position == len(candidates) - 1
+        if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
+            await upstream_response.aclose()
+            last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+            log.warning("dispatch: %s for %s; trying the next candidate",
+                        last_error, entry["name"])
+            continue
+        if no_reply and upstream_response.status_code in CLIENT_RETRYABLE_STATUS:
+            # A later error must not turn an unanswered Kindi POST into a
+            # response that makes clients replay the whole call.
+            last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+            await upstream_response.aclose()
+            continue
+        buffered = None
+        if upstream_response.status_code == 400 and need.get("tools"):
+            # The raw body is inspected as sent. A compressed error body will
+            # not match, so it is passed through and nothing is demoted.
+            buffered = await _read_raw(upstream_response)
+            await upstream_response.aclose()
+            if TOOL_REJECTION_RE.search(buffered):
+                # Skip this model for tool requests until the next poll
+                # (which rebuilds the entry) instead of failing every turn.
+                # The last candidate is remembered too; its 400 is returned.
+                entry["tools"] = False
+                last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
+                if not is_last:
+                    log.warning("dispatch: %s; trying the next candidate", last_error)
+                    continue
+                log.warning("dispatch: %s; no candidates left", last_error)
+        kindi_stream = None
+        if entry["kind"] == "kindi" and upstream_response.status_code < 400:
+            try:
+                raw_stream = upstream_response.aiter_raw()
+                if body.get("stream") is True:
+                    first_chunk = await anext(raw_stream, b"")
+                    kindi_stream = _relay_kindi_stream(entry["server"], upstream_response,
+                                                        first_chunk, raw_stream)
+                else:
+                    # The client expects one complete JSON reply. Read every
+                    # raw byte before sending 200, so a late read timeout can
+                    # still become 424 and the original encoding is preserved.
+                    buffered = b"".join([chunk async for chunk in raw_stream])
+                    await upstream_response.aclose()
+            except httpx.ReadTimeout as exc:
+                last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                no_reply = True
+                mark_kindi_draining(entry["server"])
+                await upstream_response.aclose()
+                continue
+            except httpx.RequestError as exc:
+                last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                mark_server_down(entry["server"], last_error)
+                await upstream_response.aclose()
+                continue
+        log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)",
+                 need["class"], need["code"], need["vision"], need.get("tools", False),
+                 need.get("approx_tokens"), entry["name"], entry["server"],
+                 position + 1, len(candidates))
+        router_headers = {
+            "X-Router-Model": entry["name"],
+            "X-Router-Server": entry["server"],
+            "X-Router-Class": need["class"],
+            "X-Router-Mode": "discovery",
+            "X-Router-Candidates": str(len(candidates)),
+        }
+        router_headers.update(extra_headers or {})
+        if buffered is not None:
+            return Response(content=buffered, status_code=upstream_response.status_code,
+                            headers=_response_headers(upstream_response, router_headers))
+        return StreamingResponse(
+            kindi_stream if kindi_stream is not None else upstream_response.aiter_raw(),
+            status_code=upstream_response.status_code,
+            headers=_response_headers(upstream_response, router_headers),
+            background=BackgroundTask(close_upstream, upstream_response),
+        )
+    if no_reply:
+        return kindi_no_reply("No usable model target.")
+    if kindi_was_busy:
+        return JSONResponse({"error": {"message": f"No usable model target. Last error: {last_error}",
+                                       "type": "kindi_busy", "code": "kindi_busy"}},
+                            status_code=503, headers={"Retry-After": "15"})
+    raise HTTPException(status_code=502,
+                        detail=f"No usable model target. Last error: {last_error}")
+
+
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/routing/inventory")
+async def routing_inventory():
+    """What each Ollama target is currently serving, as the router sees it."""
+    return JSONResponse({
+        "enabled": DISCOVERY_ENABLED,
+        "servers": SERVERS,
+        "updated_at": INVENTORY.get("updated_at"),
+        "age_seconds": round(time.time() - (INVENTORY.get("updated_at") or 0), 1),
+        "server_status": INVENTORY.get("servers", {}),
+        "errors": INVENTORY.get("errors", {}),
+        "models": INVENTORY.get("models", []),
+        # The direct dispatchers of Hermes, OpenClaw and Honcho compare this
+        # with the budget their CT was configured for.
+        "kindi_read_timeout_seconds": KINDI_READ_TIMEOUT,
+    })
+
+
+@app.post("/routing/refresh")
+async def routing_refresh():
+    await refresh_inventory(force_probe=True)
+    return await routing_inventory()
+
+
+@app.post("/routing/explain")
+async def routing_explain(request: Request):
+    """Show the routing decision for a prompt without executing it."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    messages = body.get("messages")
+    if not messages and isinstance(body.get("prompt"), str):
+        messages = [{"role": "user", "content": body["prompt"]}]
+    need = apply_tool_needs(classify_request(messages or []), body)
+    requested = str(body.get("model") or "").strip()
+    if requested in TIER_NAMES:
+        need = dict(need, **{"class": TIER_NAMES[requested]})
+    candidates = rank_candidates(need)
+    return JSONResponse({
+        "request": need,
+        "legacy_tier": analyze_complexity(routing_text(messages or [])),
+        "chosen": ({"model": candidates[0]["name"], "server": candidates[0]["server"]}
+                   if candidates else None),
+        "candidates": [
+            {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
+             "tools": e.get("tools"), "score": round(score_entry(e, need), 4)}
+            for e in candidates[:10]
+        ],
+    })
+
+
+def _error(status: int, message: str, code: str) -> JSONResponse:
+    return JSONResponse({"error": {"message": message, "type": "invalid_request_error",
+                                   "code": code}}, status_code=status)
+
+
+@app.post("/v1/chat/completions")
+async def route_chat_completion(request: Request):
+    if request.headers.get("x-router-subscription") == "1":
+        return await _proxy_subscription(request)
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        return _error(400, "Request body must be a JSON object.", "invalid_body")
+    messages = body.get("messages") or []
+    requested = str(body.get("model") or "").strip()
+    need = apply_tool_needs(classify_request(messages), body)
+
+    if requested in CLOUD_MODELS:
+        log.info("route explicit cloud model=%s", requested)
+        return await _stream_upstream(
+            "POST", LITELLM_URL, _forward_headers(request, drop_auth=True),
+            json_body=body,
+            extra_headers={"X-Router-Mode": "cloud", "X-Router-Model": requested},
+        )
+    if requested.split("/", 1)[0] in CLOUD_PROVIDERS and "/" in requested \
+            and not known_chat_model(requested) and not embedding_only_match(requested):
+        # Local servers may use the same prefixes (LM Studio lists
+        # "openai/gpt-oss-20b"), so only a name no local host knows is refused.
+        return _error(404, f"Cloud model '{requested}' is not configured with an API key.",
+                      "cloud_model_not_configured")
+
+    if DISCOVERY_ENABLED and INVENTORY.get("models"):
+        # An explicitly requested real model is honoured; tier aliases and
+        # "auto" mean "decide for me".
+        candidates, explicit = [], False
+        if requested and requested.lower() not in ("auto", "") \
+                and requested not in TIER_NAMES:
+            candidates = find_named_model(requested)
+            explicit = bool(candidates)
+            embedding = None if candidates else embedding_only_match(requested)
+            if embedding:
+                log.warning("route: %s is embedding-only; rejecting the chat request", embedding)
+                return _error(
+                    400,
+                    f"Model '{embedding}' is an embedding-only model and cannot answer chat "
+                    "completions. Send embedding requests to /v1/embeddings, or choose a chat "
+                    "model (see /v1/models) or 'auto'.",
+                    "embedding_model_not_chat")
+        warnings = []
+        if requested and not candidates and requested.lower() != "auto" \
+                and requested not in TIER_NAMES and known_chat_model(requested):
+            # Named, known, but every host serving it is down: answer by
+            # content, and say so rather than silently using another model.
+            log.warning("route: %s is on no reachable host; routing by content", requested)
+            warnings.append("model-unavailable")
+        if not candidates:
+            if requested in TIER_NAMES:
+                need = dict(need, **{"class": TIER_NAMES[requested]})
+            candidates = rank_candidates(need)
+        extra = {}
+        if need["vision"] and not explicit and candidates \
+                and not any(e["is_vision"] for e in candidates):
+            message = ("The request contains an image, but no discovered model "
+                       "looks vision-capable (see [discovery] vision_models).")
+            if VISION_STRICT:
+                return _error(400, message, "no_vision_model")
+            log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
+            warnings.append("no-vision-model")
+        if need["tools"] and not explicit and candidates \
+                and all(e.get("tools") is False for e in candidates):
+            message = ("The request offers tools, but every discovered model is "
+                       "known to lack tool support.")
+            if TOOLS_STRICT:
+                return _error(400, message, "no_tool_model")
+            log.warning("route: %s Routing to %s anyway.", message, candidates[0]["name"])
+            warnings.append("no-tool-model")
+        if warnings:
+            extra["X-Router-Warning"] = ", ".join(warnings)
+        if candidates:
+            return await _dispatch_direct(
+                candidates, body, _forward_headers(request, drop_auth=True),
+                need, extra)
+
+    # Fallback: the original static path through LiteLLM, which keeps its own
+    # latency routing and cross-tier fallbacks.
+    tier = _CLASS_TO_TIER[need["class"]]
+    body["model"] = globals()[tier]
+    log.info("route class=%s -> LiteLLM %s", need["class"], body["model"])
+    headers = _forward_headers(request, drop_auth=True)
+    if tier_has_kindi(need["class"]):
+        # Kindi asks for one retry at most. LiteLLM 1.75 does not read the
+        # policy's InternalServerErrorRetries, so this request header caps the
+        # retries of every error but a timeout (the policy's 0) at one. A
+        # client's own retry or timeout header is dropped; the timeout comes
+        # from each deployment (Kindi's follows router.ini), and a request-wide
+        # one would also lift LiteLLM's 600 s from the tier's other servers.
+        headers = {key: value for key, value in headers.items()
+                   if key.lower() not in ("x-litellm-num-retries", "x-litellm-timeout")}
+        headers["x-litellm-num-retries"] = "1"
+    return await _stream_upstream(
+        "POST", LITELLM_URL, headers, json_body=body,
+        extra_headers={"X-Router-Mode": "litellm", "X-Router-Model": body["model"]},
+        read_timeout=litellm_read_timeout(need["class"]),
+        kindi_tier=tier_has_kindi(need["class"]),
+    )
+
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """Advertise auto + the tier aliases, then whatever is actually available.
+
+    The aliases are emitted FIRST and UNCONDITIONALLY. They are resolved by the
+    router itself, so they must stay selectable in states where nothing
+    downstream knows about them:
+
+      * discovery empty -- every Ollama host down, discovery disabled, or the
+        first poll still in flight;
+      * a tier with no LiteLLM deployment -- which is exactly xlarge until
+        servers are assigned to it.
+
+    This path used to return LiteLLM's list verbatim whenever discovery was
+    empty. That made the picker mirror litellm_config.yaml, so a tier with no
+    deployment never appeared, and a stale alias still in that file was
+    advertised as though it were live.
+    """
+    if request.headers.get("x-router-subscription") == "1":
+        return await _proxy_subscription(request)
+    seen, data = set(), []
+    for alias in ("auto", TIER_FAST, TIER_MEDIUM, TIER_LARGE, TIER_XLARGE):
+        if alias and alias not in seen:
+            seen.add(alias)
+            data.append({"id": alias, "object": "model", "owned_by": "router"})
+
+    for name, provider in CLOUD_MODELS.items():
+        if name not in seen:
+            seen.add(name)
+            data.append({"id": name, "object": "model", "owned_by": provider})
+
+    if DISCOVERY_ENABLED and INVENTORY.get("models"):
+        for entry in INVENTORY["models"]:
+            if entry["is_embedding"] or entry["name"] in seen:
+                continue
+            seen.add(entry["name"])
+            data.append({"id": entry["name"], "object": "model",
+                         "owned_by": entry["kind"]})
+        return JSONResponse({"object": "list", "data": data})
+
+    # Discovery unavailable: supplement the aliases with LiteLLM's own list so
+    # real model names are still offered. An alias already emitted is never
+    # displaced by a stale entry of the same name.
+    try:
+        response = await http_client().get(
+            f"{LITELLM_BASE}/v1/models",
+            headers=_forward_headers(request, drop_auth=True),
+            timeout=DISCOVERY_TIMEOUT)
+        for entry in (response.json().get("data") or []):
+            name = str(entry.get("id") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                data.append({"id": name, "object": "model", "owned_by": "litellm"})
+    except Exception as exc:  # noqa: BLE001 - the alias list must still be served
+        log.warning("model list: LiteLLM unreachable (%s); serving aliases only", exc)
+    return JSONResponse({"object": "list", "data": data})
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def proxy_openai(path: str, request: Request):
+    if request.headers.get("x-router-subscription") == "1":
+        return await _proxy_subscription(request)
+    # Transparent passthrough for all other OpenAI routes (embeddings, etc.).
+    url = f"{LITELLM_BASE}/v1/{path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    raw = await request.body()
+    return await _stream_upstream(
+        request.method, url, _forward_headers(request, drop_auth=True),
+        content=raw or None
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=ROUTER_HOST, port=ROUTER_PORT)

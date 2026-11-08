@@ -1,0 +1,5 @@
+__pycache__/
+# Local secrets and model data never belong in git.
+*.env
+!ollama.env.example
+models/

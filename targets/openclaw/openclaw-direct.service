@@ -1,0 +1,34 @@
+[Unit]
+Description=OpenClaw direct model dispatch (router inventory, model servers called directly)
+Documentation=https://docs.openclaw.ai/gateway/local-models
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A separate account from the agent: the router and backend keys it reads
+# (root:openclaw-direct, 0640) are not readable by OpenClaw's tools.
+User=openclaw-direct
+Group=openclaw-direct
+# The Hermes target's dispatcher, run with this target's files.
+Environment=DIRECT_ETC=/etc/openclaw-target
+Environment=DIRECT_SECRETS_FILE=/etc/openclaw-target/router.env
+Environment=DIRECT_CONTEXT_SETTING=OPENCLAW_CONTEXT_LENGTH
+EnvironmentFile=-/etc/openclaw-target/settings
+ExecStart=/usr/bin/python3 /usr/local/lib/openclaw-direct.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

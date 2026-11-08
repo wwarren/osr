@@ -1,0 +1,30 @@
+[Unit]
+Description=DeepSeek Harness agent for Ollama Smart Router
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=deepseek-harness
+Group=deepseek-harness
+EnvironmentFile=/etc/deepseek-harness/service.env
+WorkingDirectory=/var/lib/deepseek-harness/workspace
+# current links to the release install-target.sh installed (releases/<version>.<time>).
+ExecStart=/usr/bin/node /opt/deepseek-harness/current/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --patch /etc/deepseek-harness/osr.patch.yml --no-open --host ${DSH_BIND_IP} --port ${DSH_PORT}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deepseek-harness
+UMask=0027
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

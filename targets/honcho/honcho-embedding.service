@@ -1,0 +1,39 @@
+[Unit]
+Description=Honcho local embedding model (llama.cpp, Qwen3-Embedding-0.6B Q8_0, CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=honcho-embedding
+Group=honcho-embedding
+# HONCHO_EMBEDDING_THREADS: the CT's cores, written by install-target.sh.
+EnvironmentFile=/etc/honcho-target/embedding.env
+# Loopback only, no key: Honcho in this CT is its only client. Qwen3-Embedding
+# takes the last token's state (--pooling last); one input must fit one
+# micro-batch, so the batch sizes equal the context. llama.cpp also computes
+# the model's 151k-entry vocabulary scores for every token of an embedding
+# batch, about 1.2 GB per 1000 tokens of batch at its peak (compute and output
+# buffers), so the batch stays at 2048 tokens: about 3.3 GB with the model.
+# Honcho splits messages into 1536-token chunks (EMBEDDING_MAX_INPUT_TOKENS),
+# counted with another tokenizer, which leaves room under 2048.
+ExecStart=/opt/honcho-llama/bin/llama-server \
+  --model /var/lib/honcho-embedding/Qwen3-Embedding-0.6B-Q8_0.gguf \
+  --alias qwen3-embedding-0.6b --embeddings --pooling last \
+  --ctx-size 2048 --batch-size 2048 --ubatch-size 2048 --flash-attn on --parallel 1 \
+  --threads ${HONCHO_EMBEDDING_THREADS} --host 127.0.0.1 --port 8766 --no-webui --offline
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

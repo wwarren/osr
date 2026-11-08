@@ -1,0 +1,44 @@
+[Unit]
+Description=OpenClaw Gateway (agent, Control UI and OpenAI-compatible API)
+Documentation=https://docs.openclaw.ai/gateway
+After=network-online.target openclaw-direct.service
+Wants=network-online.target
+Requires=openclaw-direct.service
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/home/openclaw
+Environment=HOME=/home/openclaw
+Environment=NVM_DIR=/home/openclaw/.nvm
+# node, npm and openclaw are links into the nvm-managed Node (install-target.sh).
+Environment=PATH=/home/openclaw/.local/bin:/usr/local/bin:/usr/bin:/bin
+# OPENCLAW_GATEWAY_TOKEN; OpenClaw also reads this file itself. The port, bind,
+# auth mode and endpoints are in /home/openclaw/.openclaw/openclaw.json.
+EnvironmentFile=/home/openclaw/.openclaw/.env
+ExecStart=/home/openclaw/.local/bin/openclaw gateway run
+Restart=always
+RestartSec=5
+# OpenClaw exits 78 for an invalid configuration: no restart loop until it is fixed.
+RestartPreventExitStatus=78
+TimeoutStopSec=60
+# --- sandboxing (same model as the other target units) ---
+# The agent's exec and file tools run inside this sandbox too: they can write
+# only to the openclaw home and a private /tmp. No MemoryDenyWriteExecute:
+# Node's JIT needs writable executable memory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/openclaw
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

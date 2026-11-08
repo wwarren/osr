@@ -1,0 +1,11 @@
+# Kindi's pins (docker/Dockerfile of Kindi 0.4.0) for the CPU engine; no CuPy.
+# Compiled with: uv pip compile --generate-hashes --python-version 3.9
+#   --python-platform x86_64-manylinux_2_17 --only-binary :all: <file>.in
+numpy==1.19.5
+fastapi==0.79.1
+uvicorn==0.16.0
+pydantic==1.9.2
+Jinja2==3.0.3
+MarkupSafe==2.0.1
+# Starlette 0.19 (FastAPI 0.79's) predates anyio 4.
+anyio<4

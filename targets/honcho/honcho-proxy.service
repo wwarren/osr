@@ -1,0 +1,27 @@
+[Unit]
+Description=Honcho local model proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=honcho-proxy
+Group=honcho-proxy
+EnvironmentFile=-/etc/honcho-target/proxy.settings
+ExecStart=/usr/bin/python3 /usr/local/lib/honcho-proxy/honcho-proxy.py --serve /etc/honcho-target
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

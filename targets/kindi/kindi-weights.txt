@@ -1,0 +1,15 @@
+# The model files the Kindi target can install: model, file, size in bytes,
+# hash, URL. Each URL names a commit of its Hugging Face repository; the
+# SHA-256 is the file's LFS hash there (checked against the Hugging Face API
+# for that commit on 2026-11-04) and the value Kindi's own catalog
+# (kindi/catalog.py at upstream-commit.txt) pins. install-target.sh downloads
+# the rows of KINDI_MODEL, plus bonsai-2b when it is the 27B's draft model.
+#
+# Ternary-Bonsai-2 (Prism ML, Apache 2.0): the PTQ1_0 files Kindi converts.
+bonsai-2b Ternary-Bonsai-2-2B-PTQ1_0.gguf 429183456 sha256:36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/683f7be2629342a50987627b40881e54761a2430/Ternary-Bonsai-2-2B-PTQ1_0.gguf
+bonsai-4b Ternary-Bonsai-2-4B-PTQ1_0.gguf 949549920 sha256:56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60 https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/8d6557168168f91ea6697a4a49ed2ef622b53adb/Ternary-Bonsai-2-4B-PTQ1_0.gguf
+bonsai-9b Ternary-Bonsai-2-9B-PTQ1_0.gguf 1997486976 sha256:3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/5b2abb02362efbed46bbe204014b02837778b2c2/Ternary-Bonsai-2-9B-PTQ1_0.gguf
+bonsai-27b Ternary-Bonsai-2-27B-PTQ1_0.gguf 5946648928 sha256:53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3 https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/b072e1d3b35a0a630cece372c2127528e0994386/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+# AH-Nanbeige4.3-33B IQ3_XXS (ahtx, Apache 2.0): Kindi's Nanbeige backend reads
+# the GGUF itself (its pack holds only the manifest).
+nanbeige-33b AH-Nanbeige4.3-33B-IQ3_XXS.gguf 13108685952 sha256:9d4f18e8a22573c94b18a455147e807a8b9d2cd4b30302f2a4639c2db0a6c239 https://huggingface.co/ahtx/AH-Nanbeige4.3-33B-IQ3_XXS-GGUF/resolve/8163e90cf9db379b7a5460dd966261d8b83b156b/AH-Nanbeige4.3-33B-IQ3_XXS.gguf

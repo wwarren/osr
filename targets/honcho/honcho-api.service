@@ -1,0 +1,25 @@
+[Unit]
+Description=Honcho API
+After=network-online.target postgresql.service honcho-proxy.service honcho-embedding.service
+Wants=network-online.target honcho-embedding.service
+Requires=postgresql.service honcho-proxy.service
+
+[Service]
+User=honcho
+Group=honcho
+WorkingDirectory=/opt/honcho
+Environment=HOME=/var/lib/honcho
+EnvironmentFile=/etc/honcho-target/honcho.env
+ExecStart=/opt/honcho-uv/bin/uv run --frozen --no-dev fastapi run --host 0.0.0.0 src/main.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/honcho /opt/honcho
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

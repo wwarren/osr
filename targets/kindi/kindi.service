@@ -1,0 +1,50 @@
+[Unit]
+Description=Kindi inference API (Ternary-Bonsai-2 / Nanbeige, OpenAI-compatible)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=kindi
+Group=kindi
+WorkingDirectory=/var/lib/kindi
+# Written by install-target.sh: the engine settings of the card's profile
+# (KINDI_DEVICE, KINDI_CARDS, OMP_NUM_THREADS, ...) and the CUDA 10.2 paths.
+# The pack, address, context, model id and API key are in the config file,
+# which only root and the kindi group can read; the key is never on a command
+# line or in the environment.
+EnvironmentFile=/etc/kindi-target/kindi.env
+Environment=KINDI_CONFIG=/etc/kindi/kindi.conf
+Environment=HOME=/var/lib/kindi
+Environment=PYTHONPATH=/opt/kindi
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/kindi/.venv/bin/python -m kindi serve
+Restart=on-failure
+RestartSec=10
+# The first start compiles the CUDA kernels (about 1.5 minutes on a K420) and,
+# for the 27B on Pascal and newer, writes its 5-trit weights into the pack
+# (up to 15 minutes). The installer waits for /health itself.
+TimeoutStartSec=0
+TimeoutStopSec=60
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The checkout (code and venv) stays read-only for the service; the models,
+# packs, the kernel caches and the CPU engine's library live in the data
+# directory.
+ReadWritePaths=/var/lib/kindi /dev/shm
+PrivateTmp=true
+# Keep passed-through GPU devices visible. Access is restricted by the CT's
+# devN entries and by the device group the kindi account belongs to.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

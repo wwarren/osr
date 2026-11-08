@@ -1,0 +1,5 @@
+# The CPU set plus CuPy 9.6, the last CuPy built for CUDA 10.2 (the last CUDA
+# with Kepler sm_30 support). Compiled like requirements-cpu.in.
+-r requirements-cpu.in
+fastrlock==0.8.3
+cupy-cuda102==9.6.0

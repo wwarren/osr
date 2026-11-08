@@ -1,0 +1,4 @@
+# The uv that installs the CT's standalone Python 3.9 and builds Kindi's venv
+# (its own venv, /opt/kindi-runtime/uv). Compiled with: uv pip compile
+#   --generate-hashes --python-platform x86_64-manylinux_2_17 --only-binary :all: uv.in
+uv==0.11.32
