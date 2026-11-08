@@ -132,6 +132,9 @@ case $cmd in
                     else echo 401; fi
                     exit 0
                 fi
+                if [[ $3 == *http:hermes-gateway* ]]; then
+                    [[ ! -e $MOCK/$id.http ]] || cat "$MOCK/$id.http"; exit 0
+                fi
                 if [[ $3 == *systemctl* ]]; then grep -v '^ct:' "$MOCK/$id.state"; fi ;;
             hostname) echo "10.0.0.$((id % 250))" ;;
             sed)
@@ -139,7 +142,16 @@ case $cmd in
                     *service.env*) [[ ! -e $MOCK/$id.port ]] || cat "$MOCK/$id.port" ;;
                     *requirements.txt*) [[ ! -e $MOCK/$id.ctpin ]] || cat "$MOCK/$id.ctpin" ;;
                     *DSH_VERSION*) [[ ! -e $MOCK/$id.dsh ]] || cat "$MOCK/$id.dsh" ;;
+                    *HERMES_COMMIT*) [[ ! -e $MOCK/$id.hermes-pin ]] || cat "$MOCK/$id.hermes-pin" ;;
                 esac ;;
+            # Hermes's checkout, hermes update (moves it to <id>.hermes-next)
+            # and the restart after it.
+            git) [[ ! -e $MOCK/$id.hermes-commit ]] || cat "$MOCK/$id.hermes-commit" ;;
+            runuser)
+                printf 'RUNUSER %s %s\n' "$id" "$*" >> "$MOCK/installs.log"
+                [[ ! -e $MOCK/$id.hermes-update-fails ]] || exit 1
+                [[ ! -e $MOCK/$id.hermes-next ]] || cp "$MOCK/$id.hermes-next" "$MOCK/$id.hermes-commit" ;;
+            systemctl) printf 'SYSTEMCTL %s %s\n' "$id" "$*" >> "$MOCK/installs.log" ;;
             /app/openwebui/venv/bin/python) [[ ! -e $MOCK/$id.webui ]] || cat "$MOCK/$id.webui" ;;
             python3) echo 'mqtts://broker.lan:8883' ;;
             test) [[ -e $MOCK/$id.tls ]] ;;
@@ -253,8 +265,14 @@ describe 'failed upgrade that rolled itself back'
 reset_mock
 echo fail > "$tmp/mock/252.upgrade"
 run_tool 'y\n\n'
-assert_contains 'says it still works' 'Everything that worked before still works' "$out"
+assert_contains 'says the checks still pass' 'Everything that worked before still passes the checks' "$out"
 assert_eq 'default is skip' skipped "$(summary_line ollama 252)"
+assert_eq 'its snapshot is kept' '' "$(grep 'delsnapshot 252' "$tmp/mock/pct.log")"
+line=$(grep '^ollama' "$tmp"/logs/*/summary.txt)
+assert_contains 'the summary says how to roll back' 'pct rollback 252 osr-upg-' "$line"
+assert_contains 'and how to drop the snapshot' 'pct delsnapshot 252 osr-upg-' "$line"
+assert_contains 'with the exit status' 'exit 1' "$line"
+assert_not_contains 'without claiming the old version runs' 'previous version still works' "$line"
 
 describe 'retry'
 reset_mock
@@ -525,6 +543,152 @@ assert_eq 'not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secr
 assert_contains 'the export ends with the provisioner' 'AFTER 0' "$out"
 out=$(in_tool reconf_case gitea 2>&1)
 assert_contains 'Gitea does not get it' $'GOT \nAFTER' "$out"
+
+describe 'the Hermes HTTP checks'
+reset_probe
+mkdir -p "$tmp/curl"
+cat > "$tmp/probe-bin/curl" <<'MOCK'
+#!/bin/sh
+# Serves $CURL_DIR/<port>_<path> for http://127.0.0.1:<port>/<path>; honours -o and -w.
+out='' write='' url='' prev=''
+for a do
+    case $prev in -o) out=$a ;; -w) write=$a ;; esac
+    case $a in http://*) url=$a ;; esac
+    prev=$a
+done
+f=$CURL_DIR/$(printf '%s' "${url#http://127.0.0.1:}" | tr / _)
+if [ -n "$write" ]; then if [ -f "$f" ]; then echo 200; else echo 404; fi; exit 0; fi
+[ -f "$f" ] || exit 22
+if [ -z "$out" ]; then cat "$f"; fi
+MOCK
+chmod +x "$tmp/probe-bin/curl"
+hermes_probe() {
+    CURL_DIR=$tmp/curl OSR_PROBE_ROOT=$probe_root PATH="${PROBE_PATH:-$tmp/probe-bin:$PATH}" \
+        sh -c "$(tables eval 'printf "%s" "$HERMES_HTTP_PROBE"')"
+}
+assert_eq 'nothing answers: nothing reported' '' "$(hermes_probe)"
+echo '{"status": "ok", "platform": "hermes-agent"}' > "$tmp/curl/8642_health"
+echo ok > "$tmp/curl/8765_healthz"
+echo '{}' > "$tmp/curl/9119_api_status"
+out=$(hermes_probe)
+assert_contains 'the gateway health' 'http:hermes-gateway' "$out"
+assert_contains 'the dispatcher' 'http:hermes-direct' "$out"
+assert_contains 'the dashboard' 'http:hermes-dashboard' "$out"
+echo '{"status": "starting"}' > "$tmp/curl/8642_health"
+assert_not_contains 'a gateway that is not ok' 'http:hermes-gateway' "$(hermes_probe)"
+echo '{"status":"ok"}' > "$tmp/curl/8650_health"
+printf 'API_SERVER_KEY=x\nAPI_SERVER_PORT="8650"\n' > "$probe_root/home/hermes/.hermes/.env"
+assert_contains 'the port from the agent .env' 'http:hermes-gateway' "$(hermes_probe)"
+rm -- "$tmp/curl/8650_health"
+assert_not_contains 'and only that port' 'http:hermes-gateway' "$(hermes_probe)"
+mkdir -p "$tmp/no-curl-bin"
+for c in sh sed tail tr grep; do ln -sf "$(command -v "$c")" "$tmp/no-curl-bin/$c"; done
+rc=0; out=$(PROBE_PATH=$tmp/no-curl-bin hermes_probe) || rc=$?
+assert_eq 'no curl in the CT: no HTTP checks' '' "$out"
+assert_eq 'and no failure' 0 "$rc"
+reset_mock
+conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
+printf 'http:hermes-gateway\nhttp:hermes-dashboard\n' > "$tmp/mock/282.http"
+collect_state_case() { add_item hermes 282; collect_state 0; }
+out=$(in_tool collect_state_case 2>/dev/null)
+assert_contains 'collected for Hermes' 'http:hermes-gateway' "$out"
+assert_contains 'with the dashboard' 'http:hermes-dashboard' "$out"
+conf 251 'ai;ai-model;osr-target;strata'
+printf 'http:hermes-gateway\n' > "$tmp/mock/251.http"
+collect_strata() { add_item strata 251; collect_state 0; }
+assert_not_contains 'not for other targets' 'http:hermes' "$(in_tool collect_strata 2>/dev/null)"
+assert_contains 'a lost check is named' 'API server /health' "$(printf 'http:hermes-gateway\n' | tables describe_missing)"
+
+describe 'Hermes itself'
+# hermes_case UPDATE OUTPUT: process Hermes 282 whose reconfigure prints OUTPUT;
+# prints RESULT|NOTE.
+hermes_case() {
+    # shellcheck disable=SC2034  # read by prepare and process_item
+    SNAPSHOTS=false KEEP_SNAPSHOTS=false NOTIFY=false ON_FAILURE=skip HEALTH_TIMEOUT=0 POLL_INTERVAL=0 \
+        INCLUDE_STOPPED=false UPDATE_HERMES=$1
+    # shellcheck disable=SC2317  # called by run_item
+    run_reconfigure() { printf '%s\n' "$item_output"; }
+    item_output=$2
+    add_item hermes 282
+    prepare 2>/dev/null
+    process_item 0 2>/dev/null
+    echo "${I_RESULT[0]}|${I_NOTE[0]}"
+}
+hermes_reset() {
+    reset_mock
+    rm -rf -- "${tmp:?}/run"
+    conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
+    printf '%040d\n' 0 | tr 0 a > "$tmp/mock/282.hermes-commit"
+}
+hermes_reset
+out=$(in_tool hermes_case false 'Hermes reconfigured')
+assert_eq 'without --update-hermes: the integration is upgraded' \
+    'upgraded|integration upgraded; Hermes itself stays at its installed version (--update-hermes updates it)' "$out"
+assert_eq 'and hermes update is not run' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+assert_eq 'a no-op is current, and says Hermes stayed' 'current|Hermes itself stays at its installed version (--update-hermes updates it)' \
+    "$(in_tool hermes_case false 'settings unchanged; nothing to do')"
+hermes_reset
+printf '%040d\n' 0 | tr 0 b > "$tmp/mock/282.hermes-next"
+out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
+assert_eq '--update-hermes: a moved checkout is an upgrade' \
+    "upgraded|Hermes updated: aaaaaaaaaaaa to bbbbbbbbbbbb" "$out"
+assert_file_contains 'runs hermes update as the hermes user' \
+    'RUNUSER 282 runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update' "$tmp/mock/installs.log"
+assert_file_contains 'restarts the gateway and dashboard' \
+    'SYSTEMCTL 282 systemctl try-restart hermes-gateway.service hermes-dashboard.service' "$tmp/mock/installs.log"
+hermes_reset
+assert_eq 'nothing newer: still current' 'current|hermes update found nothing newer (aaaaaaaaaaaa)' \
+    "$(in_tool hermes_case true 'settings unchanged; nothing to do')"
+hermes_reset
+assert_eq 'nothing newer after a reconfigure' 'upgraded|integration upgraded; hermes update found nothing newer (aaaaaaaaaaaa)' \
+    "$(in_tool hermes_case true 'Hermes reconfigured')"
+hermes_reset
+printf '%040d\n' 3 > "$tmp/mock/282.hermes-pin"  # what sed prints from the settings
+out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
+assert_eq 'a HERMES_COMMIT pin is kept' 'current|Hermes stays at its HERMES_COMMIT pin 000000000000' "$out"
+assert_eq 'and hermes update is not run under a pin' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+touch "$tmp/mock/282.hermes-update-fails"
+out=$(in_tool hermes_case true 'Hermes reconfigured')
+assert_contains 'a failed hermes update fails the item' 'skipped|upgrade failed (exit 1) and may have changed the CT' "$out"
+assert_contains 'and says no snapshot was taken' 'no snapshot was taken' "$out"
+assert_eq 'no restart after a failed update' '' "$(grep SYSTEMCTL "$tmp/mock/installs.log" 2>/dev/null)"
+hermes_reset
+run_tool '' --dry-run --only hermes
+assert_contains 'the plan says Hermes stays' 'Hermes itself stays at its installed version' "$out"
+run_tool '' --dry-run --only hermes --update-hermes
+assert_contains 'the plan with --update-hermes' 'then hermes update and a restart' "$out"
+printf '%040d\n' 3 > "$tmp/mock/282.hermes-pin"  # what sed prints from the settings
+run_tool '' --dry-run --only hermes --update-hermes
+assert_contains 'the plan under a pin' '--update-hermes does not move a pin' "$out"
+assert_eq 'a dry run updates nothing' '' "$(grep RUNUSER "$tmp/mock/installs.log" 2>/dev/null)"
+
+describe 'a provisioner that fails keeps its snapshot and defaults to rolling back'
+# fail_case TARGET ID POLICY: an upgrade that exits 1 with every check passing.
+fail_case() {
+    # shellcheck disable=SC2034  # read by process_item
+    SNAPSHOTS=true REQUIRE_SNAPSHOT=false KEEP_SNAPSHOTS=false NOTIFY=false ON_FAILURE=$3 HEALTH_TIMEOUT=0 POLL_INTERVAL=0
+    # shellcheck disable=SC2317  # called by process_item
+    run_item() { echo 'Hermes is reconfigured, but its firewall sync failed'; return 1; }
+    add_item "$1" "$2"
+    process_item 0 2>/dev/null
+    echo "${I_RESULT[0]}|${I_NOTE[0]}"
+}
+hermes_reset
+out=$(in_tool fail_case hermes 282 rollback)
+assert_contains 'Hermes: rolled back' 'rolled-back|' "$out"
+assert_file_contains 'to its snapshot' 'rollback 282 osr-upg-' "$tmp/mock/pct.log"
+hermes_reset
+out=$(in_tool fail_case strata 251 rollback)
+assert_contains 'an installer that restores itself is skipped' 'skipped|upgrade failed (exit 1); its own rollback' "$out"
+assert_contains 'with its snapshot kept' 'pct rollback 251 osr-upg-' "$out"
+assert_eq 'not rolled back' '' "$(grep 'rollback 251' "$tmp/mock/pct.log" | grep -v delsnapshot)"
+assert_eq 'nor deleted' '' "$(grep 'delsnapshot 251' "$tmp/mock/pct.log")"
+hermes_reset
+out=$(in_tool fail_case hermes 282 skip)
+assert_contains '--on-failure skip keeps the snapshot' 'snapshot osr-upg-' "$out"
+assert_contains 'and says it may have changed the CT' 'may have changed the CT' "$out"
 
 describe 'Gitea and Mattermost keep their release'
 reset_mock

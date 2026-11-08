@@ -698,6 +698,7 @@ settings or rollback changes:
 | Open Terminal | Current files pushed, installer rerun | Its recorded port, passed back |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true` | Recorded answers; an Open WebUI admin key is requested once when needed |
+| Hermes Agent itself | Not pinned here: the reconfigure upgrades its integration (units, dispatcher, settings) and Hermes stays at its installed version. `--update-hermes` also runs `hermes update` as the hermes user and restarts `hermes-gateway` and `hermes-dashboard`, unless `HERMES_COMMIT` pins it | The plan and summary say which: Hermes stayed, was updated (old and new commit), or stays at its pin |
 | MQTT | `provision-lxc.sh --reconfigure` | Address, client CIDR, host, port and TLS files read back from the broker |
 | hcom | `provision-lxc.sh` per CT | Role, native mode, instructions file and observer webhook read back from the CT |
 
@@ -730,12 +731,15 @@ filesystem is read-only, as Proxmox keeps it on a node without quorum (check
 
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`) is offered the
 repository's pin in an interactive run; `--yes` accepts it and `--keep-pins`
-preserves it. `latest`, `main` and releases newer than the repository's pin
+preserves it. A `HERMES_COMMIT` pin is always kept. `latest`, `main` and releases newer than the repository's pin
 are kept. Stopped CTs are left alone unless `--include-stopped`.
 
 **Checks and failures.** Before each upgrade it records what works in that CT:
 its services, its listening TCP ports, and for the router `/healthz`,
 `/v1/models`, Open WebUI's `/health` and every model server the router sees.
+For Hermes (and hcom on a Hermes CT) it also records whether the API server's
+`/health` answers `"status": "ok"` on its port, the direct dispatcher's
+`/healthz` and the dashboard's `/api/status` answer.
 For a model target it also records whether the router lists that server as up
 with models (after `/routing/refresh`). It then takes a Proxmox snapshot
 (`osr-upg-<time>-<n>`; when one cannot be taken, interactive runs ask whether
@@ -750,16 +754,23 @@ what broke and asks:
 |---|---|
 | `r` | Retry |
 | `i` | Retry interactively, answering the installer's or provisioner's questions yourself |
-| `s` | Skip it: leave it as it is and go on (a broken one keeps its snapshot) |
-| `b` | Roll the CT back to the snapshot, check it again, go on (default when broken) |
+| `s` | Skip it: leave it as it is and go on (it keeps its snapshot) |
+| `b` | Roll the CT back to the snapshot, check it again, go on (default when broken, or when a provisioner failed) |
 | `l` | Show the end of its log |
 | `a` | Abort: leave the rest untouched |
 
 A component may restore its own files after a failed upgrade; check its log.
+A target installer or the router updater restores what it changed; a
+provisioner (Honcho, Hermes, OpenClaw, DeepSeek Harness, Gitea, Mattermost,
+MQTT, hcom) can stop after it has changed the CT, so after its failure rolling
+back is the default, and `--on-failure rollback` rolls back even when every
+check still passes. A failed upgrade that is skipped keeps its snapshot, and
+the summary gives the `pct rollback` and `pct delsnapshot` commands for it.
 The Proxmox snapshot can restore the CT when a service or other functional
 check fails. Without one, recovery may need manual work. A snapshot covers the CT only: host firewall
 rules and Open WebUI registrations a provisioner changed are not rolled back
-with it. Snapshots are deleted after success unless `--keep-snapshots`.
+with it. Snapshots are deleted after success unless `--keep-snapshots`, and
+kept after any failure.
 
 `--yes` runs unattended: provisioners get `NONINTERACTIVE=true`, and failures
 are handled with `--on-failure rollback` (default), `skip` or `abort`.

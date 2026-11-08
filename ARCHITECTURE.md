@@ -392,7 +392,12 @@ committing, and runs `apply --all` after a venv rebuild.
 cluster in dependency order through their own update paths (§16), with a
 before/after functional check and a Proxmox snapshot around each, then prompts
 or follows `--on-failure` when one fails
-([README](README.md#everything-at-once)). It runs on one node. Proxmox's `pct`
+([README](README.md#everything-at-once)). A snapshot is deleted only after a
+success; a provisioner's failure defaults to rolling back, because a
+provisioner can stop after changing the CT. Hermes Agent's own code is not
+pinned: it moves only with `--update-hermes` (`hermes update`), never past a
+`HERMES_COMMIT` pin, and Hermes's API server, dispatcher and dashboard are
+checked over HTTP. It runs on one node. Proxmox's `pct`
 acts only on its own node's CTs, so the run puts `tools/pct-cluster.sh` first
 on `PATH` as `pct` for itself and every provisioner. That wrapper runs the real
 `pct` on the CT's node, over root SSH for another node with Proxmox VE 9's own
@@ -967,8 +972,9 @@ files on every TLS broker reconfigure.
   GitHub outage cannot hide the main results.
 * `tests/test-upgrade-all.sh` keeps `upgrade-all.sh`'s deploy file lists equal
   to what each provisioner copies and its service lists complete, and runs it
-  against a mocked `pct`: order, filters, snapshots, retry, rollback, skip,
-  abort, unattended policies, recorded MQTT and Open Terminal settings, and a
+  against a mocked `pct`: order, filters, snapshots (kept after a failure),
+  retry, rollback, skip, abort, unattended policies, recorded MQTT and Open
+  Terminal settings, the Hermes HTTP checks and `--update-hermes`, and a
   three-node cluster (a CT on another node, offline and unreachable nodes,
   `--node`, several routers, dependencies across nodes, the cluster lock, and
   `pve-select.sh` reading the merged configuration view).

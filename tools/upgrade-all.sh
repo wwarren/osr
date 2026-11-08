@@ -61,6 +61,9 @@ a Honcho or DeepSeek Harness release you pinned, and --yes accepts the move.
 Open WebUI is never
 downgraded. Gitea and Mattermost releases are not pinned here: their setup
 is re-applied (accounts, token and webhook kept) and their version stays.
+Hermes Agent itself is not pinned either: its integration (units, dispatcher,
+settings) is upgraded and Hermes stays at its installed version unless
+--update-hermes is given (never past a HERMES_COMMIT pin).
 Stopped CTs are left alone unless --include-stopped.
 
 Everything runs from this node. CTs on other nodes are reached as root over
@@ -89,6 +92,9 @@ Options:
   --on-failure ACTION   ask (default with a terminal), rollback (default
                         without one), skip or abort
   --keep-pins           keep releases you pinned yourself instead of asking
+  --update-hermes       also run `hermes update` in each Hermes CT (not one
+                        pinned with HERMES_COMMIT) and restart its gateway and
+                        dashboard; checked and rolled back like the rest
   --include-stopped     start stopped CTs, upgrade them, then stop them again
   --no-snapshot         take no Proxmox snapshots
   --require-snapshot    skip a CT that cannot be snapshotted
@@ -438,6 +444,27 @@ on_listed_node() {  # on_listed_node ID LIST: is CT ID on a node in LIST (or is 
     return 1
 }
 
+# Run in a Hermes CT: prints http:hermes-gateway, http:hermes-direct and
+# http:hermes-dashboard for each of Hermes's HTTP endpoints that answers the
+# way its installer requires (the gateway's /health with "status": "ok" on
+# API_SERVER_PORT from Hermes's .env, the direct dispatcher's /healthz on
+# 127.0.0.1:8765, the dashboard's /api/status on 9119). Whatever answered before
+# an upgrade must answer again afterwards. OSR_PROBE_ROOT is for the tests.
+read -r -d '' HERMES_HTTP_PROBE <<'PROBE'
+r=${OSR_PROBE_ROOT:-}
+command -v curl >/dev/null 2>&1 || exit 0
+port=$(sed -n 's/^API_SERVER_PORT=//p' "$r/home/hermes/.hermes/.env" 2>/dev/null | tail -n 1 | tr -d "\"' \r")
+case $port in ''|*[!0-9]*) port=8642 ;; esac
+if curl -fsS -m 10 "http://127.0.0.1:$port/health" 2>/dev/null | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    echo http:hermes-gateway
+fi
+if curl -fsS -m 10 -o /dev/null http://127.0.0.1:8765/healthz 2>/dev/null; then echo http:hermes-direct; fi
+if [ "$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/api/status 2>/dev/null)" = 200 ]; then
+    echo http:hermes-dashboard
+fi
+exit 0
+PROBE
+
 discover() {
     local -a routers=() all_routers tagged candidates order=() observers=()
     local id t name tags info i described
@@ -658,6 +685,11 @@ collect_state() {
         mapfile -t ident < <(ct_identity "$id")
         (( ${#ident[@]} == 0 )) || up_servers "${ident[@]}"
     fi
+    # Hermes's own HTTP checks: an active unit with a listening port can still
+    # answer errors (for example after hcom restarts the gateway).
+    if [[ $t == hermes || ( $t == hcom && ${agent:-} == hermes ) ]]; then
+        pct exec "$id" -- sh -c "$HERMES_HTTP_PROBE" 2>/dev/null | grep -E '^http:hermes-(gateway|direct|dashboard)$'
+    fi
     return 0
 }
 
@@ -671,6 +703,9 @@ describe_missing() {
             http:router-healthz) echo "  - the router's /healthz does not answer 200" ;;
             http:router-models) echo "  - the router's /v1/models does not answer 200" ;;
             http:openwebui-health) echo "  - Open WebUI's /health does not answer 200" ;;
+            http:hermes-gateway) echo "  - Hermes's API server /health (on its API port) no longer answers \"status\": \"ok\"" ;;
+            http:hermes-direct) echo "  - Hermes's direct dispatcher (127.0.0.1:8765/healthz) no longer answers" ;;
+            http:hermes-dashboard) echo "  - the Hermes dashboard (port 9119, /api/status) no longer answers 200" ;;
             server:*) echo "  - the router no longer lists ${line#server:} as up with models" ;;
             *) echo "  - $line" ;;
         esac
@@ -850,12 +885,51 @@ run_hcom() {
     env "${envs[@]}" bash "$REPO_ROOT/targets/hcom/provision-lxc.sh" --reconfigure </dev/null
 }
 
+# Hermes Agent's own code is not pinned by this repository: its provisioner
+# installs it once (or moves it to a HERMES_COMMIT pin) and leaves it there.
+# `hermes update`, as the hermes user, is its supported update (see
+# targets/hermes/README.md); --update-hermes runs it after the reconfigure.
+HERMES_CHECKOUT=/home/hermes/.hermes/hermes-agent
+hermes_commit() {  # hermes_commit CT: the checkout's commit, or empty
+    pct exec "$1" -- git -c "safe.directory=$HERMES_CHECKOUT" -C "$HERMES_CHECKOUT" rev-parse HEAD </dev/null 2>/dev/null || true
+}
+
+# hermes_update_wanted ITEM: will this run update Hermes itself?
+hermes_update_wanted() {
+    [[ ${I_TARGET[$1]} == hermes ]] && $UPDATE_HERMES && [[ -z $(info_value "$1" hermes_pin) ]]
+}
+
+# update_hermes ITEM: hermes update, then restart what runs Hermes's code. The
+# OSR-HERMES line tells process_item what happened.
+update_hermes() {
+    local id=${I_CT[$1]} before after
+    before=$(hermes_commit "$id")
+    note "Updating Hermes itself (--update-hermes): hermes update as the hermes user."
+    if ! pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update </dev/null; then
+        note 'hermes update failed.'
+        return 1
+    fi
+    if ! pct exec "$id" -- systemctl try-restart hermes-gateway.service hermes-dashboard.service </dev/null; then
+        note 'Restarting hermes-gateway and hermes-dashboard after hermes update failed.'
+        return 1
+    fi
+    after=$(hermes_commit "$id")
+    if [[ -n $after && $after == "$before" ]]; then
+        echo "OSR-HERMES: same ${after:0:12}"
+    else
+        after=${after:0:12}
+        echo "OSR-HERMES: moved ${before:0:12}${before:+ }to ${after:-an unknown commit}"
+    fi
+}
+
 run_item() {  # run_item ITEM MODE
     case $(method_of "${I_TARGET[$1]}") in
         router) run_router ;;
         webui) run_webui "$1" ;;
         guest) run_guest "$1" "$2" ;;
-        reconfigure) run_reconfigure "$1" "$2" ;;
+        reconfigure)
+            run_reconfigure "$1" "$2" || return
+            if hermes_update_wanted "$1"; then update_hermes "$1"; fi ;;
         hcom) run_hcom "$1" ;;
         *) note "No upgrade method for ${I_TARGET[$1]}."; return 1 ;;
     esac
@@ -878,9 +952,35 @@ describe_item() {  # what run_item does, for the plan
             if unpinned_service "$t"; then
                 echo "targets/$t/provision-lxc.sh --reconfigure (re-applies its setup; this repository does not pin the $t release, so it stays as it is)"
             else
-                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure"
+                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure$([[ $t != hermes ]] || echo "; $(hermes_plan "$i")")"
             fi ;;
         hcom) echo "targets/hcom/provision-lxc.sh as $(info_value "$i" target) (broker CT ${HCOM_MQTT_CT:-?})" ;;
+    esac
+}
+
+hermes_plan() {  # what happens to Hermes itself, for the plan
+    local pin
+    pin=$(info_value "$1" hermes_pin)
+    if [[ -n $pin ]]; then
+        echo "Hermes stays at its HERMES_COMMIT pin ${pin:0:12}$($UPDATE_HERMES && echo ' (--update-hermes does not move a pin)')"
+    elif $UPDATE_HERMES; then
+        echo 'then hermes update and a restart of its gateway and dashboard'
+    else
+        echo 'Hermes itself stays at its installed version (--update-hermes updates it)'
+    fi
+}
+
+# hermes_outcome ITEM LOG FROM: the result note for Hermes after a successful
+# attempt whose output starts after line FROM of LOG.
+hermes_outcome() {
+    local pin line
+    pin=$(info_value "$1" hermes_pin)
+    line=$(tail -n "+$(($3 + 1))" "$2" | sed -n 's/^OSR-HERMES: //p' | tail -n 1)
+    case $line in
+        moved\ *) echo "Hermes updated: ${line#moved }" ;;
+        same\ *) echo "hermes update found nothing newer (${line#same })" ;;
+        *) if [[ -n $pin ]]; then echo "Hermes stays at its HERMES_COMMIT pin ${pin:0:12}"
+           else echo 'Hermes itself stays at its installed version (--update-hermes updates it)'; fi ;;
     esac
 }
 
@@ -976,6 +1076,10 @@ prepare() {
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" ;;
+            hermes)
+                # Its reconfigure keeps the pin; --update-hermes must not move past it.
+                recorded=$(pct exec "$id" -- sed -n 's/^HERMES_COMMIT=//p' /etc/hermes-target/settings 2>/dev/null | tail -n 1 | tr -d '"'\''\r ')
+                [[ ! $recorded =~ ^[0-9a-f]{40}$ ]] || I_INFO[i]+=" hermes_pin=$recorded" ;;
             hcom)
                 if [[ -z $HCOM_MQTT_CT ]]; then
                     I_RESULT[i]=not-run; I_NOTE[i]='set MQTT_CT_ID: not exactly one CT is tagged mqtt'
@@ -1101,15 +1205,24 @@ notify() {
     pct exec "$ROUTER_CT" -- "$MANAGE" test-alert "$1" >> "$RUN_DIR/notify.log" 2>&1 || true
 }
 
-# choose_action LABEL HAS_SNAPSHOT BROKEN LOG: CHOICE becomes r, i, s, b or a.
+# may_stop_midway TARGET: is it upgraded through a provisioner, which can fail
+# after it has already changed the CT (Hermes's "Hermes is reconfigured, but
+# ..." after its guest step, for example)? A target installer or the router
+# updater restores what it changed when it fails.
+may_stop_midway() { [[ $(method_of "$1") == reconfigure || $(method_of "$1") == hcom ]]; }
+
+# choose_action LABEL HAS_SNAPSHOT BROKEN LOG PREFER_ROLLBACK: CHOICE becomes
+# r, i, s, b or a. Rolling back is the default (and what --on-failure rollback
+# does) when PREFER_ROLLBACK is yes: something broke, or a provisioner failed
+# after it may have changed the CT.
 choose_action() {
-    local label=$1 snap=$2 broken=$3 log=$4 default=s
-    [[ $snap == yes && $broken == yes ]] && default=b
+    local label=$1 snap=$2 broken=$3 log=$4 prefer=${5:-$3} default=s
+    [[ $snap == yes && $prefer == yes ]] && default=b
     if ! $INTERACTIVE || [[ $ON_FAILURE != ask ]]; then
         case $ON_FAILURE in
             abort) CHOICE=a ;;
             skip) CHOICE=s ;;
-            *) if [[ $snap == yes && $broken == yes ]]; then CHOICE=b; else CHOICE=s; fi ;;
+            *) if [[ $snap == yes && $prefer == yes ]]; then CHOICE=b; else CHOICE=s; fi ;;
         esac
         case $CHOICE in
             b) note "--on-failure=$ON_FAILURE: rolling back." ;;
@@ -1140,6 +1253,7 @@ ABORTED=false
 CURRENT_ITEM=''
 process_item() {
     local i=$1 t=${I_TARGET[$1]} id=${I_CT[$1]} label log pre post status broken unit mode=auto started=false attempt_start
+    local prefer_rollback
     local -a inactive=()
     label=$(item_label "$i")
     SNAP=''
@@ -1175,12 +1289,19 @@ process_item() {
         if verify_item "$i" "$pre" "$post"; then
             broken=no
             if (( status == 0 )); then
-                if tail -n "+$((attempt_start + 1))" "$log" | grep -qi 'nothing to do'; then
+                if tail -n "+$((attempt_start + 1))" "$log" | grep -q '^OSR-HERMES: moved '; then
+                    I_RESULT[i]=upgraded
+                elif tail -n "+$((attempt_start + 1))" "$log" | grep -qi 'nothing to do'; then
                     I_RESULT[i]=current
                 elif unpinned_service "$t"; then
                     I_RESULT[i]=reapplied; I_NOTE[i]="setup re-applied; the $t release is not pinned here"
                 else
                     I_RESULT[i]=upgraded
+                fi
+                if [[ $t == hermes ]]; then
+                    I_NOTE[i]=$(hermes_outcome "$i" "$log" "$attempt_start")
+                    [[ ${I_RESULT[$i]} != upgraded ]] || tail -n "+$((attempt_start + 1))" "$log" | grep -q '^OSR-HERMES: moved ' ||
+                        I_NOTE[i]="integration upgraded; ${I_NOTE[$i]}"
                 fi
                 note "$label: OK"
                 $KEEP_SNAPSHOTS || drop_snapshot "$id" "$SNAP" "$log"
@@ -1192,15 +1313,22 @@ process_item() {
         printf '\a' >&2
         note ''
         note "!!!! $label: UPGRADE PROBLEM !!!!"
-        (( status == 0 )) || note "The upgrade command failed (exit $status); check its log for any component rollback."
+        prefer_rollback=$broken
+        if (( status != 0 )); then
+            note "The upgrade command failed (exit $status); check its log for what it changed or restored."
+            if may_stop_midway "$t"; then
+                prefer_rollback=yes
+                note "Its provisioner can stop after it has already changed the CT, so this may not be the previous version${SNAP:+; the snapshot taken before the upgrade is the way back}."
+            fi
+        fi
         if [[ $broken == yes ]]; then
             note "This worked before the upgrade but not now (after waiting up to ${HEALTH_TIMEOUT}s):"
             describe_missing < "$post.missing" >&2
         else
-            note 'Everything that worked before still works.'
+            note 'Everything that worked before still passes the checks.'
         fi
-        notify "OSR upgrade (run on $LOCAL_NODE): $label on node $(node_of "$id") $([[ $broken == yes ]] && echo 'is BROKEN after its upgrade' || echo 'failed to upgrade but still works') (exit $status); waiting for a decision. Log: $log"
-        choose_action "$label" "$([[ -n $SNAP ]] && echo yes || echo no)" "$broken" "$log"
+        notify "OSR upgrade (run on $LOCAL_NODE): $label on node $(node_of "$id") $([[ $broken == yes ]] && echo 'is BROKEN after its upgrade' || echo 'failed to upgrade but still passes the checks') (exit $status); waiting for a decision. Log: $log"
+        choose_action "$label" "$([[ -n $SNAP ]] && echo yes || echo no)" "$broken" "$log" "$prefer_rollback"
         case $CHOICE in
             r) mode=auto; continue ;;
             i) mode=interactive; continue ;;
@@ -1208,8 +1336,19 @@ process_item() {
                 if [[ $broken == yes ]]; then
                     I_RESULT[i]=broken; I_NOTE[i]="left as it is${SNAP:+; snapshot $SNAP kept}"
                 else
-                    I_RESULT[i]=skipped; I_NOTE[i]='upgrade failed; the previous version still works'
-                    drop_snapshot "$id" "$SNAP" "$log"
+                    # A failed command keeps the snapshot: what it left behind
+                    # is only known from its log.
+                    I_RESULT[i]=skipped
+                    if may_stop_midway "$t"; then
+                        I_NOTE[i]="upgrade failed (exit $status) and may have changed the CT; it passes the checks"
+                    else
+                        I_NOTE[i]="upgrade failed (exit $status); its own rollback should have restored it (see the log); it passes the checks"
+                    fi
+                    if [[ -n $SNAP ]]; then
+                        I_NOTE[i]+="; snapshot $SNAP kept (back: pct rollback $id $SNAP; drop: pct delsnapshot $id $SNAP)"
+                    else
+                        I_NOTE[i]+='; no snapshot was taken'
+                    fi
                 fi
                 undo_webui_pin "$i"
                 break ;;
@@ -1330,7 +1469,7 @@ cleanup() {
 }
 
 main() {
-    DRY_RUN=false LIST_ONLY=false ASSUME_YES=false ON_FAILURE='' KEEP_PINS=false INCLUDE_STOPPED=false
+    DRY_RUN=false LIST_ONLY=false ASSUME_YES=false ON_FAILURE='' KEEP_PINS=false INCLUDE_STOPPED=false UPDATE_HERMES=false
     SNAPSHOTS=true REQUIRE_SNAPSHOT=false KEEP_SNAPSHOTS=false NOTIFY=true ONLY='' SKIP='' NODES='' WEBUI_TOKEN=''
     HCOM_MQTT_CT='' HCOM_MATTERMOST_CT=''
     while (( $# )); do
@@ -1347,6 +1486,7 @@ main() {
             --on-failure) ON_FAILURE=${2:-}; shift ;;
             --on-failure=*) ON_FAILURE=${1#*=} ;;
             --keep-pins) KEEP_PINS=true ;;
+            --update-hermes) UPDATE_HERMES=true ;;
             --include-stopped) INCLUDE_STOPPED=true ;;
             --no-snapshot) SNAPSHOTS=false ;;
             --require-snapshot) REQUIRE_SNAPSHOT=true ;;

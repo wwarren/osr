@@ -188,7 +188,9 @@ Code and profile live under `/home/hermes/.hermes`; the hardened gateway can
 write only `/home/hermes` and a private `/tmp`. The dashboard password, session
 secret and any OAuth dashboard credentials are kept on reconfigure. With
 `HERMES_COMMIT` set, a rerun moves the checkout back to the pin, so update or
-clear it when upgrading.
+clear it when upgrading. `tools/upgrade-all.sh` upgrades the integration and
+leaves Hermes at its version; with `--update-hermes` it also runs `hermes
+update` and restarts the gateway and dashboard, unless `HERMES_COMMIT` is set.
 
 **Choosing a model.** Hermes's `/model` switcher offers:
 
