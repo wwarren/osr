@@ -309,12 +309,28 @@ case $cmd in
   config) cat "$FAKE_DIR/ct$id/description" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")"
-    [[ $(basename "$2") != honcho-api-key ]] || cp "$1" "$FAKE_DIR/ct$id/honcho-key" ;;
+    [[ $(basename "$2") != honcho-api-key ]] || cp "$1" "$FAKE_DIR/ct$id/honcho-key"
+    [[ $(basename "$2") != open-terminal-key ]] || cp "$1" "$FAKE_DIR/ct$id/ot-key" ;;
   pull) [[ $1 == /etc/hermes-target/api-key ]] && printf '%s\n' "$FAKE_HERMES_KEY" > "$2" ;;
   exec)
     [[ $1 == -- ]] && shift
     all="$*"
-    if [[ $id == 280 ]]; then
+    if [[ $id == 270 ]]; then
+      # The Open Terminal CT: its gateway port and client keys (hash only).
+      case $all in
+        'test -x /usr/local/sbin/open-terminal-clients') exit 0 ;;
+        sed\ -n\ *OPEN_TERMINAL_PORT*) echo 8000 ;;
+        '/usr/local/sbin/open-terminal-clients has '*)
+          [[ $(cat "$FAKE_DIR/ot-${3}.sha" 2>/dev/null) == "$4" ]] ;;
+        '/usr/local/sbin/open-terminal-clients issue '*' --default-user default')
+          n=$(( $(cat "$FAKE_DIR/ot-issued" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_DIR/ot-issued"
+          key="ot-client-key-$n-0123456789"
+          printf '%s' "$key" | sha256sum | cut -d' ' -f1 > "$FAKE_DIR/ot-${3}.sha"
+          printf '%s\n' "$key" ;;
+        '/usr/local/sbin/open-terminal-clients revoke '*' --missing-ok') rm -f "$FAKE_DIR/ot-${3}.sha" ;;
+        *) echo "unexpected terminal command: $all" >&2; exit 3 ;;
+      esac
+    elif [[ $id == 280 ]]; then
       case $all in
         'test -f /app/router/router.py') exit 0 ;;
         python3\ -c\ *router.ini) echo 5400 ;;
@@ -361,6 +377,9 @@ case $cmd in
           exit "$found" ;;
         sh\ -c\ test\ -d\ /run/systemd/system*) exit 0 ;;
         sh\ -c\ sed\ *HONCHO_URL*) cat "$FAKE_DIR/ct$id/honcho-url" 2>/dev/null || : ;;
+        sh\ -c\ sed\ *OPEN_TERMINAL_URL*) cat "$FAKE_DIR/ct$id/ot-url" 2>/dev/null || : ;;
+        sh\ -c\ \[\ -s\ /root/hermes-deploy/open-terminal-key*)
+          [[ -s $FAKE_DIR/ct$id/ot-key ]] && tr -d '\r\n\t ' < "$FAKE_DIR/ct$id/ot-key" | sha256sum | cut -d' ' -f1 ;;
         'test -s /root/hermes-deploy/honcho-api-key') [[ -s $FAKE_DIR/ct$id/honcho-key ]] ;;
         'cat /etc/honcho-target/client-api-key') [[ $id == 285 ]] && printf '%s\n' "$FAKE_HONCHO_KEY" ;;
         'install -d -m 0700 /root/hermes-deploy') : ;;
@@ -371,6 +390,7 @@ case $cmd in
           [[ ${FAKE_GUEST_RC:-0} == 0 ]] || exit "$FAKE_GUEST_RC"
           touch "$FAKE_DIR/ct$id/installed"
           if [[ $all =~ HONCHO_URL=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[1]}" > "$FAKE_DIR/ct$id/honcho-url"; fi
+          if [[ $all =~ OPEN_TERMINAL_URL=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[1]}" > "$FAKE_DIR/ct$id/ot-url"; fi
           # What the guest records (install-target.sh's settings record).
           for key in HERMES_CHANNEL HERMES_COMMIT HERMES_API_MODEL_NAME; do
             if [[ $all =~ (^|\ )$key=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[2]}" > "$FAKE_DIR/ct$id/$key"; fi
@@ -437,7 +457,7 @@ real() {
 }
 reset_fake() { rm -rf -- "${fake:?}/ct282" "$fake"/pushed-* "$fake"/fw-at-* "$fake/pve/firewall/282.fw"; : > "$log"; }
 honcho_key=honcho-osr-key-0123456789
-secrets_in_argv() { grep -E -- "$router_key|$admin_token|$hermes_key|$honcho_key" "$log" || true; }
+secrets_in_argv() { grep -E -- "$router_key|$admin_token|$hermes_key|$honcho_key|ot-client-key-" "$log" || true; }
 
 stages_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hermes-setup.*' | wc -l)
 reset_fake
@@ -532,6 +552,51 @@ out=$(real --reconfigure) || fail "reconfigure after Honcho off: $out"
 [[ $out != *'Keeping Honcho memory'* ]] || fail 'Honcho came back after it was turned off'
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 pass 'Honcho: the osr key as a file and an egress rule; kept by a plain --reconfigure; HONCHO_URL= turns it off'
+
+# Open Terminal: a client key issued by the terminal CT, admitted in its
+# firewall, an egress rule here; kept (not rotated) by a plain --reconfigure;
+# OPEN_TERMINAL_URL= revokes it.
+ot_lxc=$fake/lxc; mkdir -p "$ot_lxc"
+printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.70/24,gw=192.0.2.1\n' > "$ot_lxc/270.conf"
+printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
+ot_rule='IN ACCEPT -source 192.0.2.82/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client hermes-282'
+ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-model'
+: > "$log"; rm -f "$fake"/pushed-*
+out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000 PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal on: $out"
+grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients issue hermes-282 --default-user default' "$log" ||
+  fail 'the terminal CT (found by its address) did not issue a key'
+[[ $(cat "$fake/pushed-282-open-terminal-key") == ot-client-key-1-0123456789 ]] || fail 'the key was not pushed as a file'
+grep -qxF "$ot_rule" "$fake/pve/firewall/270.fw" || fail "terminal firewall: $(cat "$fake/pve/firewall/270.fw")"
+grep -q -- '-source 192.0.2.80/32' "$fake/pve/firewall/270.fw" || fail 'the router rule in the terminal firewall was lost'
+grep -qxF "$ot_egress" "$fwfile" || fail "Open Terminal egress rule: $(cat "$fwfile")"
+grep -q 'OPEN_TERMINAL_URL=http://192.0.2.70:8000 ' "$log" || fail 'the guest did not get OPEN_TERMINAL_URL'
+: > "$log"; rm -f "$fake"/pushed-*
+out=$(real --reconfigure PVE_LXC_DIR="$ot_lxc") || fail "plain reconfigure with Open Terminal: $out"
+[[ $out == *'Keeping the Open Terminal workspace at http://192.0.2.70:8000'* && $out == *"Keeping client hermes-282's Open Terminal key"* ]] ||
+  fail "no keep notices: $out"
+grep -q ' issue ' "$log" && fail 'a plain reconfigure rotated a working key'
+[[ ! -e $fake/pushed-282-open-terminal-key ]] || fail 'a kept key was pushed again'
+grep -qxF "$ot_egress" "$fwfile" || fail 'a plain reconfigure dropped the Open Terminal egress rule'
+[[ $(grep -c 'hermes-282' "$fake/pve/firewall/270.fw") == 1 ]] || fail 'the terminal firewall rule was duplicated'
+rm -f "$fake/ot-hermes-282.sha"   # the terminal lost the key (say, rebuilt)
+: > "$log"
+out=$(real --reconfigure PVE_LXC_DIR="$ot_lxc") || fail "reconfigure after the terminal lost the key: $out"
+[[ $(cat "$fake/pushed-282-open-terminal-key") == ot-client-key-2-0123456789 ]] || fail 'a key the terminal rejects was not replaced'
+: > "$log"
+out=$(real --reconfigure OPEN_TERMINAL_URL= PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal off: $out"
+grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients revoke hermes-282 --missing-ok' "$log" || fail 'the key was not revoked'
+grep -q 'hermes-282' "$fake/pve/firewall/270.fw" && fail 'the terminal firewall still admits the CT'
+grep -q '192.0.2.70/32' "$fwfile" && fail 'OPEN_TERMINAL_URL= kept the egress rule'
+grep -q 'OPEN_TERMINAL_URL= ' "$log" || fail 'the guest was not told to disconnect'
+: > "$log"
+out=$(real --reconfigure PVE_LXC_DIR="$ot_lxc") || fail "reconfigure after Open Terminal off: $out"
+[[ $out != *'Open Terminal workspace at'* ]] || fail 'Open Terminal came back after it was turned off'
+grep -q 'pct exec 270' "$log" && fail 'a reconfigure without Open Terminal touched the terminal CT'
+out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000) && fail 'a terminal not on this host, without a key file, was accepted'
+[[ $out == *'Set OPEN_TERMINAL_CT_ID'*'OPEN_TERMINAL_KEY_FILE'* ]] || fail "no hint for a remote terminal: $out"
+out=$(real --reconfigure OPEN_TERMINAL_URL=http://terminal:8000) && fail 'a host-name URL was accepted'
+[[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
+pass 'Open Terminal: key issued by the terminal CT and kept while valid, both firewalls; OPEN_TERMINAL_URL= revokes it'
 
 # The pin, channel, API port and Open WebUI model name: given once, kept by a
 # plain --reconfigure (what tools/upgrade-all.sh runs) and --integrate-only.
@@ -740,15 +805,19 @@ pass 'every run, failed or not, removes its host staging directory'
 lxc=$(mktemp -d)
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.80/24\ntags: osr-router\n' > "$lxc/280.conf"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: osr-target;honcho\n' > "$lxc/285.conf"
-answers=$'\n282\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.82/24\n\n\n\n\n\n\n'
+printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.70/24\ntags: osr-target;open-terminal\n' > "$lxc/270.conf"
+answers=$'\n282\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.82/24\n\n\n\n\n\n\n\n'
 out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x bash "$provision" --dry-run 2>&1 <<< "$answers") ||
   fail "guided create: $out"
-order=$(sed '/== Hermes: /q' <<< "$out" | grep -oE '== [A-Za-z: ]+ ==|Router CT ID or address|New Hermes CT ID|amd64 template|Root disk storage|Hermes IP/CIDR|Hermes gateway|OSR model or tier|Context window|Offer Hermes in Open WebUI|Run the Hermes dashboard|Honcho API URL' | paste -sd'|')
-[[ $order == '== Router ==|Router CT ID or address|== Hermes container ==|New Hermes CT ID|amd64 template|Root disk storage|Hermes IP/CIDR|Hermes gateway|== Hermes settings ==|OSR model or tier|Context window|Offer Hermes in Open WebUI|Run the Hermes dashboard|== Honcho memory ==|Honcho API URL|== Hermes: create ==' ]] ||
+order=$(sed '/== Hermes: /q' <<< "$out" | grep -oE '== [A-Za-z: ]+ ==|Router CT ID or address|New Hermes CT ID|amd64 template|Root disk storage|Hermes IP/CIDR|Hermes gateway|OSR model or tier|Context window|Offer Hermes in Open WebUI|Run the Hermes dashboard|Honcho API URL|Open Terminal URL' | paste -sd'|')
+[[ $order == '== Router ==|Router CT ID or address|== Hermes container ==|New Hermes CT ID|amd64 template|Root disk storage|Hermes IP/CIDR|Hermes gateway|== Hermes settings ==|OSR model or tier|Context window|Offer Hermes in Open WebUI|Run the Hermes dashboard|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== Hermes: create ==' ]] ||
   fail "create prompts out of order: $order"
 [[ $out == *'Router CT ID or address [280]'* && $out == *'Hermes gateway [192.0.2.1]'* ]] || fail "router offers: $out"
 [[ $out == *'Honcho API URL (none to skip) [http://192.0.2.85:8000]'* && $out == *'HONCHO_URL=http://192.0.2.85:8000'* ]] ||
   fail "the Honcho CT on this host was not offered or taken: $out"
+[[ $out == *'Open Terminal URL (none to skip) [http://192.0.2.70:8000]'* && $out == *'OPEN_TERMINAL_URL=http://192.0.2.70:8000 '* &&
+   $out == *"admit 192.0.2.82 in Open Terminal CT 270's firewall"* ]] ||
+  fail "the Open Terminal CT on this host was not offered, taken or connected: $out"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.82/24\ntags: osr-target;hermes\n' > "$lxc/282.conf"
 out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x HONCHO_URL= bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n') ||
   fail "guided reconfigure: $out"

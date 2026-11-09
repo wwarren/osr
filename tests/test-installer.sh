@@ -164,6 +164,8 @@ printf 'provision %s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(basename "$(dirna
 printf 'prompt-env %s|%s|%s\n' "${PVE_ACCEPT_DEFAULTS:-}" "${PVE_CONFIRM:-}" "${PVE_INTERACTIVE:-}" > "$MOCK_LOG.prompt"
 [[ -z ${HONCHO_CLIENT_IPS:-}${HONCHO_URL:-}${HONCHO_CT_ID:-} ]] ||
   printf 'honcho-env %s|%s|%s\n' "${HONCHO_CLIENT_IPS:-}" "${HONCHO_URL:-}" "${HONCHO_CT_ID:-}" >> "$MOCK_LOG"
+[[ -z ${OPEN_TERMINAL_URL:-}${OPEN_TERMINAL_CT_ID:-} ]] ||
+  printf 'open-terminal-env %s|%s\n' "${OPEN_TERMINAL_URL:-}" "${OPEN_TERMINAL_CT_ID:-}" >> "$MOCK_LOG"
 [[ -z ${HONCHO_EMBEDDING_MODEL:-}${HONCHO_EMBEDDING_DIMENSIONS:-}${HONCHO_EMBEDDING_BASE_URL:-} ]] ||
   printf 'embedding-env %s|%s|%s\n' "${HONCHO_EMBEDDING_MODEL:-}" "${HONCHO_EMBEDDING_DIMENSIONS:-}" "${HONCHO_EMBEDDING_BASE_URL:-}" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != honcho ]] ||
@@ -1550,6 +1552,15 @@ mock_reset_log
 run_target_provisioner deepseek-harness
 assert_contains "and DeepSeek Harness (for Honcho's MCP server)" "honcho-env |http://192.0.2.100:8000|920" "$(mock_calls)"
 assert_contains "still without the Open WebUI admin token" "|no|" "$(mock_calls)"
+assert_not_contains "no Open Terminal before it is provisioned" "open-terminal-env" "$(mock_calls)"
+OPEN_TERMINAL_CT_ID=919; OPEN_TERMINAL_IP_CIDR=192.0.2.99/24; OPEN_TERMINAL_READY=true
+for _agent in hermes openclaw deepseek-harness; do
+  mock_reset_log
+  run_target_provisioner "$_agent"
+  assert_contains "$_agent gets the provisioned Open Terminal gateway and CT" \
+    "open-terminal-env http://192.0.2.99:8000|919" "$(mock_calls)"
+done
+OPEN_TERMINAL_READY=false
 COMFYUI_CT_ID=917; COMFYUI_IP_CIDR=192.0.2.97/24; COMFYUI_STORAGE=t-store
 COMFYUI_COMMUNITY_SCRIPT_SHA256=def456
 COMFYUI_IMAGE_VARIANT=klein-4b
@@ -1689,6 +1700,7 @@ describe provision_selected_targets
 run_target_provisioner() {
   echo "run $1" >> "$MOCK_LOG"
   [[ ${HONCHO_READY:-false} != true || $1 == honcho ]] || echo "honcho-ready $1" >> "$MOCK_LOG"
+  [[ ${OPEN_TERMINAL_READY:-false} != true || $1 == open-terminal ]] || echo "open-terminal-ready $1" >> "$MOCK_LOG"
   [[ " ${FAKE_FAIL:-} " != *" $1 "* ]]
 }
 register_target_key() { echo "key $1" >> "$MOCK_LOG"; [[ -n "$(target_field "$1" key)" ]] || return 0; [[ -z ${FAKE_KEY_FAIL:-} ]]; }
@@ -1757,6 +1769,12 @@ assert_eq "ComfyUI is added once Open WebUI is up and the admin key is known" \
   "$(printf '%s\n' 'run ollama' wait token 'run comfyui')" "$(mock_calls)"
 assert_contains "and is in the summary" "comfyui        CT 917    ok" "$(cat "$_out")"
 assert_eq "and count as success" 0 "$_rc"
+TARGETS="hermes deepseek-harness open-terminal comfyui"
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1
+assert_eq "Open Terminal goes first, so the agents (in menu order) get it" \
+  "$(printf '%s\n' wait token 'run open-terminal' 'run hermes' 'open-terminal-ready hermes' 'run deepseek-harness' \
+     'open-terminal-ready deepseek-harness' 'run comfyui' 'open-terminal-ready comfyui')" "$(mock_calls)"
 TARGETS="honcho hermes openclaw"
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?

@@ -11,12 +11,15 @@ usage() {
   cat <<'USAGE'
 Usage: bash install-target.sh [--dry-run]
 Install or reconfigure DeepSeek Harness as an unprivileged systemd service.
-Keys: router-api-key (empty for a keyless OSR) and, with Honcho,
-  honcho-api-key, next to this script or already in /etc/deepseek-harness.
+Keys: router-api-key (empty for a keyless OSR), with Honcho honcho-api-key,
+  with Open Terminal open-terminal-key (this CT's client key), next to this
+  script or already in /etc/deepseek-harness.
 Environment: DSH_ROUTER_URL, DSH_BIND_IP, DSH_MODEL=auto,
   DSH_CONTEXT_WINDOW=32768, DSH_MAX_TOKENS=8192, DSH_PORT=3080,
   DSH_VERSION=0.2.1-rc.5 (an exact npm release, or latest),
-  DSH_HONCHO_MCP_URL (Honcho memory through its MCP server; empty = off).
+  DSH_HONCHO_MCP_URL (Honcho memory through its MCP server; empty = off),
+  DSH_OPEN_TERMINAL_URL (this agent's own Open Terminal workspace, the
+  gateway as http://IP:port, as MCP tools; empty = off).
 An unchanged rerun does nothing. A failed upgrade or reconfigure restores the
 previous release, configuration and unit and restarts them.
 USAGE
@@ -45,6 +48,7 @@ MAX_TOKENS=${DSH_MAX_TOKENS:-8192}
 PORT=${DSH_PORT:-3080}
 VERSION=${DSH_VERSION:-$DEFAULT_VERSION}
 HONCHO_MCP_URL=${DSH_HONCHO_MCP_URL:-}
+OPEN_TERMINAL_URL=${DSH_OPEN_TERMINAL_URL:-}
 ETC_DIR=${DSH_ETC_DIR:-/etc/deepseek-harness}
 OPT_DIR=${DSH_OPT_DIR:-/opt/deepseek-harness}
 STATE_DIR=${DSH_STATE_DIR:-/var/lib/deepseek-harness}
@@ -70,6 +74,9 @@ if [[ -n $HONCHO_MCP_URL ]]; then
   (( CONTEXT_WINDOW >= 32768 )) ||
     die 'Honcho memory adds about 40 tool definitions; it needs DSH_CONTEXT_WINDOW of 32768 or more.'
 fi
+[[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
+  die 'DSH_OPEN_TERMINAL_URL must be the Open Terminal gateway, such as http://<terminal-ip>:8000.'
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 for path in "$ETC_DIR" "$OPT_DIR" "$STATE_DIR" "$ROLLBACK_DIR" "$UNIT_DIR"; do
   [[ $path == /* && $path != *..* ]] || die "Invalid path: $path"
 done
@@ -90,6 +97,7 @@ settings_record() {
     "$1" "$MODEL" "$CONTEXT_WINDOW" "$MAX_TOKENS" "$PORT"
   printf 'DSH_ROUTER_URL=%s\nDSH_BIND_IP=%s\nDSH_HONCHO_MCP_URL=%s\n' "$ROUTER_URL" "$BIND_IP" "$HONCHO_MCP_URL"
   printf 'ROUTER_KEY_SHA256=%s\nHONCHO_KEY_SHA256=%s\nFILES_SHA256=%s\n' "$2" "$3" "$4"
+  printf 'DSH_OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "${ot_key_sha:-none}"
 }
 # release_version DIR: the dsh version installed in a release directory.
 release_version() {
@@ -160,6 +168,9 @@ if (( dry_run )); then
   else
     printf '+ no Honcho memory\n'
   fi
+  if [[ -n $OPEN_TERMINAL_URL ]]; then
+    printf '+ connect this agent'\''s Open Terminal workspace at %s/mcp (MCP initialize with this CT'\''s key)\n' "$OPEN_TERMINAL_URL"
+  fi
   printf '+ install and start deepseek-harness.service on %s:%s; roll back on failure\n' "$BIND_IP" "$PORT"
   exit 0
 fi
@@ -171,7 +182,7 @@ flock -n "$lock_fd" || die 'Another install-target.sh run holds the lock.'
 # The pushed copies are one-shot inputs: gone after this run, whatever happens,
 # also when the snapshot check below refuses it. Set after the lock, so a run
 # refused by the lock cannot remove keys a running install is about to read.
-trap 'rm -f -- "$SOURCE_DIR/router-api-key" "$SOURCE_DIR/honcho-api-key"' EXIT
+trap 'rm -f -- "$SOURCE_DIR/router-api-key" "$SOURCE_DIR/honcho-api-key" "$SOURCE_DIR/open-terminal-key"' EXIT
 # A signal (Ctrl-C, a closed SSH session, kill) must reach the EXIT trap as a
 # failure so it rolls back: after a signal bash runs it with $? = 0. After a
 # hangup the output goes to OSR_INTERRUPT_LOG, so writes to the closed
@@ -201,9 +212,16 @@ if [[ -n $HONCHO_MCP_URL ]]; then
   honcho_key=$(tr -d '\r\n' < "$honcho_key_file")
   [[ $honcho_key =~ ^[A-Za-z0-9._~+/=-]+$ ]] || die 'The Honcho key is empty or has unsupported characters.'
 fi
+ot_key=''
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  ot_key_file=$(key_source open-terminal-key) || die 'DSH_OPEN_TERMINAL_URL needs open-terminal-key (provision-lxc.sh pushes it).'
+  ot_key=$(tr -d '\r\n\t ' < "$ot_key_file")
+  [[ $ot_key =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || die 'The Open Terminal key is empty or has unsupported characters.'
+fi
 key_sha() { if [[ -n $1 ]]; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; else echo none; fi; }
 router_key_sha=$(key_sha "$router_key")
 honcho_key_sha=$(key_sha "$honcho_key")
+ot_key_sha=$(key_sha "$ot_key")
 files_sha=$(cat "$SOURCE_DIR/configure.mjs" "$SOURCE_DIR/deepseek-harness.service" | sha256sum | cut -d' ' -f1)
 
 previous_record=''
@@ -285,7 +303,8 @@ chmod -R a+rX,go-w -- "$release"
 # --- snapshot, then change -------------------------------------------------
 # Everything below is put back on failure when a previous install exists.
 snapshot_files=("$ETC_DIR/osr.patch.yml" "$ETC_DIR/service.env" "$ETC_DIR/settings"
-  "$ETC_DIR/router-api-key" "$ETC_DIR/honcho-api-key" "$UNIT" "$DSH_HOME_DIR/AGENTS.md")
+  "$ETC_DIR/router-api-key" "$ETC_DIR/honcho-api-key" "$UNIT" "$DSH_HOME_DIR/AGENTS.md"
+  "$ETC_DIR/open-terminal-key")
 take_snapshot() {
   local file i=0
   install -d -m 0700 "$ROLLBACK_DIR"
@@ -320,7 +339,7 @@ on_exit() {
   local status=$1
   trap - EXIT
   trap '' INT TERM HUP  # the rollback below must finish
-  rm -f -- "$SOURCE_DIR/router-api-key" "$SOURCE_DIR/honcho-api-key"
+  rm -f -- "$SOURCE_DIR/router-api-key" "$SOURCE_DIR/honcho-api-key" "$SOURCE_DIR/open-terminal-key"
   if (( status == 0 )); then return 0; fi
   # A failed upgrade goes back to the previous release; a failed first
   # install keeps its release for inspection (a rerun reuses it).
@@ -353,18 +372,21 @@ trap 'on_exit $?' EXIT
 
 if $installed; then take_snapshot; fi
 phase=configure
-for name in router-api-key honcho-api-key; do
+for name in router-api-key honcho-api-key open-terminal-key; do
   if [[ -f $SOURCE_DIR/$name ]]; then install -m 0600 "$SOURCE_DIR/$name" "$ETC_DIR/$name"; fi
 done
 [[ -n $HONCHO_MCP_URL ]] || rm -f -- "$ETC_DIR/honcho-api-key"
+[[ -n $OPEN_TERMINAL_URL ]] || rm -f -- "$ETC_DIR/open-terminal-key"
 
 overlay_tmp=$(mktemp "$ETC_DIR/osr.patch.yml.XXXXXX")
 configure_args=(--router-url "$ROUTER_URL" --model "$MODEL" --context-window "$CONTEXT_WINDOW"
   --max-tokens "$MAX_TOKENS" --output "$overlay_tmp" --force --instructions "$DSH_HOME_DIR/AGENTS.md")
 [[ -z $HONCHO_MCP_URL ]] || configure_args+=(--honcho-mcp-url "$HONCHO_MCP_URL")
-if ! OSR_API_KEY="$service_router_key" HONCHO_API_KEY="$honcho_key" node "$SOURCE_DIR/configure.mjs" "${configure_args[@]}"; then
+[[ -z $OPEN_TERMINAL_URL ]] || configure_args+=(--open-terminal-url "$OPEN_TERMINAL_URL")
+if ! OSR_API_KEY="$service_router_key" HONCHO_API_KEY="$honcho_key" OSR_OPEN_TERMINAL_KEY="$ot_key" \
+    node "$SOURCE_DIR/configure.mjs" "${configure_args[@]}"; then
   rm -f -- "$overlay_tmp"
-  die 'The OSR or Honcho check failed (above).'
+  die 'The OSR, Honcho or Open Terminal check failed (above).'
 fi
 [[ ! -f $DSH_HOME_DIR/AGENTS.md ]] || { chown "$SERVICE_USER:$SERVICE_USER" "$DSH_HOME_DIR/AGENTS.md"; chmod 0640 "$DSH_HOME_DIR/AGENTS.md"; }
 install -m 0640 -g "$SERVICE_USER" "$overlay_tmp" "$ETC_DIR/osr.patch.yml"
@@ -376,6 +398,7 @@ service_env=$(mktemp "$ETC_DIR/service.env.XXXXXX")
 {
   printf 'OSR_API_KEY=%s\n' "$service_router_key"
   [[ -z $honcho_key ]] || printf 'HONCHO_API_KEY=%s\n' "$honcho_key"
+  [[ -z $ot_key ]] || printf 'OSR_OPEN_TERMINAL_KEY=%s\n' "$ot_key"
   printf 'DSH_HOME=%s\nDSH_BIND_IP=%s\nDSH_PORT=%s\n' "$DSH_HOME_DIR" "$BIND_IP" "$PORT"
 } > "$service_env"
 chmod 0600 "$service_env"
@@ -418,3 +441,4 @@ if [[ -d $OPT_DIR/node_modules ]]; then
 fi
 note "DeepSeek Harness $resolved is serving on http://$BIND_IP:$PORT/ (open the tokenized URL from its journal)."
 if [[ -n $HONCHO_MCP_URL ]]; then note "Honcho memory: $HONCHO_MCP_URL (workspace osr, peer user)."; fi
+if [[ -n $OPEN_TERMINAL_URL ]]; then note "Open Terminal workspace: $OPEN_TERMINAL_URL (tools mcp__open_terminal__*)."; fi

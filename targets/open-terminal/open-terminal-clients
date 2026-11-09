@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Manage who may use this Open Terminal: client keys and their workspaces.
+
+  open-terminal-clients list
+  open-terminal-clients issue NAME [--default-user USER]
+        Create NAME or give it a new key (the old one stops working at once).
+        Prints the key on stdout, nothing else. Agents get a default user:
+        their one workspace (any other X-User-Id is refused for them).
+  open-terminal-clients import-key NAME FILE [--default-user USER]
+        Use the key in FILE for NAME (the installer does this for openwebui).
+  open-terminal-clients has NAME SHA256
+        Exit 0 if NAME's key has that SHA-256 (lets a provisioner keep a
+        working key without the key itself leaving the agent CT).
+  open-terminal-clients revoke NAME [--missing-ok]
+  open-terminal-clients workspaces
+        Every workspace: ID, client, user, created, running or stopped.
+
+clients.json holds SHA-256 hashes only (root:ot-gateway, 0640); the gateway
+rereads it on change. Workspace files stay when a client is revoked; to delete
+one, stop open-terminal-ws@<id>.service, then remove the ot-<id> account,
+/srv/open-terminal/ws/<id>, /etc/open-terminal/ws/<id>.env and
+/var/lib/open-terminal/workspaces/<id>.json.
+"""
+
+import argparse
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+CLIENT_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}")
+KEY_RE = re.compile(r"[A-Za-z0-9._~+/=-]{16,512}")
+OT_ETC = os.environ.get("OT_ETC", "/etc/open-terminal")
+CLIENTS = os.path.join(OT_ETC, "clients.json")
+RECORDS = os.environ.get("OT_WS_RECORD_DIR", "/var/lib/open-terminal/workspaces")
+GROUP = os.environ.get("OT_GATEWAY_GROUP", "ot-gateway")
+SYSTEMCTL = os.environ.get("OT_SYSTEMCTL", "systemctl")
+
+
+def die(message):
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load():
+    try:
+        with open(CLIENTS, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except ValueError as exc:
+        die(f"{CLIENTS} is not valid JSON: {exc}")
+    clients = data.get("clients") if isinstance(data, dict) else None
+    return {"version": 1, "clients": clients if isinstance(clients, dict) else {}}
+
+
+def save(data):
+    try:
+        gid = grp.getgrnam(GROUP).gr_gid
+    except KeyError:
+        die(f"group {GROUP} does not exist (rerun install-target.sh)")
+    tmp = f"{CLIENTS}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        if os.geteuid() == 0:
+            os.chown(tmp, 0, gid)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, CLIENTS)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def locked(func):
+    def wrapper(*args):
+        os.makedirs(OT_ETC, exist_ok=True)
+        with open(os.path.join(OT_ETC, ".clients.lock"), "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            return func(*args)
+    return wrapper
+
+
+def check_name(name):
+    if not CLIENT_RE.fullmatch(name):
+        die("client names are 1-32 characters: a lowercase letter, then lowercase letters, digits or -")
+
+
+def check_user(user):
+    if user is not None and not USER_RE.fullmatch(user):
+        die("invalid default user (letters, digits and ._@:+- , at most 128)")
+
+
+@locked
+def set_key(name, key, default_user):
+    data = load()
+    entry = {"key_sha256": hashlib.sha256(key.encode()).hexdigest()}
+    if default_user is not None:
+        entry["default_user"] = default_user
+    changed = data["clients"].get(name) != entry
+    data["clients"][name] = entry
+    if changed:
+        save(data)
+    return changed
+
+
+@locked
+def revoke(name, missing_ok=False):
+    data = load()
+    if data["clients"].pop(name, None) is None:
+        if missing_ok:
+            return False
+        die(f"no client named {name}")
+    save(data)
+    return True
+
+
+def workspace_states():
+    try:
+        out = subprocess.run([SYSTEMCTL, "list-units", "--plain", "--no-legend", "--state=active",
+                              "open-terminal-ws@*.service"], capture_output=True, text=True,
+                             check=False).stdout
+    except OSError:
+        out = ""
+    return set(re.findall(r"open-terminal-ws@([0-9a-f]{16})\.service", out))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("list")
+    issue = sub.add_parser("issue")
+    issue.add_argument("name")
+    issue.add_argument("--default-user")
+    imp = sub.add_parser("import-key")
+    imp.add_argument("name")
+    imp.add_argument("file")
+    imp.add_argument("--default-user")
+    has = sub.add_parser("has")
+    has.add_argument("name")
+    has.add_argument("sha256")
+    rev = sub.add_parser("revoke")
+    rev.add_argument("name")
+    rev.add_argument("--missing-ok", action="store_true")
+    sub.add_parser("workspaces")
+    args = parser.parse_args()
+
+    if args.command == "list":
+        for name, entry in sorted(load()["clients"].items()):
+            default = entry.get("default_user")
+            print(f"{name}\t{'default user ' + default if default else 'users named by X-User-Id'}")
+    elif args.command == "issue":
+        check_name(args.name)
+        check_user(args.default_user)
+        key = secrets.token_urlsafe(32)
+        set_key(args.name, key, args.default_user)
+        print(key)
+    elif args.command == "import-key":
+        check_name(args.name)
+        check_user(args.default_user)
+        try:
+            with open(args.file, encoding="utf-8") as f:
+                key = re.sub(r"\s", "", f.read())
+        except OSError as exc:
+            die(f"cannot read {args.file}: {exc.strerror}")
+        if not KEY_RE.fullmatch(key):
+            die(f"{args.file} does not hold a usable key")
+        changed = set_key(args.name, key, args.default_user)
+        print(f"{args.name}: key {'updated' if changed else 'unchanged'}", file=sys.stderr)
+    elif args.command == "has":
+        check_name(args.name)
+        entry = load()["clients"].get(args.name) or {}
+        sys.exit(0 if re.fullmatch(r"[0-9a-f]{64}", args.sha256)
+                 and entry.get("key_sha256") == args.sha256 else 1)
+    elif args.command == "revoke":
+        check_name(args.name)
+        if revoke(args.name, args.missing_ok):
+            print(f"{args.name}: revoked; its workspaces are kept", file=sys.stderr)
+    elif args.command == "workspaces":
+        running = workspace_states()
+        try:
+            names = sorted(os.listdir(RECORDS))
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(RECORDS, name), encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                continue
+            ws = record.get("id", name[:-5])
+            print(f"{ws}\t{record.get('client')}\t{record.get('user')}\t{record.get('created')}\t"
+                  f"{'running' if ws in running else 'stopped'}")
+
+
+if __name__ == "__main__":
+    main()

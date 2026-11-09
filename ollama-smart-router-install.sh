@@ -1010,7 +1010,7 @@ target_table() {
     'hermes|companion|Hermes Agent: offered in Open WebUI as the model hermes-agent|||' \
     'openclaw|companion|OpenClaw: agent offered in Open WebUI as the model openclaw|||' \
     'deepseek-harness|companion|DeepSeek Harness: agent Web UI in its own LXC, using OSR models|||' \
-    'open-terminal|companion|Open Terminal: a shell tool for Open WebUI|||' \
+    'open-terminal|companion|Open Terminal: a private workspace per user, for Open WebUI and the agents|||' \
     'comfyui|companion|ComfyUI: image generation for Open WebUI (NVIDIA, AMD or Intel Arc GPU when present)|||optional:nvidia,amd,intel'
 }
 # target_field NAME FIELD: one column of the table (phase, label, entry, key, gpu).
@@ -2178,6 +2178,14 @@ run_target_provisioner() {
         honcho_ct="$(target_setting honcho CT_ID)"
         export HONCHO_URL="http://${HONCHO_IP_CIDR%/*}:8000" HONCHO_CT_ID="$honcho_ct"
       fi
+      # The same for Open Terminal: each agent gets its own workspace there,
+      # with a client key the terminal CT issues.
+      if [[ ( "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness ) && "${OPEN_TERMINAL_READY:-false}" == true ]]; then
+        local ot_ct ot_ip
+        ot_ct="$(target_setting open-terminal CT_ID)"
+        ot_ip="$(target_setting open-terminal IP_CIDR)"
+        export OPEN_TERMINAL_URL="http://${ot_ip%/*}:${OPEN_TERMINAL_PORT:-8000}" OPEN_TERMINAL_CT_ID="$ot_ct"
+      fi
       # Harness talks to the router, never to Open WebUI: no admin token.
       if [[ "$name" == deepseek-harness ]]; then
         export DEEPSEEK_HARNESS_MODEL="${DEEPSEEK_HARNESS_MODEL:-auto}"
@@ -2290,7 +2298,7 @@ provision_selected_targets() {
   local name id companions=false webui_companions=false webui_ready=true status=0
   local -a key_targets=()
   declare -A result=()
-  HONCHO_READY=false
+  HONCHO_READY=false OPEN_TERMINAL_READY=false
   [[ -n "${TARGETS:-}" ]] || return 0
   for name in $TARGETS; do
     case "$(target_field "$name" phase)" in
@@ -2337,7 +2345,13 @@ provision_selected_targets() {
     if $webui_companions && ! { wait_for_openwebui && prompt_openwebui_admin_token; }; then
       webui_ready=false
     fi
-    for name in $TARGETS; do
+    # Honcho and Open Terminal first: the agents connect to both.
+    local ordered=""
+    for name in honcho open-terminal $TARGETS; do
+      [[ " ${TARGETS} " == *" ${name} "* && " ${ordered} " != *" ${name} "* ]] || continue
+      ordered+="${ordered:+ }${name}"
+    done
+    for name in $ordered; do
       [[ "$(target_field "$name" phase)" == companion ]] || continue
       if [[ $name != deepseek-harness ]] && ! $webui_ready; then
         result[$name]="skipped (no Open WebUI admin key)"
@@ -2348,6 +2362,7 @@ provision_selected_targets() {
       if run_target_provisioner "$name"; then
         result[$name]=ok
         [[ "$name" != honcho ]] || HONCHO_READY=true
+        [[ "$name" != open-terminal ]] || OPEN_TERMINAL_READY=true
       else result[$name]=failed; fi
     done
     TARGET_ADMIN_TOKEN=""

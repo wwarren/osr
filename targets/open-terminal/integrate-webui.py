@@ -37,22 +37,27 @@ def request(url, token=None, data=None, expect=dict):
 
 
 def check_terminal_key(terminal, key):
-    """Prove the key against an endpoint that requires it.
+    """Prove the key against the workspace gateway, which requires it.
 
-    Open WebUI's own verify only calls GET /api/config, which Open Terminal
-    serves without authentication, so a wrong key would pass it and fail only
-    when someone first uses the terminal. GET /files/cwd answers 401 to a
-    missing or wrong key.
+    Open WebUI's own verify only calls GET /api/config, which answers without
+    a working key, so a wrong key would pass it and fail only when someone
+    first uses the terminal. GET /osr/v1/whoami answers 401 to a missing or
+    wrong key and names the client the key belongs to: it must be openwebui,
+    whose users each get their own workspace.
     """
     try:
-        body = request(f"{terminal}/files/cwd", key)
+        body = request(f"{terminal}/osr/v1/whoami", key)
     except RuntimeError as exc:
         if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
             raise RuntimeError("Open Terminal rejected the API key "
                                "(/etc/open-terminal/api-key and the key given here differ)") from exc
+        if "HTTP 404" in str(exc):
+            raise RuntimeError("Open Terminal has no workspace gateway (an install from before per-user "
+                               "workspaces): rerun install-target.sh in the terminal CT first") from exc
         raise
-    if "cwd" not in body:
-        raise RuntimeError(f"{terminal}/files/cwd: not an Open Terminal response: {body}")
+    if body.get("client") != "openwebui":
+        raise RuntimeError(f"{terminal}/osr/v1/whoami: the key belongs to client "
+                           f"{body.get('client')!r}, not openwebui")
 
 
 def main():
@@ -80,7 +85,8 @@ def main():
         "path": "/openapi.json",
         "key": terminal_key,
         "auth_type": "bearer",
-        # Empty grants keep the shared shell admin-only. Grant groups in the UI.
+        # Empty grants keep it admin-only. Each user granted access in the UI
+        # gets their own workspace (the gateway keys it on X-User-Id).
         "config": {"access_grants": []},
     }
 

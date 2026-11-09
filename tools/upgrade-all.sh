@@ -132,7 +132,9 @@ declare -A UNITS=(
     [ollama]='ollama'
     [strata]='strata' [basalt]='basalt' [maya]='maya' [xolotl]='xolotl' [avalon]='avalon' [kindi]='kindi'
     [comfyui]='comfyui'
-    [open-terminal]='open-terminal'
+    # The workspace gateway; per-user open-terminal-ws@<id> instances start on
+    # demand and stop when idle, so neither they nor their ports are checked.
+    [open-terminal]='open-terminal-gateway open-terminal-spawner'
     [honcho]='postgresql honcho-api honcho-deriver honcho-embedding honcho-mcp honcho-proxy'
     [hermes]='hermes-gateway hermes-direct hermes-dashboard'
     [openclaw]='openclaw-gateway openclaw-direct'
@@ -162,7 +164,7 @@ declare -A GUEST_FILES=(
     [llamacpp]='install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example'
     [ollama]='install-target.sh ollama.env.example ollama-target.conf README.md'
     [comfyui]='install-target.sh comfyui-target.conf comfyui.env.example README.md klein-weights.txt'
-    [open-terminal]='install-target.sh open-terminal.service requirements.in requirements.lock'
+    [open-terminal]='install-target.sh open-terminal-gateway.service open-terminal-spawner.service open-terminal-ws@.service gateway.py spawner.py open-terminal-clients requirements.in requirements.lock'
 )
 
 # Gitea and Mattermost come from community scripts that install the newest
@@ -671,8 +673,11 @@ collect_state() {
     # shellcheck disable=SC2086  # unit names are single words
     pct exec "$id" -- sh -c 'for u in "$@"; do systemctl is-active --quiet "$u.service" 2>/dev/null && echo "unit:$u"; done
         if command -v ss >/dev/null 2>&1; then ss -Hltn 2>/dev/null | sed "s/^/ss: /"; fi' sh $units 2>/dev/null |
-        # Ephemeral ports (such as Ollama's per-model runners) come and go by themselves.
-        awk '$1 == "ss:" { a = $5; sub(/.*:/, "", a); if (a ~ /^[0-9]+$/ && a + 0 < 32768) print "port:" a; next } { print }'
+        # Ephemeral ports (such as Ollama's per-model runners) come and go by
+        # themselves, and so do Open Terminal's workspaces (20000-29999).
+        awk -v t="$t" '$1 == "ss:" { a = $5; sub(/.*:/, "", a)
+            if (a ~ /^[0-9]+$/ && a + 0 < 32768 && !(t == "open-terminal" && a + 0 >= 20000 && a + 0 <= 29999)) print "port:" a
+            next } { print }'
     case $t in
         router|open-webui)
             [[ $(router_probe healthz) == 200 ]] && echo http:router-healthz

@@ -30,7 +30,10 @@ separately installed Honcho set `HONCHO_URL` and `HONCHO_CT_ID`.
 The [hcom target](../hcom/README.md) adds `osr-bus` and a managed block in
 `/home/hermes/AGENTS.md` and opens this CT's egress to the broker; its native
 plugin (`HCOM_HERMES_NATIVE=true`) gives Hermes the group key and works only in
-messaging-platform chats, not Open WebUI.
+messaging-platform chats, not Open WebUI. With the
+[Open Terminal target](../open-terminal/README.md), `OPEN_TERMINAL_URL` gives
+Hermes its own workspace there as MCP server `open_terminal` (see
+[Open Terminal workspace](#open-terminal-workspace)).
 
 ## Before you start
 
@@ -100,6 +103,7 @@ connection by URL, keeping all others.
 | `HERMES_DASHBOARD` | `true` | `false` stops the dashboard and closes TCP 9119 |
 | `TASK_MODEL` | `fast` | Open WebUI's Task Model (External) for titles, tags, follow-ups; set only when unset or pointing at Hermes; blank leaves it alone |
 | `HERMES_API_PORT` / `HERMES_API_MODEL_NAME` | `8642` / `hermes-agent` | API port (8644–8646 are reserved by Hermes) and model name in Open WebUI. Kept by `--reconfigure` and `--integrate-only`, like `HERMES_CHANNEL` |
+| `OPEN_TERMINAL_URL` | — | Open Terminal gateway (`http://IP:port`); offered when a CT tagged `open-terminal` is on this host. Kept by `--reconfigure`; `OPEN_TERMINAL_URL=` disconnects and revokes. `OPEN_TERMINAL_CT_ID` (detected from the address) or `OPEN_TERMINAL_KEY_FILE` |
 | `EGRESS` | `restricted` | See [Network](#network) |
 | `ROUTER_URL`, `ROUTER_IP`, `OPENWEBUI_PORT` | Detected | Overrides |
 | `BRIDGE`, `CT_HOSTNAME`, `CORES`, `MEMORY_MB`, `SWAP_MB`, `ROOTFS_GB`, `ONBOOT`, `NAMESERVER`, `VLAN_TAG` | 2 cores, 4096 MB, 1024 MB swap, 32 GB | CT settings |
@@ -130,10 +134,34 @@ streams tool progress and keep-alives, so long runs do not time out).
   profile per user or group with its own `API_SERVER_PORT`, key and connection.
 - **Task model.** Titles, tags and follow-ups go to `TASK_MODEL`; pointing it
   at Hermes would start an agent run (and a memory entry) for every title.
-- **One agent at a time.** Don't attach Open WebUI tools, Open Terminal or web
-  search to `hermes-agent`; Hermes has its own.
+- **One agent at a time.** Don't attach Open WebUI tools, Open WebUI's Open
+  Terminal connection or web search to `hermes-agent`; Hermes has its own (and
+  its own Open Terminal workspace, below).
 - **Files.** Document retrieval works; raw attachments (`input_file`) are
   refused; inline images work.
+
+## Open Terminal workspace
+
+With `OPEN_TERMINAL_URL`, the provisioner has the terminal CT (found by its
+address, or `OPEN_TERMINAL_CT_ID`) issue a client key for `hermes-<CT>`, admit
+this CT in the terminal's firewall, and push the key here; the guest checks it
+against the gateway (`/osr/v1/whoami`) before changing anything. Hermes gets
+`mcp_servers.open_terminal` (`<URL>/mcp`, header
+`Authorization: Bearer ${OSR_OPEN_TERMINAL_KEY}`, expanded from
+`~/.hermes/.env`, so `config.yaml` holds no key) and tools such as
+`mcp_open_terminal_run_command` and `mcp_open_terminal_read_file`. They act in
+Hermes's own workspace in the terminal CT, separate from every Open WebUI user
+and every other agent; Hermes's built-in terminal and file tools still run in
+this CT. Everyone who chats with `hermes-agent` shares that workspace, as they
+share its memory.
+
+A plain `--reconfigure` keeps the connection and the key while the terminal
+accepts it (a rebuilt terminal gets a new one). `OPEN_TERMINAL_URL=` removes
+the MCP server, revokes the key and drops the terminal firewall rule; the
+workspace's files stay in the terminal CT. For a terminal on another host,
+issue a key there (`open-terminal-clients issue hermes-<CT> --default-user
+default`), pass it as `OPEN_TERMINAL_KEY_FILE` and admit this CT in that
+terminal's firewall yourself.
 
 ## Network
 
@@ -143,7 +171,8 @@ SSH is not admitted; use `pct enter`.
 
 `EGRESS=restricted` (default) allows outbound, in order: the router's API (from
 `ROUTER_URL`); the model server IPs and ports from the inventory at the last
-provision or reconfigure (names resolved in the CT; unresolvable ones are
+provision or reconfigure, and Honcho's and the Open Terminal gateway's address
+when set (names resolved in the CT; unresolvable ones are
 reported and skipped); DNS; internet HTTP(S) for packages, `hermes update` and
 web tools. Everything else, including RFC 1918, CGNAT and link-local, is
 dropped. `EGRESS=open` allows all (e.g. for a LAN proxy). A new model server or

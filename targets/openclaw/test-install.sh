@@ -143,6 +143,8 @@ ROUTER_URL=http://r:8000 OPENCLAW_MODEL=auto OPENCLAW_CONTEXT_LENGTH=65536 OPENC
 OPENCLAW_NODE_VERSION=24 NVM_VERSION=v0.40.4 OPENCLAW_API=true OPENCLAW_PORT=18789 OPENCLAW_DASHBOARD=true origins='[]'
 # shellcheck disable=SC2034
 backend_keys_sha256=none targets_sha256=none providers_sha256=p unit_sha256=u HONCHO_URL='' honcho_key_sha256=none
+# shellcheck disable=SC2034
+OPEN_TERMINAL_URL='' ot_key_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
 record=$(settings_record)
 [[ $record == *"ROUTER_KEY_SHA256=$router_key_sha256"* && $record != *sk-secret-key* ]] ||
@@ -344,6 +346,13 @@ def refused():
     if fmt: sys.stdout.write("000")
     sys.exit(7)
 router = os.environ.get("FAKE_ROUTER_URL", "http://192.168.11.80:8000")
+terminal = os.environ.get("FAKE_OT_URL", "http://192.0.2.70:8000")
+if url and url.startswith(terminal):
+    if os.environ.get("FAKE_OT_DOWN"): refused()
+    if url.endswith("/osr/v1/whoami"):
+        if auth != os.environ.get("FAKE_OT_KEY", "ot-key-0123456789abcdef"):
+            reply(401, {"detail": "Invalid API key"})
+        reply(200, {"client": "openclaw-283", "user": "default", "workspace": "0123456789abcdef"})
 if url == "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh":
     with open(out, "w") as f:
         f.write(open(os.environ["FAKE_NVM_INSTALLER"]).read())
@@ -718,5 +727,33 @@ out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_hon
 out=$(guest HONCHO_URL= HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho off: $out"
 [[ $(<"$external_honcho_key") == external-honcho-key ]] || fail 'disabling Honcho deleted a caller-supplied key file'
 pass 'Honcho: the plugin installed once, enabled with the osr workspace; a failed run restores it; HONCHO_URL= disables it'
+
+# Open Terminal: OpenClaw's own workspace as MCP server open-terminal.
+ot_key=ot-key-0123456789abcdef
+printf '%s\n' "$ot_key" > "$deploy/open-terminal-key"
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000/) || fail "Open Terminal on: $out"
+entry=$(kv mcp.servers.open-terminal "$config")
+python3 - "$entry" <<'PY' || fail "MCP entry: $entry"
+import json, sys
+e = json.loads(sys.argv[1])
+assert e["url"] == "http://192.0.2.70:8000/mcp" and e["transport"] == "streamable-http"
+assert e["headers"] == {"Authorization": "Bearer ${OSR_OPEN_TERMINAL_KEY}"}
+PY
+grep -q "$ot_key" "$config" && fail 'openclaw.json holds the Open Terminal key'
+[[ $(kv OSR_OPEN_TERMINAL_KEY "$env_file") == "$ot_key" ]] || fail 'the key is not in OpenClaw .env'
+[[ $(kv OPEN_TERMINAL_URL "$etc/settings") == http://192.0.2.70:8000 ]] || fail 'settings do not record OPEN_TERMINAL_URL'
+grep -q -- "$ot_key" "$log" && fail 'the Open Terminal key appeared in a command line'
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000 FAKE_OT_KEY=another-key-0123456789) && fail 'a rejected key was accepted'
+[[ $out == *'rejected this CT'* ]] || fail "rejected key message: $out"
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000 FAKE_OT_DOWN=1) && fail 'an unreachable terminal was accepted'
+[[ $out == *'unreachable from this CT'* ]] || fail "unreachable message: $out"
+out=$(guest OPEN_TERMINAL_URL=) || fail "Open Terminal off: $out"
+grep -q '^mcp.servers.open-terminal' "$config" && fail 'OPEN_TERMINAL_URL= left the MCP server'
+grep -q '^OSR_OPEN_TERMINAL_KEY=' "$env_file" && fail 'OPEN_TERMINAL_URL= left the key in .env'
+[[ ! -e $deploy/open-terminal-key ]] || fail 'OPEN_TERMINAL_URL= left the pushed key'
+: > "$log"
+out=$(guest) || fail "rerun without Open Terminal: $out"
+grep -q 'mcp.servers.open-terminal' "$log" && fail 'a run that never had Open Terminal touched the MCP config'
+pass 'Open Terminal: MCP server with the key only in .env, checked from the CT; OPEN_TERMINAL_URL= removes it'
 
 printf '%s install cases passed. No system files, packages or services were touched.\n' "$passed"

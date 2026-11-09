@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Generate a DeepSeek Harness overlay for an existing Ollama Smart Router, and
-// optionally connect Honcho memory through its MCP server.
+// optionally connect Honcho memory and this agent's Open Terminal workspace
+// through their MCP servers.
 // Keys are read only for discovery and checks. The overlay names their
 // environment variables, never their values.
 import { writeFile, readFile } from 'node:fs/promises';
@@ -25,6 +26,11 @@ Options:
   --instructions FILE   Harness user-global AGENTS.md: write the Honcho block into it,
                         or remove that block when no --honcho-mcp-url is given
   --skip-honcho-check   Do not contact Honcho (the overlay is still written)
+  --open-terminal-url URL  Open Terminal workspace gateway (http://host:port); adds
+                        this agent's private workspace as MCP tools (mcp__open_terminal__*)
+  --open-terminal-key-env NAME  Environment variable holding this CT's Open Terminal
+                        client key (default: OSR_OPEN_TERMINAL_KEY)
+  --skip-open-terminal-check  Do not contact Open Terminal
   --force               Replace an existing output file
 
 Set the named key environment variables before running this command and
@@ -39,6 +45,7 @@ export function parseArgs(argv) {
     contextWindow: 32768, maxTokens: 8192, apiKeyEnv: 'OSR_API_KEY', force: false,
     honchoKeyEnv: 'HONCHO_API_KEY', honchoWorkspace: 'osr', honchoPeer: 'deepseek-harness',
     userPeer: 'user', skipHonchoCheck: false,
+    openTerminalKeyEnv: 'OSR_OPEN_TERMINAL_KEY', skipOpenTerminalCheck: false,
   };
   const names = new Map([
     ['--router-url', 'routerUrl'], ['--model', 'model'], ['--output', 'output'],
@@ -46,12 +53,14 @@ export function parseArgs(argv) {
     ['--api-key-env', 'apiKeyEnv'], ['--honcho-mcp-url', 'honchoMcpUrl'],
     ['--honcho-key-env', 'honchoKeyEnv'], ['--honcho-workspace', 'honchoWorkspace'],
     ['--honcho-peer', 'honchoPeer'], ['--user-peer', 'userPeer'], ['--instructions', 'instructions'],
+    ['--open-terminal-url', 'openTerminalUrl'], ['--open-terminal-key-env', 'openTerminalKeyEnv'],
   ]);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') return { help: true };
     if (arg === '--force') { options.force = true; continue; }
     if (arg === '--skip-honcho-check') { options.skipHonchoCheck = true; continue; }
+    if (arg === '--skip-open-terminal-check') { options.skipOpenTerminalCheck = true; continue; }
     const key = names.get(arg);
     if (!key || i + 1 >= argv.length) throw new Error(`Unknown or incomplete option: ${arg}`);
     options[key] = argv[++i];
@@ -66,7 +75,7 @@ export function parseArgs(argv) {
     options[key] = Number(options[key]);
   }
   if (options.maxTokens >= options.contextWindow) throw new Error('max-tokens must be smaller than context-window');
-  for (const key of ['apiKeyEnv', 'honchoKeyEnv']) {
+  for (const key of ['apiKeyEnv', 'honchoKeyEnv', 'openTerminalKeyEnv']) {
     if (!ENV_NAME.test(options[key])) throw new Error(`Invalid ${key} name`);
   }
   for (const key of ['honchoWorkspace', 'honchoPeer', 'userPeer']) {
@@ -86,6 +95,15 @@ export function parseArgs(argv) {
       throw new Error('honcho-mcp-url must be an HTTP(S) URL without credentials, query, or fragment');
     }
     options.honchoMcpUrl = mcp.href;
+  }
+  if (options.openTerminalUrl) {
+    let terminal;
+    try { terminal = new URL(options.openTerminalUrl); } catch { throw new Error('open-terminal-url must be an HTTP(S) URL'); }
+    if (!['http:', 'https:'].includes(terminal.protocol) || terminal.username || terminal.password ||
+        terminal.search || terminal.hash || terminal.pathname !== '/') {
+      throw new Error('open-terminal-url must be the gateway origin (http://host:port), without a path');
+    }
+    options.openTerminalMcpUrl = `${terminal.origin}/mcp`;
   }
   options.output = resolve(options.output);
   if (options.instructions) options.instructions = resolve(options.instructions);
@@ -119,12 +137,12 @@ export function validateModel(models, inventory, model, contextWindow) {
 
 // Streamable HTTP may return one JSON message or an SSE stream. Read through
 // the initialize response rather than treating any HTTP 200 as success.
-async function readMcpInitialize(response) {
+async function readMcpInitialize(response, label = 'Honcho') {
   if (!response.headers.get('content-type')?.includes('text/event-stream')) {
     try { return await response.json(); }
-    catch { throw new Error('Honcho MCP initialize returned invalid JSON'); }
+    catch { throw new Error(`${label} MCP initialize returned invalid JSON`); }
   }
-  if (!response.body) throw new Error('Honcho MCP initialize returned an empty event stream');
+  if (!response.body) throw new Error(`${label} MCP initialize returned an empty event stream`);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -132,7 +150,7 @@ async function readMcpInitialize(response) {
     while (true) {
       const { done, value } = await reader.read();
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-      if (buffer.length > 1024 * 1024) throw new Error('Honcho MCP initialize response is too large');
+      if (buffer.length > 1024 * 1024) throw new Error(`${label} MCP initialize response is too large`);
       const events = buffer.split(/\r?\n\r?\n/);
       buffer = events.pop();
       for (const event of events) {
@@ -141,7 +159,7 @@ async function readMcpInitialize(response) {
         if (!data) continue;
         let message;
         try { message = JSON.parse(data); }
-        catch { throw new Error('Honcho MCP initialize returned invalid event JSON'); }
+        catch { throw new Error(`${label} MCP initialize returned invalid event JSON`); }
         // An error the server could not tie to the request carries id null.
         if (message?.id === 1 || (message?.id === null && message.error)) return message;
       }
@@ -150,7 +168,7 @@ async function readMcpInitialize(response) {
   } finally {
     await reader.cancel().catch(() => {});
   }
-  throw new Error('Honcho MCP initialize returned no response');
+  throw new Error(`${label} MCP initialize returned no response`);
 }
 
 // checkHoncho: one MCP initialize with the key and workspace header, so a
@@ -202,6 +220,33 @@ async function checkHoncho(options, key) {
   }
 }
 
+// checkOpenTerminal: one MCP initialize against the workspace gateway with
+// this CT's key, so a wrong key or a firewall that does not admit this CT
+// fails the install instead of the first tool call.
+async function checkOpenTerminal(options, key) {
+  let response;
+  try {
+    response = await fetch(options.openTerminalMcpUrl, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+        protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'osr-deepseek-harness', version: '1' } } }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (error) {
+    throw new Error(`Open Terminal at ${options.openTerminalMcpUrl} is unreachable (${error.cause?.code ?? error.message}); the Open Terminal CT firewall must admit this CT`);
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`Open Terminal rejected this CT's key (HTTP ${response.status}); reconfigure with OPEN_TERMINAL_CT_ID to issue a new one`);
+  }
+  if (!response.ok) throw new Error(`Open Terminal MCP initialize: HTTP ${response.status}`);
+  const message = await readMcpInitialize(response, 'Open Terminal');
+  if (message?.id !== 1 || message?.error || typeof message?.result?.protocolVersion !== 'string') {
+    throw new Error(`Open Terminal MCP initialize failed: ${message?.error?.message ?? 'unexpected JSON-RPC response'}`);
+  }
+}
+
 export function overlay(options) {
   const q = value => JSON.stringify(value); // JSON strings are valid YAML scalars.
   let text = `# Generated for DeepSeek Harness by OSR. No API key is stored here.
@@ -243,6 +288,20 @@ export function overlay(options) {
           X-Honcho-Workspace-ID: ${q(options.honchoWorkspace)}
           X-Honcho-Plugin: osr-deepseek-harness
         toolCallTimeoutMs: 300000
+`;
+  }
+  if (options.openTerminalMcpUrl) {
+    text += `# This agent's own Open Terminal workspace (tools appear as mcp__open_terminal__*).
+- insert:
+    - id: tools-open-terminal
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: open_terminal
+        transport: streamable-http
+        url: ${q(options.openTerminalMcpUrl)}
+        headers:
+          Authorization: !!js '\`Bearer \${process.env.${options.openTerminalKeyEnv}}\`'
+        toolCallTimeoutMs: 660000
 `;
   }
   return text;
@@ -299,6 +358,11 @@ async function main() {
     const key = process.env[options.honchoKeyEnv];
     if (!key) throw new Error(`Set ${options.honchoKeyEnv} with --honcho-mcp-url`);
     if (!options.skipHonchoCheck) await checkHoncho(options, key);
+  }
+  if (options.openTerminalMcpUrl) {
+    const key = process.env[options.openTerminalKeyEnv];
+    if (!key) throw new Error(`Set ${options.openTerminalKeyEnv} with --open-terminal-url`);
+    if (!options.skipOpenTerminalCheck) await checkOpenTerminal(options, key);
   }
   if (!options.force) {
     try { await readFile(options.output); throw new Error(`Output exists: ${options.output} (pass --force to replace)`); }

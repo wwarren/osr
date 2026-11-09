@@ -158,3 +158,46 @@ test('Honcho initialize requires a JSON-RPC success, including over SSE', async 
     }
   });
 });
+
+test('Open Terminal adds its own MCP entry, keyed from the environment', () => {
+  const base = ['--router-url', 'http://192.0.2.50:8000', '--model', 'm', '--output', 'x'];
+  const yaml = overlay(parseArgs([...base, '--open-terminal-url', 'http://192.0.2.70:8000/']));
+  assert.match(yaml, /id: tools-open-terminal/);
+  assert.match(yaml, /serverName: open_terminal/);
+  assert.match(yaml, /url: "http:\/\/192\.0\.2\.70:8000\/mcp"/);
+  assert.match(yaml, /Authorization: !!js '`Bearer \$\{process\.env\.OSR_OPEN_TERMINAL_KEY\}`'/);
+  assert.doesNotMatch(overlay(parseArgs(base)), /open_terminal/);
+  const both = overlay(parseArgs([...base, '--open-terminal-url', 'http://192.0.2.70:8000',
+    '--honcho-mcp-url', 'http://192.0.2.85:3000/mcp']));
+  assert.equal(both.match(/- insert:/g).length, 2, 'Honcho and Open Terminal are separate entries');
+  assert.throws(() => parseArgs([...base, '--open-terminal-url', 'http://192.0.2.70:8000/mcp']), /without a path/);
+  assert.throws(() => parseArgs([...base, '--open-terminal-key-env', 'bad name']), /openTerminalKeyEnv/);
+});
+
+test('Open Terminal initialize must succeed with this CT key before the overlay is written', async () => {
+  let payload = { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26' } };
+  let seen;
+  await withRouter(async (router, dir) => {
+    const output = join(dir, 'ot.yml');
+    const args = ['--router-url', router, '--model', 'code-model', '--output', output,
+      '--open-terminal-url', router, '--force'];
+    let result = await invoke(args, { OSR_OPEN_TERMINAL_KEY: 'test-secret' });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(seen).method, 'initialize');
+    assert.doesNotMatch(await readFile(output, 'utf8'), /test-secret/);
+    result = await invoke(args, { OSR_OPEN_TERMINAL_KEY: 'wrong-key' });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /rejected this CT's key/);
+    payload = { jsonrpc: '2.0', id: 1, error: { code: -32603, message: 'spawner down' } };
+    result = await invoke(args, { OSR_OPEN_TERMINAL_KEY: 'test-secret' });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /spawner down/);
+    result = await invoke(args);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Set OSR_OPEN_TERMINAL_KEY/);
+  }, (request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => { seen = body; response.end(JSON.stringify(payload)); });
+  });
+});

@@ -85,6 +85,8 @@ ROUTER_URL=http://r:8000 HERMES_MODEL=auto HERMES_CONTEXT_LENGTH=65536 HERMES_CH
 HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent HERMES_DASHBOARD=true unit_sha256=u dashboard_auth_sha256=none
 # shellcheck disable=SC2034
 backend_keys_sha256=none targets_sha256=none HONCHO_URL='' honcho_key_sha256=none
+# shellcheck disable=SC2034
+OPEN_TERMINAL_URL='' ot_key_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
 record=$(settings_record)
 [[ $record == *"ROUTER_KEY_SHA256=$router_key_sha256"* && $record != *sk-secret-key* ]] ||
@@ -216,6 +218,13 @@ def refused():
     if fmt: sys.stdout.write("000")
     sys.exit(7)
 router = os.environ.get("FAKE_ROUTER_URL", "http://192.168.11.80:8000")
+terminal = os.environ.get("FAKE_OT_URL", "http://192.0.2.70:8000")
+if url.startswith(terminal):
+    if os.environ.get("FAKE_OT_DOWN"): refused()
+    if url.endswith("/osr/v1/whoami"):
+        if auth != os.environ.get("FAKE_OT_KEY", "ot-key-0123456789abcdef"):
+            reply(401, {"detail": "Invalid API key"})
+        reply(200, {"client": "hermes-282", "user": "default", "workspace": "0123456789abcdef"})
 if url == "https://hermes-agent.nousresearch.com/install.sh":
     with open(out, "w") as f:
         f.write(open(os.environ["FAKE_INSTALLER"]).read())
@@ -555,5 +564,36 @@ out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_hon
 out=$(guest HONCHO_URL= HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho off: $out"
 [[ $(<"$external_honcho_key") == external-honcho-key ]] || fail 'disabling Honcho deleted a caller-supplied key file'
 pass 'Honcho: plugin and osr config as a private file; a failed run restores it; HONCHO_URL= turns it off'
+
+# Open Terminal: Hermes's own workspace as MCP server open_terminal.
+ot_key=ot-key-0123456789abcdef
+printf '%s\n' "$ot_key" > "$deploy/open-terminal-key"
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000/) || fail "Open Terminal on: $out"
+config=$home/.hermes/config.kv
+[[ $(kv mcp_servers.open_terminal.url "$config") == http://192.0.2.70:8000/mcp ]] || fail "MCP url: $(cat "$config")"
+# shellcheck disable=SC2016
+[[ $(kv mcp_servers.open_terminal.headers.Authorization "$config") == 'Bearer ${OSR_OPEN_TERMINAL_KEY}' ]] ||
+  fail 'the MCP header must reference the .env variable, not hold the key'
+grep -q "$ot_key" "$config" && fail 'config.yaml holds the Open Terminal key'
+[[ $(kv OSR_OPEN_TERMINAL_KEY "$home/.hermes/.env") == "$ot_key" ]] || fail 'the key is not in .env'
+[[ $(kv OPEN_TERMINAL_URL "$etc/settings") == http://192.0.2.70:8000 ]] || fail 'settings do not record OPEN_TERMINAL_URL'
+grep -q "$ot_key" "$etc/settings" && fail 'the settings hold the key itself'
+grep '^curl ' "$log" | grep -q "$ot_key" && fail 'the Open Terminal key was passed to curl in argv'
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000) || fail "Open Terminal rerun: $out"
+[[ $out == *'nothing to do'* ]] || fail "an unchanged Open Terminal rerun changed something: $out"
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000 FAKE_OT_KEY=another-key-0123456789) && fail 'a rejected key was accepted'
+[[ $out == *'rejected this CT'*'OPEN_TERMINAL_CT_ID'* ]] || fail "rejected key message: $out"
+out=$(guest OPEN_TERMINAL_URL=http://192.0.2.70:8000 FAKE_OT_DOWN=1) && fail 'an unreachable terminal was accepted'
+[[ $out == *'unreachable from this CT'*'firewall'* ]] || fail "unreachable message: $out"
+[[ $(kv mcp_servers.open_terminal.url "$config") == http://192.0.2.70:8000/mcp ]] || fail 'a refused run changed the MCP config'
+out=$(guest OPEN_TERMINAL_URL=) || fail "Open Terminal off: $out"
+grep -q '^mcp_servers.open_terminal' "$config" && fail 'OPEN_TERMINAL_URL= left the MCP server'
+grep -q '^OSR_OPEN_TERMINAL_KEY=' "$home/.hermes/.env" && fail 'OPEN_TERMINAL_URL= left the key in .env'
+[[ ! -e $deploy/open-terminal-key ]] || fail 'OPEN_TERMINAL_URL= left the pushed key'
+# The previous run removed the server; this one has nothing to remove.
+: > "$log"
+out=$(guest) || fail "rerun without Open Terminal: $out"
+grep -q 'mcp_servers.open_terminal' "$log" && fail 'a run that never had Open Terminal touched the MCP config'
+pass 'Open Terminal: MCP server with the key only in .env, checked from the CT; OPEN_TERMINAL_URL= removes it'
 
 printf '%s install cases passed. No system files, packages or services were touched.\n' "$passed"

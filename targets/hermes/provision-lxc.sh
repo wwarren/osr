@@ -9,6 +9,8 @@ umask 077
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+# shellcheck source=targets/open-terminal/client-lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../open-terminal/client-lib.sh"
 note() { printf '%s\n' "$*" >&2; }
 usage() {
   cat <<'USAGE'
@@ -51,6 +53,13 @@ Network:  EGRESS=restricted (outbound to router, registered model servers,
           DNS and internet HTTP(S); other private destinations dropped) or open.
           Model server host names are resolved inside the Hermes CT; a URL
           without a port means port 80 (http) or 443 (https).
+Open Terminal: OPEN_TERMINAL_URL (the terminal CT's gateway, http://IP:port;
+          offered when a CT tagged open-terminal is on this host) gives Hermes
+          its own workspace there, as MCP server open_terminal. With
+          OPEN_TERMINAL_CT_ID (detected from the address) this script issues
+          the CT's client key and admits it in the terminal's firewall;
+          OPEN_TERMINAL_KEY_FILE uses a key issued by hand instead.
+          --reconfigure keeps it; OPEN_TERMINAL_URL= disconnects and revokes.
 CT:       BRIDGE=vmbr0, CT_HOSTNAME=hermes-agent, CORES=2, MEMORY_MB=4096,
           SWAP_MB=1024, ROOTFS_GB=32, ONBOOT=1, NAMESERVER, VLAN_TAG.
 
@@ -583,6 +592,23 @@ if [[ $mode != integrate ]]; then
     HONCHO_CT_ID=$(pve_ct_with_ip "${BASH_REMATCH[1]}")
     [[ -n $HONCHO_CT_ID ]] || unset HONCHO_CT_ID
   fi
+  # Open Terminal: the same pattern (the recorded one on a reconfigure, the
+  # terminal CT on this host offered on a create).
+  if [[ -z ${OPEN_TERMINAL_URL+set} ]]; then
+    pve_section 'Open Terminal workspace'
+    pve_note 'A private workspace for Hermes in the Open Terminal CT, as MCP tools beside its own shell.'
+    ot_recorded=$(recorded_or OPEN_TERMINAL_URL '')
+    if [[ -n $ot_recorded ]]; then
+      pve_ask OPEN_TERMINAL_URL 'Open Terminal URL (none to turn off)' "$ot_recorded" ot_valid_url
+    elif [[ $mode == create ]]; then
+      ot_ct_here=$(pve_tagged_ct open-terminal) ot_offer=''
+      [[ -z $ot_ct_here ]] || ot_offer="http://$(pve_ct_net "$ot_ct_here" ip):8000"
+      [[ $ot_offer != 'http://:8000' ]] || ot_offer=''
+      OPEN_TERMINAL_URL=''
+      pve_offer OPEN_TERMINAL_URL 'Open Terminal URL' "$ot_offer" ot_valid_url
+      [[ -n $OPEN_TERMINAL_URL ]] || unset OPEN_TERMINAL_URL
+    fi
+  fi
 fi
 OPENWEBUI=${OPENWEBUI:-true}
 HERMES_MODEL=${HERMES_MODEL:-auto}
@@ -653,6 +679,11 @@ for file in "$source_dir/../pve-firewall-swap.pl" "$source_dir/install-target.sh
             "$source_dir/integrate-webui.py" "$verify_webui"; do
   [[ -r $file ]] || die "Deployment file is missing: $file"
 done
+# A given OPEN_TERMINAL_URL is checked now; unset, a reconfigure takes the
+# recorded one below.
+ot_valid_url "${OPEN_TERMINAL_URL:-}" || die 'OPEN_TERMINAL_URL must be the terminal gateway as http://IPv4:port.'
+[[ -z ${OPEN_TERMINAL_CT_ID:-} || $OPEN_TERMINAL_CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'OPEN_TERMINAL_CT_ID must be a CT ID.'
+[[ -z ${OPEN_TERMINAL_KEY_FILE:-} || -s ${OPEN_TERMINAL_KEY_FILE:-} ]] || die "OPEN_TERMINAL_KEY_FILE is empty or missing: ${OPEN_TERMINAL_KEY_FILE:-}"
 # Overridable for tests only.
 PVE_ETC=${PVE_ETC:-/etc/pve}
 [[ $PVE_ETC == / ]] || PVE_ETC=${PVE_ETC%/}
@@ -703,7 +734,7 @@ cleanup() {
   if [[ $router_kind == ssh ]] && (( ! dry_run )); then
     ssh "${ssh_opts[@]}" -O exit "$ssh_dest" >/dev/null 2>&1 || true
   fi
-  rm -f -- "$stage/admin-token" "$stage/router-api-key" "$stage/backend-keys" "$stage/hermes-api-key" "$stage/router-auth" "$stage/honcho-api-key" 2>/dev/null || true
+  rm -f -- "$stage/admin-token" "$stage/router-api-key" "$stage/backend-keys" "$stage/hermes-api-key" "$stage/router-auth" "$stage/honcho-api-key" "$stage/open-terminal-key" 2>/dev/null || true
   rm -rf -- "$stage" 2>/dev/null || true
   if (( rc != 0 && ! dry_run )); then
     printf 'Setup stopped. CT %s, if created, is retained: fix the error and re-run with --reconfigure.\n' "$CT_ID" >&2
@@ -803,7 +834,23 @@ else
     HONCHO_URL=$(pct exec "$CT_ID" -- sh -c 'sed -n "s/^HONCHO_URL=//p" /etc/hermes-target/settings 2>/dev/null | head -n 1' | tr -d '\r')
     [[ -z $HONCHO_URL ]] || note "Keeping Honcho memory at $HONCHO_URL (set HONCHO_URL= to turn it off)."
   fi
+  # The same for Open Terminal; the recorded URL also names the terminal to
+  # disconnect from when it is turned off or moved.
+  ot_prev_url=$(pct exec "$CT_ID" -- sh -c 'sed -n "s/^OPEN_TERMINAL_URL=//p" /etc/hermes-target/settings 2>/dev/null | head -n 1' | tr -d '\r')
+  if [[ $mode == reconfigure && -z ${OPEN_TERMINAL_URL+set} ]]; then
+    OPEN_TERMINAL_URL=$ot_prev_url
+    [[ -z $OPEN_TERMINAL_URL ]] || note "Keeping the Open Terminal workspace at $OPEN_TERMINAL_URL (set OPEN_TERMINAL_URL= to disconnect)."
+  fi
 fi
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL:-}
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
+ot_valid_url "$OPEN_TERMINAL_URL" || die "The recorded OPEN_TERMINAL_URL is invalid: $OPEN_TERMINAL_URL"
+ot_prev_url=${ot_prev_url:-}
+if [[ -n $OPEN_TERMINAL_URL && -z ${OPEN_TERMINAL_CT_ID:-} && -z ${OPEN_TERMINAL_KEY_FILE:-} ]]; then
+  # The key is issued by the terminal CT at that address, when it is here.
+  OPEN_TERMINAL_CT_ID=$(pve_ct_with_ip "$(ot_url_ip "$OPEN_TERMINAL_URL")")
+fi
+OPEN_TERMINAL_CT_ID=${OPEN_TERMINAL_CT_ID:-}
 if [[ -z $ROUTER_IP ]]; then
   if (( dry_run )); then
     ROUTER_IP='<router-source-ip>'
@@ -874,6 +921,12 @@ add_honcho_rule() {
   model_rules+=("OUT ACCEPT -dest ${BASH_REMATCH[1]}/32 -p tcp -dport ${BASH_REMATCH[3]} -log nolog # ${FW_TAG}-model")
 }
 add_honcho_rule
+# The Open Terminal gateway, owned like the model rules (replaced on reconfigure).
+add_open_terminal_rule() {
+  [[ -n $OPEN_TERMINAL_URL && $model_egress == restricted ]] || return 0
+  model_rules+=("OUT ACCEPT -dest $(ot_url_ip "$OPEN_TERMINAL_URL")/32 -p tcp -dport $(ot_url_port "$OPEN_TERMINAL_URL") -log nolog # ${FW_TAG}-model")
+}
+add_open_terminal_rule
 
 pve_summary "Hermes: $mode"
 pve_row 'Router' "$router_label, $ROUTER_URL"
@@ -890,6 +943,7 @@ if [[ $mode != integrate ]]; then
   pve_row 'Dashboard' "$( [[ $HERMES_DASHBOARD == true ]] && printf 'on (port 9119)' || printf 'off')"
   pve_row 'Egress' "$model_egress"
   pve_row 'Honcho memory' "${HONCHO_URL:-off}"
+  pve_row 'Open Terminal' "${OPEN_TERMINAL_URL:-off}"
 fi
 case $mode in
   create) pve_confirm "Create Hermes CT $CT_ID?" ;;
@@ -961,6 +1015,7 @@ if [[ $mode == create ]]; then
     else
       model_rules_for all
       add_honcho_rule
+      add_open_terminal_rule
       fw_seen=$(fw_snapshot "$firewall_file")
       fw_replace "$firewall_file" "$fw_seen" "$(firewall_config "$EGRESS" "$ROUTER_IP" "$router_dest" "$fw_router_port" "$api_rule_port" "$dashboard_rule_port")" ||
         die "Could not update $firewall_file (it changed meanwhile, or the write failed). CT $CT_ID is kept: fix the file, then rerun --reconfigure."
@@ -1031,11 +1086,34 @@ if [[ $mode != integrate ]]; then
     [[ $honcho_key_push == false ]] ||
       run pct push "$CT_ID" "$stage/honcho-api-key" "$deploy/honcho-api-key" --perms 0600
   fi
+  # Open Terminal: this CT's own client key, issued by the terminal CT, which
+  # also admits this CT in its firewall. A key the terminal still accepts is
+  # kept, so a reconfigure does not rotate it.
+  ot_client=$(ot_client_name hermes "$CT_ID")
+  if [[ -n $OPEN_TERMINAL_URL ]]; then
+    if [[ -n ${OPEN_TERMINAL_KEY_FILE:-} ]]; then
+      run pct push "$CT_ID" "$OPEN_TERMINAL_KEY_FILE" "$deploy/open-terminal-key" --perms 0600
+    elif [[ -n $OPEN_TERMINAL_CT_ID ]]; then
+      ot_have=''
+      if (( ! dry_run )); then
+        ot_have=$(pct exec "$CT_ID" -- sh -c "[ -s $deploy/open-terminal-key ] && tr -d '\\r\\n\\t ' < $deploy/open-terminal-key | sha256sum | cut -d' ' -f1" | tr -d '\r' || true)
+      fi
+      ot_connect "$OPEN_TERMINAL_CT_ID" "$HERMES_IP" "$ot_client" "$ot_have" "$stage/open-terminal-key"
+      if (( ! dry_run )) && [[ -s $stage/open-terminal-key ]]; then
+        run pct push "$CT_ID" "$stage/open-terminal-key" "$deploy/open-terminal-key" --perms 0600
+      fi
+    elif (( ! dry_run )) && pct exec "$CT_ID" -- test -s "$deploy/open-terminal-key"; then
+      note "Using the Open Terminal key already in CT $CT_ID; set OPEN_TERMINAL_CT_ID to connect it again."
+    else
+      die 'Set OPEN_TERMINAL_CT_ID (the terminal CT on this host) or OPEN_TERMINAL_KEY_FILE with OPEN_TERMINAL_URL.'
+    fi
+  fi
   run pct exec "$CT_ID" -- env "ROUTER_URL=$ROUTER_URL" "HERMES_MODEL=$HERMES_MODEL" \
     "HERMES_CONTEXT_LENGTH=$HERMES_CONTEXT_LENGTH" "HERMES_CHANNEL=$HERMES_CHANNEL" \
     "HERMES_COMMIT=$HERMES_COMMIT" "HERMES_INSTALLER_SHA256=$HERMES_INSTALLER_SHA256" \
     "HERMES_API_SERVER=$api_server" "HERMES_API_PORT=$HERMES_API_PORT" "HERMES_DASHBOARD=$HERMES_DASHBOARD" \
     "HERMES_API_MODEL_NAME=$HERMES_API_MODEL_NAME" "HONCHO_URL=${HONCHO_URL:-}" \
+    "OPEN_TERMINAL_URL=$OPEN_TERMINAL_URL" \
     "KINDI_READ_TIMEOUT_SECONDS=$kindi_timeout" bash "$deploy/install-target.sh"
 fi
 
@@ -1050,6 +1128,17 @@ if [[ $mode == reconfigure ]]; then
       die "Hermes is reconfigured, but $firewall_file changed meanwhile and still admits the old router address or port. Fix it, then rerun --reconfigure."
     fw_replace "$firewall_file" "$fw_seen" "$fw_new" ||
       die "Hermes is reconfigured, but $firewall_file changed while its old rules were being removed (or could not be written); it still admits the old and new rules. Check it, then rerun --reconfigure."
+  fi
+fi
+
+# The guest no longer uses the terminal it was connected to (turned off, or
+# moved to another one): revoke its key and firewall rule there.
+if [[ $mode != integrate && -n $ot_prev_url && $ot_prev_url != "$OPEN_TERMINAL_URL" ]]; then
+  ot_prev_ct=$(pve_ct_with_ip "$(ot_url_ip "$ot_prev_url")")
+  if [[ -n $ot_prev_ct ]]; then
+    ot_disconnect "$ot_prev_ct" "$(ot_client_name hermes "$CT_ID")"
+  else
+    note "Revoke client $(ot_client_name hermes "$CT_ID") on the Open Terminal at $ot_prev_url by hand (open-terminal-clients revoke)."
   fi
 fi
 

@@ -98,6 +98,11 @@ Environment:
                                (for Open WebUI) and listen on every address
   OPENCLAW_PORT=18789          Gateway port (WebSocket, Control UI, HTTP API)
   OPENCLAW_DASHBOARD=true      serve the Control UI on every CT IPv4 address
+  OPEN_TERMINAL_URL            Open Terminal gateway (http://IP:port): OpenClaw's
+                               own workspace there, as MCP server open-terminal;
+                               empty after a run that set it disconnects it
+  OPEN_TERMINAL_KEY_FILE       this CT's client key (default: open-terminal-key
+                               next to this script, pushed by provision-lxc.sh)
   OPENCLAW_SKIP_CHAT_PROBE=false  true: skip the test chat request
 OpenClaw updates are made with `openclaw update` as the openclaw user.
 USAGE
@@ -120,6 +125,7 @@ settings_record() {
   printf 'OPENCLAW_PORT=%s\n' "$OPENCLAW_PORT"
   printf 'OPENCLAW_DASHBOARD=%s\n' "$OPENCLAW_DASHBOARD"
   printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\n' "$HONCHO_URL" "$honcho_key_sha256"
+  printf 'OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "$ot_key_sha256"
   printf 'ORIGINS=%s\n' "$origins"
   printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
   printf 'BACKEND_KEYS_SHA256=%s\n' "$backend_keys_sha256"
@@ -338,6 +344,12 @@ HONCHO_URL=${HONCHO_URL:-}
 HONCHO_API_KEY_FILE=${HONCHO_API_KEY_FILE:-$source_dir/honcho-api-key}
 honcho_key_owned=false
 [[ $HONCHO_API_KEY_FILE != "$source_dir/honcho-api-key" ]] || honcho_key_owned=true
+# Open Terminal: OpenClaw's own workspace in the terminal CT, reached as MCP
+# tools (the gateway's /mcp) with this CT's client key.
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL:-}
+OPEN_TERMINAL_KEY_FILE=${OPEN_TERMINAL_KEY_FILE:-$source_dir/open-terminal-key}
+ot_key_owned=false
+[[ $OPEN_TERMINAL_KEY_FILE != "$source_dir/open-terminal-key" ]] || ot_key_owned=true
 OPENCLAW_SKIP_CHAT_PROBE=${OPENCLAW_SKIP_CHAT_PROBE:-false}
 OC_STATE=$OC_USER_HOME/.openclaw
 OC_CONFIG=$OC_STATE/openclaw.json
@@ -374,6 +386,8 @@ fi
 ROUTER_URL=${ROUTER_URL%/}
 [[ -z $HONCHO_URL || $HONCHO_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid HONCHO_URL.'
 HONCHO_URL=${HONCHO_URL%/}
+[[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid OPEN_TERMINAL_URL.'
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 [[ $OPENCLAW_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid OPENCLAW_MODEL.'
 [[ $OPENCLAW_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCLAW_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
   die "OPENCLAW_CONTEXT_LENGTH must be at least $MIN_CONTEXT: OpenClaw's prompt, tools and history need it. The model's host must serve that much too."
@@ -435,6 +449,10 @@ if (( dry_run )); then
   else
     printf '+ Control UI disabled\n'
   fi
+  if [[ -n $OPEN_TERMINAL_URL ]]; then
+    printf '+ check %s/osr/v1/whoami with this CT'\''s key; MCP server open-terminal at %s/mcp (key in %s)\n' \
+      "$OPEN_TERMINAL_URL" "$OPEN_TERMINAL_URL" "$OC_ENV"
+  fi
   printf '+ install %s/%s, enable and start it, wait for /healthz\n' "$UNIT_DIR" "$UNIT"
   exit 0
 fi
@@ -476,6 +494,15 @@ prev_honcho_url=$(env_file_get "$OC_ETC/settings" HONCHO_URL 2>/dev/null || true
 if [[ -n $HONCHO_URL ]]; then
   [[ -s $HONCHO_API_KEY_FILE ]] || die "HONCHO_URL needs $HONCHO_API_KEY_FILE."
   honcho_key_sha256=$(sha256sum "$HONCHO_API_KEY_FILE" | cut -d' ' -f1)
+fi
+ot_key_sha256=none
+ot_key=''
+prev_ot_url=$(env_file_get "$OC_ETC/settings" OPEN_TERMINAL_URL 2>/dev/null || true)
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  [[ -s $OPEN_TERMINAL_KEY_FILE ]] || die "OPEN_TERMINAL_URL needs $OPEN_TERMINAL_KEY_FILE (provision-lxc.sh pushes it)."
+  ot_key=$(tr -d '\r\n\t ' < "$OPEN_TERMINAL_KEY_FILE")
+  [[ $ot_key =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || die "$OPEN_TERMINAL_KEY_FILE does not hold a usable key."
+  ot_key_sha256=$(printf '%s' "$ot_key" | sha256sum | cut -d' ' -f1)
 fi
 if [[ -n $router_key ]]; then
   router_key_sha256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)
@@ -522,6 +549,18 @@ case $status in
 esac
 models_has "$OPENCLAW_MODEL" < "$stage/response" ||
   die "The router does not advertise model '$OPENCLAW_MODEL'. Choose one from $ROUTER_URL/v1/models."
+
+# --- the Open Terminal gateway admits this CT and accepts its key ---------------
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  printf 'Authorization: Bearer %s\n' "$ot_key" > "$stage/open-terminal-auth"
+  status=$(api "$OPEN_TERMINAL_URL/osr/v1/whoami" "$stage/open-terminal-auth")
+  case $status in
+    200) ;;
+    401|403) die "Open Terminal at $OPEN_TERMINAL_URL rejected this CT's key. Rerun provision-lxc.sh --reconfigure with OPEN_TERMINAL_CT_ID to issue a new one." ;;
+    000) die "Open Terminal at $OPEN_TERMINAL_URL is unreachable from this CT: $(head -c 300 "$stage/curl-error"). Its firewall must admit this CT (provision-lxc.sh does that with OPEN_TERMINAL_CT_ID)." ;;
+    *) die "Open Terminal at $OPEN_TERMINAL_URL answered /osr/v1/whoami with HTTP $status (is it the workspace gateway?)." ;;
+  esac
+fi
 
 # --- health checks and the commands they need ---------------------------------
 run_as_oc() {
@@ -723,6 +762,7 @@ owned_files=("$OC_CONFIG" "$OC_ENV" "$UNIT_DIR/$UNIT" "$UNIT_DIR/$DIRECT_UNIT" "
   "$OC_ETC/backend-keys" "$OC_ETC/router.env" "$OC_ETC/settings" "$OC_ETC/targets" "$OC_ETC/providers.json"
   "$OC_USER_HOME/.honcho/config.json")
 [[ $honcho_key_owned == false ]] || owned_files+=("$HONCHO_API_KEY_FILE")
+[[ $ot_key_owned == false ]] || owned_files+=("$OPEN_TERMINAL_KEY_FILE")
 for file in "${owned_files[@]}"; do
   if [[ -f $file ]]; then cp -a -- "$file" "$backup/$(basename "$file").prev"; fi
 done
@@ -826,6 +866,12 @@ if [[ ! -s $OC_ETC/api-key ]]; then
 fi
 touch "$OC_ENV"
 ENV_SET_OPENCLAW_GATEWAY_TOKEN=$(tr -d '\r\n' < "$OC_ETC/api-key") env_file_update "$OC_ENV"
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  ENV_SET_OSR_OPEN_TERMINAL_KEY=$ot_key env_file_update "$OC_ENV"
+elif [[ -n $prev_ot_url ]]; then
+  ENV_UNSET_OSR_OPEN_TERMINAL_KEY=1 env_file_update "$OC_ENV"
+fi
+unset ot_key
 chown "$OC_USER:$OC_USER" "$OC_ENV"
 chmod 0600 "$OC_ENV"
 run_oc config set gateway.mode local
@@ -863,6 +909,20 @@ elif [[ -n $prev_honcho_url ]]; then
   rm -f -- "$OC_USER_HOME/.honcho/config.json"
   [[ $honcho_key_owned == false ]] || rm -f -- "$HONCHO_API_KEY_FILE"
   note 'The OpenClaw Honcho plugin is disabled.'
+fi
+# Open Terminal: an MCP server whose bearer key OpenClaw substitutes from its
+# .env (${OSR_OPEN_TERMINAL_KEY}), so openclaw.json holds no key. OpenClaw's
+# own exec tool still runs here; these add its private workspace.
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  run_oc config set mcp.servers.open-terminal \
+    "{\"url\":\"$OPEN_TERMINAL_URL/mcp\",\"transport\":\"streamable-http\",\"headers\":{\"Authorization\":\"Bearer \${OSR_OPEN_TERMINAL_KEY}\"}}" \
+    --strict-json --replace
+elif [[ -n $prev_ot_url ]]; then
+  # The last run connected Open Terminal; OPEN_TERMINAL_URL is now empty.
+  run_oc config unset mcp.servers.open-terminal ||
+    note "Could not remove mcp.servers.open-terminal from $OC_CONFIG; delete it there by hand."
+  [[ $ot_key_owned == false ]] || rm -f -- "$OPEN_TERMINAL_KEY_FILE"
+  note 'Open Terminal is disconnected from OpenClaw.'
 fi
 if [[ $OPENCLAW_DASHBOARD == true ]]; then
   run_oc config set gateway.controlUi.allowedOrigins "$origins" --strict-json

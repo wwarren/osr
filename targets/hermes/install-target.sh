@@ -86,6 +86,12 @@ Environment:
   HERMES_API_MODEL_NAME=hermes-agent   model name the API server advertises
   HERMES_DASHBOARD=true       start the authenticated dashboard on all CT IPv4 addresses, port 9119
   HERMES_SKIP_CHAT_PROBE=false true: skip the test chat request
+  HONCHO_URL                   Honcho memory (HONCHO_API_KEY_FILE: its key)
+  OPEN_TERMINAL_URL            Open Terminal gateway (http://IP:port): Hermes's
+                               own workspace there, as MCP server open_terminal;
+                               empty after a run that set it disconnects it
+  OPEN_TERMINAL_KEY_FILE       this CT's client key (default: open-terminal-key
+                               next to this script, pushed by provision-lxc.sh)
 Hermes code updates are made with `hermes update` as the hermes user.
 USAGE
 }
@@ -106,6 +112,7 @@ settings_record() {
   printf 'HERMES_DASHBOARD=%s\n' "$HERMES_DASHBOARD"
   printf 'KINDI_READ_TIMEOUT_SECONDS=%s\n' "${KINDI_READ_TIMEOUT_SECONDS:-3600}"
   printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\n' "$HONCHO_URL" "$honcho_key_sha256"
+  printf 'OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "$ot_key_sha256"
   printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
   printf 'BACKEND_KEYS_SHA256=%s\n' "$backend_keys_sha256"
   printf 'TARGETS_SHA256=%s\n' "$targets_sha256"
@@ -226,6 +233,12 @@ HONCHO_URL=${HONCHO_URL:-}
 HONCHO_API_KEY_FILE=${HONCHO_API_KEY_FILE:-$source_dir/honcho-api-key}
 honcho_key_owned=false
 [[ $HONCHO_API_KEY_FILE != "$source_dir/honcho-api-key" ]] || honcho_key_owned=true
+# Open Terminal: Hermes's own workspace in the terminal CT, reached as MCP
+# tools (the gateway's /mcp) with this CT's client key.
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL:-}
+OPEN_TERMINAL_KEY_FILE=${OPEN_TERMINAL_KEY_FILE:-$source_dir/open-terminal-key}
+ot_key_owned=false
+[[ $OPEN_TERMINAL_KEY_FILE != "$source_dir/open-terminal-key" ]] || ot_key_owned=true
 HERMES_HOME=$HERMES_USER_HOME/.hermes
 HERMES_BIN=$HERMES_USER_HOME/.local/bin/hermes
 UNIT=hermes-gateway.service
@@ -261,6 +274,8 @@ fi
 [[ $ROUTER_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
   die 'ROUTER_URL must be an HTTP(S) host and port, such as http://router-address:8000.'
 [[ -z $HONCHO_URL || $HONCHO_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid HONCHO_URL.'
+[[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid OPEN_TERMINAL_URL.'
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 ROUTER_URL=${ROUTER_URL%/}
 [[ $HERMES_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid HERMES_MODEL.'
 [[ $HERMES_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( HERMES_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
@@ -317,6 +332,10 @@ if (( dry_run )); then
   else
     printf '+ stop and remove %s if present\n' "$DASHBOARD_UNIT"
   fi
+  if [[ -n $OPEN_TERMINAL_URL ]]; then
+    printf '+ check %s/osr/v1/whoami with this CT'\''s key; MCP server open_terminal at %s/mcp (key in %s/.env)\n' \
+      "$OPEN_TERMINAL_URL" "$OPEN_TERMINAL_URL" "$HERMES_HOME"
+  fi
   exit 0
 fi
 
@@ -357,6 +376,15 @@ prev_honcho_url=$(env_file_get "$HERMES_ETC/settings" HONCHO_URL 2>/dev/null || 
 if [[ -n $HONCHO_URL ]]; then
   [[ -s $HONCHO_API_KEY_FILE ]] || die "HONCHO_URL needs $HONCHO_API_KEY_FILE."
   honcho_key_sha256=$(sha256sum "$HONCHO_API_KEY_FILE" | cut -d' ' -f1)
+fi
+ot_key_sha256=none
+ot_key=''
+prev_ot_url=$(env_file_get "$HERMES_ETC/settings" OPEN_TERMINAL_URL 2>/dev/null || true)
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  [[ -s $OPEN_TERMINAL_KEY_FILE ]] || die "OPEN_TERMINAL_URL needs $OPEN_TERMINAL_KEY_FILE (provision-lxc.sh pushes it)."
+  ot_key=$(tr -d '\r\n\t ' < "$OPEN_TERMINAL_KEY_FILE")
+  [[ $ot_key =~ ^[A-Za-z0-9._~+/=-]{16,512}$ ]] || die "$OPEN_TERMINAL_KEY_FILE does not hold a usable key."
+  ot_key_sha256=$(printf '%s' "$ot_key" | sha256sum | cut -d' ' -f1)
 fi
 if [[ -n $router_key ]]; then
   router_key_sha256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)
@@ -402,6 +430,18 @@ case $status in
 esac
 models_has "$HERMES_MODEL" < "$stage/response" ||
   die "The router does not advertise model '$HERMES_MODEL'. Choose one from $ROUTER_URL/v1/models."
+
+# --- the Open Terminal gateway admits this CT and accepts its key ---------------
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  printf 'Authorization: Bearer %s\n' "$ot_key" > "$stage/open-terminal-auth"
+  status=$(api "$OPEN_TERMINAL_URL/osr/v1/whoami" "$stage/open-terminal-auth")
+  case $status in
+    200) ;;
+    401|403) die "Open Terminal at $OPEN_TERMINAL_URL rejected this CT's key. Rerun provision-lxc.sh --reconfigure with OPEN_TERMINAL_CT_ID to issue a new one." ;;
+    000) die "Open Terminal at $OPEN_TERMINAL_URL is unreachable from this CT: $(head -c 300 "$stage/curl-error"). Its firewall must admit this CT (provision-lxc.sh does that with OPEN_TERMINAL_CT_ID)." ;;
+    *) die "Open Terminal at $OPEN_TERMINAL_URL answered /osr/v1/whoami with HTTP $status (is it the workspace gateway?)." ;;
+  esac
+fi
 
 # --- unchanged and healthy: nothing to do ---------------------------------------
 unit_sha256=none
@@ -564,6 +604,7 @@ owned_files=("$HERMES_HOME/config.yaml" "$HERMES_HOME/.env" "$UNIT_DIR/$UNIT" \
             "$UNIT_DIR/$DIRECT_UNIT" "$UNIT_DIR/$DASHBOARD_UNIT" "$DIRECT_LIB" "$HERMES_ETC/backend-keys" "$HERMES_ETC/settings" "$HERMES_ETC/targets" \
             "$HERMES_HOME/honcho.json")
 [[ $honcho_key_owned == false ]] || owned_files+=("$HONCHO_API_KEY_FILE")
+[[ $ot_key_owned == false ]] || owned_files+=("$OPEN_TERMINAL_KEY_FILE")
 for file in "${owned_files[@]}"; do
   if [[ -f $file ]]; then cp -a -- "$file" "$backup/$(basename "$file").prev"; fi
 done
@@ -727,6 +768,25 @@ if [[ $HERMES_DASHBOARD == true &&
   fi
   unset dashboard_user dashboard_password dashboard_hash
 fi
+# Open Terminal: an MCP server whose bearer key Hermes expands from .env at
+# connect time, so config.yaml holds no key. Hermes's tools still run here
+# as well; these add its private workspace in the terminal CT.
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  ENV_SET_OSR_OPEN_TERMINAL_KEY=$ot_key env_file_update "$HERMES_HOME/.env"
+  run_hermes config set mcp_servers.open_terminal.url "$OPEN_TERMINAL_URL/mcp"
+  # shellcheck disable=SC2016  # Hermes expands it, not the shell
+  run_hermes config set mcp_servers.open_terminal.headers.Authorization 'Bearer ${OSR_OPEN_TERMINAL_KEY}'
+  run_hermes config set mcp_servers.open_terminal.timeout 660
+  run_hermes config set mcp_servers.open_terminal.enabled true
+elif [[ -n $prev_ot_url ]]; then
+  # The last run connected Open Terminal; OPEN_TERMINAL_URL is now empty.
+  run_hermes config unset mcp_servers.open_terminal ||
+    note 'Could not remove mcp_servers.open_terminal from config.yaml; delete it there by hand.'
+  ENV_UNSET_OSR_OPEN_TERMINAL_KEY=1 env_file_update "$HERMES_HOME/.env"
+  [[ $ot_key_owned == false ]] || rm -f -- "$OPEN_TERMINAL_KEY_FILE"
+  note 'Open Terminal is disconnected from Hermes.'
+fi
+unset ot_key
 chown "$HERMES_USER:$HERMES_USER" "$HERMES_HOME/.env"
 chmod 0600 "$HERMES_HOME/.env"
 dashboard_auth_sha256=$(dashboard_auth_hash)

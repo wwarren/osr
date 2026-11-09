@@ -154,9 +154,14 @@ has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8000'
 has 'wait for systemd, a default route and DNS'
 has '+ pct exec 281 -- install -d -m 0711 /etc/open-terminal'
 has '+ pct exec 281 -- install -d -m 0700 /root/open-terminal-deploy'
-for file in install-target.sh open-terminal.service requirements.in requirements.lock; do
-    has "/root/open-terminal-deploy/$file"
+for file in install-target.sh open-terminal-gateway.service open-terminal-spawner.service \
+            open-terminal-ws@.service gateway.py spawner.py requirements.in requirements.lock; do
+    has "/root/open-terminal-deploy/$file --perms"
 done
+has '/root/open-terminal-deploy/open-terminal-clients --perms 0755'
+has '--memory 4096'
+lacks 'open-terminal.service'
+lacks 'OPEN_TERMINAL_IDLE_MINUTES='   # unset settings keep the guest's recorded values
 has '/etc/open-terminal/api-key --perms 0600'
 has 'OPEN_TERMINAL_VERSION=v0.14.0 OPEN_TERMINAL_COMMIT= bash /root/open-terminal-deploy/install-target.sh'
 has 'integrate-webui.py --webui-url http://127.0.0.1:\<router-webui-port\> --terminal-url http://192.0.2.81:8000'
@@ -167,9 +172,11 @@ lacks 'Setup stopped'
 # The plan neither prompts for nor stores an admin token.
 lacks 'admin API key or JWT:'
 
-plan OPEN_TERMINAL_PORT=8100 ROUTER_IP=192.0.2.80 OPENWEBUI_PORT=3000 VLAN_TAG=20 NAMESERVER=192.0.2.53
+plan OPEN_TERMINAL_PORT=8100 ROUTER_IP=192.0.2.80 OPENWEBUI_PORT=3000 VLAN_TAG=20 NAMESERVER=192.0.2.53 \
+    OPEN_TERMINAL_IDLE_MINUTES=30 OPEN_TERMINAL_WS_MEMORY=2G
 has '-source 192.0.2.80/32 -p tcp -dport 8100'
 has 'OPEN_TERMINAL_PORT=8100'
+has 'OPEN_TERMINAL_IDLE_MINUTES=30 OPEN_TERMINAL_WS_MEMORY=2G bash /root/open-terminal-deploy/install-target.sh'
 has 'http://127.0.0.1:3000 --terminal-url http://192.0.2.81:8100'
 has '\,tag=20'
 has '--nameserver 192.0.2.53'

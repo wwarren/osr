@@ -1,0 +1,34 @@
+[Unit]
+Description=Open Terminal workspace gateway
+# The public port: checks client keys and forwards each user's requests to
+# their own workspace (open-terminal-ws@<id>.service).
+After=network-online.target open-terminal-spawner.service
+Wants=network-online.target
+Requires=open-terminal-spawner.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ot-gateway
+Group=ot-gateway
+# OPEN_TERMINAL_PORT, OPEN_TERMINAL_IDLE_MINUTES, OPEN_TERMINAL_MAX_ACTIVE
+# (written by install-target.sh). No key is in it: clients.json holds hashes.
+EnvironmentFile=/etc/open-terminal/service.env
+ExecStart=/opt/open-terminal/venv/bin/python -I /opt/open-terminal/lib/gateway.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

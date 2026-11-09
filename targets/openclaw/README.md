@@ -29,7 +29,9 @@ workspace) beside OpenClaw's own memory plugin; for a separate Honcho set
 rule; `HONCHO_URL=` turns it off. The [hcom target](../hcom/README.md) adds
 `osr-bus` and managed workspace instructions (OpenClaw polls through its
 terminal tool; hcom has no native OpenClaw hooks) and opens this CT's egress to
-the broker.
+the broker. With the [Open Terminal target](../open-terminal/README.md),
+`OPEN_TERMINAL_URL` gives OpenClaw its own workspace there as MCP server
+`open-terminal` (see [Open Terminal workspace](#open-terminal-workspace)).
 
 ## How OpenClaw is installed
 
@@ -105,6 +107,7 @@ the same agent).
 | `OPENCLAW_DASHBOARD` | `true` | Control UI on every CT IPv4 address; with neither this nor Open WebUI the Gateway binds loopback only |
 | `TASK_MODEL` | `fast` | As for Hermes (set only when unset or pointing at an OpenClaw agent) |
 | `OPENCLAW_PORT` | `18789` | Gateway port (WebSocket, Control UI, HTTP API) |
+| `OPEN_TERMINAL_URL` | — | Open Terminal gateway (`http://IP:port`); offered when a CT tagged `open-terminal` is on this host. Kept by `--reconfigure`; `OPEN_TERMINAL_URL=` disconnects and revokes. `OPEN_TERMINAL_CT_ID` (detected from the address) or `OPEN_TERMINAL_KEY_FILE` |
 | `EGRESS` | `restricted` | See [Network](#network) |
 | `ROUTER_URL`, `ROUTER_IP`, `OPENWEBUI_PORT` | Detected | Overrides |
 | `BRIDGE`, `CT_HOSTNAME`, `CORES`, `MEMORY_MB`, `SWAP_MB`, `ROOTFS_GB`, `ONBOOT`, `NAMESERVER`, `VLAN_TAG` | `openclaw`, 2 cores, 4096 MB, 1024 MB swap, 32 GB | CT settings |
@@ -128,7 +131,9 @@ Choose **openclaw** in the model picker. Everyone who can chat with it runs
 tools as `openclaw` and shares one agent, memory and workspace, and OpenClaw
 documents the chat token as full operator access to the Gateway: keep the
 connection admin-only or limited to one group. Keep `TASK_MODEL` on a router
-model and don't attach Open WebUI tools, Open Terminal or web search to it.
+model and don't attach Open WebUI tools, Open WebUI's Open Terminal connection
+or web search to it (OpenClaw has its own, and its own Open Terminal
+workspace, below).
 
 The Control UI is at `http://<CT-IP>:18789/`; log in with the Gateway token,
 then approve the browser pairing from the host:
@@ -144,12 +149,35 @@ Origins `http://<each CT IPv4>:<port>` are allowed
 (`gateway.controlUi.allowedOrigins`). OpenClaw treats plain HTTP on a LAN as a
 downgraded transport: use a trusted LAN or VPN.
 
+## Open Terminal workspace
+
+With `OPEN_TERMINAL_URL`, the provisioner has the terminal CT (found by its
+address, or `OPEN_TERMINAL_CT_ID`) issue a client key for `openclaw-<CT>`,
+admit this CT in the terminal's firewall, and push the key here; the guest
+checks it against the gateway (`/osr/v1/whoami`) before changing anything.
+OpenClaw gets `mcp.servers.open-terminal` (streamable HTTP at `<URL>/mcp`,
+header `Authorization: Bearer ${OSR_OPEN_TERMINAL_KEY}`, substituted from
+`~/.openclaw/.env`, so `openclaw.json` holds no key). Its tools act in
+OpenClaw's own workspace in the terminal CT, separate from every Open WebUI
+user and every other agent; OpenClaw's exec and file tools still run in this
+CT, and everyone who uses the agent shares that workspace.
+
+A plain `--reconfigure` keeps the connection and the key while the terminal
+accepts it. `OPEN_TERMINAL_URL=` removes the MCP server, revokes the key and
+drops the terminal firewall rule; the workspace's files stay in the terminal
+CT. For a terminal on another host, issue a key there (`open-terminal-clients
+issue openclaw-<CT> --default-user default`), pass it as
+`OPEN_TERMINAL_KEY_FILE` and admit this CT in that terminal's firewall
+yourself. New MCP servers reach running sessions only once a new session
+starts.
+
 ## Network
 
 The CT firewall admits the Gateway port from the router (Open WebUI) and, with
 the Control UI, from anywhere; no inbound SSH (use `pct enter`).
 `EGRESS=restricted` allows the router API, the inventory's model servers
-(resolved in the CT), DNS and internet HTTP(S) (npm, nvm, Node, `openclaw
+(resolved in the CT), Honcho and the Open Terminal gateway when set, DNS and
+internet HTTP(S) (npm, nvm, Node, `openclaw
 update`, web tools), dropping everything else including private ranges;
 `EGRESS=open` allows all. Unreachable-server handling is the dispatcher's
 ([Hermes's Network section](../hermes/README.md#network)).

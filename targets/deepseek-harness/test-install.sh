@@ -67,7 +67,9 @@ class Handler(BaseHTTPRequestHandler):
                                 "method": json.loads(body or b"{}").get("method")}) + "\n")
         if self.path != "/mcp":
             return self.send(404, {})
-        if self.headers.get("Authorization") != "Bearer " + get("honcho-key"):
+        # The same endpoint plays Honcho's MCP server and the Open Terminal
+        # gateway's (each with its own key).
+        if self.headers.get("Authorization") not in ("Bearer " + get("honcho-key"), "Bearer " + get("ot-key")):
             return self.send(401, {"error": "bad key"})
         self.send(200, {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18",
                   "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-honcho", "version": "0"}}},
@@ -81,6 +83,7 @@ server.serve_forever()
 PY
 printf 'router-secret' > "$fake/router-key"
 printf 'honcho-client-key' > "$fake/honcho-key"
+printf 'ot-client-key-0123456789' > "$fake/ot-key"
 python3 "$tmp/server.py" "$fake" & server_pid=$!
 for _ in $(seq 50); do [[ -s $fake/port ]] && break; sleep 0.1; done
 [[ -s $fake/port ]] || { echo 'FAIL the fake server did not start'; exit 1; }
@@ -147,6 +150,7 @@ push_deploy() {
   cp "$here/install-target.sh" "$here/configure.mjs" "$here/deepseek-harness.service" "$deploy/"
   printf 'router-secret\n' > "$deploy/router-api-key"
   if [[ ${1:-} == honcho ]]; then printf 'honcho-client-key\n' > "$deploy/honcho-api-key"; fi
+  if [[ ${1:-} == open-terminal ]]; then printf 'ot-client-key-0123456789\n' > "$deploy/open-terminal-key"; fi
 }
 base_env=(DSH_ROUTER_URL="http://127.0.0.1:$port" DSH_BIND_IP=127.0.0.1 DSH_MODEL=code-model DSH_CONTEXT_WINDOW=32768)
 out=''
@@ -400,6 +404,36 @@ assert_ok "and from /etc" test ! -e "$DSH_ETC_DIR/honcho-api-key"
 agents=$(cat "$DSH_STATE_DIR/home/AGENTS.md")
 assert_not_contains "the managed block is removed" "osr-honcho" "$agents"
 assert_contains "and the user's text stays" "Keep answers short." "$agents"
+
+describe install_open_terminal
+push_deploy open-terminal
+rm -f "$fake/mcp-requests"
+ot_env=(DSH_VERSION=0.2.4 DSH_MODEL=auto DSH_OPEN_TERMINAL_URL="http://127.0.0.1:$port/")
+assert_ok "the Open Terminal workspace can be connected" install_run "${ot_env[@]}"
+assert_file_contains "the overlay adds the Open Terminal MCP server" 'serverName: open_terminal' "$DSH_ETC_DIR/osr.patch.yml"
+assert_file_contains "at the gateway's /mcp" "url: \"http://127.0.0.1:$port/mcp\"" "$DSH_ETC_DIR/osr.patch.yml"
+assert_file_contains "keyed from the environment" 'Authorization: !!js '"'"'`Bearer ${process.env.OSR_OPEN_TERMINAL_KEY}`'"'" "$DSH_ETC_DIR/osr.patch.yml"
+assert_ok "the overlay never holds the key" bash -c "! grep -q ot-client-key '$DSH_ETC_DIR/osr.patch.yml'"
+assert_file_contains "the service gets the key" 'OSR_OPEN_TERMINAL_KEY=ot-client-key-0123456789' "$DSH_ETC_DIR/service.env"
+assert_file_mode "the installed key is root-only" 600 "$DSH_ETC_DIR/open-terminal-key"
+assert_contains "the key was checked with an MCP initialize" '"auth": "Bearer ot-client-key-0123456789", "workspace": null, "method": "initialize"' "$(cat "$fake/mcp-requests")"
+assert_file_contains "the record has the gateway" "DSH_OPEN_TERMINAL_URL=http://127.0.0.1:$port" "$DSH_ETC_DIR/settings"
+assert_ok "and not the key" bash -c "! grep -q ot-client-key '$DSH_ETC_DIR/settings'"
+assert_ok "the pushed key is consumed" test ! -e "$deploy/open-terminal-key"
+push_deploy
+assert_ok "a rerun reuses the installed key" install_run "${ot_env[@]}"
+assert_contains "and changes nothing" "nothing to do" "$out"
+push_deploy
+printf 'wrong-key-0123456789abc\n' > "$deploy/open-terminal-key"
+run_fails "a key the terminal rejects stops the run" "${ot_env[@]}" DSH_MAX_TOKENS=4096
+assert_contains "and says so" "rejected this CT's key" "$out"
+assert_file_contains "the previous key is back" 'OSR_OPEN_TERMINAL_KEY=ot-client-key-0123456789' "$DSH_ETC_DIR/service.env"
+push_deploy
+assert_ok "the workspace can be disconnected" install_run DSH_VERSION=0.2.4 DSH_MODEL=auto
+assert_ok "the MCP server is gone from the overlay" bash -c "! grep -q open_terminal '$DSH_ETC_DIR/osr.patch.yml'"
+assert_ok "the key from the service env" bash -c "! grep -q OSR_OPEN_TERMINAL_KEY '$DSH_ETC_DIR/service.env'"
+assert_ok "and from /etc" test ! -e "$DSH_ETC_DIR/open-terminal-key"
+assert_status "a URL with a path is refused" 1 env "${base_env[@]}" DSH_OPEN_TERMINAL_URL="http://127.0.0.1:$port/mcp" bash "$deploy/install-target.sh" --dry-run
 
 describe install_first_layout
 # The first version of this target installed into /opt/deepseek-harness

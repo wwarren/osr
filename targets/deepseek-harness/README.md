@@ -10,7 +10,9 @@ into a root-only systemd environment file; the generated Harness patch names
 only the variable. With Honcho, Harness gets the shared long-term memory
 ([Honcho memory](#honcho-memory)). The [hcom target](../hcom/README.md) adds
 `osr-bus` and its own instruction block (Harness polls through its shell
-tools; the relay key stays in an account Harness cannot read).
+tools; the relay key stays in an account Harness cannot read). With the
+[Open Terminal target](../open-terminal/README.md), Harness gets its own
+workspace there as MCP tools ([Open Terminal workspace](#open-terminal-workspace)).
 
 **Trust.** Harness's shell tools inherit the service environment, so the agent
 and anything it runs can read the router key and, with Honcho, the `osr`
@@ -68,6 +70,7 @@ is ever deleted.
 | `DSH_ACCESS_CIDR` | The CT's network | Source range admitted to the Web UI (a host address like `192.0.2.81/24` becomes `192.0.2.0/24`) |
 | `DSH_ROUTER_FIREWALL` | `true` | Keep this CT's rule in the router's firewall file |
 | `HONCHO_URL`, `HONCHO_CT_ID` | Unset | Honcho memory |
+| `OPEN_TERMINAL_URL`, `OPEN_TERMINAL_CT_ID` | Unset | Open Terminal workspace (`OPEN_TERMINAL_KEY_FILE` for a key issued by hand) |
 | `CORES`, `MEMORY_MB`, `ROOTFS_GB` | 2, 4096, 32 | Each release takes ~860 MB in `/opt/deepseek-harness/releases/`; an upgrade briefly holds two |
 
 The main installer accepts `DEEPSEEK_HARNESS_*` equivalents (`_MODEL`,
@@ -119,6 +122,26 @@ To verify: ask Harness to remember something unique, watch for an
 `mcp__honcho__add_messages_to_session` or `create_conclusions` call, then ask
 for it in a new session; Hermes or OpenClaw can recall it once the deriver has
 processed it (`journalctl -u honcho-deriver` in the Honcho CT).
+
+## Open Terminal workspace
+
+`OPEN_TERMINAL_URL=http://<terminal-ip>:8000` (offered when a CT tagged
+`open-terminal` is on this host) adds an MCP entry `tools-open-terminal`
+(`serverName: open_terminal`, so the tools appear as `mcp__open_terminal__*`)
+pointing at the gateway's `/mcp`. The provisioner has the terminal CT (found
+by its address, or `OPEN_TERMINAL_CT_ID`) issue a client key for
+`deepseek-harness-<CT>` and admit this CT in its firewall; the key lives in
+`/etc/deepseek-harness/open-terminal-key` and the service environment
+(`OSR_OPEN_TERMINAL_KEY`, read by the overlay with a `!!js` expression), and
+the guest checks it with an MCP `initialize` before writing the overlay. The
+tools act in Harness's own workspace in the terminal CT, separate from every
+Open WebUI user and every other agent; Harness's shell tools still run here.
+As with the router key, anything Harness runs can read this key; it reaches
+only that workspace.
+
+Reconfigures keep the connection, and the key while the terminal accepts it;
+`OPEN_TERMINAL_URL=` removes the MCP entry and the key, revokes it in the
+terminal and drops the terminal firewall rule (the workspace's files stay).
 
 ## Use and recovery
 
@@ -195,8 +218,9 @@ journal, then restore from `/var/lib/deepseek-harness-target/rollback/`:
 `release` names the previous release (point `current` at it); `file.<n>` go
 back, in order, to `/etc/deepseek-harness/osr.patch.yml`, `service.env`,
 `settings`, `router-api-key`, `honcho-api-key`,
-`/etc/systemd/system/deepseek-harness.service` and
-`/var/lib/deepseek-harness/home/AGENTS.md` (an `absent.<n>` marker means it did
+`/etc/systemd/system/deepseek-harness.service`,
+`/var/lib/deepseek-harness/home/AGENTS.md` and
+`/etc/deepseek-harness/open-terminal-key` (an `absent.<n>` marker means it did
 not exist); `profiles.tar` unpacks into `/var/lib/deepseek-harness/home`. Run
 `systemctl daemon-reload`, restart, and once healthy remove the directory and
 reconfigure.

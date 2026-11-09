@@ -42,7 +42,7 @@ flowchart LR
         o3["Strata / Basalt / Maya / Xolotl / Avalon<br/>:8080"]
         o4["Kindi<br/>:8093"]
     end
-    term["Open Terminal LXC<br/>:8000"]
+    term["Open Terminal LXC<br/>gateway :8000, a workspace per user"]
     hermes["Hermes Agent LXC<br/>API server :8642"]
     openclaw["OpenClaw LXC<br/>Gateway :18789"]
     harness["DeepSeek Harness LXC<br/>Web UI :3080"]
@@ -89,7 +89,7 @@ flowchart LR
 | Model hosts (`:11434`, `:1234`, `:8080`, `:8093`) | **Critical** | Fail forward to other hosts; all down → 502 |
 | Gitea (HTTP(S)) | Provisioning only | Install falls back to local config; running system unaffected |
 | Mattermost (webhook) | Optional | Alerts logged and retried |
-| Open Terminal (`:8000`) | Optional | Terminal tool unavailable; chat unaffected |
+| Open Terminal (`:8000`) | Optional | Terminal tool and agents' workspace tools unavailable; chat unaffected |
 | Hermes API server (`:8642`) | Optional | `hermes-agent` unavailable in Open WebUI |
 | OpenClaw Gateway (`:18789`) | Optional | `openclaw` unavailable in Open WebUI |
 | DeepSeek Harness Web UI (`:3080`) | Optional | Its agent UI is unavailable |
@@ -483,7 +483,7 @@ service account before its venv is built.
 | 4000 | LiteLLM | `127.0.0.1` | CT-local only |
 | 443 | Cloud APIs; subscription gateway | Outbound | LiteLLM → providers; router → gateway (any HTTPS port, or loopback HTTP) |
 | 11434 / 1234 / 8080 / 8093 | Model hosts | Outbound | Router, LiteLLM, monitor, agent and Honcho dispatchers → pool |
-| 8000 | Open Terminal CT | `0.0.0.0` in its CT | Open WebUI → terminal |
+| 8000 / 20000-29999 | Open Terminal gateway / per-user workspaces | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI and connected agents → gateway → each user's workspace |
 | 8642 / 8765 | Hermes API / local dispatcher | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI → Hermes; dispatcher → router metadata and model servers |
 | 9119 | Hermes dashboard | `0.0.0.0` in its CT, when enabled | Authenticated browser UI |
 | 18789 / 8765 | OpenClaw Gateway (API, Control UI) / dispatcher | `0.0.0.0` (loopback without Open WebUI and Control UI) / `127.0.0.1` | Open WebUI and browsers → OpenClaw; dispatcher as for Hermes |
@@ -496,18 +496,21 @@ service account before its venv is built.
 With the router CT's firewall enabled, the installer accepts TCP 22, 8000 and
 the Open WebUI port from `API_ALLOW_CIDR` (SSH is included because enabling the
 firewall sets the input policy to drop). Target CTs are created with
-`firewall=1`. Open Terminal, Hermes, OpenClaw and ComfyUI admit only the
-router's address (ComfyUI also `UI_ALLOW_CIDR`; Hermes's dashboard and
+`firewall=1`. Open Terminal admits the router and each connected agent CT (one
+`# osr-open-terminal-client <agent>-<ct>` rule each, kept by the agent's
+provisioner); Hermes, OpenClaw and ComfyUI admit only the router's address (ComfyUI also `UI_ALLOW_CIDR`; Hermes's dashboard and
 OpenClaw's Control UI anyone); Honcho admits the router and selected agents;
 DeepSeek Harness `DSH_ACCESS_CIDR`; model targets leave rules to the operator.
 Hermes and OpenClaw also restrict egress by default to the router API, the
-registered model servers, DNS and internet HTTP(S) (§17.1, §17.4). Honcho and
+registered model servers, Honcho and Open Terminal when set, DNS and internet
+HTTP(S) (§17.1, §17.4). Honcho and
 DeepSeek Harness keep one tagged rule each in the router CT's firewall file so
 they can reach its API. hcom adds owned outbound rules to the broker (and, for
 an observer, Mattermost) before an agent's private-address drops. The MQTT
 target installs its own inbound allowlist, effective only with the host or
 datacenter firewall enabled. Provisioners that rewrite an existing firewall
-file (Hermes, OpenClaw, Honcho, DeepSeek Harness, hcom, MQTT) go through
+file (Hermes, OpenClaw, Honcho, DeepSeek Harness, hcom, MQTT, and the agents'
+rule in the Open Terminal CT's file) go through
 `targets/pve-firewall-swap.pl`, under the CT's lock and only if the file is
 unchanged. No agent coordination API is added to the router.
 
@@ -531,7 +534,8 @@ unchanged. No agent coordination API is added to the router.
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | `secrets.env` | `set-cloud-key`; never forwarded to clients |
 | Codex/Claude Code logins, gateway virtual keys | Not kept by OSR | Sent per request and passed through to the subscription gateway |
 | Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT; also Xolotl's `/etc/xolotl/xolotl-ds41.json`, Avalon's `/etc/avalon/api-key` and Kindi's `/etc/kindi/kindi.conf` (0640, service group) | Generated in the CT; never in a unit, log or the router's process list |
-| Open Terminal key | `/etc/open-terminal/api-key`, root-only `service.env`; Open WebUI connection | Generated in the terminal CT |
+| Open Terminal client keys | Open WebUI's: `/etc/open-terminal/api-key` (0600) and the Open WebUI connection; each agent's: its CT (`~hermes/.hermes/.env`, `~openclaw/.openclaw/.env`, `/etc/deepseek-harness/` and service env); the terminal keeps only SHA-256 hashes (`clients.json`, 0640 root:ot-gateway) | Open WebUI's generated by the terminal provisioner; agents' issued by `open-terminal-clients` and kept while valid |
+| Open Terminal workspace keys | `/etc/open-terminal/ws/<id>.env` (0600 root) | One per workspace, generated by the spawner; reaches only that workspace |
 | Hermes API server key | `/etc/hermes-target/api-key` (0600), `~hermes/.hermes/.env` (0600); Open WebUI connection | Generated in the Hermes CT |
 | Router and backend keys in the Hermes CT | `~hermes/.hermes/.env` (router key); `/etc/hermes-target/backend-keys` (0640) | Pushed as 0600 files; `--reconfigure` after rotation |
 | OpenClaw Gateway token | `/etc/openclaw-target/api-key` (0600), `~openclaw/.openclaw/.env` (`OPENCLAW_GATEWAY_TOKEN`; config holds an env SecretRef); Open WebUI connection | Also the Control UI login |
@@ -784,9 +788,19 @@ These CTs extend Open WebUI or support the router; none is a model-pool host.
 
 **Open Terminal** ([README](targets/open-terminal/README.md)) is a separate CT
 registered as an Open WebUI system terminal connection, from a pinned release
-with a hash-locked venv. Its bearer-protected API on 8000 is reachable only
-from the router CT when the firewall is on. The connection is admin-only by
-default; users granted access share one shell and workspace.
+with a hash-locked venv. Every user gets an isolated workspace: a gateway on
+8000 (unprivileged `ot-gateway`) checks each client's key (Open WebUI, and each
+agent CT connected with `OPEN_TERMINAL_URL`; only hashes are stored) and
+forwards each (client, user) pair, Open WebUI's `X-User-Id` or the agent's
+default user, to its own `open-terminal-ws@<id>` instance. A root spawner,
+reachable only by the gateway over a Unix socket, creates that workspace's
+account, home, key and loopback port and starts it on demand; each instance
+runs upstream single-user mode sandboxed to its own home, with private `/tmp`,
+hidden processes and per-workspace memory, task and CPU limits, and idle ones
+are stopped. Agents reach their workspace as MCP tools at the gateway's `/mcp`.
+With the firewall on, port 8000 admits the router and the connected agents.
+The connection is admin-only by default; each user granted access works in
+their own workspace.
 
 ### 17.1 Hermes Agent (`targets/hermes/`)
 

@@ -180,13 +180,14 @@ done
 assert_ok "ollama: rollback is health-checked" \
   grep -q 'did not answer either' "${ROOT}/targets/ollama/install-target.sh"
 ot="${ROOT}/targets/open-terminal/install-target.sh"
-assert_ok "open-terminal: rollback restores service.env" grep -q 'mv -f -- "\$OT_ETC/service.env.prev"' "$ot"
-assert_ok "open-terminal: rollback restores the unit" grep -q 'install -m 0644 "\$OT_ETC/open-terminal.service.prev"' "$ot"
+assert_ok "open-terminal: rollback restores every saved file" grep -q 'cp -p -- "\$saved/file.\$i" "\${snapshot\[i\]}"' "$ot"
+assert_ok "open-terminal: rollback removes files the run added" grep -q 'rm -f -- "\${snapshot\[i\]:?}"' "$ot"
+assert_ok "open-terminal: the earlier shared-workspace unit is in the snapshot" grep -q 'snapshot+=("\$OT_ETC/clients.json" "\$UNIT_DIR/\$LEGACY_UNIT")' "$ot"
 # Configuration must not change before the new venv is ready (a refused tag or
 # dependency drift would otherwise leave a new port behind).
-env_line=$(grep -n 'service_env "\$key" "\$PORT" >' "$ot" | head -n1 | cut -d: -f1)
+env_line=$(grep -n 'content_of "\$from" > "\$dest.new"' "$ot" | head -n1 | cut -d: -f1)
 venv_line=$(grep -n 'pip install --no-cache-dir --no-deps' "$ot" | head -n1 | cut -d: -f1)
-assert_ok "open-terminal: service.env is written after the venv is built" \
+assert_ok "open-terminal: configuration is written after the venv is built" \
   test "${env_line:-0}" -gt "${venv_line:-999999}"
 # With set -E an ERR trap also fires inside ( ... ) subshells; a rollback trap
 # must act only in the main shell, or a failure there rolls back twice.

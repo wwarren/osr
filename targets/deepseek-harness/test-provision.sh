@@ -81,7 +81,7 @@ assert_contains "and the router address" 'DSH_ROUTER_URL=http://\<router-ct-ip\>
 assert_contains "the pinned release by default" 'DSH_VERSION=0.2.1-rc.5' "$plan"
 assert_contains "the router key goes to the deploy directory as a private file" 'router-api-key /root/deepseek-harness-deploy/router-api-key --perms 0600' "$plan"
 assert_contains "the router firewall admits the CT" 'admit 192.0.2.81 to the router API in /etc/pve/firewall/250.fw' "$plan"
-assert_contains "Honcho is off unless asked for" 'DSH_HONCHO_MCP_URL= bash' "$plan"
+assert_contains "Honcho is off unless asked for" 'DSH_HONCHO_MCP_URL= DSH_OPEN_TERMINAL_URL= bash' "$plan"
 plan=$(env "${common[@]}" bash "$provision" --dry-run 2>&1)
 assert_contains "the default Web UI range is the CT's network, not its host address" '-source 192.0.2.0/24 -p tcp -dport 3080' "$plan"
 assert_not_contains "the router firewall can be left alone" 'admit' "$(env "${common[@]}" DSH_ROUTER_FIREWALL=false bash "$provision" --dry-run 2>&1)"
@@ -102,6 +102,17 @@ assert_fail "an unreadable key file is refused" env "${common[@]}" HONCHO_URL=ht
 assert_contains "the agent takes the workspace key" '/etc/honcho-target/client-api-key' "$(cat "$provision")"
 assert_not_contains "never the Honcho admin key" 'cat /etc/honcho-target/api-key' "$(cat "$provision")"
 
+describe dsh_provision_open_terminal
+plan=$(env "${common[@]}" OPEN_TERMINAL_URL=http://192.0.2.70:8000/ OPEN_TERMINAL_CT_ID=270 bash "$provision" --dry-run 2>&1)
+assert_contains "the guest gets the gateway URL" 'DSH_OPEN_TERMINAL_URL=http://192.0.2.70:8000 bash' "$plan"
+assert_contains "the terminal CT admits this CT" "admit 192.0.2.81 in Open Terminal CT 270's firewall (# osr-open-terminal-client deepseek-harness-281)" "$plan"
+assert_contains "and issues (or keeps) its key" 'open-terminal-clients issue deepseek-harness-281 --default-user default' "$plan"
+plan=$(env "${common[@]}" OPEN_TERMINAL_URL=http://192.0.2.70:8000 OPEN_TERMINAL_KEY_FILE=/etc/hostname bash "$provision" --dry-run 2>&1)
+assert_contains "a key issued by hand is pushed as a private file" 'open-terminal-key --perms 0600' "$plan"
+assert_fail "a host name is refused (the firewall needs an address)" env "${common[@]}" OPEN_TERMINAL_URL=http://terminal:8000 bash "$provision" --dry-run
+assert_fail "a URL with a path is refused" env "${common[@]}" OPEN_TERMINAL_URL=http://192.0.2.70:8000/mcp bash "$provision" --dry-run
+assert_fail "OPEN_TERMINAL_CT_ID cannot be this CT" env "${common[@]}" OPEN_TERMINAL_URL=http://192.0.2.70:8000 OPEN_TERMINAL_CT_ID=281 bash "$provision" --dry-run
+
 describe dsh_provision_refusals
 assert_fail "an invalid firewall source is refused" env "${common[@]}" DSH_ACCESS_CIDR=bad bash "$provision" --dry-run
 assert_fail "the router CT cannot be reused" env "${common[@]}" CT_ID=250 bash "$provision" --dry-run
@@ -119,11 +130,12 @@ describe dsh_guided_prompts
 lxc=$(mktemp -d)
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.80/24\ntags: ai;osr-router\n' > "$lxc/250.conf"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: ai;osr-target;honcho\n' > "$lxc/285.conf"
-answers=$'\n281\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.81/24\n\n\n\n\n\n\n\n\n'
+printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.70/24\ntags: ai;osr-target;open-terminal\n' > "$lxc/270.conf"
+answers=$'\n281\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.81/24\n\n\n\n\n\n\n\n\n\n'
 out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "$answers")
-order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL' <<< "$out" | paste -sd'|')
+order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL|Open Terminal URL' <<< "$out" | paste -sd'|')
 assert_eq "create asks router, then container, then settings, then Honcho" \
-  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== DeepSeek Harness: create ==' \
+  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== DeepSeek Harness: create ==' \
   "$order"
 assert_contains "the tagged router is offered" 'Router CT ID [250]' "$out"
 assert_contains "the router's gateway is offered" 'Harness gateway [192.0.2.1]' "$out"
@@ -131,19 +143,22 @@ assert_contains "the Web UI range defaults to the CT's network" 'Web UI allowed 
 assert_contains "the Honcho CT on this host is offered" 'Honcho API URL (none to skip) [http://192.0.2.85:8000]' "$out"
 assert_contains "Enter took it: memory through Honcho's MCP" 'DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp' "$out"
 assert_contains "and its key comes from that CT" 'read the osr workspace key from Honcho CT 285' "$out"
+assert_contains "the Open Terminal CT on this host is offered" 'Open Terminal URL (none to skip) [http://192.0.2.70:8000]' "$out"
+assert_contains "Enter took it" 'DSH_OPEN_TERMINAL_URL=http://192.0.2.70:8000' "$out"
+assert_contains "and that CT issues the key" "admit 192.0.2.81 in Open Terminal CT 270's firewall" "$out"
 assert_contains "the summary lists the plan" 'Network                    192.0.2.81/24 via 192.0.2.1 on vmbr0' "$out"
-out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "${answers%$'\n'}"$'none\n')
+out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "${answers%$'\n\n'}"$'none\nnone\n')
 assert_contains '"none" leaves Honcho off' 'Honcho memory              off' "$out"
-assert_contains "and the guest gets no MCP URL" 'DSH_HONCHO_MCP_URL= bash' "$out"
+assert_contains "and the guest gets no MCP URL" 'DSH_HONCHO_MCP_URL= DSH_OPEN_TERMINAL_URL' "$out"
 out=$(env "${common[@]}" PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< $'\n\n\n\n\n\n\n')
 assert_not_contains "preset values are not asked again" 'Router CT ID' "$out"
 assert_not_contains "(nor the address)" 'Harness IP/CIDR' "$out"
 # A reconfigure starts with the CT to change, offered by its tag, then Router.
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.81/24\ntags: ai;osr-target;deepseek-harness\n' > "$lxc/281.conf"
-out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n\n\nnone\n')
+out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n\n\nnone\nnone\n')
 order=$(grep -oE '== [A-Za-z: ]+ ==|DeepSeek Harness CT ID|Router CT ID' <<< "$out" | paste -sd'|')
 assert_eq "reconfigure asks the CT first, then Router, then settings" \
-  '== DeepSeek Harness container to reconfigure ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness settings ==|== Honcho memory ==|== DeepSeek Harness: reconfigure ==' "$order"
+  '== DeepSeek Harness container to reconfigure ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness settings ==|== Honcho memory ==|== Open Terminal workspace ==|== DeepSeek Harness: reconfigure ==' "$order"
 assert_contains "the tagged Harness CT is offered" 'DeepSeek Harness CT ID [281]' "$out"
 assert_not_contains "and never a new address" 'Harness IP/CIDR' "$out"
 rm -rf -- "$lxc"
@@ -163,6 +178,11 @@ case $1 in
   exec)
     id=$2; shift 3
     case "$*" in
+      'test -x /usr/local/sbin/open-terminal-clients') exit 0 ;;
+      *OPEN_TERMINAL_PORT*) echo 8000 ;;
+      '/usr/local/sbin/open-terminal-clients has '*) exit 1 ;;
+      '/usr/local/sbin/open-terminal-clients issue '*) echo "$*" >> "$FAKE/terminal-calls"; echo ot-client-key-0123456789 ;;
+      '/usr/local/sbin/open-terminal-clients revoke '*) echo "$*" >> "$FAKE/terminal-calls" ;;
       *'ip -4 -o addr'*) [[ $id == 250 ]] && echo '2: eth0 inet 192.0.2.50/24' || echo '2: eth0 inet 192.0.2.81/24' ;;
       *'/var/lib/deepseek-harness-target/rollback'*)
         [[ -e $FAKE/rollback-pending ]] && echo pending || echo clear ;;
@@ -185,7 +205,7 @@ printf '#!/bin/sh\n[ "$1" = -u ] && echo 0 || command -p id "$@"\n' > "$fake/bin
 printf '#!/bin/sh\nexit 0\n' > "$fake/bin/pvesh"; cp "$fake/bin/pvesh" "$fake/bin/pvesm"
 chmod +x "$fake/bin/"*
 reset_fake() {
-  rm -f -- "$fake"/{edit,slow,commit,commit-model,break-settings,settings-unreadable,rollback-pending,swap-fail,guest-status,guest-started,fw-during}
+  rm -f -- "$fake"/{edit,slow,commit,commit-model,break-settings,settings-unreadable,rollback-pending,swap-fail,guest-status,guest-started,fw-during,terminal-calls,pushed-open-terminal-key}
   printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3080 -log nolog # osr-deepseek-harness\nIN ACCEPT -source 192.0.2.9/32 -p tcp -dport 22\n' > "$fake/pve/firewall/281.fw"
   printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 8000\n' > "$fake/pve/firewall/250.fw"
   printf 'DSH_VERSION=0.2.1-rc.5\nDSH_MODEL=fast\nDSH_PORT=3080\n' > "$fake/settings"
@@ -293,6 +313,30 @@ assert_eq "an interrupted run fails" 143 "$status"
 assert_eq "and keeps both ports open, as the guest may still be installing" '3080 3081' "$(harness_ports)"
 assert_contains "telling how to finish" 'Rerun with --reconfigure to finish' "$(cat "$fake/out")"
 assert_eq "without leaving the staging directory" 0 "$(stages)"
+# Open Terminal on a reconfigure: the terminal CT (found by its address)
+# issues the key and admits this CT; turning it off revokes both.
+reset_fake
+mkdir -p "$fake/lxc"
+printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.70/24,gw=192.0.2.1\n' > "$fake/lxc/270.conf"
+printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.50/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
+ot_reconf() {
+  env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "PVE_LXC_DIR=$fake/lxc" "TMPDIR=$fake/tmp" \
+    NONINTERACTIVE=true CT_ID=281 ROUTER_CT_ID=250 "$@" bash "$provision" --reconfigure
+}
+status=0; out=$(ot_reconf OPEN_TERMINAL_URL=http://192.0.2.70:8000 2>&1) || status=$?
+assert_eq "connecting the Open Terminal workspace succeeds" 0 "$status"
+assert_file_contains "the terminal CT issues the key" 'issue deepseek-harness-281 --default-user default' "$fake/terminal-calls"
+assert_eq "which is pushed as a file" ot-client-key-0123456789 "$(cat "$fake/pushed-open-terminal-key" 2>/dev/null)"
+assert_file_contains "the terminal firewall admits this CT" 'IN ACCEPT -source 192.0.2.81/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client deepseek-harness-281' "$fake/pve/firewall/270.fw"
+assert_file_contains "and keeps the router" '-source 192.0.2.50/32' "$fake/pve/firewall/270.fw"
+reset_fake
+printf 'DSH_VERSION=0.2.1-rc.5\nDSH_MODEL=fast\nDSH_PORT=3080\nDSH_OPEN_TERMINAL_URL=http://192.0.2.70:8000\n' > "$fake/settings"
+status=0; out=$(ot_reconf OPEN_TERMINAL_URL= 2>&1) || status=$?
+assert_eq "disconnecting succeeds" 0 "$status"
+assert_file_contains "the key is revoked" 'revoke deepseek-harness-281 --missing-ok' "$fake/terminal-calls"
+assert_eq "and the terminal firewall forgets this CT" 0 "$(grep -c deepseek-harness-281 "$fake/pve/firewall/270.fw")"
+assert_eq "no staging directory is left" 0 "$(stages)"
+
 rm -rf -- "$fake"
 
 describe dsh_guest_dry_run

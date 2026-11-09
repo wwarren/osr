@@ -19,13 +19,16 @@ SPEC.loader.exec_module(MODULE)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    """One server plays both parts: Open WebUI's admin API and, at /files/cwd,
-    the terminal (which, like Open Terminal, wants its own bearer key)."""
+    """One server plays both parts: Open WebUI's admin API and, at
+    /osr/v1/whoami, the terminal's workspace gateway (which wants its own
+    bearer key and names the client it belongs to)."""
     connections = []
     posts = 0
     verify_ok = True
     terminal_key = "terminal-secret"
     list_override = None
+    gateway = True
+    client = "openwebui"
 
     def log_message(self, *_args):
         pass
@@ -39,11 +42,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
-        if self.path == "/files/cwd":
-            if self.headers.get("Authorization") != f"Bearer {self.terminal_key}":
+        if self.path == "/osr/v1/whoami":
+            if not self.gateway:
+                self.reply(404, {"detail": "Not Found"})
+            elif self.headers.get("Authorization") != f"Bearer {self.terminal_key}":
                 self.reply(401, {"detail": "Invalid API key"})
             else:
-                self.reply(200, {"cwd": "/srv/open-terminal/workspace"})
+                self.reply(200, {"client": self.client, "user": None, "workspace": None})
             return
         self.assert_authorized()
         if self.path == "/api/v1/configs/terminal_servers":
@@ -78,6 +83,8 @@ class IntegrationTests(unittest.TestCase):
         Handler.verify_ok = True
         Handler.terminal_key = "terminal-secret"
         Handler.list_override = None
+        Handler.gateway = True
+        Handler.client = "openwebui"
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -126,6 +133,20 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             self.invoke()
         self.assertIn("rejected the API key", str(caught.exception))
+        self.assertEqual(Handler.posts, 0)
+
+    def test_a_terminal_without_the_gateway_is_refused(self):
+        Handler.gateway = False
+        with self.assertRaises(RuntimeError) as caught:
+            self.invoke()
+        self.assertIn("rerun install-target.sh", str(caught.exception))
+        self.assertEqual(Handler.posts, 0)
+
+    def test_an_agent_key_is_not_used_for_open_webui(self):
+        Handler.client = "hermes-282"
+        with self.assertRaises(RuntimeError) as caught:
+            self.invoke()
+        self.assertIn("not openwebui", str(caught.exception))
         self.assertEqual(Handler.posts, 0)
 
     def test_malformed_connection_list_is_refused(self):

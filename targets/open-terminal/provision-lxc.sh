@@ -13,8 +13,10 @@ usage() {
 Usage: bash provision-lxc.sh [--dry-run] [--integrate-only]
 
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Open Terminal from
-the open-webui/open-terminal v0.14.0 GitHub tag, and registers an admin-only
-system terminal in an existing ollama-smart-router Open WebUI. It asks for an
+the open-webui/open-terminal v0.14.0 GitHub tag behind a workspace gateway
+(every Open WebUI user, and every agent CT connected later, gets an isolated
+workspace), and registers an admin-only system terminal in an existing
+ollama-smart-router Open WebUI. It asks for an
 Open WebUI admin API key or session JWT unless OPENWEBUI_ADMIN_TOKEN is set.
 
 The router (the LXC or VM running that Open WebUI) is given as ROUTER:
@@ -31,19 +33,24 @@ Required for a new install: ROUTER (existing Open WebUI CT ID/IP/hostname), TEMP
           runs list downloaded templates and eligible storage when those values
           are unset. CT_ID defaults to the cluster's next free ID (set it
           to choose another). --integrate-only needs CT_ID and ROUTER.
-Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=2048,
+Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=4096,
           SWAP_MB=512, ROOTFS_GB=16, ONBOOT=1, NAMESERVER, VLAN_TAG,
           ROUTER_SSH_PORT=22,
           ROUTER_IP (the address the router uses to reach the terminal; detected
           with "ip route get" on the router), OPENWEBUI_PORT (read from the
           router's /app/openwebui/.env, default 8080), OPEN_TERMINAL_PORT=8000,
           OPEN_TERMINAL_VERSION=v0.14.0, OPEN_TERMINAL_COMMIT=<reviewed SHA-1;
-          required for a non-default version>, CONNECTION_NAME='Open Terminal LXC'.
+          required for a non-default version>, CONNECTION_NAME='Open Terminal LXC',
+          OPEN_TERMINAL_IDLE_MINUTES=120, OPEN_TERMINAL_MAX_ACTIVE=8,
+          OPEN_TERMINAL_WS_MEMORY=1G, OPEN_TERMINAL_WS_TASKS=512,
+          OPEN_TERMINAL_WS_CPU=100% (see README.md, "Workspaces").
 
 --dry-run prints the command plan without touching Proxmox, logging in to the
 router, or asking for a token.
 --integrate-only registers an already installed terminal CT (CT_ID on this
-host). Its API key is read from that CT; no new CT is created.
+host). Its API key (Open WebUI's client key) is read from that CT; no new CT is
+created. Agent CTs connect themselves: OPEN_TERMINAL_URL with their own
+provisioner (targets/hermes, openclaw, deepseek-harness).
 USAGE
 }
 
@@ -263,7 +270,7 @@ GATEWAY=${GATEWAY:-}
 BRIDGE=${BRIDGE:-vmbr0}
 CT_HOSTNAME=${CT_HOSTNAME:-open-terminal}
 CORES=${CORES:-2}
-MEMORY_MB=${MEMORY_MB:-2048}
+MEMORY_MB=${MEMORY_MB:-4096}
 SWAP_MB=${SWAP_MB:-512}
 ROOTFS_GB=${ROOTFS_GB:-16}
 ONBOOT=${ONBOOT:-1}
@@ -379,7 +386,8 @@ if (( ! integrate_only )); then
 fi
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-deploy_files=(install-target.sh open-terminal.service requirements.in requirements.lock)
+# One line: tests/test-upgrade-all.sh compares it with tools/upgrade-all.sh.
+deploy_files=(install-target.sh open-terminal-gateway.service open-terminal-spawner.service open-terminal-ws@.service gateway.py spawner.py open-terminal-clients requirements.in requirements.lock)
 for file in "${deploy_files[@]}" integrate-webui.py verify-webui.py; do
   [[ -r $source_dir/$file ]] || die "Deployment file is missing: $source_dir/$file"
 done
@@ -599,12 +607,17 @@ else
   run pct push "$CT_ID" "$stage/api-key" /etc/open-terminal/api-key --perms 0600
   for file in "${deploy_files[@]}"; do
     perms=0644
-    [[ $file == *.sh ]] && perms=0755
+    [[ $file == *.sh || $file == open-terminal-clients ]] && perms=0755
     run pct push "$CT_ID" "$source_dir/$file" "/root/open-terminal-deploy/$file" --perms "$perms"
+  done
+  ws_settings=()
+  for name in OPEN_TERMINAL_IDLE_MINUTES OPEN_TERMINAL_MAX_ACTIVE OPEN_TERMINAL_WS_MEMORY \
+              OPEN_TERMINAL_WS_TASKS OPEN_TERMINAL_WS_CPU; do
+    [[ -z ${!name:-} ]] || ws_settings+=("$name=${!name}")
   done
   run pct exec "$CT_ID" -- env "OPEN_TERMINAL_PORT=$OPEN_TERMINAL_PORT" \
     "OPEN_TERMINAL_VERSION=$OPEN_TERMINAL_VERSION" "OPEN_TERMINAL_COMMIT=$OPEN_TERMINAL_COMMIT" \
-    bash /root/open-terminal-deploy/install-target.sh
+    "${ws_settings[@]}" bash /root/open-terminal-deploy/install-target.sh
   terminal_installed=1
 fi
 
@@ -631,5 +644,6 @@ router_run python3 "$router_stage/integrate-webui.py" \
 (( dry_run )) && router_stage=''
 
 printf 'Open Terminal: http://%s:%s (reachable from %s at %s).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT" "$router_label" "$ROUTER_IP"
-printf 'Select "%s" in Open WebUI chats. Workspace: /srv/open-terminal/workspace in CT %s.\n' "$CONNECTION_NAME" "$CT_ID"
-printf 'Connection is admin-only. Grant trusted groups in Admin Settings > Integrations > Open Terminal if needed.\n'
+printf 'Select "%s" in Open WebUI chats. Each user gets a workspace of their own in CT %s (/srv/open-terminal/ws/<id>; list them with: pct exec %s -- open-terminal-clients workspaces).\n' "$CONNECTION_NAME" "$CT_ID" "$CT_ID"
+printf 'Connection is admin-only. Grant groups in Admin Settings > Integrations > Open Terminal; each member works in their own workspace.\n'
+printf 'Agents: rerun their provisioner with OPEN_TERMINAL_URL=http://%s:%s (Hermes, OpenClaw, DeepSeek Harness).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT"

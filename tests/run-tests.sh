@@ -81,6 +81,11 @@ add_suite router  pytest "${HERE}/test_router.py"                  "$ROUTER_PYTH
 add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTHON"
 # Standard-library unittest scripts: no venv needed.
 add_suite open-terminal-integration python "${ROOT}/targets/open-terminal/test-integration.py" python3
+# The workspace gateway runs from the Open Terminal venv (starlette, httpx,
+# websockets, uvicorn from targets/open-terminal/requirements.lock). Without
+# OPEN_TERMINAL_PYTHON that suite prints a SKIP line, which --strict fails.
+OPEN_TERMINAL_PYTHON="${OPEN_TERMINAL_PYTHON:-python3}"
+add_suite open-terminal-gateway     python "${ROOT}/targets/open-terminal/test-gateway.py"     "$OPEN_TERMINAL_PYTHON"
 add_suite open-terminal-webui-probe python "${ROOT}/targets/open-terminal/test-webui-probe.py" python3
 add_suite hermes-integration        python "${ROOT}/targets/hermes/test-integration.py"        python3
 add_suite hermes-direct-dispatch    python "${ROOT}/targets/hermes/test-direct-dispatch.py"    python3

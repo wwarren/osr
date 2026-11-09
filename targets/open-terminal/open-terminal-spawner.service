@@ -1,0 +1,31 @@
+[Unit]
+Description=Open Terminal workspace spawner
+# Root helper for the gateway: creates workspace accounts, keys and ports and
+# starts or stops open-terminal-ws@<id>.service. Its socket accepts only root
+# and ot-gateway.
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /opt/open-terminal/lib/spawner.py
+RuntimeDirectory=open-terminal-spawner
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+# useradd writes the account files in /etc; workspace keys are in
+# /etc/open-terminal/ws, homes in /srv/open-terminal/ws, records in
+# /var/lib/open-terminal. systemctl only connects to systemd's socket.
+ProtectSystem=strict
+ReadWritePaths=/etc /srv/open-terminal /var/lib/open-terminal -/var/log/lastlog -/var/log/faillog
+ProtectHome=true
+# Root, but only what account and directory setup needs: chown a new home and
+# the socket, and keep useradd working where /etc/shadow is not owner-writable.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_AUDIT_WRITE
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

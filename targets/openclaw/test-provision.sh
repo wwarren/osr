@@ -237,12 +237,28 @@ case $cmd in
   config) cat "$FAKE_DIR/ct$id/description" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")"
-    [[ $(basename "$2") != honcho-api-key ]] || cp "$1" "$FAKE_DIR/ct$id/honcho-key" ;;
+    [[ $(basename "$2") != honcho-api-key ]] || cp "$1" "$FAKE_DIR/ct$id/honcho-key"
+    [[ $(basename "$2") != open-terminal-key ]] || cp "$1" "$FAKE_DIR/ct$id/ot-key" ;;
   pull) [[ $1 == /etc/openclaw-target/api-key ]] && printf '%s\n' "$FAKE_OPENCLAW_KEY" > "$2" ;;
   exec)
     [[ $1 == -- ]] && shift
     all="$*"
-    if [[ $id == 280 ]]; then
+    if [[ $id == 270 ]]; then
+      # The Open Terminal CT: its gateway port and client keys (hash only).
+      case $all in
+        'test -x /usr/local/sbin/open-terminal-clients') exit 0 ;;
+        sed\ -n\ *OPEN_TERMINAL_PORT*) echo 8000 ;;
+        '/usr/local/sbin/open-terminal-clients has '*)
+          [[ $(cat "$FAKE_DIR/ot-${3}.sha" 2>/dev/null) == "$4" ]] ;;
+        '/usr/local/sbin/open-terminal-clients issue '*' --default-user default')
+          n=$(( $(cat "$FAKE_DIR/ot-issued" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_DIR/ot-issued"
+          key="ot-client-key-$n-0123456789"
+          printf '%s' "$key" | sha256sum | cut -d' ' -f1 > "$FAKE_DIR/ot-${3}.sha"
+          printf '%s\n' "$key" ;;
+        '/usr/local/sbin/open-terminal-clients revoke '*' --missing-ok') rm -f "$FAKE_DIR/ot-${3}.sha" ;;
+        *) echo "unexpected terminal command: $all" >&2; exit 3 ;;
+      esac
+    elif [[ $id == 280 ]]; then
       case $all in
         'test -f /app/router/router.py') exit 0 ;;
         python3\ -c\ *router.ini) echo 5400 ;;
@@ -282,6 +298,9 @@ case $cmd in
           exit "$found" ;;
         sh\ -c\ test\ -d\ /run/systemd/system*) exit 0 ;;
         sh\ -c\ sed\ *HONCHO_URL*) cat "$FAKE_DIR/ct$id/honcho-url" 2>/dev/null || : ;;
+        sh\ -c\ sed\ *OPEN_TERMINAL_URL*) cat "$FAKE_DIR/ct$id/ot-url" 2>/dev/null || : ;;
+        sh\ -c\ \[\ -s\ /root/openclaw-deploy/open-terminal-key*)
+          [[ -s $FAKE_DIR/ct$id/ot-key ]] && tr -d '\r\n\t ' < "$FAKE_DIR/ct$id/ot-key" | sha256sum | cut -d' ' -f1 ;;
         'test -s /root/openclaw-deploy/honcho-api-key') [[ -s $FAKE_DIR/ct$id/honcho-key ]] ;;
         'cat /etc/honcho-target/client-api-key') [[ $id == 285 ]] && printf '%s\n' "$FAKE_HONCHO_KEY" ;;
         'install -d -m 0700 /root/openclaw-deploy') : ;;
@@ -293,6 +312,7 @@ case $cmd in
           [[ ${FAKE_GUEST_RC:-0} == 0 ]] || exit "$FAKE_GUEST_RC"
           touch "$FAKE_DIR/ct$id/installed"
           if [[ $all =~ HONCHO_URL=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[1]}" > "$FAKE_DIR/ct$id/honcho-url"; fi
+          if [[ $all =~ OPEN_TERMINAL_URL=([^\ ]*) ]]; then printf '%s\n' "${BASH_REMATCH[1]}" > "$FAKE_DIR/ct$id/ot-url"; fi
           if [[ $all == *OPENCLAW_API=true* ]]; then touch "$FAKE_DIR/ct$id/api-on"; else rm -f "$FAKE_DIR/ct$id/api-on"; fi
           exit 0 ;;
         *) echo "unexpected CT command: $all" >&2; exit 3 ;;
@@ -351,7 +371,7 @@ real() {
 }
 reset_fake() { rm -rf -- "${fake:?}/ct283" "$fake"/pushed-* "$fake"/fw-at-* "$fake/guest-env" "$fake/pve/firewall/283.fw"; : > "$log"; }
 honcho_key=honcho-osr-key-0123456789
-secrets_in_argv() { grep -E -- "$router_key|$admin_token|$openclaw_key|$honcho_key" "$log" || true; }
+secrets_in_argv() { grep -E -- "$router_key|$admin_token|$openclaw_key|$honcho_key|ot-client-key-" "$log" || true; }
 fwfile=$fake/pve/firewall/283.fw
 
 stages_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'openclaw-setup.*' | wc -l)
@@ -457,6 +477,37 @@ out=$(real --reconfigure) || fail "reconfigure after Honcho off: $out"
 [[ $out != *'Keeping Honcho memory'* ]] || fail 'Honcho came back after it was turned off'
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 pass 'Honcho: the osr key as a file and an egress rule; kept by a plain --reconfigure; HONCHO_URL= turns it off'
+
+# Open Terminal: a client key issued by the terminal CT, admitted in its
+# firewall, an egress rule here; kept (not rotated) by a plain --reconfigure;
+# OPEN_TERMINAL_URL= revokes it.
+ot_lxc=$fake/lxc; mkdir -p "$ot_lxc"
+printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.70/24,gw=192.0.2.1\n' > "$ot_lxc/270.conf"
+printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
+ot_rule='IN ACCEPT -source 192.0.2.83/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client openclaw-283'
+ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-model'
+: > "$log"; rm -f "$fake"/pushed-*
+out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000 PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal on: $out"
+grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients issue openclaw-283 --default-user default' "$log" ||
+  fail 'the terminal CT (found by its address) did not issue a key'
+[[ $(cat "$fake/pushed-283-open-terminal-key") == ot-client-key-1-0123456789 ]] || fail 'the key was not pushed as a file'
+grep -qxF "$ot_rule" "$fake/pve/firewall/270.fw" || fail "terminal firewall: $(cat "$fake/pve/firewall/270.fw")"
+grep -qxF "$ot_egress" "$fwfile" || fail "Open Terminal egress rule: $(cat "$fwfile")"
+grep -q 'OPEN_TERMINAL_URL=http://192.0.2.70:8000' "$fake/guest-env" || fail 'the guest did not get OPEN_TERMINAL_URL'
+: > "$log"; rm -f "$fake"/pushed-*
+out=$(real --reconfigure PVE_LXC_DIR="$ot_lxc") || fail "plain reconfigure with Open Terminal: $out"
+[[ $out == *'Keeping the Open Terminal workspace at http://192.0.2.70:8000'* && $out == *"Keeping client openclaw-283's Open Terminal key"* ]] ||
+  fail "no keep notices: $out"
+grep -q ' issue ' "$log" && fail 'a plain reconfigure rotated a working key'
+grep -qxF "$ot_egress" "$fwfile" || fail 'a plain reconfigure dropped the Open Terminal egress rule'
+: > "$log"
+out=$(real --reconfigure OPEN_TERMINAL_URL= PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal off: $out"
+grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients revoke openclaw-283 --missing-ok' "$log" || fail 'the key was not revoked'
+grep -q 'openclaw-283' "$fake/pve/firewall/270.fw" && fail 'the terminal firewall still admits the CT'
+grep -q '192.0.2.70/32' "$fwfile" && fail 'OPEN_TERMINAL_URL= kept the egress rule'
+grep -q 'OPEN_TERMINAL_URL= ' "$fake/guest-env" || fail 'the guest was not told to disconnect'
+[[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
+pass 'Open Terminal: key issued by the terminal CT and kept while valid, both firewalls; OPEN_TERMINAL_URL= revokes it'
 : > "$log"
 out=$(real --integrate-only) || fail "integrate-only: $out"
 grep -q 'install-target.sh' "$log" && fail '--integrate-only ran the installer'
@@ -559,15 +610,19 @@ pass 'every run, failed or not, removes its host staging directory'
 lxc=$(mktemp -d)
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.80/24\ntags: osr-router\n' > "$lxc/280.conf"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: osr-target;honcho\n' > "$lxc/285.conf"
-answers=$'\n282\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.82/24\n\n\n\n\n\n\n\n'
+printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.70/24\ntags: osr-target;open-terminal\n' > "$lxc/270.conf"
+answers=$'\n282\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.82/24\n\n\n\n\n\n\n\n\n'
 out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x bash "$provision" --dry-run 2>&1 <<< "$answers") ||
   fail "guided create: $out"
-order=$(sed '/== OpenClaw: /q' <<< "$out" | grep -oE '== [A-Za-z: ]+ ==|Router CT ID or address|New OpenClaw CT ID|amd64 template|Root disk storage|OpenClaw IP/CIDR|OpenClaw gateway|OSR model or tier|Context window|Max reply tokens|Offer OpenClaw in Open WebUI|Run the OpenClaw Control UI|Honcho API URL' | paste -sd'|')
-[[ $order == '== Router ==|Router CT ID or address|== OpenClaw container ==|New OpenClaw CT ID|amd64 template|Root disk storage|OpenClaw IP/CIDR|OpenClaw gateway|== OpenClaw settings ==|OSR model or tier|Context window|Max reply tokens|Offer OpenClaw in Open WebUI|Run the OpenClaw Control UI|== Honcho memory ==|Honcho API URL|== OpenClaw: create ==' ]] ||
+order=$(sed '/== OpenClaw: /q' <<< "$out" | grep -oE '== [A-Za-z: ]+ ==|Router CT ID or address|New OpenClaw CT ID|amd64 template|Root disk storage|OpenClaw IP/CIDR|OpenClaw gateway|OSR model or tier|Context window|Max reply tokens|Offer OpenClaw in Open WebUI|Run the OpenClaw Control UI|Honcho API URL|Open Terminal URL' | paste -sd'|')
+[[ $order == '== Router ==|Router CT ID or address|== OpenClaw container ==|New OpenClaw CT ID|amd64 template|Root disk storage|OpenClaw IP/CIDR|OpenClaw gateway|== OpenClaw settings ==|OSR model or tier|Context window|Max reply tokens|Offer OpenClaw in Open WebUI|Run the OpenClaw Control UI|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== OpenClaw: create ==' ]] ||
   fail "create prompts out of order: $order"
 [[ $out == *'Router CT ID or address [280]'* && $out == *'OpenClaw gateway [192.0.2.1]'* ]] || fail "router offers: $out"
 [[ $out == *'Honcho API URL (none to skip) [http://192.0.2.85:8000]'* && $out == *'HONCHO_URL=http://192.0.2.85:8000'* ]] ||
   fail "the Honcho CT on this host was not offered or taken: $out"
+[[ $out == *'Open Terminal URL (none to skip) [http://192.0.2.70:8000]'* && $out == *'OPEN_TERMINAL_URL=http://192.0.2.70:8000'* &&
+   $out == *"admit 192.0.2.82 in Open Terminal CT 270's firewall"* ]] ||
+  fail "the Open Terminal CT on this host was not offered, taken or connected: $out"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.82/24\ntags: osr-target;openclaw\n' > "$lxc/282.conf"
 out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x HONCHO_URL= bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n') ||
   fail "guided reconfigure: $out"

@@ -1,0 +1,38 @@
+[Unit]
+Description=Open Terminal workspace %i
+# Started and stopped by open-terminal-spawner.service on the gateway's behalf.
+# One instance per workspace: its own account (ot-%i), key, port, files,
+# processes and /tmp; it listens on loopback only.
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ot-%i
+Group=ot-%i
+WorkingDirectory=/srv/open-terminal/ws/%i
+# Shared settings (system prompt, CORS, single-user mode), then this
+# workspace's root-only key and port. The key is given as the variable itself,
+# never as OPEN_TERMINAL_API_KEY_FILE: open-terminal's CLI exports the
+# variable after reading a _FILE, and v0.14.0 then refuses to start.
+EnvironmentFile=/etc/open-terminal/workspace.env
+EnvironmentFile=/etc/open-terminal/ws/%i.env
+ExecStart=/opt/open-terminal/venv/bin/open-terminal run --host 127.0.0.1 --port ${OPEN_TERMINAL_PORT} --cwd /srv/open-terminal/ws/%i
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The shell can write only its own workspace (and its private /tmp).
+ReadWritePaths=/srv/open-terminal/ws/%i
+InaccessiblePaths=-/etc/open-terminal/ws -/var/lib/open-terminal -/srv/open-terminal/workspace
+PrivateTmp=true
+# Other workspaces' processes (and their environments) are invisible.
+ProtectProc=invisible
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native

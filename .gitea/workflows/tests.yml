@@ -46,11 +46,19 @@ jobs:
           python -m venv .venv-litellm
           .venv-litellm/bin/pip install --require-hashes -r services/litellm-proxy/requirements.lock
 
+      # The Open Terminal release's hash-locked dependencies, for the
+      # workspace gateway test (targets/open-terminal/test-gateway.py).
+      - name: Open Terminal venv
+        run: |
+          python -m venv .venv-open-terminal
+          .venv-open-terminal/bin/pip install --require-hashes -r targets/open-terminal/requirements.lock
+
       - name: Test suites
         env:
           ROUTER_PYTHON: ${{ github.workspace }}/.venv-router/bin/python
           BRIDGE_PYTHON: ${{ github.workspace }}/.venv-bridge/bin/python
           LITELLM_PYTHON: ${{ github.workspace }}/.venv-litellm/bin/python
+          OPEN_TERMINAL_PYTHON: ${{ github.workspace }}/.venv-open-terminal/bin/python
         # --strict: a suite that skips cases (most end-to-end cases need root)
         # fails the job, so a green run means they all ran. The runner's
         # job container must therefore run as root, as act_runner's do.

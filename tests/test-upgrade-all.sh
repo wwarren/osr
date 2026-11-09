@@ -57,6 +57,7 @@ for unit_file in "$ROOT"/targets/*/*.service "$ROOT"/services/*/*.service; do
     target=$(basename "$(dirname "$unit_file")")
     unit=$(basename "$unit_file" .service)
     case $target in ollama-router|litellm-proxy|ollama-monitor|open-webui) target=router ;; esac
+    [[ $unit != *@ ]] || continue   # a template is never active itself
     assert_contains "$unit.service is checked for $target" " $unit " " $(tables eval "printf '%s' \"\${UNITS[$target]:-}\"") "
 done
 

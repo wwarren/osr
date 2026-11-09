@@ -8,6 +8,8 @@ umask 077
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
+# shellcheck source=targets/open-terminal/client-lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../open-terminal/client-lib.sh"
 usage() {
   cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run | --reconfigure]
@@ -24,6 +26,11 @@ Settings: DSH_MODEL=auto, DSH_CONTEXT_WINDOW=32768, DSH_MAX_TOKENS=8192,
 Honcho memory: HONCHO_URL=http://<honcho-ip>:8000 with HONCHO_CT_ID (or
   HONCHO_API_KEY_FILE); HONCHO_MCP_URL overrides the derived
   http://<honcho-ip>:3000/mcp. HONCHO_URL= (set, empty) turns it off.
+Open Terminal: OPEN_TERMINAL_URL=http://<terminal-ip>:8000 gives Harness its
+  own workspace in the Open Terminal CT, as MCP tools. With OPEN_TERMINAL_CT_ID
+  (detected from the address) this script issues the CT's client key and
+  admits it in the terminal's firewall; OPEN_TERMINAL_KEY_FILE uses a key
+  issued by hand. OPEN_TERMINAL_URL= (set, empty) disconnects and revokes.
 CT: BRIDGE=vmbr0, CT_HOSTNAME=deepseek-harness, CORES=2, MEMORY_MB=4096,
   SWAP_MB=1024, ROOTFS_GB=32, ONBOOT=1, NAMESERVER, VLAN_TAG.
 
@@ -168,6 +175,10 @@ HONCHO_URL=${HONCHO_URL:-}
 HONCHO_MCP_URL=${HONCHO_MCP_URL:-}
 HONCHO_CT_ID=${HONCHO_CT_ID:-}
 HONCHO_API_KEY_FILE=${HONCHO_API_KEY_FILE:-}
+ot_url_set=${OPEN_TERMINAL_URL+set}
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL:-}
+OPEN_TERMINAL_CT_ID=${OPEN_TERMINAL_CT_ID:-}
+OPEN_TERMINAL_KEY_FILE=${OPEN_TERMINAL_KEY_FILE:-}
 
 template_re='^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-(12|13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
 valid_template() { [[ $1 =~ $template_re ]]; }
@@ -279,6 +290,35 @@ fi
 [[ -z $HONCHO_CT_ID || ( $HONCHO_CT_ID =~ ^[1-9][0-9]{2,8}$ && $HONCHO_CT_ID != "$CT_ID" ) ]] ||
   die 'HONCHO_CT_ID must be the Honcho CT ID (100 or greater), not this CT.'
 
+# Open Terminal workspace: given, else on a reconfigure the recorded one, else
+# (asked) the Open Terminal CT on this host. The recorded URL also names the
+# terminal to disconnect from when it is turned off or moved.
+ot_valid_url "$OPEN_TERMINAL_URL" || die 'OPEN_TERMINAL_URL must be the terminal gateway as http://IPv4:port.'
+ot_prev_url=$(recorded_or DSH_OPEN_TERMINAL_URL '')
+if [[ -z $ot_url_set ]]; then
+  ot_offer=$ot_prev_url
+  if [[ -z $ot_offer && $mode == create ]]; then
+    ot_ct_here=$(pve_tagged_ct open-terminal)
+    if [[ -n $ot_ct_here ]]; then
+      ot_ip_here=$(pve_ct_net "$ot_ct_here" ip)
+      [[ -z $ot_ip_here ]] || ot_offer="http://$ot_ip_here:8000"
+    fi
+  fi
+  pve_section 'Open Terminal workspace'
+  pve_note 'A private workspace for Harness in the Open Terminal CT, as MCP tools beside its own shell tools.'
+  if [[ -n $ot_prev_url ]]; then
+    # A recorded workspace stays connected unattended; "none" disconnects it.
+    pve_ask OPEN_TERMINAL_URL 'Open Terminal URL (none to turn off)' "$ot_offer" ot_valid_url
+  else
+    pve_offer OPEN_TERMINAL_URL 'Open Terminal URL' "$ot_offer" ot_valid_url
+  fi
+fi
+OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
+if [[ -n $OPEN_TERMINAL_URL && -z $OPEN_TERMINAL_CT_ID && -z $OPEN_TERMINAL_KEY_FILE ]]; then
+  # The key is issued by the terminal CT at that address, when it is here.
+  OPEN_TERMINAL_CT_ID=$(pve_ct_with_ip "$(ot_url_ip "$OPEN_TERMINAL_URL")")
+fi
+
 # --- Checks ---------------------------------------------------------------------
 for name in CORES MEMORY_MB ROOTFS_GB; do positive "$name" "${!name}"; done
 [[ $SWAP_MB =~ ^(0|[1-9][0-9]{0,8})$ && $ONBOOT =~ ^[01]$ ]] || die 'Invalid SWAP_MB or ONBOOT.'
@@ -293,6 +333,9 @@ for name in CORES MEMORY_MB ROOTFS_GB; do positive "$name" "${!name}"; done
 [[ -z $HONCHO_MCP_URL || $HONCHO_MCP_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] ||
   die 'HONCHO_MCP_URL must be an HTTP(S) URL such as http://192.0.2.85:3000/mcp.'
 [[ -z $HONCHO_API_KEY_FILE || -r $HONCHO_API_KEY_FILE ]] || die "Cannot read HONCHO_API_KEY_FILE: $HONCHO_API_KEY_FILE"
+[[ -z $OPEN_TERMINAL_CT_ID || ( $OPEN_TERMINAL_CT_ID =~ ^[1-9][0-9]{2,8}$ && $OPEN_TERMINAL_CT_ID != "$CT_ID" ) ]] ||
+  die 'OPEN_TERMINAL_CT_ID must be the Open Terminal CT ID (100 or greater), not this CT.'
+[[ -z $OPEN_TERMINAL_KEY_FILE || -s $OPEN_TERMINAL_KEY_FILE ]] || die "OPEN_TERMINAL_KEY_FILE is empty or missing: $OPEN_TERMINAL_KEY_FILE"
 if [[ $mode == create ]]; then
   valid_template "$TEMPLATE" || die 'TEMPLATE must be a Debian 12/13 amd64 archive.'
   valid_storage "$STORAGE" || die 'Invalid STORAGE.'
@@ -349,7 +392,7 @@ finish() {
   fi
   if $keep_backups || $preserve_stage; then
     # Only the firewall copies are kept: never the router or Honcho key.
-    rm -f -- "$stage/router-api-key" "$stage/honcho-api-key"
+    rm -f -- "$stage/router-api-key" "$stage/honcho-api-key" "$stage/open-terminal-key"
     note "Firewall backups remain in $stage for manual recovery."
   else
     rm -rf -- "$stage"
@@ -446,6 +489,7 @@ pve_row 'Model' "$DSH_MODEL (context $DSH_CONTEXT_WINDOW, replies up to $DSH_MAX
 pve_row 'Harness release' "$DSH_VERSION"
 pve_row 'Web UI' "port $DSH_PORT, allowed from $DSH_ACCESS_CIDR"
 pve_row 'Honcho memory' "${honcho_mcp:-off}"
+pve_row 'Open Terminal' "${OPEN_TERMINAL_URL:-off}"
 pve_confirm "$( [[ $mode == create ]] && printf 'Create DeepSeek Harness CT %s?' "$CT_ID" || printf 'Reconfigure DeepSeek Harness CT %s?' "$CT_ID")"
 
 if [[ $mode == create ]]; then
@@ -532,6 +576,29 @@ run pct push "$CT_ID" "$stage/router-api-key" "$deploy/router-api-key" --perms 0
 if [[ $honcho_key_push == true ]] || { (( dry_run )) && [[ -n $honcho_mcp && ( -n $HONCHO_CT_ID || -n $HONCHO_API_KEY_FILE ) ]]; }; then
   run pct push "$CT_ID" "$stage/honcho-api-key" "$deploy/honcho-api-key" --perms 0600
 fi
+# Open Terminal: this CT's own client key, issued by the terminal CT, which
+# also admits this CT in its firewall. A key the terminal still accepts is
+# kept, so a reconfigure does not rotate it.
+if [[ -n $OPEN_TERMINAL_URL ]]; then
+  if [[ -n $OPEN_TERMINAL_KEY_FILE ]]; then
+    run pct push "$CT_ID" "$OPEN_TERMINAL_KEY_FILE" "$deploy/open-terminal-key" --perms 0600
+  elif [[ -n $OPEN_TERMINAL_CT_ID ]]; then
+    ot_have=''
+    if (( ! dry_run )); then
+      ot_have=$(pct exec "$CT_ID" -- sh -c "[ -s /etc/deepseek-harness/open-terminal-key ] && tr -d '\\r\\n\\t ' < /etc/deepseek-harness/open-terminal-key | sha256sum | cut -d' ' -f1" | tr -d '\r' || true)
+    fi
+    ot_connect "$OPEN_TERMINAL_CT_ID" "${IP_CIDR%/*}" "$(ot_client_name deepseek-harness "$CT_ID")" "$ot_have" "$stage/open-terminal-key"
+    if (( ! dry_run )) && [[ -s $stage/open-terminal-key ]]; then
+      run pct push "$CT_ID" "$stage/open-terminal-key" "$deploy/open-terminal-key" --perms 0600
+    fi
+  elif (( ! dry_run )) && [[ $mode == reconfigure ]] && pct exec "$CT_ID" -- test -s /etc/deepseek-harness/open-terminal-key; then
+    note "Using the Open Terminal key already in CT $CT_ID; set OPEN_TERMINAL_CT_ID to connect it again."
+  elif (( ! dry_run )); then
+    die 'The Open Terminal workspace needs OPEN_TERMINAL_CT_ID (the terminal CT on this host) or OPEN_TERMINAL_KEY_FILE.'
+  else
+    printf '+ the Open Terminal key: OPEN_TERMINAL_CT_ID or OPEN_TERMINAL_KEY_FILE is needed (or the key already in CT %s)\n' "$CT_ID"
+  fi
+fi
 for file in install-target.sh configure.mjs deepseek-harness.service; do
   perms=0644
   [[ $file == *.sh || $file == *.mjs ]] && perms=0755
@@ -541,7 +608,8 @@ guest_status=0
 run pct exec "$CT_ID" -- env "DSH_ROUTER_URL=$ROUTER_URL" "DSH_BIND_IP=${IP_CIDR%/*}" \
   "DSH_MODEL=$DSH_MODEL" "DSH_CONTEXT_WINDOW=$DSH_CONTEXT_WINDOW" \
   "DSH_MAX_TOKENS=$DSH_MAX_TOKENS" "DSH_PORT=$DSH_PORT" "DSH_VERSION=$DSH_VERSION" \
-  "DSH_HONCHO_MCP_URL=$honcho_mcp" bash "$deploy/install-target.sh" || guest_status=$?
+  "DSH_HONCHO_MCP_URL=$honcho_mcp" "DSH_OPEN_TERMINAL_URL=$OPEN_TERMINAL_URL" \
+  bash "$deploy/install-target.sh" || guest_status=$?
 
 if (( guest_status != 0 )); then
   # install-target.sh writes its settings record only once the new service
@@ -594,6 +662,18 @@ if [[ $mode == reconfigure && $dry_run == 0 ]]; then
 fi
 (( guest_status == 0 )) || exit "$guest_status"
 
+# The guest no longer uses the terminal it was connected to (turned off, or
+# moved to another one): revoke its key and firewall rule there.
+if [[ -n $ot_prev_url && $ot_prev_url != "$OPEN_TERMINAL_URL" ]]; then
+  ot_prev_ct=$(pve_ct_with_ip "$(ot_url_ip "$ot_prev_url")")
+  if [[ -n $ot_prev_ct ]]; then
+    ot_disconnect "$ot_prev_ct" "$(ot_client_name deepseek-harness "$CT_ID")"
+  else
+    note "Revoke client $(ot_client_name deepseek-harness "$CT_ID") on the Open Terminal at $ot_prev_url by hand (open-terminal-clients revoke)."
+  fi
+fi
+
 printf 'DeepSeek Harness CT %s: http://%s:%s/\n' "$CT_ID" "${IP_CIDR%/*}" "$DSH_PORT"
 [[ -z $honcho_mcp ]] || printf 'Honcho memory: %s (workspace osr; peers user and deepseek-harness).\n' "$honcho_mcp"
+[[ -z $OPEN_TERMINAL_URL ]] || printf 'Open Terminal workspace: %s (MCP tools mcp__open_terminal__*).\n' "$OPEN_TERMINAL_URL"
 printf 'Read its tokenized login URL with: pct exec %s -- journalctl -u deepseek-harness.service -b --no-pager | grep "dsh web:" | tail -n1\n' "$CT_ID"
