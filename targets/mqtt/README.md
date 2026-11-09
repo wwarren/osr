@@ -24,7 +24,7 @@ carry the OSR MQTT description. Outside Proxmox, run
 |---|---|---|
 | `CT_ID` | Cluster's next free ID | New CT's ID (required for `--reconfigure` and dry runs) |
 | `TEMPLATE`, `STORAGE`, `IP_CIDR`, `GATEWAY` | Required to create | Placement and network |
-| `MQTT_CLIENT_CIDR` | Required by the provisioner | Allowed client source network |
+| `MQTT_CLIENT_CIDR` | Required; asked with the broker's subnet as suggestion | The one IPv4 range allowed to connect: it must cover every agent CT that runs hcom (see Firewall) |
 | `MQTT_PORT` | `1883` | Listener port (8883 for TLS) |
 | `MQTT_HOST` | CT IP | Address advertised to hcom clients |
 | `MQTT_BIND_IP` | CT IP; `127.0.0.1` for direct guest installs | Listener address |
@@ -34,7 +34,20 @@ carry the OSR MQTT description. Outside Proxmox, run
 
 **Firewall.** The CT's firewall drops inbound traffic except `MQTT_CLIENT_CIDR`
 on the MQTT port; the Proxmox host/datacenter firewall must be enabled for it
-to apply. Reconfigure preserves unrelated rules and replaces the file under the
+to apply. Choose one range, in `a.b.c.d/nn` form, that contains every CT
+whose hcom relay connects: Hermes, OpenClaw, DeepSeek Harness, and an observer
+on any other CT (an observer on the broker CT itself needs no entry):
+
+| Agents are… | Enter |
+|---|---|
+| All on the broker's subnet, e.g. `192.168.1.x` (usual) | `192.168.1.0/24` |
+| One CT only, e.g. `192.168.1.82` | `192.168.1.82/32` |
+| On two subnets | One range spanning both (e.g. `10.0.0.0/16`), or add a second rule yourself |
+
+The prompt lists the agent CTs it finds by tag and warns about any outside the
+range you enter. Clients also need the generated password, so the range is an
+extra layer, not the only check. To change it later, rerun with the new
+`MQTT_CLIENT_CIDR` and `--reconfigure`. Reconfigure preserves unrelated rules and replaces the file under the
 shared Proxmox lock after a content check. Debian apt access is required.
 
 **Credentials.** Anonymous access is off; clients use username `hcom` with a

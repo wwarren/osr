@@ -135,6 +135,14 @@ smallest chosen. A llama.cpp window is multiplied by `PARALLEL_SLOTS` for
 `XOLOTL_CONTEXT`, `AVALON_CONTEXT`, `KINDI_CONTEXT`, `HONCHO_CONTEXT_TOKENS`,
 `DEEPSEEK_HARNESS_CONTEXT_WINDOW`. AirLLM keeps its own small window.
 
+**Strata KV cache.** After the windows, the installer asks how Strata stores
+its context (`STRATA_KV`): `int8` (8-bit keys and values, Strata's default),
+`k8v4` (8-bit keys, 4-bit values: 23% smaller) or `q4_0` (4-bit: 45% smaller,
+less precise on long documents). It suggests `k8v4` for cards under 24 GB (12
+and 16 GB), where the freed memory holds more of the model, and `int8` for 24
+and 32 GB cards or a card it cannot read yet. A Strata window of 8192 or less
+keeps a 16-bit cache, so nothing is asked.
+
 **Host drivers.** Before creating CTs, the installer checks for a working
 driver for each chosen card and once for the NVIDIA-only targets. If one is
 missing, [tools/setup-host-gpu.sh](tools/setup-host-gpu.sh) identifies the card
@@ -395,8 +403,10 @@ CT_ID=286 MQTT_CT_ID=286 HCOM_TARGET=observer MATTERMOST_CT_ID=277 bash tools/in
 
 Remove `--dry-run` to apply. The hcom provisioner adds owned outbound rules
 where an agent restricts egress (Hermes and OpenClaw do by default). The
-broker's `MQTT_CLIENT_CIDR` limits inbound access (Proxmox firewall
-enforcement must be on). Port 1883 (`mqtt://`) is for a trusted network; for
+broker's `MQTT_CLIENT_CIDR` is the one IPv4 range allowed to connect (Proxmox
+firewall enforcement must be on): give a range containing every agent CT, usually
+their shared subnet such as `192.168.1.0/24`, or `a.b.c.d/32` for a single CT.
+The prompt suggests the broker's subnet and warns about agents outside it. Port 1883 (`mqtt://`) is for a trusted network; for
 TLS set `MQTT_PORT=8883`, `MQTT_HOST` to the certificate's name, and
 `MQTT_TLS_CERT_FILE`/`MQTT_TLS_KEY_FILE`, with clients trusting the
 certificate.

@@ -5,8 +5,20 @@ exec </dev/null
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 provision=$here/provision-lxc.sh
 guest=$here/install-target.sh
+fake=$(mktemp -d "${TMPDIR:-/tmp}/strata-provision-test.XXXXXX")
+installed=''
+trap 'rm -rf -- "$fake" ${installed:+"$installed"}' EXIT
+mkdir -p "$fake/bin" "$fake/none" "$fake/proc/gpus/0000:01:00.0" "$fake/proc/gpus/0000:02:00.0"
+printf 'Model: \t\t NVIDIA RTX PRO 2000 Blackwell\nDevice Minor: \t 0\n' > "$fake/proc/gpus/0000:01:00.0/information"
+printf 'Model: \t\t NVIDIA RTX 5090\nDevice Minor: \t 1\n' > "$fake/proc/gpus/0000:02:00.0/information"
+cat > "$fake/bin/nvidia-smi" <<'SMI'
+#!/bin/sh
+printf '00000000:01:00.0, %s\n00000000:02:00.0, 32607\n' "${FAKE_VRAM_MIB:-16311}"
+SMI
+chmod +x "$fake/bin/nvidia-smi"
+gpu=("PATH=$fake/bin:$PATH" "NVIDIA_PROC=$fake/proc")
 common=(CT_ID=280 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
-        STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1)
+        STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1 "NVIDIA_PROC=$fake/none")
 pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' "$here/test-pinned-run-script.py")
 [[ $pin =~ ^[0-9a-f]{40}$ ]] || { echo 'FAIL missing Strata test pin' >&2; exit 1; }
 passed=0
@@ -85,6 +97,46 @@ reject 'MEMORY_MB' MEMORY_MB=8192
 reject 'STRATA_COMMIT' STRATA_COMMIT=bad
 reject 'GPU_GID' GPU_GID=0
 
+# The KV cache: suggested from the GPU's memory (k8v4 under 24 GB, int8 from
+# 24 GB or for an unknown card); a preset is kept; up to 8192 tokens nothing is
+# asked. Unattended runs take the suggestion.
+plan
+has 'STRATA_KV=int8'; has 'KV cache int8'
+plan "${gpu[@]}" FAKE_VRAM_MIB=12282
+has 'STRATA_KV=k8v4'
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311
+has 'STRATA_KV=k8v4'; has 'context 65536, KV cache k8v4, port 8080'
+plan "${gpu[@]}" FAKE_VRAM_MIB=24564
+has 'STRATA_KV=int8'
+plan "${gpu[@]}" FAKE_VRAM_MIB=32607
+has 'STRATA_KV=int8'
+plan "${gpu[@]}" GPU_DEVICES='/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm'
+has 'STRATA_KV=int8'   # minor 1 is the 32 GB card, not GPU 0
+plan "${gpu[@]}" STRATA_KV=q4_0
+has 'STRATA_KV=q4_0'
+plan "${gpu[@]}" STRATA_CONTEXT=8192
+has 'STRATA_KV=int8'
+reject 'STRATA_KV must be int8, k8v4 or q4_0' STRATA_KV=q8
+
+# Interactive: the question shows the suggestion; Enter takes it, a bad answer
+# is asked again.
+ask() {
+    output=$(printf '%b' "$1" | env -i "PATH=$fake/bin:$PATH" "${common[@]}" "NVIDIA_PROC=$fake/proc" \
+        PVE_INTERACTIVE=true FAKE_VRAM_MIB=16311 bash "$provision" --dry-run 2>&1) || {
+        printf 'FAIL interactive plan\n%s\n' "$output" >&2; exit 1;
+    }
+    passed=$((passed + 1))
+}
+ask '\n'
+has '== Strata settings =='
+has 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards.'
+has 'This GPU: k8v4 (its 16311 MiB GPU'
+has 'KV cache (int8, k8v4 or q4_0) [k8v4]:'
+has 'STRATA_KV=k8v4'
+ask 'q8\nint8\n'
+has 'Choose int8, k8v4 or q4_0.'
+has 'STRATA_KV=int8'
+
 plan GPU_GID=1000
 has 'path=/dev/nvidia0\,gid=1000\,mode=0660'
 plan GPU_DEVICES='/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools'
@@ -92,6 +144,7 @@ has '--dev3 path=/dev/nvidia-uvm-tools'
 
 output=$(env -i "PATH=$PATH" bash "$guest" --dry-run 2>&1)
 has "git fetch --depth 1 https://github.com/Niko1221/Strata.git $pin into /opt/strata (as strata)"
+has '[--kv int8]'
 has 'setup.sh --help: keep only the options this checkout supports'
 has '--setup --no-start --yes'
 has '--host 0.0.0.0 --port 8080'
@@ -105,7 +158,6 @@ lacks 'sudo'
 passed=$((passed + 1))
 
 installed=$(mktemp -d "${TMPDIR:-/tmp}/strata-rerun-test.XXXXXX")
-trap 'rm -rf -- "$installed"' EXIT
 mkdir -p "$installed/opt/strata/.git" "$installed/etc/systemd/system" "$installed/etc/strata-target"
 : > "$installed/etc/systemd/system/strata.service"
 # An installed target has a settings record; a rerun plans from it.
@@ -114,7 +166,7 @@ rerun_plan() {
     env -i "PATH=$PATH" STRATA_DIR="$installed/opt/strata" STRATA_ETC_DIR="$installed/etc/strata-target" \
         UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1
 }
-output=$(rerun_plan)
+output=$(rerun_plan)   # a record from before STRATA_KV: still complete
 has "git fetch --depth 1 https://github.com/Niko1221/Strata.git $pin (before anything is stopped"
 has 'nothing to do'
 has 'record the current commit; systemctl stop strata.service'
@@ -143,6 +195,14 @@ passed=$((passed + 1))
 commit=0123456789abcdef0123456789abcdef01234567
 output=$(env -i "PATH=$PATH" STRATA_COMMIT=$commit bash "$guest" --dry-run 2>&1)
 has "Strata.git $commit into"   # fetched by commit, not cloned at a branch tip
+passed=$((passed + 1))
+
+output=$(env -i "PATH=$PATH" STRATA_KV=k8v4 bash "$guest" --dry-run 2>&1)
+has '[--kv k8v4]'
+if output=$(env -i "PATH=$PATH" STRATA_KV=q8 bash "$guest" --dry-run 2>&1); then
+    printf 'FAIL accepted STRATA_KV=q8\n' >&2; exit 1
+fi
+has 'STRATA_KV must be int8, k8v4 or q4_0'
 passed=$((passed + 1))
 
 output=$(env -i "PATH=$PATH" STRATA_FAMILY=coder bash "$guest" --dry-run 2>&1)

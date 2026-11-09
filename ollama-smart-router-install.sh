@@ -2018,6 +2018,44 @@ prompt_target_contexts() {
   fi
 }
 
+# Strata's KV cache: int8 (8-bit keys and values, Strata's default and most
+# precise), k8v4 (8-bit keys, 4-bit values: 23% smaller) or q4_0 (4-bit: 45%
+# smaller, less precise on long documents). A smaller cache leaves room for more
+# of the model on the GPU. Strata uses it above an 8192-token context.
+valid_strata_kv() { [[ $1 == int8 || $1 == k8v4 || $1 == q4_0 ]]; }
+# strata_kv_recommendation VRAM: VALUE|REASON, the cache to suggest (Strata's
+# provisioner suggests the same). VRAM is target_vram's answer. Below 24 GB
+# (12 and 16 GB cards) k8v4, where every GB freed holds about 700 more experts
+# on the GPU; on 24 and 32 GB cards, and when the card is not known, int8.
+strata_kv_recommendation() {
+  if [[ ! $1 =~ ^[0-9]+$ ]]; then
+    echo "int8|its GPU's memory is not known yet; int8 is Strata's default"
+  elif (( $1 >= 24000 )); then
+    echo "int8|its $1 MiB GPU has room for the most precise cache"
+  else
+    echo "k8v4|its $1 MiB GPU fits more of the model with a 23% smaller cache"
+  fi
+}
+# prompt_strata_kv_cache: Strata's KV cache, with a suggestion from its GPU's
+# memory. Asked after the context windows: a window of 8192 or less keeps
+# Strata's 16-bit cache, so nothing is asked. A preset STRATA_KV is the default.
+prompt_strata_kv_cache() {
+  local vram rec reason
+  [[ " ${TARGETS:-} " == *" strata "* ]] || return 0
+  if [[ ${STRATA_CONTEXT:-} =~ ^[0-9]+$ ]] && (( STRATA_CONTEXT <= 8192 )); then return 0; fi
+  vram="$(target_vram strata)"
+  IFS='|' read -r rec reason <<< "$(strata_kv_recommendation "$vram")"
+  echo
+  echo "--- Strata KV cache ---"
+  echo "  How Strata stores the text it is working on (its context):"
+  echo "    int8  8-bit keys and values: the most precise, Strata's default"
+  echo "    k8v4  8-bit keys, 4-bit values: 23% smaller, more of the model fits on the GPU"
+  echo "    q4_0  4-bit keys and values: 45% smaller, less precise on long documents"
+  echo "  Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards."
+  echo "  strata: ${rec} recommended (${reason})."
+  prompt_until_valid "    KV cache (int8, k8v4 or q4_0)" STRATA_KV "${STRATA_KV:-$rec}" valid_strata_kv || return 1
+}
+
 # target_default_port NAME: the API port a model target serves by default
 # (Kindi keeps its own 8093; the other Strata-style targets use 8080).
 target_default_port() { if [[ $1 == kindi ]]; then echo 8093; else echo 8080; fi; }
@@ -2125,6 +2163,7 @@ run_target_provisioner() {
     done <<< "$gpu_env"
     [[ -z "$cuda_env" ]] || export "${cuda_env?}"
     [[ -z "$context_env" ]] || export "${context_env?}"
+    [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
     if [[ "$phase" == companion ]]; then
       export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
       if [[ "$name" == honcho ]]; then
@@ -3262,6 +3301,8 @@ prompt_target_settings || exit 1
 prompt_target_gpus || exit 1
 # Each model target's context window, recommended from its GPU and the agents.
 prompt_target_contexts || exit 1
+# Strata's KV cache precision, suggested from its GPU's memory.
+prompt_strata_kv_cache || exit 1
 prepare_host_gpu || exit 1
 # Root SSH between the cluster's nodes, for later upgrades from any node.
 prepare_cluster_ssh || exit 1

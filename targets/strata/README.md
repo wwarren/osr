@@ -25,12 +25,41 @@ Because `setup.sh` options differ between releases, the installer reads the
 checkout's `setup.sh --help` and:
 
 - passes only supported options (`--no-browser`, `--family`, `--context`,
-  `--vision`, `--data-dir` or else `--models-dir`);
+  `--kv`, `--vision`, `--data-dir` or else `--models-dir`);
 - stops before setup if `--setup`, `--no-start`, `--yes`, `--model`, `--port`
   or `--host` is missing (without `--host` the API binds to 127.0.0.1);
 - refuses a checkout without `--api-key` unless `STRATA_ALLOW_NO_KEY=true`;
-- checks `STRATA_FAMILY`, `STRATA_MODEL` and `STRATA_VISION` against the
-  choices `setup.sh` lists (`qwen`, `swift`, `coder`, `unsloth` at the pin).
+- checks `STRATA_FAMILY`, `STRATA_MODEL`, `STRATA_KV` and `STRATA_VISION`
+  against the choices `setup.sh` lists (`qwen`, `swift`, `coder`, `unsloth` at
+  the pin), and refuses a `STRATA_KV` other than `int8` without `--kv`.
+
+## KV cache
+
+`STRATA_KV` is how Strata stores the text it is working on (its context):
+
+| Value | Keys / values | Size | Trade-off |
+| --- | --- | --- | --- |
+| `int8` | 8-bit / 8-bit | Strata's default | the most precise |
+| `k8v4` | 8-bit / 4-bit | 23% smaller | more of the model fits on the GPU |
+| `q4_0` | 4-bit / 4-bit | 45% smaller | measurably less precise on long documents |
+
+The provisioner (and the OSR installer when it creates Strata) asks for it and
+suggests one from the GPU's memory: `k8v4` for 12 and 16 GB cards, where each GB
+freed holds about 700 more of the model's experts on the GPU, and `int8` for 24
+and 32 GB cards or a card it cannot read. Unattended runs take the suggestion.
+Strata uses it above an 8192-token context (at 8192 or less it keeps a 16-bit
+cache, so nothing is asked). From a 64K context, when the CT's RAM allows,
+Strata keeps the cache in RAM with only a 32K-token window on the GPU, and the
+choice matters less. Change it on an existing CT with a rerun (setup, restart,
+rollback on failure):
+
+```bash
+pct exec <id> -- env STRATA_KV=k8v4 bash /root/strata-target-deploy/install-target.sh
+```
+
+Installs from before this setting ran `int8` and keep it; their unchanged reruns
+still do nothing. Strata's setup prints `KV cache: 4-bit (Hadamard-rotated)` for
+`k8v4`, but writes `--kv k8v4`.
 
 ## Requirements
 
@@ -164,7 +193,7 @@ Healthy unchanged reruns backfill a missing record.
 
 **Rollback.** A rerun fetches the source while the service runs (a failed
 fetch changes nothing) and does nothing if commit, settings (family, model,
-context, vision, port, data dir, key), unit and health are unchanged.
+context, KV cache, vision, port, data dir, key), unit and health are unchanged.
 Otherwise it stops the service, snapshots the runnable checkout, venv,
 launcher and unit to the root-only `/var/lib/strata-target/` (a snapshot
 failure restarts the original), re-runs setup and health-checks. On failure it

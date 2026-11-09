@@ -40,6 +40,9 @@ Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (or swift, coder,
           unsloth: whatever the checkout's setup.sh offers),
           STRATA_CONTEXT=65536,
+          STRATA_KV=<asked> (the KV cache: int8, k8v4 = 8-bit keys and 4-bit
+                    values, or q4_0; suggested from the GPU's memory: k8v4 for
+                    12 and 16 GB cards, int8 for 24 and 32 GB cards),
           STRATA_VISION=no, STRATA_PORT=8080 (or 11434),
           STRATA_READY_TIMEOUT=900, STRATA_ALLOW_NO_KEY=false.
 
@@ -74,6 +77,48 @@ run() {
     printf '+'; printf ' %q' "$@"; printf '\n'
     if (( ! dry_run )); then "$@"; fi
 }
+
+# strata_gpu_vram_mib NODE...: the memory in MiB of the card behind the first
+# /dev/nvidiaN among NODE, or nothing when it is not known (no driver, no
+# nvidia-smi, or the card is not listed). The driver's /proc information maps
+# the node's minor number to the card's PCI address; nvidia-smi gives its size.
+strata_gpu_vram_mib() {
+    local node minor info address='' bus mib
+    for node in "$@"; do
+        [[ $node =~ ^/dev/nvidia([0-9]+)$ ]] || continue
+        minor=${BASH_REMATCH[1]}
+        for info in "${NVIDIA_PROC:-/proc/driver/nvidia}"/gpus/*/information; do
+            [[ -r $info ]] || continue
+            if [[ $(sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$info" | head -n1) == "$minor" ]]; then
+                address=${info%/information}; address=${address##*/}
+                break
+            fi
+        done
+        [[ -n $address ]] && command -v nvidia-smi >/dev/null 2>&1 || return 0
+        while IFS=', ' read -r bus mib; do
+            [[ $mib =~ ^[0-9]+$ ]] || continue
+            # nvidia-smi writes the domain with 8 digits (00000000:03:00.0).
+            if [[ ${bus,,} == *":${address#*:}" ]]; then printf '%s\n' "$mib"; return 0; fi
+        done < <(nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits 2>/dev/null)
+        return 0
+    done
+    return 0
+}
+# strata_kv_recommendation VRAM_MIB: VALUE|REASON, the KV cache to suggest (the
+# OSR installer suggests the same). Below 24 GB (12 and 16 GB cards) k8v4: its
+# 23% smaller cache leaves room for more of the model on the GPU, about 700
+# experts per GB freed, and it reads long documents better than q4_0. On 24 and
+# 32 GB cards, and on an unknown card, int8: Strata's default and most precise.
+strata_kv_recommendation() {
+    if [[ ! $1 =~ ^[0-9]+$ ]]; then
+        echo "int8|the GPU's memory is not known; int8 is Strata's default"
+    elif (( $1 >= 24000 )); then
+        echo "int8|its $1 MiB GPU has room for the most precise cache"
+    else
+        echo "k8v4|its $1 MiB GPU fits more of the model with a 23% smaller cache"
+    fi
+}
+valid_strata_kv() { [[ $1 =~ ^(int8|k8v4|q4_0)$ ]]; }
 
 dry_run=0
 while (( $# )); do
@@ -127,6 +172,7 @@ case $STRATA_FAMILY in
     *) STRATA_MODEL=${STRATA_MODEL:-IQ2_XS} ;;
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
+STRATA_KV=${STRATA_KV:-}
 STRATA_VISION=${STRATA_VISION:-no}
 STRATA_PORT=${STRATA_PORT:-8080}
 STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}
@@ -196,6 +242,22 @@ for device in "${devices[@]}"; do
 done
 (( have_gpu && have_ctl && have_uvm )) || die 'GPU_DEVICES must include /dev/nvidiaN, /dev/nvidiactl, and /dev/nvidia-uvm.'
 
+# --- Questions: Strata settings ----------------------------------------------
+if [[ -z $STRATA_KV ]] && (( STRATA_CONTEXT <= 8192 )); then
+    STRATA_KV=int8   # Strata keeps a 16-bit cache up to 8192 tokens: nothing to choose.
+elif [[ -z $STRATA_KV ]]; then
+    IFS='|' read -r kv_suggestion kv_reason <<< "$(strata_kv_recommendation "$(strata_gpu_vram_mib "${devices[@]}")")"
+    pve_section 'Strata settings'
+    pve_note 'KV cache: how Strata stores the text it is working on (its context).'
+    pve_note "  int8  8-bit keys and values: the most precise, Strata's default"
+    pve_note '  k8v4  8-bit keys, 4-bit values: 23% smaller, more of the model fits on the GPU'
+    pve_note '  q4_0  4-bit keys and values: 45% smaller, less precise on long documents'
+    pve_note 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards.'
+    pve_note "This GPU: $kv_suggestion ($kv_reason)."
+    pve_ask STRATA_KV 'KV cache (int8, k8v4 or q4_0)' "$kv_suggestion" valid_strata_kv 'Choose int8, k8v4 or q4_0.'
+fi
+valid_strata_kv "$STRATA_KV" || die 'STRATA_KV must be int8, k8v4 or q4_0.'
+
 ostype=debian
 [[ $TEMPLATE == *:vztmpl/ubuntu-* ]] && ostype=ubuntu
 net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,firewall=1"
@@ -247,7 +309,7 @@ pve_summary "Strata: create"
 pve_row 'Strata CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Server' "context $STRATA_CONTEXT, port $STRATA_PORT"
+pve_row 'Server' "context $STRATA_CONTEXT, KV cache $STRATA_KV, port $STRATA_PORT"
 pve_confirm "Create Strata CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Strata pins tens of GiB of model memory. systemd's LimitMEMLOCK must be
@@ -297,7 +359,7 @@ run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/strata-target-deploy/nvidi
 nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/strata-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "STRATA_REF=$STRATA_REF" "STRATA_COMMIT=$STRATA_COMMIT" \
     "STRATA_MODEL=$STRATA_MODEL" "STRATA_FAMILY=$STRATA_FAMILY" \
-    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_VISION=$STRATA_VISION" "STRATA_PORT=$STRATA_PORT" \
+    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_KV=$STRATA_KV" "STRATA_VISION=$STRATA_VISION" "STRATA_PORT=$STRATA_PORT" \
     "STRATA_READY_TIMEOUT=$STRATA_READY_TIMEOUT" "STRATA_ALLOW_NO_KEY=$STRATA_ALLOW_NO_KEY" \
     bash /root/strata-target-deploy/install-target.sh
 

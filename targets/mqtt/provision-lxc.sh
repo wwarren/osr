@@ -10,7 +10,7 @@ for arg in "$@"; do
   case $arg in
     --dry-run) dry_run=1 ;;
     --reconfigure) reconfigure=1 ;;
-    -h|--help) echo 'Usage: [CT_ID=<default: next free ID>] TEMPLATE= STORAGE=... IP_CIDR=... GATEWAY=... MQTT_CLIENT_CIDR=... bash provision-lxc.sh [--dry-run] [--reconfigure]'; exit 0 ;;
+    -h|--help) echo 'Usage: [CT_ID=<default: next free ID>] TEMPLATE= STORAGE=... IP_CIDR=... GATEWAY=... MQTT_CLIENT_CIDR=<range of the agent CTs, e.g. 192.168.1.0/24> bash provision-lxc.sh [--dry-run] [--reconfigure]'; exit 0 ;;
     *) die "Unknown argument: $arg" ;;
   esac
 done
@@ -31,13 +31,37 @@ if (( ! reconfigure )); then
 fi
 pve_prompt_required IP_CIDR 'Broker static IPv4/prefix'
 pve_prompt_required GATEWAY 'Gateway IPv4'
-pve_prompt_required MQTT_CLIENT_CIDR 'Client IPv4 CIDR admitted to MQTT'
+# The client range is the broker's firewall allowlist. Explain it, offer the
+# broker's own subnet and show the agent CTs it has to cover.
+client_suggestion=$(python3 -c 'import ipaddress, sys; print(ipaddress.IPv4Interface(sys.argv[1]).network)' "$IP_CIDR" 2>/dev/null) || client_suggestion=''
+agent_ips=()
+pve_section 'MQTT client access'
+pve_note "The broker's firewall drops every connection to TCP $MQTT_PORT except from this one IPv4 range."
+pve_note 'Enter a range covering every agent CT that will run hcom (Hermes, OpenClaw, DeepSeek Harness,'
+pve_note 'and an observer on another CT). An observer on this broker CT needs no entry.'
+pve_note 'Examples: 192.168.1.0/24 = the whole 192.168.1.x subnet; 192.168.1.82/32 = one CT only.'
+pve_note 'Clients still need the generated broker password; this range is an extra layer.'
+for agent in hermes openclaw deepseek-harness; do
+  agent_ct=$(pve_tagged_ct "$agent")
+  [[ -n $agent_ct ]] || continue
+  agent_ip=$(pve_ct_net "$agent_ct" ip)
+  pve_note "Found $agent: CT $agent_ct at ${agent_ip:-an unknown address (DHCP?)}"
+  [[ -z $agent_ip ]] || agent_ips+=("$agent=$agent_ip")
+done
+pve_suggest MQTT_CLIENT_CIDR 'Allowed client range (a.b.c.d/nn)' "$client_suggestion" pve_valid_cidr \
+  'Use a.b.c.d/nn, e.g. 192.168.1.0/24 for a subnet or 192.168.1.82/32 for one CT.'
 python3 - "$IP_CIDR" "$GATEWAY" "$MQTT_CLIENT_CIDR" <<'PY'
 import ipaddress, sys
 ipaddress.IPv4Interface(sys.argv[1])
 ipaddress.IPv4Address(sys.argv[2])
 ipaddress.IPv4Network(sys.argv[3], strict=False)
 PY
+for agent in "${agent_ips[@]}"; do
+  python3 -c 'import ipaddress, sys; sys.exit(ipaddress.IPv4Address(sys.argv[1]) not in ipaddress.IPv4Network(sys.argv[2], strict=False))' \
+    "${agent#*=}" "$MQTT_CLIENT_CIDR" ||
+    printf 'Warning: %s (%s) is outside MQTT_CLIENT_CIDR %s; its hcom relay will not reach the broker.\n' \
+      "${agent%%=*}" "${agent#*=}" "$MQTT_CLIENT_CIDR" >&2
+done
 [[ $BRIDGE =~ ^[A-Za-z0-9_.-]+$ && $CT_HOSTNAME =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die 'Invalid bridge or hostname.'
 for value in "$CORES" "$MEMORY_MB" "$ROOTFS_GB" "$MQTT_PORT"; do
   [[ $value =~ ^[1-9][0-9]{0,5}$ ]] || die 'Sizing and port must be positive integers.'

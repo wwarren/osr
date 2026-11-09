@@ -62,7 +62,7 @@ for helper in help_has help_choices check_choice validate_setup_options setup_ar
               validate_settings settings_env load_settings fingerprint_env saved_settings; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
-STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_VISION=no
+STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_KV=int8 STRATA_VISION=no
 STRATA_PORT=8080 STRATA_DATA_DIR=/var/lib/strata STRATA_ALLOW_NO_KEY=false
 
 SETUP_HELP=$(< "$help_documented")
@@ -99,6 +99,33 @@ STRATA_MODEL=IQ2_XS
 (validate_setup_options) || fail 'valid choices rejected'
 pass 'family, model and vision are checked against the listed choices'
 
+# The KV cache: passed to a checkout with --kv and checked against its choices;
+# a checkout without --kv keeps Strata's 8-bit cache, so only int8 is accepted.
+help_kv=$tmp_root/help-kv
+sed 's/\[--context CONTEXT\]/[--context CONTEXT] [--kv {int8,q4_0,k8v4}]/' "$help_documented" > "$help_kv"
+SETUP_HELP=$(< "$help_kv")
+[[ $(help_choices --kv) == 'int8 q4_0 k8v4' ]] || fail "kv choices: $(help_choices --kv)"
+STRATA_KV=k8v4
+(validate_setup_options) || fail 'k8v4 refused by a checkout that offers it'
+[[ $(setup_args | tr '\n' ' ') == *'--context 32768 --kv k8v4 --vision no '* ]] || fail "kv args: $(setup_args | tr '\n' ' ')"
+STRATA_KV=int8
+[[ $(setup_args | tr '\n' ' ') == *'--kv int8 '* ]] || fail 'int8 is not passed to a checkout with --kv'
+SETUP_HELP=$(sed 's/{int8,q4_0,k8v4}/{int8,q4_0}/' "$help_kv")
+STRATA_KV=k8v4
+out=$( (validate_setup_options) 2>&1 ) && fail 'a cache outside the listed choices was accepted'
+[[ $out == *'does not accept --kv k8v4 (it offers: int8 q4_0)'* ]] || fail "kv choice message: $out"
+SETUP_HELP=$(< "$help_documented")
+out=$( (validate_setup_options) 2>&1 ) && fail 'k8v4 accepted by a checkout without --kv'
+[[ $out == *'has no --kv option'* ]] || fail "no --kv message: $out"
+STRATA_KV=int8
+(validate_setup_options) || fail 'int8 refused by a checkout without --kv'
+[[ $(setup_args) != *--kv* ]] || fail '--kv passed to a checkout without it'
+STRATA_KV=q8
+out=$( (validate_settings) 2>&1 ) && fail 'an unknown cache was accepted'
+[[ $out == *'STRATA_KV must be int8, k8v4 or q4_0'* ]] || fail "kv validation: $out"
+STRATA_KV=int8
+pass 'the KV cache is passed only to checkouts with --kv and checked against their choices'
+
 STRATA_DIR=$tmp_root/strata; mkdir -p "$STRATA_DIR"
 printf '#!/bin/sh\nexit 0\n' > "$STRATA_DIR/run-iq2_xs.sh"
 chmod +x "$STRATA_DIR/run-iq2_xs.sh"
@@ -130,7 +157,7 @@ pass 'an unnamed launcher falls back to the one setup just wrote, never a guess'
 # all-or-nothing, never sourced.
 STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_VISION=no STRATA_PORT=8080
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 6 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 7 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
 STRATA_MODEL=IQ3_S STRATA_PORT=11434
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $STRATA_MODEL == IQ2_XS && $STRATA_PORT == 8080 ]] || fail "record not restored: $STRATA_MODEL $STRATA_PORT"
@@ -143,6 +170,23 @@ load_settings "$tmp_root/evil-env" && fail 'a malformed record was loaded'
 [[ ! -e $tmp_root/pwned ]] || fail 'the record was executed'
 STRATA_PORT=8080
 pass 'the settings record is read back all-or-nothing and never executed'
+
+# Installs from before STRATA_KV ran int8: their records still load (as int8)
+# and their fingerprints still match, so an unchanged rerun stays a no-op.
+grep -v '^STRATA_KV=' "$tmp_root/installed-env" > "$tmp_root/legacy-env"
+STRATA_KV=k8v4
+load_settings "$tmp_root/legacy-env" || fail 'a record from before STRATA_KV was not loaded'
+[[ $STRATA_KV == int8 ]] || fail "a record from before STRATA_KV is not int8: $STRATA_KV"
+api_key=test-key
+[[ $(settings_fingerprint) != *kv=* ]] || fail 'int8 changed the fingerprint'
+STRATA_KV=k8v4
+settings_fingerprint > "$tmp_root/fingerprint-kv"
+grep -qx 'kv=k8v4' "$tmp_root/fingerprint-kv" || fail "k8v4 is not in the fingerprint: $(cat "$tmp_root/fingerprint-kv")"
+STRATA_KV=int8
+load_settings <(fingerprint_env "$tmp_root/fingerprint-kv") || fail 'a fingerprint with kv= was not loaded'
+[[ $STRATA_KV == k8v4 ]] || fail "the fingerprint's cache was not read back: $STRATA_KV"
+STRATA_KV=int8
+pass 'records and fingerprints from before STRATA_KV mean int8'
 
 # Exercise the GPU access decision without root or Proxmox. A root-group node
 # is accepted only when the service user can actually read and write it.
@@ -400,6 +444,36 @@ contains 'Re-applying Strata' "$tmp_root/out"
 contains '--port 11434' "$log"
 contains 'systemctl stop strata.service' "$log"
 pass 'changed settings on the same commit re-run setup'
+
+# The KV cache: a change re-runs setup and is recorded; it is kept on the next
+# rerun; going back to int8 removes it from the fingerprint again.
+: > "$log"
+FAKE_HELP=$help_kv STRATA_KV=k8v4 STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'KV cache rerun'; }
+contains 'Re-applying Strata' "$tmp_root/out"
+contains '--kv k8v4' "$log"
+contains 'STRATA_KV=k8v4' "$tree/etc/strata-target/installed-env"
+grep -qx 'kv=k8v4' "$tree/etc/strata-target/installed-settings" || fail 'the cache is not in the fingerprint'
+: > "$log"
+FAKE_HELP=$help_kv STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'rerun keeping the KV cache'; }
+contains 'nothing to do' "$tmp_root/out"
+grep -q '^setup.sh ' "$log" && fail 'a rerun keeping the recorded cache re-ran setup'
+: > "$log"
+FAKE_HELP=$help_kv STRATA_KV=int8 STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'rerun back to int8'; }
+contains '--kv int8' "$log"
+grep -q '^kv=' "$tree/etc/strata-target/installed-settings" && fail 'int8 left a kv line in the fingerprint'
+pass 'a KV cache change re-runs setup with --kv, is recorded and kept'
+
+# A record written before STRATA_KV existed (no STRATA_KV line) is int8: an
+# unchanged rerun does nothing.
+sed -i '/^STRATA_KV=/d' "$tree/etc/strata-target/installed-env"
+: > "$log"
+STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'legacy-record rerun'; }
+contains 'nothing to do' "$tmp_root/out"
+grep -q 'systemctl stop' "$log" && fail 'a record without STRATA_KV stopped the service'
+pass 'an install recorded before STRATA_KV keeps running untouched'
 
 : > "$log"
 before=$(< "$tree/opt/strata/.git/HEAD")

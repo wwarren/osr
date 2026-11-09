@@ -81,7 +81,9 @@ STRATA_REF=<branch or tag> (follow it when no commit is set); STRATA_COMMIT=
 explicitly follows main,
 STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (any family the
 checkout's setup.sh lists, e.g. swift, coder, unsloth), STRATA_CONTEXT=65536,
-STRATA_VISION=no, STRATA_PORT=8080, STRATA_READY_TIMEOUT=900 (seconds),
+STRATA_KV=int8 (the KV cache: int8, k8v4 = 8-bit keys and 4-bit values, or
+q4_0; used above an 8192-token context; installs from before this setting keep
+int8), STRATA_VISION=no, STRATA_PORT=8080, STRATA_READY_TIMEOUT=900 (seconds),
 STRATA_ALLOW_NO_KEY=false (true: accept a checkout without --api-key support).
 USAGE
 }
@@ -124,6 +126,10 @@ validate_setup_options() {
     check_choice --family "$STRATA_FAMILY"
     check_choice --model "$STRATA_MODEL"
     check_choice --vision "$STRATA_VISION"
+    # A checkout without --kv keeps Strata's 8-bit cache, which is what int8 asks for.
+    help_has --kv || [[ $STRATA_KV == int8 ]] ||
+        die "This Strata checkout has no --kv option, so STRATA_KV=$STRATA_KV cannot be selected (it always uses the 8-bit cache). Set STRATA_KV=int8, or pin STRATA_REF/STRATA_COMMIT to a release that has --kv."
+    check_choice --kv "$STRATA_KV"
 }
 
 # setup_args: setup.sh arguments, one per line, for installing or refreshing
@@ -136,6 +142,7 @@ setup_args() {
     if help_has --family; then printf '%s\n' --family "$STRATA_FAMILY"; fi
     printf '%s\n' --model "$STRATA_MODEL"
     if help_has --context; then printf '%s\n' --context "$STRATA_CONTEXT"; fi
+    if help_has --kv; then printf '%s\n' --kv "$STRATA_KV"; fi
     if help_has --vision; then printf '%s\n' --vision "$STRATA_VISION"; fi
     printf '%s\n' --host 0.0.0.0 --port "$STRATA_PORT"
     if help_has --data-dir; then
@@ -191,13 +198,27 @@ settings_fingerprint() {
     key_hash=$(printf '%s' "${api_key:-}" | sha256sum | cut -d' ' -f1) || return 1
     printf 'family=%s\nmodel=%s\ncontext=%s\nvision=%s\nport=%s\ndata_dir=%s\nallow_no_key=%s\nkey_sha256=%s\n' \
         "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_VISION" "$STRATA_PORT" \
-        "$STRATA_DATA_DIR" "$STRATA_ALLOW_NO_KEY" "$key_hash"
+        "$STRATA_DATA_DIR" "$STRATA_ALLOW_NO_KEY" "$key_hash" || return 1
+    # Only a non-default cache adds a line: an install from before STRATA_KV
+    # ran int8 and keeps its fingerprint, so an unchanged rerun stays a no-op.
+    if [[ $STRATA_KV != int8 ]]; then printf 'kv=%s\n' "$STRATA_KV"; fi
 }
 
 # The settings that decide how setup runs. save_settings records them after
 # every successful install or upgrade, so a failed upgrade can roll back to
 # what last worked rather than re-running setup with the settings that failed.
-SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_VISION STRATA_PORT STRATA_ALLOW_NO_KEY)
+SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_KV STRATA_VISION STRATA_PORT STRATA_ALLOW_NO_KEY)
+# Settings added after records existed, with the value those installs ran with.
+# A record without one of them is still complete.
+declare -gA SETTING_LEGACY_DEFAULTS=([STRATA_KV]=int8)
+
+# required_setting_keys: the settings every record must hold.
+required_setting_keys() {
+    local key
+    for key in "${SETTING_KEYS[@]}"; do
+        [[ -v SETTING_LEGACY_DEFAULTS[$key] ]] || printf '%s\n' "$key"
+    done
+}
 
 # validate_settings: die unless every setting has a value this script accepts.
 # (Family, model and vision are also checked against setup.sh --help later.)
@@ -205,6 +226,7 @@ validate_settings() {
     [[ $STRATA_FAMILY =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die 'Invalid STRATA_FAMILY.'
     [[ $STRATA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STRATA_MODEL.'
     [[ $STRATA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid STRATA_CONTEXT.'
+    [[ $STRATA_KV =~ ^(int8|k8v4|q4_0)$ ]] || die 'STRATA_KV must be int8, k8v4 or q4_0.'
     [[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'Invalid STRATA_VISION.'
     [[ $STRATA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( STRATA_PORT <= 65535 )) || die 'Invalid STRATA_PORT.'
     [[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
@@ -218,7 +240,8 @@ settings_env() {
 
 # load_settings FILE: set the recorded settings from FILE. The file is parsed,
 # never sourced: only the known keys are read, and nothing is changed unless
-# every key is present and valid. Returns 1 otherwise, for example for an
+# every key is present and valid (a key in SETTING_LEGACY_DEFAULTS may be
+# missing: it takes that value). Returns 1 otherwise, for example for an
 # install made by an earlier version of this script (fingerprint only).
 load_settings() {
     local file=$1 line key
@@ -229,6 +252,9 @@ load_settings() {
         [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
         found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
     done < "$file"
+    for key in "${!SETTING_LEGACY_DEFAULTS[@]}"; do
+        [[ -v found[$key] ]] || found[$key]=${SETTING_LEGACY_DEFAULTS[$key]}
+    done
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -250,6 +276,7 @@ fingerprint_env() {
     sed -n -e 's/^family=/STRATA_FAMILY=/p' \
         -e 's/^model=/STRATA_MODEL=/p' \
         -e 's/^context=/STRATA_CONTEXT=/p' \
+        -e 's/^kv=/STRATA_KV=/p' \
         -e 's/^vision=/STRATA_VISION=/p' \
         -e 's/^port=/STRATA_PORT=/p' \
         -e 's/^allow_no_key=/STRATA_ALLOW_NO_KEY=/p' "$1"
@@ -291,9 +318,11 @@ saved_settings() {
             else
                 missing="Found an existing Strata installation (checkout, unit or pending-env) but no readable settings record (installed-env, installed-settings or pending-env in $STRATA_ETC_DIR)"
             fi
-            for key in "${SETTING_KEYS[@]}"; do
+            local -a required
+            mapfile -t required < <(required_setting_keys)
+            for key in "${required[@]}"; do
                 [[ -v overrides[$key] ]] ||
-                    die "$missing; set ${SETTING_KEYS[*]} explicitly, or restore a record."
+                    die "$missing; set ${required[*]} explicitly, or restore a record."
             done
         fi
     fi
@@ -642,8 +671,8 @@ do_install() {
         printf '+ create the %s service account; add it to the groups of %s\n' "$SERVICE_USER" "$GPU_NODES"
         printf '+ git fetch --depth 1 %s %s into %s (as %s)\n' "$STRATA_URL" "${STRATA_COMMIT:-$STRATA_REF}" "$STRATA_DIR" "$SERVICE_USER"
         printf '+ bash setup.sh --help: keep only the options this checkout supports\n'
-        printf '+ bash setup.sh --setup --no-start --yes [--no-browser] [--family %s] --model %s [--context %s] [--vision %s] --host 0.0.0.0 --port %s [--data-dir %s] --api-key [redacted]\n' \
-            "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_VISION" "$STRATA_PORT" "$STRATA_DATA_DIR"
+        printf '+ bash setup.sh --setup --no-start --yes [--no-browser] [--family %s] --model %s [--context %s] [--kv %s] [--vision %s] --host 0.0.0.0 --port %s [--data-dir %s] --api-key [redacted]\n' \
+            "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_KV" "$STRATA_VISION" "$STRATA_PORT" "$STRATA_DATA_DIR"
         printf '+ if setup needs a local engine build: install NVIDIA CUDA toolkit as root (13.0 on Ubuntu/Debian 12, 13.1 on Debian 13), then retry setup once\n'
         printf '+ verify setup generated run-<model>.sh; write %s/strata.env (STRATA_RUN_SCRIPT) and %s/strata.service\n' "$STRATA_ETC_DIR" "$UNIT_DIR"
         run systemctl enable strata.service
@@ -850,6 +879,7 @@ case $STRATA_FAMILY in
     *) STRATA_MODEL=${STRATA_MODEL:-IQ2_XS} ;;
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
+STRATA_KV=${STRATA_KV:-int8}
 STRATA_VISION=${STRATA_VISION:-no}
 STRATA_PORT=${STRATA_PORT:-8080}
 STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}

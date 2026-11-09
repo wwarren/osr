@@ -174,6 +174,7 @@ printf 'prompt-env %s|%s|%s\n' "${PVE_ACCEPT_DEFAULTS:-}" "${PVE_CONFIRM:-}" "${
   printf 'gpu-env %s|%s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" "${GPU_CARD:-}" >> "$MOCK_LOG"
 _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_CONTEXT:-}|${HONCHO_CONTEXT_TOKENS-unset}|${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-}"
 [[ $_ctx == '||||unset|' ]] || printf 'context-env %s\n' "$_ctx" >> "$MOCK_LOG"
+[[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
 [[ -z ${KINDI_BACKEND:-}${KINDI_CONTEXT:-} ]] ||
   printf 'kindi-env %s|%s|%s\n' "${KINDI_BACKEND:-}" "${GPU_DEVICES:-}" "${KINDI_CONTEXT:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
@@ -1364,6 +1365,55 @@ unset STRATA_CONTEXT XOLOTL_CONTEXT HONCHO_CONTEXT_TOKENS DEEPSEEK_HARNESS_CONTE
   LLAMACPP_GPU_CARD LLAMACPP_CONTEXT PARALLEL_SLOTS
 TARGETS=""
 
+describe valid_strata_kv
+assert_ok "int8" valid_strata_kv int8
+assert_ok "k8v4" valid_strata_kv k8v4
+assert_ok "q4_0" valid_strata_kv q4_0
+assert_fail "an unknown cache" valid_strata_kv q8
+assert_fail "empty" valid_strata_kv ""
+
+describe strata_kv_recommendation
+assert_eq "a 12 GB card takes k8v4" k8v4 "$(strata_kv_recommendation 12282 | cut -d'|' -f1)"
+assert_eq "a 16 GB card takes k8v4" k8v4 "$(strata_kv_recommendation 16311 | cut -d'|' -f1)"
+assert_eq "a 24 GB card takes int8" int8 "$(strata_kv_recommendation 24564 | cut -d'|' -f1)"
+assert_eq "a 32 GB card takes int8" int8 "$(strata_kv_recommendation 32607 | cut -d'|' -f1)"
+assert_eq "an unknown card takes Strata's default" "int8|its GPU's memory is not known yet; int8 is Strata's default" "$(strata_kv_recommendation "")"
+assert_contains "the reason names the card's memory" "its 16311 MiB GPU" "$(strata_kv_recommendation 16311)"
+
+describe prompt_strata_kv_cache
+HOST_GPU_CARDS=""
+unset STRATA_KV STRATA_CONTEXT
+_out="$(mktemp)"
+TARGETS="ollama hermes"
+assert_eq "no Strata, nothing asked" "" "$(prompt_strata_kv_cache)"
+TARGETS="strata hermes"
+nvidia-smi() { printf '00000000:01:00.0, 16311\n'; }
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "Enter takes the 16 GB card's suggestion" k8v4 "$STRATA_KV"
+assert_contains "the suggestion names its card" "strata: k8v4 recommended (its 16311 MiB GPU" "$(cat "$_out")"
+assert_contains "the sizes are explained" "Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards." "$(cat "$_out")"
+unset STRATA_KV
+nvidia-smi() { printf '00000000:01:00.0, 24564\n'; }
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'q8\n\n'
+assert_contains "a bad answer is asked again" "Not a valid value: 'q8'" "$(cat "$_out")"
+assert_eq "a 24 GB card defaults to int8" int8 "$STRATA_KV"
+STRATA_KV=q4_0
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "a preset is the default" q4_0 "$STRATA_KV"
+unset STRATA_KV
+NONINTERACTIVE=true
+nvidia-smi() { printf '00000000:01:00.0, 12282\n'; }
+prompt_strata_kv_cache > "$_out" 2>&1
+assert_eq "unattended takes the suggestion" k8v4 "$STRATA_KV"
+NONINTERACTIVE=false
+unset STRATA_KV
+STRATA_CONTEXT=8192
+assert_eq "a window of 8192 or less asks nothing" "" "$(prompt_strata_kv_cache)"
+assert_eq "and chooses nothing" "" "${STRATA_KV:-}"
+unset -f nvidia-smi
+unset STRATA_KV STRATA_CONTEXT
+TARGETS=""
+
 describe run_target_provisioner
 CT_ID=910; GATEWAY=192.0.2.1; BRIDGE=vmbr2; NAMESERVER=""; OPENWEBUI_PORT=8080
 TEMPLATE_REF=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
@@ -1455,6 +1505,15 @@ assert_contains "and the window chosen for it" "context-env ||||unset|32768" "$(
 mock_reset_log
 STRATA_CONTEXT=131072 run_target_provisioner strata
 assert_contains "a model target gets its chosen window" "context-env ||131072||unset|" "$(mock_calls)"
+assert_not_contains "no KV cache was chosen, none is passed" "strata-kv" "$(mock_calls)"
+STRATA_KV=k8v4
+mock_reset_log
+run_target_provisioner strata
+assert_contains "Strata gets the KV cache chosen for it" "strata-kv k8v4" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner ollama
+assert_not_contains "another target does not" "strata-kv" "$(mock_calls)"
+unset STRATA_KV
 mock_reset_log
 OLLAMA_CONTEXT_LENGTH=32768 run_target_provisioner ollama
 assert_contains "Ollama as its server default" "context-env 32768||||unset|" "$(mock_calls)"
