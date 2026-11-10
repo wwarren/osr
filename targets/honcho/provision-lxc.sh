@@ -761,7 +761,7 @@ if [[ $rotate_keys == true ]]; then
 fi
 printf 'Honcho API: http://%s:8000; MCP: http://%s:3000/mcp\n' "$honcho_ip" "$honcho_ip"
 printf 'Every Open WebUI user granted the Honcho Memory tools gets a memory of their own\n'
-printf '(Admin Settings > External Tools grants access; pct exec %s -- honcho-clients workspaces lists them).\n' "$CT_ID"
+printf '(Admin Settings > External Tools grants access; pct exec %s -- /usr/local/sbin/honcho-clients workspaces lists them).\n' "$CT_ID"
 if [[ $rotate_keys == true ]]; then
   printf 'The JWT secret, the admin key and Open WebUI'"'"'s key changed; the agents keep their own keys.\n'
 fi

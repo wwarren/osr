@@ -39,7 +39,7 @@ hc_key_sha256() {
 hc_connect() {
   local ct=$1 name=$2 have=$3 out=$4
   if (( dry_run )); then
-    printf '+ keep Honcho client %s'\''s key if Honcho CT %s accepts it, else: pct exec %s -- honcho-clients issue %s --workspace %s\n' \
+    printf '+ keep Honcho client %s'\''s key if Honcho CT %s accepts it, else: pct exec %s -- /usr/local/sbin/honcho-clients issue %s --workspace %s\n' \
       "$name" "$ct" "$ct" "$name" "$name"
     return 0
   fi
@@ -62,7 +62,7 @@ hc_connect() {
 hc_disconnect() {
   local ct=$1 name=$2
   if (( dry_run )); then
-    printf '+ pct exec %s -- honcho-clients revoke %s --missing-ok\n' "$ct" "$name"
+    printf '+ pct exec %s -- /usr/local/sbin/honcho-clients revoke %s --missing-ok\n' "$ct" "$name"
     return 0
   fi
   pct exec "$ct" -- "$HC_CLIENTS" revoke "$name" --missing-ok ||
