@@ -894,6 +894,14 @@ elif [[ -n $prev_ot_url ]]; then
   ENV_UNSET_OSR_OPEN_TERMINAL_KEY=1 env_file_update "$OC_ENV"
 fi
 unset ot_key
+# The Honcho plugin (1.7.0 and later) reads its key from HONCHO_API_KEY in the
+# gateway's environment, which OpenClaw loads from this .env; openclaw.json
+# holds no key.
+if [[ -n $HONCHO_URL ]]; then
+  ENV_SET_HONCHO_API_KEY=$(tr -d '\r\n' < "$HONCHO_API_KEY_FILE") env_file_update "$OC_ENV"
+elif [[ -n $prev_honcho_url ]]; then
+  ENV_UNSET_HONCHO_API_KEY=1 env_file_update "$OC_ENV"
+fi
 chown "$OC_USER:$OC_USER" "$OC_ENV"
 chmod 0600 "$OC_ENV"
 run_oc config set gateway.mode local
@@ -913,7 +921,11 @@ if [[ -n $HONCHO_URL ]]; then
   run_oc config set plugins.entries.openclaw-honcho.hooks.allowConversationAccess true --strict-json
   run_oc config set plugins.entries.openclaw-honcho.config.baseUrl "$HONCHO_URL"
   run_oc config set plugins.entries.openclaw-honcho.config.workspaceId "$honcho_workspace"
-  run_oc config set plugins.entries.openclaw-honcho.config.peerName user
+  # The plugin's schema (1.7.0) refuses unknown settings, peerName among them:
+  # it names the owner peer itself and maps other senders in
+  # ~/.honcho/openclaw-peers.json. Drop one an earlier install wrote.
+  run_oc config unset plugins.entries.openclaw-honcho.config.peerName >/dev/null 2>&1 || true
+  # Plugin releases before 1.7.0 read their key from ~/.honcho/config.json.
   install -d -m 0700 -o "$OC_USER" -g "$OC_USER" "$OC_USER_HOME/.honcho"
   python3 - "$HONCHO_API_KEY_FILE" "$HONCHO_URL" "$OC_USER_HOME/.honcho/config.json" <<'PY'
 import json, sys

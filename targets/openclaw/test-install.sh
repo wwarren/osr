@@ -279,6 +279,11 @@ case $1 in
       set)
         path=$3 value=$4
         [[ ${FAKE_CONFIG_FAIL:-} != "$path" ]] || exit 1
+        # openclaw-honcho 1.7.0's schema has no peerName (additionalProperties: false).
+        if [[ $path == plugins.entries.openclaw-honcho.config.peerName ]]; then
+          echo 'Config validation failed: plugins.entries.openclaw-honcho.config: invalid config: must not have additional properties: "peerName"' >&2
+          exit 1
+        fi
         if [[ $value == --ref-provider ]]; then value="ref:$7:$9"; fi
         if [[ $path == agents.defaults.model.primary ]] && grep -q '^agents.defaults.model="' "$cfg"; then exit 1; fi
         grep -v "^$path=" "$cfg" > "$cfg.new" 2>/dev/null || true
@@ -717,8 +722,10 @@ out=$(guest HONCHO_URL=http://192.0.2.85:8000/) || fail "Honcho on: $out"
 [[ $(kv plugins.entries.openclaw-honcho.enabled "$config") == true ]] || fail 'the plugin is not enabled'
 [[ $(kv plugins.entries.openclaw-honcho.hooks.allowConversationAccess "$config") == true ]] || fail 'no conversation access'
 [[ $(kv plugins.entries.openclaw-honcho.config.baseUrl "$config") == http://192.0.2.85:8000 ]] || fail 'baseUrl (trailing slash kept?)'
-[[ $(kv plugins.entries.openclaw-honcho.config.workspaceId "$config") == openclaw-283 &&
-   $(kv plugins.entries.openclaw-honcho.config.peerName "$config") == user ]] || fail 'workspace or peer'
+[[ $(kv plugins.entries.openclaw-honcho.config.workspaceId "$config") == openclaw-283 ]] || fail 'workspace'
+[[ -z $(kv plugins.entries.openclaw-honcho.config.peerName "$config") ]] || fail 'peerName is not in the plugin schema'
+[[ $(kv HONCHO_API_KEY "$home/.openclaw/.env") == honcho-key-A ]] || fail 'the plugin gets no HONCHO_API_KEY in the gateway environment'
+grep -q honcho-key-A "$config" && fail 'openclaw.json holds the Honcho key'
 honcho_cfg=$home/.honcho/config.json
 grep -q '"apiKey": "honcho-key-A"' "$honcho_cfg" || fail "Honcho key file: $(cat "$honcho_cfg")"
 [[ $(stat -c %a "$honcho_cfg") == 600 ]] || fail 'the Honcho key file is not private'
@@ -731,6 +738,7 @@ grep -q honcho-key-A "$honcho_cfg" || fail 'a failed run did not put the previou
 out=$(guest HONCHO_URL=) || fail "Honcho off: $out"
 [[ $(kv plugins.entries.openclaw-honcho.enabled "$config") == false ]] || fail 'HONCHO_URL= did not disable the plugin'
 [[ ! -e $honcho_cfg && ! -e $deploy/honcho-api-key ]] || fail 'HONCHO_URL= left the Honcho key behind'
+[[ -z $(kv HONCHO_API_KEY "$home/.openclaw/.env") ]] || fail 'HONCHO_URL= left HONCHO_API_KEY in the .env'
 external_honcho_key=$tmp_root/external-honcho-key
 printf 'external-honcho-key\n' > "$external_honcho_key"
 out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" FAKE_HONCHO_NO_GATEWAY=1) || fail "external Honcho on: $out"
