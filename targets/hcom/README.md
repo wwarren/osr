@@ -10,8 +10,30 @@ Update the version and both hashes together, after a live test.
 
 ## Deploy
 
-Provision [the MQTT target](../mqtt/README.md) first. From a full checkout on
-the Proxmox host, as root, with your agent and broker CT IDs:
+Provision [the MQTT target](../mqtt/README.md) first. Then, from a full
+checkout on the Proxmox host, as root, run the provisioner in a terminal. It
+asks for each setting not already set, offering CTs by their tags, shows the
+plan and asks to confirm:
+
+```bash
+bash tools/install-hcom.sh                  # add hcom to an agent CT, or an observer
+bash tools/install-hcom.sh --reconfigure    # a CT that has hcom: its recorded settings are the defaults
+bash tools/install-hcom.sh --help           # every setting and option
+```
+
+| Setting | When | Meaning (offered default) |
+|---|---|---|
+| `HCOM_TARGET` | always | `hermes`, `openclaw` or `deepseek-harness` (the agent the CT runs), or `observer` (no agent; posts handoffs to Mattermost). A reconfigure offers the recorded one. |
+| `CT_ID` | always | The existing CT to add hcom to (the CT tagged with the target; observer: the broker CT). A reconfigure asks for it first. |
+| `MQTT_CT_ID` | always | The broker CT from `targets/mqtt` (the CT at the recorded broker address, else the one tagged `mqtt`). |
+| `MATTERMOST_CT_ID` | observer | Where the agent-handoffs webhook is created (tag `mattermost`); `none` keeps an observer's current webhook, or posts nothing. |
+| `HCOM_HERMES_NATIVE` | hermes | `true` adds Hermes's native plugin, which gives Hermes the relay key (default `false`, or the recorded mode). |
+| `HCOM_INSTRUCTIONS_FILE` | optional | A custom AGENTS.md for the managed block; never asked. |
+
+Preset any of them as environment variables to skip its question. Without a
+terminal nothing is asked, and the run stops listing each missing required
+setting (a reconfigure can take the recorded target). For example, with your
+agent and broker CT IDs:
 
 ```bash
 CT_ID=282 MQTT_CT_ID=286 HCOM_TARGET=hermes           bash tools/install-hcom.sh --dry-run

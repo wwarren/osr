@@ -374,8 +374,8 @@ Create Hermes CT 282? [Y/n]:
 The shared helpers are `targets/pve-select.sh`; each provisioner using them
 keeps an identical copy (checked by `targets/test-pve-select.sh`). llama.cpp
 and AirLLM keep their own container prompts in the same order; MQTT prompts
-for missing values without the confirmation flow; hcom takes its CT IDs from
-the environment. Review `--dry-run` output first.
+for missing values without the confirmation flow; hcom asks for its target and
+CT IDs (offered by tag; a reconfigure defaults to the CT's recorded settings). Review `--dry-run` output first.
 
 ## Agent coordination targets
 

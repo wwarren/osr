@@ -72,4 +72,49 @@ if (
   echo 'FAIL: early provisioning failure was reported as success'; exit 1
 fi
 [[ $(<"$stage/ct.fw") == original ]] || { echo 'FAIL: early provisioning failure left its firewall rule'; exit 1; }
-echo 'PASS hcom: snapshots, rollback failure, drift detection, dry-run plans, early firewall rollback and validation'
+# Parameters: an unattended run names every missing setting; a person is asked,
+# with CTs offered by their tags and, on --reconfigure, the CT's recorded values.
+output=$(bash "$here/provision-lxc.sh" --dry-run </dev/null 2>&1) && { echo 'FAIL: missing settings accepted'; exit 1; }
+[[ $output == *'CT_ID (the existing CT)'* && $output == *'MQTT_CT_ID (the broker CT)'* && $output == *'HCOM_TARGET ('* ]] ||
+  { echo 'FAIL: unattended run must name each missing setting'; exit 1; }
+output=$(bash "$here/provision-lxc.sh" --reconfigure --dry-run </dev/null 2>&1) && { echo 'FAIL: missing CT accepted'; exit 1; }
+[[ $output == *'CT_ID (the existing CT)'* && $output != *'HCOM_TARGET ('* ]] ||
+  { echo 'FAIL: a reconfigure can take the recorded target'; exit 1; }
+output=$(CT_ID=12 bash "$here/provision-lxc.sh" --dry-run </dev/null 2>&1) && exit 1
+[[ $output == *"CT_ID must be a CT ID (100 or more), not '12'"* ]] || { echo 'FAIL: bad CT_ID message'; exit 1; }
+bash "$here/provision-lxc.sh" --help | grep -q 'MATTERMOST_CT_ID    observer' || { echo 'FAIL: --help lists the settings'; exit 1; }
+lxc=$stage/lxc
+mkdir -p "$lxc"
+for ct in '282 hermes' '283 openclaw' '286 mqtt' '277 mattermost'; do
+  set -- $ct
+  printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.%s/24\ntags: ai;ai-tools;osr-target;%s\n' "${1:1}" "$2" > "$lxc/$1.conf"
+done
+asked() { PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$here/provision-lxc.sh" "$@" 2>&1; }
+output=$(printf 'hermes\n\n\n\n' | asked --dry-run)
+[[ $output == *'Existing Hermes CT ID [282]'* && $output == *'MQTT broker CT ID [286]'* && $output == *'existing hermes CT 282'* ]] ||
+  { echo 'FAIL: tagged Hermes and broker CTs offered'; exit 1; }
+output=$(printf 'nope\nobserver\n\n\n\n' | asked --dry-run)
+[[ $output == *'Use hermes, openclaw'* && $output == *'Mattermost CT ID (none to skip) [277]'* && $output == *'Mattermost CT 277'* ]] ||
+  { echo 'FAIL: observer prompts'; exit 1; }
+output=$(printf 'openclaw\n\n\n' | MQTT_CT_ID=286 asked --dry-run)
+[[ $output != *'MQTT broker CT ID'* && $output != *'native'* ]] || { echo 'FAIL: preset or irrelevant settings asked'; exit 1; }
+# --reconfigure reads what the CT recorded (fake pct): target, native mode and
+# the broker address, found again by IP even though the broker lost its tag.
+sed -i 's/;mqtt$//' "$lxc/286.conf"
+mkdir -p "$stage/bin"
+cat > "$stage/bin/pct" <<'PCT'
+#!/bin/sh
+case $1 in
+  status) echo 'status: running' ;;
+  exec) printf 'target=hermes\nnative=true\nbroker=192.0.2.86\n' ;;
+esac
+PCT
+chmod +x "$stage/bin/pct"
+# Not a dry run (that reads nothing from the CT), so answer "n" at the
+# confirmation: it stops before any change, even on a real Proxmox host.
+output=$(printf '282\n\n\n\nn\n' | PATH="$stage/bin:$PATH" asked --reconfigure) && { echo 'FAIL: declined plan ran'; exit 1; }
+[[ $output == *'(hermes, openclaw, deepseek-harness, observer) [hermes]'* && $output == *'MQTT broker CT ID [286]'* &&
+   $output == *'native hcom plugin? [Y/n]'* && $output == *'Native Hermes plugin       true'* &&
+   $output == *'nothing was changed'* ]] ||
+  { echo 'FAIL: reconfigure defaults to the recorded settings'; printf '%s\n' "$output"; exit 1; }
+echo 'PASS hcom: snapshots, rollback failure, drift detection, dry-run plans, early firewall rollback, parameter prompts and validation'
