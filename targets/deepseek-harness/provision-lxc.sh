@@ -277,6 +277,11 @@ elif [[ -z $honcho_url_set && -z $honcho_mcp_set ]]; then
   elif [[ -n $honcho_ct_here && $mode == create ]]; then
     honcho_ip_here=$(pve_ct_net "$honcho_ct_here" ip)
     [[ -z $honcho_ip_here ]] || honcho_offer="http://$honcho_ip_here:8000"
+  elif [[ -n $honcho_ct_here ]]; then
+    # A reconfigure of a CT without Honcho can turn it on; Enter keeps it off.
+    honcho_ip_here=$(pve_ct_net "$honcho_ct_here" ip)
+    [[ -z $honcho_ip_here ]] ||
+      pve_note "Honcho CT $honcho_ct_here is at http://$honcho_ip_here:8000; enter that to turn Honcho memory on."
   fi
   pve_section 'Honcho memory'
   pve_note 'Long-term memory in a Honcho workspace of Harness'"'"'s own (like its Open Terminal workspace).'

@@ -841,6 +841,15 @@ order=$(sed '/== Hermes: /q' <<< "$out" | grep -oE '== [A-Za-z: ]+ ==|Hermes CT 
 [[ $order == '== Hermes container to reconfigure ==|Hermes CT ID|== Router ==|Router CT ID or address|== Hermes settings ==|== Hermes: reconfigure ==' ]] ||
   fail "reconfigure prompts out of order: $order"
 [[ $out == *'Hermes CT ID [282]'* && $out != *'Hermes IP/CIDR'* ]] || fail "reconfigure CT offer: $out"
+out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\nhttp://192.0.2.85:8000\n') ||
+  fail "guided reconfigure turning Honcho on: $out"
+[[ $out == *'Honcho CT 285 is at http://192.0.2.85:8000'* && $out == *'Honcho API URL (Enter keeps it off)'* ]] ||
+  fail "a reconfigure without Honcho did not offer to turn it on: $out"
+[[ $out == *'HONCHO_URL=http://192.0.2.85:8000'* && $out == *'honcho-clients issue hermes-282'* ]] ||
+  fail "the Honcho URL given on a reconfigure was not used: $out"
+out=$(env -i "PATH=$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR="$lxc" OPENWEBUI_ADMIN_TOKEN=x bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n') ||
+  fail "guided reconfigure keeping Honcho off: $out"
+[[ $out == *'HONCHO_URL= '* || $out != *'HONCHO_URL=http'* ]] || fail "Enter turned Honcho on: $out"
 rm -rf -- "$lxc"
 pass 'guided prompts: router, container, settings, Honcho; a reconfigure starts with the CT, offered by its tag'
 

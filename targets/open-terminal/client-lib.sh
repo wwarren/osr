@@ -84,7 +84,7 @@ ot_connect() {
   local ct=$1 ip=$2 name=$3 have=$4 out=$5 port
   if (( dry_run )); then
     printf '+ admit %s in Open Terminal CT %s'\''s firewall (# %s %s)\n' "$ip" "$ct" "$OT_FW_TAG" "$name"
-    printf '+ keep client %s'\''s key if the terminal accepts it, else: pct exec %s -- open-terminal-clients issue %s --default-user default\n' "$name" "$ct" "$name"
+    printf '+ keep client %s'\''s key if the terminal accepts it, else: pct exec %s -- /usr/local/sbin/open-terminal-clients issue %s --default-user default\n' "$name" "$ct" "$name"
     return 0
   fi
   port=$(ot_terminal_port "$ct")
@@ -106,7 +106,7 @@ ot_connect() {
 ot_disconnect() {
   local ct=$1 name=$2
   if (( dry_run )); then
-    printf '+ pct exec %s -- open-terminal-clients revoke %s; remove its rule from %s\n' "$ct" "$name" "$PVE_ETC/firewall/$ct.fw"
+    printf '+ pct exec %s -- /usr/local/sbin/open-terminal-clients revoke %s; remove its rule from %s\n' "$ct" "$name" "$PVE_ETC/firewall/$ct.fw"
     return 0
   fi
   pct exec "$ct" -- /usr/local/sbin/open-terminal-clients revoke "$name" --missing-ok ||

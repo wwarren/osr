@@ -644,6 +644,6 @@ router_run python3 "$router_stage/integrate-webui.py" \
 (( dry_run )) && router_stage=''
 
 printf 'Open Terminal: http://%s:%s (reachable from %s at %s).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT" "$router_label" "$ROUTER_IP"
-printf 'Select "%s" in Open WebUI chats. Each user gets a workspace of their own in CT %s (/srv/open-terminal/ws/<id>; list them with: pct exec %s -- open-terminal-clients workspaces).\n' "$CONNECTION_NAME" "$CT_ID" "$CT_ID"
+printf 'Select "%s" in Open WebUI chats. Each user gets a workspace of their own in CT %s (/srv/open-terminal/ws/<id>; list them with: pct exec %s -- /usr/local/sbin/open-terminal-clients workspaces).\n' "$CONNECTION_NAME" "$CT_ID" "$CT_ID"
 printf 'Connection is admin-only. Grant groups in Admin Settings > Integrations > Open Terminal; each member works in their own workspace.\n'
 printf 'Agents: rerun their provisioner with OPEN_TERMINAL_URL=http://%s:%s (Hermes, OpenClaw, DeepSeek Harness).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT"

@@ -524,6 +524,15 @@ if [[ $mode != integrate ]]; then
       HONCHO_URL=''
       pve_offer HONCHO_URL 'Honcho API URL' "$honcho_offer" valid_honcho_url
       [[ -n $HONCHO_URL ]] || unset HONCHO_URL
+    else
+      # A reconfigure of a CT without Honcho can turn it on; Enter keeps it off.
+      honcho_ct_here=$(pve_tagged_ct honcho) honcho_offer=''
+      [[ -z $honcho_ct_here ]] || honcho_offer="http://$(pve_ct_net "$honcho_ct_here" ip):8000"
+      [[ $honcho_offer == 'http://:8000' || -z $honcho_offer ]] ||
+        pve_note "Honcho CT $honcho_ct_here is at $honcho_offer; enter that to turn Honcho memory on."
+      HONCHO_URL=''
+      pve_offer HONCHO_URL 'Honcho API URL (Enter keeps it off)' '' valid_honcho_url
+      [[ -n $HONCHO_URL ]] || unset HONCHO_URL
     fi
   fi
   if [[ -n ${HONCHO_URL:-} && -z ${HONCHO_CT_ID:-} && -z ${HONCHO_API_KEY_FILE:-} &&
