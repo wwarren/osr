@@ -313,9 +313,9 @@ BIND_IP=127.0.0.1 PORT=3080
 printf '500\n' > "$fake/http-code"
 assert_fail "HTTP 500 is not healthy" healthy
 printf '404\n' > "$fake/http-code"
-assert_fail "HTTP 404 is not the Harness login response" healthy
+assert_fail "HTTP 404 is not the DeepSeek login response" healthy
 printf '401\n' > "$fake/http-code"
-assert_ok "the unauthenticated Harness response is healthy" healthy
+assert_ok "the unauthenticated DeepSeek response is healthy" healthy
 rm -f -- "$fake/http-code"
 
 describe install_nodesource_repo
@@ -358,7 +358,7 @@ rm -f "$fake/npm-fail"
 describe install_dump_failure
 push_deploy
 touch "$fake/dump-fail"
-run_fails "a patch Harness rejects stops the run" DSH_VERSION=0.2.3
+run_fails "a patch DeepSeek rejects stops the run" DSH_VERSION=0.2.3
 assert_contains "the previous configuration is restored without a restart" "The previous configuration is back" "$out"
 assert_eq "on the previous release" "$first_release" "$(link)"
 rm -f "$fake/dump-fail"

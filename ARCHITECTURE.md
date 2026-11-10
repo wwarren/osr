@@ -45,7 +45,7 @@ flowchart LR
     term["Open Terminal LXC<br/>gateway :8000, a workspace per user"]
     hermes["Hermes Agent LXC<br/>API server :8642"]
     openclaw["OpenClaw LXC<br/>Gateway :18789"]
-    harness["DeepSeek Harness LXC<br/>Web UI :3080"]
+    deepseek["DeepSeek Harness LXC<br/>Web UI :3080"]
     honcho["Honcho LXC<br/>gateway :8000 API, :3000 MCP; a memory per user"]
     comfy["ComfyUI LXC<br/>:8188"]
     gitea["Gitea"]
@@ -64,9 +64,9 @@ flowchart LR
     hermes -->|direct inference| pool
     openclaw -.->|inventory and ranking :8000| router
     openclaw -->|direct inference| pool
-    browser -->|authenticated Web UI| harness
-    harness -->|OpenAI API| router
-    harness -.->|"MCP memory (optional)"| honcho
+    browser -->|authenticated Web UI| deepseek
+    deepseek -->|OpenAI API| router
+    deepseek -.->|"MCP memory (optional)"| honcho
     hermes -.->|"memory plugin (optional)"| honcho
     openclaw -.->|"memory plugin (optional)"| honcho
     webui -.->|"MCP tools (optional)"| honcho
@@ -78,7 +78,7 @@ flowchart LR
     monitor -->|health webhook: ollama-monitor| mm
     hermes <-->|hcom relay| mqtt
     openclaw <-->|hcom relay| mqtt
-    harness <-->|hcom relay| mqtt
+    deepseek <-->|hcom relay| mqtt
     observer <-->|hcom relay| mqtt
     observer -->|handoff webhook: agent-handoffs| mm
     gitea -.->|clone at provisioning| ct
@@ -948,7 +948,7 @@ acknowledgements.
 **Framework integration.** Hermes, OpenClaw and DeepSeek Harness poll `osr-bus
 inbox` through their terminal tools, as managed instruction blocks tell them
 (Hermes reads `/home/hermes/AGENTS.md`, its working directory's). hcom 0.7.31
-has no native hooks or wakeups for OpenClaw and Harness. Hermes's native plugin
+has no native hooks or wakeups for OpenClaw and DeepSeek. Hermes's native plugin
 is opt-in (`HCOM_HERMES_NATIVE=true`): the relay then runs as `hermes`, which
 holds the key, and `/hcom start hermes` works only in messaging-platform chats
 (the plugin treats Open WebUI's API-server sessions as not a chat). Tool use
@@ -968,7 +968,7 @@ an intentionally skipped event advances the atomically saved cursor (§10). One
 observer per group avoids duplicate streams.
 
 **Memory boundary.** No bus-to-Honcho archive or transcript retention job is
-installed; Honcho's plugins and Harness's MCP memory stay separate from hcom's
+installed; Honcho's plugins and DeepSeek's MCP memory stay separate from hcom's
 stores, but an agent can pass what it reads to memory, so separate storage and
 instructions alone do not enforce exclusion.
 

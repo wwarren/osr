@@ -24,7 +24,7 @@ Options:
                         names for this key, this agent's own; osr for another Honcho)
   --honcho-peer ID      This agent's Honcho peer (default: deepseek-harness)
   --user-peer ID        The user's Honcho peer (default: user)
-  --instructions FILE   Harness user-global AGENTS.md: write the Honcho block into it,
+  --instructions FILE   DeepSeek user-global AGENTS.md: write the Honcho block into it,
                         or remove that block when no --honcho-mcp-url is given
   --skip-honcho-check   Do not contact Honcho (the overlay is still written)
   --open-terminal-url URL  Open Terminal workspace gateway (http://host:port); adds
@@ -376,7 +376,7 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) { process.stdout.write(usage()); return; }
   const apiKey = process.env[options.apiKeyEnv];
-  if (!apiKey) throw new Error(`Set ${options.apiKeyEnv} before configuring Harness`);
+  if (!apiKey) throw new Error(`Set ${options.apiKeyEnv} before configuring DeepSeek`);
   const models = await getJson(`${options.routerUrl}/v1/models`, apiKey);
   const inventory = await getJson(`${options.routerUrl}/routing/inventory`, apiKey);
   const exact = validateModel(models, inventory, options.model, options.contextWindow);

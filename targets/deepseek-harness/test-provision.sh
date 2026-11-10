@@ -32,7 +32,7 @@ assert_fail "a missing one fails" record_value "$record" DSH_VERSION
 fw=$(mktemp)
 printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 8000 -log nolog\n' > "$fw"
 updated=$(router_fw_with_dsh "$fw" 192.0.2.81 8000)
-assert_contains "the router admits Harness first in [RULES]" \
+assert_contains "the router admits DeepSeek first in [RULES]" \
   "$(printf '[RULES]\nIN ACCEPT -source 192.0.2.81/32 -p tcp -dport 8000 -log nolog # osr-deepseek-harness-router\nIN ACCEPT -source 192.0.2.0/24')" "$updated"
 printf '%s\n' "$updated" > "$fw"
 moved=$(router_fw_with_dsh "$fw" 192.0.2.82 8001)
@@ -42,13 +42,13 @@ printf '[OPTIONS]\nenable: 1\n' > "$fw"
 assert_contains "a file without rules gets a [RULES] section" "$(printf '[RULES]\nIN ACCEPT -source 192.0.2.81/32')" "$(router_fw_with_dsh "$fw" 192.0.2.81 8000)"
 printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3080 -log nolog # osr-deepseek-harness\nIN ACCEPT -source 192.0.2.9/32 -p tcp -dport 22 -log nolog\n' > "$fw"
 new_rule='IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3081 -log nolog # osr-deepseek-harness'
-transition=$(harness_fw_transition "$fw" "$new_rule")
+transition=$(deepseek_fw_transition "$fw" "$new_rule")
 assert_contains "a port change keeps the old Web UI rule during guest install" '-dport 3080 -log nolog # osr-deepseek-harness' "$transition"
 assert_contains "and admits the new port during guest install" '-dport 3081 -log nolog # osr-deepseek-harness' "$transition"
 assert_contains "unrelated firewall rules remain" '-source 192.0.2.9/32 -p tcp -dport 22' "$transition"
 printf '%s\n' "$transition" > "$fw"
-final=$(harness_fw_final "$fw" "$new_rule")
-assert_eq "success leaves one Harness firewall rule" 1 "$(grep -c '# osr-deepseek-harness$' <<< "$final")"
+final=$(deepseek_fw_final "$fw" "$new_rule")
+assert_eq "success leaves one DeepSeek firewall rule" 1 "$(grep -c '# osr-deepseek-harness$' <<< "$final")"
 assert_not_contains "the old port closes after success" '-dport 3080 -log nolog # osr-deepseek-harness' "$final"
 assert_contains "the new port remains after success" '-dport 3081 -log nolog # osr-deepseek-harness' "$final"
 rm -f "$fw"
@@ -127,7 +127,7 @@ assert_contains "a dry-run reconfigure plans the guest run" 'install-target.sh' 
 assert_not_contains "and never creates a CT" 'pct create' "$plan"
 
 describe dsh_guided_prompts
-# An interactive run asks one section at a time: Router, then the Harness
+# An interactive run asks one section at a time: Router, then the DeepSeek
 # container (ID, template, storage, address, gateway), then its settings, then
 # Honcho. Offers come from the PVE configs (the router's tag, its gateway).
 lxc=$(mktemp -d)
@@ -136,12 +136,12 @@ printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: ai;osr
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.70/24\ntags: ai;osr-target;open-terminal\n' > "$lxc/270.conf"
 answers=$'\n281\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.81/24\n\n\n\n\n\n\n\n\n\n'
 out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "$answers")
-order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL|Open Terminal URL' <<< "$out" | paste -sd'|')
+order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL|Open Terminal URL' <<< "$out" | paste -sd'|')
 assert_eq "create asks router, then container, then settings, then Honcho" \
-  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|Harness IP/CIDR|Harness gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== DeepSeek Harness: create ==' \
+  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== DeepSeek Harness: create ==' \
   "$order"
 assert_contains "the tagged router is offered" 'Router CT ID [250]' "$out"
-assert_contains "the router's gateway is offered" 'Harness gateway [192.0.2.1]' "$out"
+assert_contains "the router's gateway is offered" 'DeepSeek gateway [192.0.2.1]' "$out"
 assert_contains "the Web UI range defaults to the CT's network" 'Web UI allowed from (IPv4 CIDR) [192.0.2.0/24]' "$out"
 assert_contains "the Honcho CT on this host is offered" 'Honcho API URL (none to skip) [http://192.0.2.85:8000]' "$out"
 assert_contains "Enter took it: memory through Honcho's MCP" 'DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp' "$out"
@@ -155,15 +155,15 @@ assert_contains '"none" leaves Honcho off' 'Honcho memory              off' "$ou
 assert_contains "and the guest gets no MCP URL" 'DSH_HONCHO_MCP_URL= DSH_OPEN_TERMINAL_URL' "$out"
 out=$(env "${common[@]}" PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< $'\n\n\n\n\n\n\n')
 assert_not_contains "preset values are not asked again" 'Router CT ID' "$out"
-assert_not_contains "(nor the address)" 'Harness IP/CIDR' "$out"
+assert_not_contains "(nor the address)" 'DeepSeek IP/CIDR' "$out"
 # A reconfigure starts with the CT to change, offered by its tag, then Router.
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.81/24\ntags: ai;osr-target;deepseek-harness\n' > "$lxc/281.conf"
 out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n\n\nnone\nnone\n')
 order=$(grep -oE '== [A-Za-z: ]+ ==|DeepSeek Harness CT ID|Router CT ID' <<< "$out" | paste -sd'|')
 assert_eq "reconfigure asks the CT first, then Router, then settings" \
   '== DeepSeek Harness container to reconfigure ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness settings ==|== Honcho memory ==|== Open Terminal workspace ==|== DeepSeek Harness: reconfigure ==' "$order"
-assert_contains "the tagged Harness CT is offered" 'DeepSeek Harness CT ID [281]' "$out"
-assert_not_contains "and never a new address" 'Harness IP/CIDR' "$out"
+assert_contains "the tagged DeepSeek CT is offered" 'DeepSeek Harness CT ID [281]' "$out"
+assert_not_contains "and never a new address" 'DeepSeek IP/CIDR' "$out"
 rm -rf -- "$lxc"
 
 describe dsh_reconfigure_firewall
@@ -217,16 +217,16 @@ reset_fake() {
 reconf=(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp"
   "OSR_FW_SWAP_TEST_FAIL_FILE=$fake/swap-fail" NONINTERACTIVE=true
   CT_ID=281 ROUTER_CT_ID=250 DSH_PORT=3081 bash "$provision" --reconfigure)
-harness_ports() { sed -nE 's/.*-dport ([0-9]+) .*# osr-deepseek-harness$/\1/p' "$fake/pve/firewall/281.fw" | paste -sd' '; }
+deepseek_ports() { sed -nE 's/.*-dport ([0-9]+) .*# osr-deepseek-harness$/\1/p' "$fake/pve/firewall/281.fw" | paste -sd' '; }
 stages() { find "$fake/tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' '; }
 
 reset_fake
 status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a healthy reconfigure succeeds" 0 "$status"
 assert_eq "both ports are open while the guest installs" '3080 3081' "$(sed -nE 's/.*-dport ([0-9]+) .*# osr-deepseek-harness$/\1/p' "$fake/fw-during" | paste -sd' ')"
-assert_eq "then only the new port" 3081 "$(harness_ports)"
+assert_eq "then only the new port" 3081 "$(deepseek_ports)"
 assert_contains "other CT rules stay" '-source 192.0.2.9/32 -p tcp -dport 22' "$(cat "$fake/pve/firewall/281.fw")"
-assert_contains "the router admits Harness" '# osr-deepseek-harness-router' "$(cat "$fake/pve/firewall/250.fw")"
+assert_contains "the router admits DeepSeek" '# osr-deepseek-harness-router' "$(cat "$fake/pve/firewall/250.fw")"
 assert_eq "and no staging directory is left" 0 "$(stages)"
 
 reset_fake
@@ -253,14 +253,14 @@ reset_fake
 echo 1 > "$fake/guest-status"; touch "$fake/commit"
 status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a guest that fails after switching still fails the run" 1 "$status"
-assert_eq "but its new port stays open, alone" 3081 "$(harness_ports)"
-assert_contains "and the run says why" 'failed after Harness switched to the new settings' "$out"
+assert_eq "but its new port stays open, alone" 3081 "$(deepseek_ports)"
+assert_contains "and the run says why" 'failed after DeepSeek switched to the new settings' "$out"
 
 reset_fake
 echo 1 > "$fake/guest-status"; touch "$fake/break-settings"
 status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a failed guest whose settings cannot be read fails" 1 "$status"
-assert_eq "and keeps both ports, as either may be serving" '3080 3081' "$(harness_ports)"
+assert_eq "and keeps both ports, as either may be serving" '3080 3081' "$(deepseek_ports)"
 assert_contains "saying so" 'keeps both Web UI rules' "$out"
 assert_eq "without leaving the staging directory" 0 "$(stages)"
 
@@ -268,13 +268,13 @@ reset_fake
 echo 1 > "$fake/guest-status"; touch "$fake/commit-model"
 status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a changed record without the new port fails" 1 "$status"
-assert_eq "and keeps both ports too" '3080 3081' "$(harness_ports)"
+assert_eq "and keeps both ports too" '3080 3081' "$(deepseek_ports)"
 
 reset_fake
 echo 1 > "$fake/guest-status"; touch "$fake/rollback-pending"
 status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a failed rollback before the new settings record fails" 1 "$status"
-assert_eq "and keeps both ports even though the record is unchanged" '3080 3081' "$(harness_ports)"
+assert_eq "and keeps both ports even though the record is unchanged" '3080 3081' "$(deepseek_ports)"
 assert_contains "with an unknown-state explanation" 'keeps both Web UI rules' "$out"
 
 reset_fake
@@ -283,7 +283,7 @@ status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 assert_eq "a firewall staging failure stops reconfigure" 1 "$status"
 assert_ok "without changing the live firewall" cmp -s "$fake/ct.orig" "$fake/pve/firewall/281.fw"
 kept=$(find "$fake/tmp" -mindepth 1 -maxdepth 1)
-assert_ok "and keeps the original firewall backup" test -s "$kept/harness.fw.before"
+assert_ok "and keeps the original firewall backup" test -s "$kept/deepseek.fw.before"
 assert_ok "without keeping the router key" test ! -e "$kept/router-api-key"
 rm -rf -- "${fake:?}/tmp/"*
 
@@ -301,7 +301,7 @@ assert_contains "the edit is kept" '-source 192.0.2.7/32 -p tcp -dport 22' "$(ca
 assert_contains "and the run says it did not restore" 'changed during this run; it was not restored' "$out"
 assert_eq "the router firewall is still restored" "$(cat "$fake/router.orig")" "$(cat "$fake/pve/firewall/250.fw")"
 kept=$(find "$fake/tmp" -mindepth 1 -maxdepth 1)
-assert_ok "the previous content is kept for recovery" test -s "$kept/harness.fw.before"
+assert_ok "the previous content is kept for recovery" test -s "$kept/deepseek.fw.before"
 assert_ok "without the router key" test ! -e "$kept/router-api-key"
 rm -rf -- "${fake:?}/tmp/"*
 
@@ -313,7 +313,7 @@ for _ in $(seq 50); do [[ -e $fake/guest-started ]] && break; sleep 0.1; done
 kill -TERM "$pid"
 status=0; wait "$pid" || status=$?
 assert_eq "an interrupted run fails" 143 "$status"
-assert_eq "and keeps both ports open, as the guest may still be installing" '3080 3081' "$(harness_ports)"
+assert_eq "and keeps both ports open, as the guest may still be installing" '3080 3081' "$(deepseek_ports)"
 assert_contains "telling how to finish" 'Rerun with --reconfigure to finish' "$(cat "$fake/out")"
 assert_eq "without leaving the staging directory" 0 "$(stages)"
 # Open Terminal on a reconfigure: the terminal CT (found by its address)

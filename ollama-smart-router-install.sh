@@ -1758,7 +1758,7 @@ prompt_target_settings() {
       echo "    Its context window is asked with the model targets' windows, below."
     fi
     if [[ $name == deepseek-harness ]]; then
-      echo "    Harness runs its own tools; choose an OSR model that supports tool calls."
+      echo "    DeepSeek runs its own tools; choose an OSR model that supports tool calls."
       prompt_until_valid "    Model or tier" DEEPSEEK_HARNESS_MODEL "${DEEPSEEK_HARNESS_MODEL:-auto}" valid_honcho_model || return 1
     fi
     if [[ $name == comfyui ]]; then
@@ -2186,7 +2186,7 @@ run_target_provisioner() {
         ot_ip="$(target_setting open-terminal IP_CIDR)"
         export OPEN_TERMINAL_URL="http://${ot_ip%/*}:${OPEN_TERMINAL_PORT:-8000}" OPEN_TERMINAL_CT_ID="$ot_ct"
       fi
-      # Harness talks to the router, never to Open WebUI: no admin token.
+      # DeepSeek talks to the router, never to Open WebUI: no admin token.
       if [[ "$name" == deepseek-harness ]]; then
         export DEEPSEEK_HARNESS_MODEL="${DEEPSEEK_HARNESS_MODEL:-auto}"
         export DEEPSEEK_HARNESS_CONTEXT_WINDOW="${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-65536}"

@@ -2,21 +2,21 @@
 
 Runs [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`) as a separate CPU-only agent in its own unprivileged Debian 12/13 LXC,
-with its Web UI, sessions, shell tools and workspace there. Harness uses the
+with its Web UI, sessions, shell tools and workspace there. DeepSeek uses the
 router as a custom OpenAI-compatible provider (no direct dispatcher); it is
 not a model in OSR's pool and not an Open WebUI tool, so it needs **no Open
 WebUI admin token**. The provisioner reads the router key from the router CT
-into a root-only systemd environment file; the generated Harness patch names
-only the variable. With Honcho, Harness gets the shared long-term memory
+into a root-only systemd environment file; the generated DeepSeek patch names
+only the variable. With Honcho, DeepSeek gets the shared long-term memory
 ([Honcho memory](#honcho-memory)). The [hcom target](../hcom/README.md) adds
-`osr-bus` and its own instruction block (Harness polls through its shell
-tools; the relay key stays in an account Harness cannot read). With the
-[Open Terminal target](../open-terminal/README.md), Harness gets its own
+`osr-bus` and its own instruction block (DeepSeek polls through its shell
+tools; the relay key stays in an account DeepSeek cannot read). With the
+[Open Terminal target](../open-terminal/README.md), DeepSeek gets its own
 workspace there as MCP tools ([Open Terminal workspace](#open-terminal-workspace)).
 
-**Trust.** Harness's shell tools inherit the service environment, so the agent
+**Trust.** DeepSeek's shell tools inherit the service environment, so the agent
 and anything it runs can read the router key and, with Honcho, this CT's
-Honcho key (which reaches only Harness's own Honcho workspace, never another
+Honcho key (which reaches only DeepSeek's own Honcho workspace, never another
 agent's or an Open WebUI user's memory). Limit Web UI access to people trusted to operate OSR.
 
 ## Requirements
@@ -26,7 +26,7 @@ agent's or an Open WebUI user's memory). Limit Web UI access to people trusted t
 - The router running as a CT **on the same PVE host** (address and key are read
   with `pct exec`).
 - An OSR model with tool calls that serves the configured context (check
-  `tools` and `context_length` in `/routing/inventory`). Harness's 29 tools
+  `tools` and `context_length` in `/routing/inventory`). DeepSeek's 29 tools
   take ~6,000 tokens per request in 0.2.1; Honcho's MCP tools add several
   thousand more.
 - The router port must accept the CT. When the router has a firewall file, the
@@ -37,7 +37,7 @@ The guest installs Node.js 24.9+ (NodeSource's signed Node 24 repository if
 missing), then the official `@deepseek-ai/dsh` npm package as the unprivileged
 `deepseek-harness` account. No DeepSeek API subscription is needed.
 
-**Pinned release.** Harness is a developer preview with breaking changes, so
+**Pinned release.** DeepSeek is a developer preview with breaking changes, so
 the target installs `0.2.1-rc.5` (npm `latest` on 2026-11-03) unless
 `DSH_VERSION` is set. It was checked against the generated patch (`dsh
 --dump-config`), a headless chat through the OSR provider (system role,
@@ -82,31 +82,31 @@ when none is given.
 ## Honcho memory
 
 Hermes and OpenClaw use native Honcho plugins that record every turn and
-inject memory without the model acting. Harness has no plugin; it uses
+inject memory without the model acting. DeepSeek has no plugin; it uses
 Honcho's MCP server through `@deepseek-ai/dsh-mcp-client` (DeepSeek's route
 for third-party memory), so the tools appear as `mcp__honcho__*` and the
 model decides when to call them:
 
-- **Its own memory.** A Honcho workspace of Harness's own
+- **Its own memory.** A Honcho workspace of DeepSeek's own
   (`deepseek-harness-<CT>`, named by the Honcho gateway for its key), as its
-  Open Terminal workspace is: the `user` peer there is what Harness learned;
-  Hermes, OpenClaw and Open WebUI users have workspaces of their own. Harness
+  Open Terminal workspace is: the `user` peer there is what DeepSeek learned;
+  Hermes, OpenClaw and Open WebUI users have workspaces of their own. DeepSeek
   writes as peer `deepseek-harness`.
 - **Model-driven.** Honcho's MCP instructions and a managed block (between
   `osr-honcho` markers) in the user-global
   `/var/lib/deepseek-harness/home/AGENTS.md` tell the model to look up context,
   open a session and record each exchange; weak tool callers forget.
 - **Cost.** Recording adds tool calls every turn and tool definitions to every
-  request: give Harness 32768 tokens or more.
+  request: give DeepSeek 32768 tokens or more.
 
 With the main installer, select `honcho` with `deepseek-harness`. On an
 existing install:
 
 ```bash
-# Admit Harness in the Honcho firewall (list every agent's IP).
+# Admit DeepSeek in the Honcho firewall (list every agent's IP).
 CT_ID=285 ROUTER_CT_ID=280 HONCHO_CLIENT_IPS='192.0.2.82 192.0.2.83 192.0.2.81' \
   bash targets/honcho/provision-lxc.sh --reconfigure
-# Turn Honcho on for Harness; CT 285 issues its own key (client deepseek-harness-281).
+# Turn Honcho on for DeepSeek; CT 285 issues its own key (client deepseek-harness-281).
 CT_ID=281 ROUTER_CT_ID=280 HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=285 \
   bash targets/deepseek-harness/provision-lxc.sh --reconfigure
 ```
@@ -118,13 +118,13 @@ admit this CT (and prints the Honcho command); the guest checks the key with an
 MCP `initialize` before writing the overlay. The key lives only in
 `/etc/deepseek-harness/service.env` (root-only) and the service environment,
 read by the overlay with a `!!js` expression. The key is this CT's own client
-key for the Honcho gateway, pinned to Harness's own workspace; it is
+key for the Honcho gateway, pinned to DeepSeek's own workspace; it is
 issued once the run is confirmed and kept by later reconfigures while Honcho
 accepts it (a Honcho `--rotate-keys` does not change it). Reconfigures keep
 Honcho on; `HONCHO_URL=` removes the MCP entry, key and `AGENTS.md` block and
 revokes the key in the Honcho CT.
 
-To verify: ask Harness to remember something unique, watch for an
+To verify: ask DeepSeek to remember something unique, watch for an
 `mcp__honcho__add_messages_to_session` or `create_conclusions` call, then ask
 for it in a new session; Hermes or OpenClaw can recall it once the deriver has
 processed it (`journalctl -u honcho-deriver` in the Honcho CT).
@@ -140,9 +140,9 @@ by its address, or `OPEN_TERMINAL_CT_ID`) issue a client key for
 `/etc/deepseek-harness/open-terminal-key` and the service environment
 (`OSR_OPEN_TERMINAL_KEY`, read by the overlay with a `!!js` expression), and
 the guest checks it with an MCP `initialize` before writing the overlay. The
-tools act in Harness's own workspace in the terminal CT, separate from every
-Open WebUI user and every other agent; Harness's shell tools still run here.
-As with the router key, anything Harness runs can read this key; it reaches
+tools act in DeepSeek's own workspace in the terminal CT, separate from every
+Open WebUI user and every other agent; DeepSeek's shell tools still run here.
+As with the router key, anything DeepSeek runs can read this key; it reaches
 only that workspace.
 
 Reconfigures keep the connection, and the key while the terminal accepts it;
@@ -169,9 +169,9 @@ pct exec <CT> -- journalctl -u deepseek-harness.service -b --no-pager | grep 'ds
 The Web UI is plain HTTP (the token crosses the LAN). Workspace:
 `/var/lib/deepseek-harness/workspace`; profile home:
 `/var/lib/deepseek-harness/home`. Tools run as `deepseek-harness` under
-Harness's permission preset; releases are root-owned, so the agent cannot
+DeepSeek's permission preset; releases are root-owned, so the agent cannot
 change its own code. Outbound traffic is allowed (npm, agent tools), subject to
-Harness's policy.
+DeepSeek's policy.
 
 **Models chosen in the Web UI** (Settings > Models) edit the profile's own
 `cordis.patch.yml`, but this target's overlay is applied after it and replaces
@@ -195,7 +195,7 @@ to the pin. An unchanged rerun with a healthy service does nothing.
 
 **Firewall during reconfigure.** A port change admits both old and new ports
 until the guest is healthy, then only the new one. A failed guest run restores
-the Harness and router firewall files once the previous service is back; if the
+the DeepSeek and router firewall files once the previous service is back; if the
 new service is running the new rule stays (the run still fails); if rollback is
 incomplete or unreadable, or the run was interrupted (Ctrl-C, closed SSH), both
 rules stay. Writes use Proxmox's per-CT lock and a staged replacement; a file
@@ -215,7 +215,7 @@ restored and the service is never restarted. If the new release does not answer
 within 90 seconds of the restart, the previous release and files are restored,
 restarted and health-checked, and the run says whether it runs again. After
 success, the copies and previous release are deleted. Session logs are not
-snapshotted: a newer Harness may upgrade sessions it opened beyond what an
+snapshotted: a newer DeepSeek may upgrade sessions it opened beyond what an
 older release can read.
 
 **When the rollback does not complete**, the snapshot stays and the next run
@@ -232,7 +232,7 @@ not exist); `profiles.tar` unpacks into `/var/lib/deepseek-harness/home`. Run
 reconfigure.
 
 A failed first install keeps its CT and release; reconfigure after fixing the
-DNS, model or npm error. A CT from the first version of this target (Harness
+DNS, model or npm error. A CT from the first version of this target (DeepSeek
 directly in `/opt/deepseek-harness`, no settings record) moves to the release
 layout on its first reconfigure; pass `DSH_MODEL` and the other settings then.
 

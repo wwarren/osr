@@ -1106,13 +1106,13 @@ assert_fail "a unit suffix" valid_honcho_context_tokens 32k
 assert_fail "a leading zero" valid_honcho_context_tokens 032768
 
 describe valid_dsh_context_tokens
-assert_ok "a 32k Harness window" valid_dsh_context_tokens 32768
-assert_ok "Harness minimum" valid_dsh_context_tokens 16384
-assert_ok "Harness maximum" valid_dsh_context_tokens 1048576
-assert_fail "Harness refuses an 8k window" valid_dsh_context_tokens 8192
-assert_fail "Harness refuses excessive context" valid_dsh_context_tokens 1048577
-assert_fail "Harness refuses a unit suffix" valid_dsh_context_tokens 32k
-assert_fail "Harness refuses a leading zero" valid_dsh_context_tokens 032768
+assert_ok "a 32k DeepSeek window" valid_dsh_context_tokens 32768
+assert_ok "DeepSeek minimum" valid_dsh_context_tokens 16384
+assert_ok "DeepSeek maximum" valid_dsh_context_tokens 1048576
+assert_fail "DeepSeek refuses an 8k window" valid_dsh_context_tokens 8192
+assert_fail "DeepSeek refuses excessive context" valid_dsh_context_tokens 1048577
+assert_fail "DeepSeek refuses a unit suffix" valid_dsh_context_tokens 32k
+assert_fail "DeepSeek refuses a leading zero" valid_dsh_context_tokens 032768
 
 describe valid_honcho_model
 assert_ok "a router tier" valid_honcho_model fast
@@ -1356,7 +1356,7 @@ TARGETS="llamacpp deepseek-harness"; LLAMACPP_GPU_CARD=0000:01:00.0; PARALLEL_SL
 prompt_target_contexts > "$_out" 2>&1 <<< $'\n\n'
 assert_eq "llama.cpp asks per request" 65536 "$LLAMACPP_CONTEXT"
 assert_contains "and says what CONTEXT_SIZE becomes" "CONTEXT_SIZE=131072" "$(cat "$_out")"
-assert_eq "Harness defaults to the smallest window too" 65536 "$DEEPSEEK_HARNESS_CONTEXT_WINDOW"
+assert_eq "DeepSeek defaults to the smallest window too" 65536 "$DEEPSEEK_HARNESS_CONTEXT_WINDOW"
 TARGETS="honcho"; unset HONCHO_CONTEXT_TOKENS
 prompt_target_contexts > "$_out" 2>&1 <<< $'\n'
 assert_eq "without model targets, Honcho defaults to 65536" 65536 "$HONCHO_CONTEXT_TOKENS"
@@ -1498,7 +1498,7 @@ assert_eq "OpenClaw too gets the router CT, the router's template and the token"
   "provision openclaw|918|192.0.2.98/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner deepseek-harness
-assert_eq "Harness gets its own CT and router, without the Open WebUI admin token" \
+assert_eq "DeepSeek gets its own CT and router, without the Open WebUI admin token" \
   "provision deepseek-harness|921|192.0.2.101/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|no|
 context-env ||||unset|65536" "$(mock_calls)"
 mock_reset_log
@@ -1743,12 +1743,12 @@ assert_contains "and gives its partial CT recovery command" \
 TARGETS="deepseek-harness"
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?
-assert_eq "Harness alone succeeds without Open WebUI admin setup" 0 "$_rc"
+assert_eq "DeepSeek alone succeeds without Open WebUI admin setup" 0 "$_rc"
 assert_eq "it provisions directly" "run deepseek-harness" "$(mock_calls)"
 TARGETS="hermes deepseek-harness"
 mock_reset_log
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
-assert_eq "Harness still runs when Open WebUI has no admin key" "$(printf '%s\n' wait token 'run deepseek-harness')" "$(mock_calls)"
+assert_eq "DeepSeek still runs when Open WebUI has no admin key" "$(printf '%s\n' wait token 'run deepseek-harness')" "$(mock_calls)"
 assert_contains "Hermes is skipped" "skipped (no Open WebUI admin key)" "$(cat "$_out")"
 TARGETS="ollama strata hermes"
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?

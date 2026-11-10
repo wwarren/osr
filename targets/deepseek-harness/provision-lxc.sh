@@ -28,7 +28,7 @@ Settings: DSH_MODEL=auto, DSH_CONTEXT_WINDOW=32768, DSH_MAX_TOKENS=8192,
 Honcho memory: HONCHO_URL=http://<honcho-ip>:8000 with HONCHO_CT_ID (or
   HONCHO_API_KEY_FILE); HONCHO_MCP_URL overrides the derived
   http://<honcho-ip>:3000/mcp. HONCHO_URL= (set, empty) turns it off.
-Open Terminal: OPEN_TERMINAL_URL=http://<terminal-ip>:8000 gives Harness its
+Open Terminal: OPEN_TERMINAL_URL=http://<terminal-ip>:8000 gives DeepSeek its
   own workspace in the Open Terminal CT, as MCP tools. With OPEN_TERMINAL_CT_ID
   (detected from the address) this script issues the CT's client key and
   admits it in the terminal's firewall; OPEN_TERMINAL_KEY_FILE uses a key
@@ -90,7 +90,7 @@ router_fw_with_dsh() {
 }
 # Keep the old Web UI rule until the reconfigured guest is healthy. The new
 # port is also reachable while its service starts; other rules stay in place.
-harness_fw_transition() {
+deepseek_fw_transition() {
   awk -v rule="$2" '
     / # osr-deepseek-harness$/ {
       if (!seen) { print; if ($0 != rule) print rule; seen=1 }
@@ -100,7 +100,7 @@ harness_fw_transition() {
     END { if (!seen) exit 1 }
   ' "$1"
 }
-harness_fw_final() {
+deepseek_fw_final() {
   awk -v rule="$2" '
     / # osr-deepseek-harness$/ { next }
     { print; if ($0 == "[RULES]") print rule }
@@ -162,7 +162,7 @@ NAMESERVER=${NAMESERVER:-}
 VLAN_TAG=${VLAN_TAG:-}
 DSH_ROUTER_FIREWALL=${DSH_ROUTER_FIREWALL:-true}
 DEFAULT_DSH_VERSION=0.2.1-rc.5
-# Harness settings: DSH_* or the installer's DEEPSEEK_HARNESS_* names. Unset
+# DeepSeek settings: DSH_* or the installer's DEEPSEEK_HARNESS_* names. Unset
 # ones keep the CT's recorded value on a reconfigure, else take the default.
 declare -A dsh_default=([MODEL]=auto [CONTEXT_WINDOW]=32768 [MAX_TOKENS]=8192 [VERSION]=$DEFAULT_DSH_VERSION [PORT]=3080)
 declare -A dsh_given=()
@@ -214,17 +214,17 @@ if [[ $mode == create ]]; then
   pve_select_storage STORAGE rootdir "$ROOTFS_GB"
   pve_suggest TEMPLATE 'Debian 12/13 amd64 template' '' valid_template 'Use a downloaded Debian 12/13 amd64 template (storage:vztmpl/...).'
   pve_suggest STORAGE 'Root disk storage' '' valid_storage
-  pve_ask_network 'Harness'
+  pve_ask_network 'DeepSeek'
 else
   pve_ask_existing_ct deepseek-harness 'DeepSeek Harness'
   pve_valid_ct_id "$CT_ID" || die 'CT_ID must be a numeric Proxmox ID (100 or greater).'
   if (( ! dry_run )); then
     # What the CT records: the defaults for every question below.
-    pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "Harness CT $CT_ID is not running."
+    pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "DeepSeek CT $CT_ID is not running."
     pve_ct_described "$CT_ID" 'DeepSeek Harness for Ollama Smart Router' ||
       die 'The selected CT is not this target; refusing to reconfigure it.'
     IP_CIDR=$(pct exec "$CT_ID" -- ip -4 -o addr show dev eth0 | awk 'NR==1 {print $4}')
-    valid_cidr "$IP_CIDR" || die 'Cannot determine the Harness CT IPv4 address.'
+    valid_cidr "$IP_CIDR" || die 'Cannot determine the DeepSeek CT IPv4 address.'
     recorded=$(pct exec "$CT_ID" -- cat /etc/deepseek-harness/settings 2>/dev/null | tr -d '\r' || true)
     [[ -n $recorded ]] || note "CT $CT_ID has no settings record (made by the first version of this target); the defaults below are this target's."
     recorded_router=$(record_value "$recorded" DSH_ROUTER_URL 2>/dev/null || true)
@@ -237,7 +237,7 @@ else
 fi
 pve_valid_ct_id "$ROUTER_CT_ID" && pve_valid_ct_id "$CT_ID" ||
   die 'ROUTER_CT_ID and CT_ID must be numeric Proxmox IDs (100 or greater).'
-[[ $ROUTER_CT_ID != "$CT_ID" ]] || die 'Harness and router CT IDs must differ.'
+[[ $ROUTER_CT_ID != "$CT_ID" ]] || die 'DeepSeek and router CT IDs must differ.'
 
 pve_section 'DeepSeek Harness settings'
 pve_note 'A concrete OSR model that calls tools gives steadier agent sessions than a tier (auto, fast, ...).'
@@ -256,7 +256,7 @@ fi
 # A dry-run reconfigure cannot read the CT's firewall; it plans without a range.
 valid_access() { valid_cidr "$1" || [[ -z $1 && $mode == reconfigure && $dry_run == 1 ]]; }
 pve_ask DSH_ACCESS_CIDR 'Web UI allowed from (IPv4 CIDR)' "$access_default" valid_access 'Use a.b.c.d/nn, e.g. your LAN.'
-pve_ask DSH_VERSION 'Harness npm release' "$(recorded_or DSH_VERSION "${dsh_default[VERSION]}")" valid_version \
+pve_ask DSH_VERSION 'DeepSeek npm release' "$(recorded_or DSH_VERSION "${dsh_default[VERSION]}")" valid_version \
   'Use an exact npm version (e.g. 0.2.1-rc.5) or latest.'
 if [[ $DSH_VERSION != "$DEFAULT_DSH_VERSION" && -n $recorded ]]; then
   note "This target is tested with $DEFAULT_DSH_VERSION; answer $DEFAULT_DSH_VERSION to move to it."
@@ -284,7 +284,7 @@ elif [[ -z $honcho_url_set && -z $honcho_mcp_set ]]; then
       pve_note "Honcho CT $honcho_ct_here is at http://$honcho_ip_here:8000; enter that to turn Honcho memory on."
   fi
   pve_section 'Honcho memory'
-  pve_note 'Long-term memory in a Honcho workspace of Harness'"'"'s own (like its Open Terminal workspace).'
+  pve_note 'Long-term memory in a Honcho workspace of DeepSeek'"'"'s own (like its Open Terminal workspace).'
   if [[ -n $honcho_recorded ]]; then
     # A recorded Honcho stays on unattended; "none" turns it off.
     pve_ask HONCHO_URL 'Honcho API URL (none to turn off)' "$honcho_offer" valid_honcho_url
@@ -315,7 +315,7 @@ if [[ -z $ot_url_set ]]; then
     fi
   fi
   pve_section 'Open Terminal workspace'
-  pve_note 'A private workspace for Harness in the Open Terminal CT, as MCP tools beside its own shell tools.'
+  pve_note 'A private workspace for DeepSeek in the Open Terminal CT, as MCP tools beside its own shell tools.'
   if [[ -n $ot_prev_url ]]; then
     # A recorded workspace stays connected unattended; "none" disconnects it.
     pve_ask OPEN_TERMINAL_URL 'Open Terminal URL (none to turn off)' "$ot_offer" ot_valid_url
@@ -394,7 +394,7 @@ finish() {
       # the old nor the new port is shut. A rerun finishes the change.
       note "Interrupted: the CT firewall still admits the old and new Web UI rules. Rerun with --reconfigure to finish."
     else
-      restore_fw "$FW_DIR/${CT_ID}.fw" "$ct_fw_before" "$stage/firewall.transition" 'Harness CT' || keep_backups=true
+      restore_fw "$FW_DIR/${CT_ID}.fw" "$ct_fw_before" "$stage/firewall.transition" 'DeepSeek CT' || keep_backups=true
       if $router_fw_written; then
         restore_fw "$FW_DIR/${ROUTER_CT_ID}.fw" "$router_fw_before" "$stage/router.fw" 'router CT' || keep_backups=true
       fi
@@ -491,14 +491,14 @@ ROUTER_URL="http://$router_ip:$router_port"
 pve_summary "DeepSeek Harness: $mode"
 pve_row 'Router' "CT $ROUTER_CT_ID, $ROUTER_URL"
 if [[ $mode == create ]]; then
-  pve_row 'Harness CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
+  pve_row 'DeepSeek CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
   pve_row 'Template' "$TEMPLATE"
   pve_row 'Network' "$IP_CIDR via $GATEWAY on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
 else
-  pve_row 'Harness CT' "$CT_ID at ${IP_CIDR:-<existing address>}"
+  pve_row 'DeepSeek CT' "$CT_ID at ${IP_CIDR:-<existing address>}"
 fi
 pve_row 'Model' "$DSH_MODEL (context $DSH_CONTEXT_WINDOW, replies up to $DSH_MAX_TOKENS tokens)"
-pve_row 'Harness release' "$DSH_VERSION"
+pve_row 'DeepSeek release' "$DSH_VERSION"
 pve_row 'Web UI' "port $DSH_PORT, allowed from $DSH_ACCESS_CIDR"
 pve_row 'Honcho memory' "${honcho_mcp:-off}"
 pve_row 'Open Terminal' "${OPEN_TERMINAL_URL:-off}"
@@ -543,9 +543,9 @@ else
     # A CT made by an older version gets the tags tools/upgrade-all.sh finds it by.
     pve_ensure_tags "$CT_ID" ai ai-tools osr-target deepseek-harness
     router_fw=$FW_DIR/${ROUTER_CT_ID}.fw
-    ct_fw_before=$stage/harness.fw.before
+    ct_fw_before=$stage/deepseek.fw.before
     cp -- "$firewall_file" "$ct_fw_before"
-    harness_fw_transition "$ct_fw_before" "$rule" > "$stage/firewall.transition"
+    deepseek_fw_transition "$ct_fw_before" "$rule" > "$stage/firewall.transition"
     swap=0
     fw_swap "$firewall_file" "$ct_fw_before" "$stage/firewall.transition" || swap=$?
     if (( swap != 0 )); then
@@ -558,8 +558,8 @@ else
   fi
 fi
 
-# The router CT's own firewall must let Harness reach the router API. One owned
-# rule, replaced when the Harness address or router port changes; everything
+# The router CT's own firewall must let DeepSeek reach the router API. One owned
+# rule, replaced when the DeepSeek address or router port changes; everything
 # else in that file stays as it is.
 router_fw=$FW_DIR/${ROUTER_CT_ID}.fw
 if [[ $DSH_ROUTER_FIREWALL == true ]]; then
@@ -647,11 +647,11 @@ if (( guest_status != 0 )); then
   fi
   case $state in
     previous) exit "$guest_status" ;;  # the EXIT trap restores the firewall
-    switched) note "The guest run failed after Harness switched to the new settings; keeping the new Web UI rule." ;;
+    switched) note "The guest run failed after DeepSeek switched to the new settings; keeping the new Web UI rule." ;;
     *)
       # Closing either port could shut the one being served: keep both.
       firewall_txn_active=false
-      note "Cannot tell whether Harness serves port $DSH_PORT or the previous one, so $firewall_file keeps both Web UI rules."
+      note "Cannot tell whether DeepSeek serves port $DSH_PORT or the previous one, so $firewall_file keeps both Web UI rules."
       note "Check with: pct exec $CT_ID -- cat /etc/deepseek-harness/settings; then run --reconfigure again."
       exit "$guest_status" ;;
   esac
@@ -662,20 +662,20 @@ if [[ $mode == reconfigure && $dry_run == 0 ]]; then
   # firewall if finalization fails, so the new Web UI port stays reachable.
   firewall_txn_active=false
   cp -- "$firewall_file" "$stage/firewall.seen"
-  if ! harness_fw_final "$stage/firewall.seen" "$rule" > "$stage/firewall.final"; then
+  if ! deepseek_fw_final "$stage/firewall.seen" "$rule" > "$stage/firewall.final"; then
     preserve_stage=true
-    die "Harness is running, but its final firewall rule could not be built. Check $firewall_file."
+    die "DeepSeek is running, but its final firewall rule could not be built. Check $firewall_file."
   fi
   swap=0
   fw_swap "$firewall_file" "$stage/firewall.seen" "$stage/firewall.final" || swap=$?
   case $swap in
     0) ;;
     1) preserve_stage=true
-       die "Harness is running, but $firewall_file changed while the run finished; it was left as it is. Check the live file and rerun --reconfigure." ;;
+       die "DeepSeek is running, but $firewall_file changed while the run finished; it was left as it is. Check the live file and rerun --reconfigure." ;;
     *)
       preserve_stage=true
       note "The previous content is in $stage/firewall.seen; check the live file before restoring it."
-      die "Harness is running, but its firewall rule could not be finalized. Check $firewall_file." ;;
+      die "DeepSeek is running, but its firewall rule could not be finalized. Check $firewall_file." ;;
   esac
 fi
 (( guest_status == 0 )) || exit "$guest_status"

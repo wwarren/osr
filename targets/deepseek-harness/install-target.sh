@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run inside the dedicated DeepSeek Harness LXC after provision-lxc.sh pushes
-# the keys and this target's files. Installs or reconfigures Harness; on an
+# the keys and this target's files. Installs or reconfigures DeepSeek; on an
 # installed CT a failed run puts the previous release and configuration back.
 set -Eeuo pipefail
 umask 077
@@ -26,7 +26,7 @@ USAGE
 }
 
 # The release this target was tested with (dsh --dump-config, a headless chat
-# through the OSR provider and the Honcho MCP connection). Harness is a
+# through the OSR provider and the Honcho MCP connection). DeepSeek is a
 # developer preview with breaking changes; move the pin after testing.
 DEFAULT_VERSION=0.2.1-rc.5
 
@@ -175,7 +175,7 @@ if (( dry_run )); then
   exit 0
 fi
 
-[[ $(id -u) == 0 ]] || die 'Run as root inside the Harness CT.'
+[[ $(id -u) == 0 ]] || die 'Run as root inside the DeepSeek CT.'
 install -d -m 0750 "$ETC_DIR"
 exec {lock_fd}> "$ETC_DIR/.install.lock"
 flock -n "$lock_fd" || die 'Another install-target.sh run holds the lock.'
@@ -404,7 +404,7 @@ service_env=$(mktemp "$ETC_DIR/service.env.XXXXXX")
 chmod 0600 "$service_env"
 mv -f -- "$service_env" "$ETC_DIR/service.env"
 
-# A configuration dump with the new release validates Harness's patch syntax
+# A configuration dump with the new release validates DeepSeek's patch syntax
 # without a model request. Keep the dump private: it shows the composition.
 dump=$(mktemp)
 if ! runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR" \
@@ -412,7 +412,7 @@ if ! runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR
     --profile web --patch "$ETC_DIR/osr.patch.yml" --dump-config > "$dump" 2>&1; then
   tail -n 40 "$dump" >&2
   rm -f -- "$dump"
-  die 'Harness rejected the generated patch.'
+  die 'DeepSeek rejected the generated patch.'
 fi
 rm -f -- "$dump"
 

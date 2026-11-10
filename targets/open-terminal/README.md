@@ -17,7 +17,7 @@ the router's filesystem.
 Open WebUI ──(key openwebui, X-User-Id: <account>)──┐
 Hermes  ──(key hermes-<ct>, MCP)───────────────────┤
 OpenClaw ──(key openclaw-<ct>, MCP)─────────────────┼─> open-terminal-gateway :8000 ──> open-terminal-ws@<id> 127.0.0.1:20000-29999
-Harness ──(key deepseek-harness-<ct>, MCP)──────────┘          │ (ot-gateway)            (ot-<id>, /srv/open-terminal/ws/<id>)
+DeepSeek ──(key deepseek-harness-<ct>, MCP)─────────┘          │ (ot-gateway)            (ot-<id>, /srv/open-terminal/ws/<id>)
                                                                └─> open-terminal-spawner (root, Unix socket): accounts, keys, start/stop
 ```
 
