@@ -164,7 +164,7 @@ if (( dry_run )); then
   printf '+ install Node.js 24 and %s@%s in %s/releases\n' "$PACKAGE" "$VERSION" "$OPT_DIR"
   printf '+ validate %s against %s and write the OSR provider overlay\n' "$MODEL" "$ROUTER_URL"
   if [[ -n $HONCHO_MCP_URL ]]; then
-    printf '+ connect Honcho memory at %s (workspace osr, peers user and deepseek-harness)\n' "$HONCHO_MCP_URL"
+    printf '+ connect Honcho memory at %s (its own workspace, peers user and deepseek-harness)\n' "$HONCHO_MCP_URL"
   else
     printf '+ no Honcho memory\n'
   fi
@@ -440,5 +440,5 @@ if [[ -d $OPT_DIR/node_modules ]]; then
   rm -rf -- "$OPT_DIR/node_modules" "$OPT_DIR/package.json" "$OPT_DIR/package-lock.json"
 fi
 note "DeepSeek Harness $resolved is serving on http://$BIND_IP:$PORT/ (open the tokenized URL from its journal)."
-if [[ -n $HONCHO_MCP_URL ]]; then note "Honcho memory: $HONCHO_MCP_URL (workspace osr, peer user)."; fi
+if [[ -n $HONCHO_MCP_URL ]]; then note "Honcho memory: $HONCHO_MCP_URL (its own workspace, peer user)."; fi
 if [[ -n $OPEN_TERMINAL_URL ]]; then note "Open Terminal workspace: $OPEN_TERMINAL_URL (tools mcp__open_terminal__*)."; fi

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 spec = importlib.util.spec_from_file_location(
     "honcho_webui", Path(__file__).with_name("integrate-webui.py"))
@@ -24,6 +25,16 @@ class Response(io.BytesIO):
         self.close()
 
 
+def whoami(request, key, body=None):
+    """The gateway's answer to /osr/v1/whoami, or None for another URL."""
+    if not request.full_url.endswith("/osr/v1/whoami"):
+        return None
+    if request.get_header("Authorization") != "Bearer " + key:
+        raise HTTPError(request.full_url, 401, "Invalid API key", {}, None)
+    return Response(json.dumps(body or {"client": "openwebui", "user": None,
+                                        "workspace": None, "per_user": True}).encode())
+
+
 class IntegrationTest(unittest.TestCase):
     def test_add_then_update_without_losing_other_connections_or_grants(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -37,6 +48,11 @@ class IntegrationTest(unittest.TestCase):
             calls = []
 
             def fake_urlopen(request, timeout):
+                answer = whoami(request, key.read_text())
+                if answer is not None:
+                    self.assertEqual("http://192.0.2.85:3000/osr/v1/whoami", request.full_url)
+                    calls.append("WHOAMI")
+                    return answer
                 self.assertEqual(request.get_header("Authorization"),
                                  "Bearer webui-secret")
                 self.assertEqual(timeout, 20)
@@ -56,25 +72,56 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual(["GET"], calls)
                 calls.clear()
                 module.main()
-                self.assertEqual(["GET", "POST"], calls)
+                self.assertEqual(["GET", "WHOAMI", "POST"], calls)
                 self.assertEqual(original, state[0])
                 self.assertEqual("http://192.0.2.85:3000/mcp", state[1]["url"])
                 self.assertEqual("honcho-secret", state[1]["key"])
                 self.assertEqual("/mcp", state[1]["path"])
-                self.assertEqual("osr", state[1]["headers"]["X-Honcho-Workspace-ID"])
+                # Open WebUI fills in each user's ID; the gateway gives each a workspace.
+                self.assertEqual({"X-User-Id": "{{USER_ID}}"}, state[1]["headers"])
                 state[1]["config"]["access_grants"] = [{"principal_id": "group-1"}]
+                # An older registration named the shared workspace; an admin added a header.
+                state[1]["headers"] = {"X-Honcho-Workspace-ID": "osr", "x-user-id": "fixed",
+                                       "X-Trace": "on"}
                 state[1]["info"]["name"] = "My Memory"
                 key.write_text("rotated-secret")
                 calls.clear()
                 module.main()
-                self.assertEqual(["GET", "POST"], calls)
+                self.assertEqual(["GET", "WHOAMI", "POST"], calls)
                 self.assertEqual("rotated-secret", state[1]["key"])
+                self.assertEqual({"X-Trace": "on", "X-User-Id": "{{USER_ID}}"}, state[1]["headers"])
                 self.assertEqual("My Memory", state[1]["info"]["name"])
                 self.assertEqual([{"principal_id": "group-1"}],
                                  state[1]["config"]["access_grants"])
                 calls.clear()
                 module.main()
-                self.assertEqual(["GET"], calls)
+                self.assertEqual(["GET", "WHOAMI"], calls)
+
+    def test_a_key_the_gateway_does_not_accept_for_open_webui_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            admin = Path(directory, "admin")
+            key = Path(directory, "honcho")
+            admin.write_text("webui-secret")
+            key.write_text("agent-key")
+            argv = ["integrate-webui.py", "http://127.0.0.1:8080", str(admin), str(key),
+                    "http://192.0.2.85:3000"]
+            for answer, message in (
+                    ({"client": "hermes-201", "workspace": "osr", "per_user": False}, "hermes-201"),
+                    (HTTPError("u", 401, "Invalid API key", {}, None), "rejected the key"),
+                    (HTTPError("u", 404, "Not Found", {}, None), "no client gateway")):
+                writes = []
+
+                def fake_urlopen(request, timeout, answer=answer, writes=writes):
+                    if request.full_url.endswith("/osr/v1/whoami"):
+                        if isinstance(answer, HTTPError):
+                            raise answer
+                        return Response(json.dumps(answer).encode())
+                    writes.append(request.get_method())
+                    return Response(json.dumps({"TOOL_SERVER_CONNECTIONS": []}).encode())
+                with patch.object(module, "urlopen", fake_urlopen), patch.object(sys, "argv", argv):
+                    with self.assertRaisesRegex(ValueError, message):
+                        module.main()
+                self.assertNotIn("POST", writes)
 
 
 class SnapshotRestoreTest(unittest.TestCase):
@@ -92,6 +139,9 @@ class SnapshotRestoreTest(unittest.TestCase):
 
     def run_main(self, *args):
         def fake_urlopen(request, timeout):
+            answer = whoami(request, (self.dir / "honcho").read_text())
+            if answer is not None:
+                return answer
             self.assertEqual(request.get_header("Authorization"), "Bearer webui-secret")
             if request.data is not None:
                 self.posts += 1

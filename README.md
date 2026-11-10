@@ -286,7 +286,7 @@ Services and companions use separate CTs and stay out of the model pool:
 |---|---|
 | [Gitea](targets/gitea/README.md) | Configuration history; optional |
 | [Mattermost](targets/mattermost/README.md) | Health alerts and, with hcom, a separate handoff channel; optional |
-| [Honcho](targets/honcho/README.md) | CPU-only shared agent memory and Open WebUI MCP tools, with its own embedding model. Needs a router model with tools and structured output; its proxy dispatches directly to model hosts. Reconfigure after key rotation |
+| [Honcho](targets/honcho/README.md) | CPU-only agent memory and Open WebUI MCP tools (a private memory per Open WebUI user and per agent, each client with its own key), with its own embedding model. Needs a router model with tools and structured output; its proxy dispatches directly to model hosts. Reconfigure after key rotation |
 | [Hermes](targets/hermes/README.md) | Open WebUI agent `hermes-agent`; direct dispatch needs tools and 64K context. Reconfigure after key rotation or host changes |
 | [OpenClaw](targets/openclaw/README.md) | Open WebUI agent `openclaw` and Control UI on :18789; same dispatcher. Reconfigure after key rotation or host changes |
 | [DeepSeek Harness](targets/deepseek-harness/README.md) | Agent Web UI on :3080 using OSR as provider; no Open WebUI token needed |

@@ -49,6 +49,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
     def do_GET(self):
+        if self.path == "/osr/v1/whoami":
+            # OSR's Honcho gateway names this agent's own workspace.
+            if self.headers.get("Authorization") != "Bearer " + get("honcho-key"):
+                return self.send(401, {"detail": "Invalid API key"})
+            return self.send(200, {"client": "deepseek-harness-281", "user": None,
+                                   "workspace": "deepseek-harness-281", "per_user": False})
         if self.headers.get("Authorization") != "Bearer " + get("router-key"):
             return self.send(401, {"error": "bad key"})
         if self.path == "/v1/models":
@@ -176,7 +182,7 @@ plan=$(env "${base_env[@]}" bash "$script" --dry-run 2>&1)
 assert_contains "the dry run names the pinned release" "@deepseek-ai/dsh@0.2.1-rc.5" "$plan"
 assert_contains "and says Honcho is off" "no Honcho memory" "$plan"
 plan=$(env "${base_env[@]}" DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp bash "$script" --dry-run 2>&1)
-assert_contains "Honcho is planned with its workspace and peers" "workspace osr, peers user and deepseek-harness" "$plan"
+assert_contains "Honcho is planned with its workspace and peers" "its own workspace, peers user and deepseek-harness" "$plan"
 assert_fail "Honcho needs a 32k window" env "${base_env[@]}" DSH_CONTEXT_WINDOW=16384 DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp bash "$script" --dry-run
 assert_fail "a Honcho URL with a query is refused" env "${base_env[@]}" DSH_HONCHO_MCP_URL='http://h:3000/mcp?x=1' bash "$script" --dry-run
 assert_fail "a router URL with a path is refused" env "${base_env[@]}" DSH_ROUTER_URL=http://127.0.0.1:8000/v1 bash "$script" --dry-run
@@ -378,12 +384,13 @@ assert_ok "Honcho memory can be turned on" install_run "${honcho_env[@]}"
 assert_file_contains "the overlay adds the Honcho MCP server" 'serverName: honcho' "$DSH_ETC_DIR/osr.patch.yml"
 assert_file_contains "with its URL" "url: \"http://127.0.0.1:$port/mcp\"" "$DSH_ETC_DIR/osr.patch.yml"
 assert_file_contains "the key comes from the environment" 'Authorization: !!js '"'"'`Bearer ${process.env.HONCHO_API_KEY}`'"'" "$DSH_ETC_DIR/osr.patch.yml"
-assert_file_contains "and the shared workspace" 'X-Honcho-Workspace-ID: "osr"' "$DSH_ETC_DIR/osr.patch.yml"
+assert_file_contains "and the workspace Honcho names for its key, its own" 'X-Honcho-Workspace-ID: "deepseek-harness-281"' "$DSH_ETC_DIR/osr.patch.yml"
 assert_ok "the overlay never holds the Honcho key" bash -c "! grep -q honcho-client-key '$DSH_ETC_DIR/osr.patch.yml'"
 assert_file_contains "the service gets the Honcho key" 'HONCHO_API_KEY=honcho-client-key' "$DSH_ETC_DIR/service.env"
-assert_contains "the key was checked with an MCP initialize" '"auth": "Bearer honcho-client-key", "workspace": "osr", "method": "initialize"' "$(cat "$fake/mcp-requests")"
+assert_contains "the key was checked with an MCP initialize" '"auth": "Bearer honcho-client-key", "workspace": "deepseek-harness-281", "method": "initialize"' "$(cat "$fake/mcp-requests")"
 agents=$(cat "$DSH_STATE_DIR/home/AGENTS.md")
-assert_contains "the instructions name the shared user peer" 'peer `user`' "$agents"
+assert_contains "the instructions name the user peer" 'peer `user`' "$agents"
+assert_contains "and its own workspace" 'Workspace: `deepseek-harness-281`' "$agents"
 assert_contains "and this agent's peer" 'you are peer `deepseek-harness`' "$agents"
 assert_contains "the user's own instructions are kept" "Keep answers short." "$agents"
 push_deploy honcho
@@ -392,7 +399,7 @@ assert_eq "exactly one" 1 "$(grep -c 'osr-honcho:begin' "$DSH_STATE_DIR/home/AGE
 push_deploy
 printf 'wrong-key\n' > "$deploy/honcho-api-key"
 run_fails "a key Honcho rejects stops the run" "${honcho_env[@]}" DSH_MODEL=auto
-assert_contains "and says so" "Honcho MCP rejected the key" "$out"
+assert_contains "and says so" "Honcho rejected the key" "$out"
 assert_file_contains "the previous Honcho key is back" 'HONCHO_API_KEY=honcho-client-key' "$DSH_ETC_DIR/service.env"
 push_deploy
 assert_ok "a reconfigure without a new key reuses the installed one" install_run "${honcho_env[@]}" DSH_MODEL=auto

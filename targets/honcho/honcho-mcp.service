@@ -1,5 +1,5 @@
 [Unit]
-Description=Honcho MCP HTTP server
+Description=Honcho MCP HTTP server (loopback; clients reach it through honcho-gateway)
 After=honcho-api.service
 Requires=honcho-api.service
 
@@ -8,9 +8,9 @@ User=honcho
 Group=honcho
 WorkingDirectory=/opt/honcho/mcp
 Environment=HOME=/var/lib/honcho
-Environment=HOST=0.0.0.0
-Environment=PORT=3000
-Environment=HONCHO_API_URL=http://127.0.0.1:8000
+Environment=HOST=127.0.0.1
+Environment=PORT=3010
+Environment=HONCHO_API_URL=http://127.0.0.1:8010
 ExecStart=/opt/honcho-bun/bun run http
 Restart=on-failure
 RestartSec=5

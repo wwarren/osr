@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 
 const script = fileURLToPath(new URL('./configure.mjs', import.meta.url));
 
-async function withRouter(run, onMcp) {
+async function withRouter(run, onMcp, onWhoami) {
   const server = createServer((request, response) => {
     if (request.headers.authorization !== 'Bearer test-secret') {
       response.writeHead(401).end(); return;
@@ -24,6 +24,8 @@ async function withRouter(run, onMcp) {
       ] }));
     } else if (request.url === '/mcp' && request.method === 'POST' && onMcp) {
       onMcp(request, response);
+    } else if (request.url === '/osr/v1/whoami' && onWhoami) {
+      onWhoami(request, response);
     } else {
       response.writeHead(404).end();
     }
@@ -156,6 +158,42 @@ test('Honcho initialize requires a JSON-RPC success, including over SSE', async 
     } else {
       response.end(JSON.stringify(payload));
     }
+  });
+});
+
+test('the Honcho workspace is the one the gateway names for the key', async () => {
+  const own = { client: 'deepseek-harness-281', user: null, workspace: 'deepseek-harness-281', per_user: false };
+  let whoami = { status: 200, body: own };
+  const seen = [];
+  await withRouter(async (router, dir) => {
+    const output = join(dir, 'honcho.yml');
+    const instructions = join(dir, 'AGENTS.md');
+    const args = ['--router-url', router, '--model', 'code-model', '--output', output,
+      '--honcho-mcp-url', `${router}/mcp`, '--instructions', instructions, '--force'];
+    const env = { HONCHO_API_KEY: 'test-secret' };
+    let result = await invoke(args, env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(await readFile(output, 'utf8'), /X-Honcho-Workspace-ID: "deepseek-harness-281"/);
+    assert.match(await readFile(instructions, 'utf8'), /Workspace: `deepseek-harness-281`/);
+    assert.deepEqual(seen, ['deepseek-harness-281'], 'the key is checked against that workspace');
+    whoami = { status: 200, body: { client: 'openwebui', user: null, workspace: null, per_user: true } };
+    result = await invoke(args, env);
+    assert.equal(result.code, 1, "Open WebUI's per-user key is not an agent's");
+    assert.match(result.stderr, /Open WebUI's key/);
+    whoami = { status: 404, body: { detail: 'Not Found' } };
+    result = await invoke(args, env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(await readFile(output, 'utf8'), /X-Honcho-Workspace-ID: "osr"/, 'a Honcho without the gateway keeps osr');
+    whoami = { status: 200, body: own };
+    result = await invoke([...args, '--honcho-workspace', 'lab'], env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(await readFile(output, 'utf8'), /X-Honcho-Workspace-ID: "lab"/, 'a given workspace wins');
+  }, (request, response) => {
+    seen.push(request.headers['x-honcho-workspace-id']);
+    response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-06-18' } }));
+  }, (_request, response) => {
+    response.writeHead(whoami.status, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(whoami.body));
   });
 });
 

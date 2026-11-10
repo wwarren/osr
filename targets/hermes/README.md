@@ -24,9 +24,12 @@ account in this CT. The web dashboard (`hermes-dashboard.service`) listens on
 trusted LAN or VPN.
 
 **Integrations.** With the [Honcho target](../honcho/README.md) the installer
-adds Hermes's Honcho memory plugin on the shared `osr` workspace; for a
+adds Hermes's Honcho memory plugin with this CT's own Honcho key and workspace
+(client and workspace `hermes-<CT>`, issued by the Honcho CT, which other
+agents and Open WebUI users cannot reach); for a
 separately installed Honcho set `HONCHO_URL` and `HONCHO_CT_ID`.
-`--reconfigure` keeps the URL, key and egress rule; `HONCHO_URL=` turns it off.
+`--reconfigure` keeps the URL, key (while Honcho accepts it) and egress rule;
+`HONCHO_URL=` turns it off and revokes the key.
 The [hcom target](../hcom/README.md) adds `osr-bus` and a managed block in
 `/home/hermes/AGENTS.md` and opens this CT's egress to the broker; its native
 plugin (`HCOM_HERMES_NATIVE=true`) gives Hermes the group key and works only in

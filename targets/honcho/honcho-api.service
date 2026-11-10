@@ -1,5 +1,5 @@
 [Unit]
-Description=Honcho API
+Description=Honcho API (loopback; clients reach it through honcho-gateway)
 After=network-online.target postgresql.service honcho-proxy.service honcho-embedding.service
 Wants=network-online.target honcho-embedding.service
 Requires=postgresql.service honcho-proxy.service
@@ -10,7 +10,7 @@ Group=honcho
 WorkingDirectory=/opt/honcho
 Environment=HOME=/var/lib/honcho
 EnvironmentFile=/etc/honcho-target/honcho.env
-ExecStart=/opt/honcho-uv/bin/uv run --frozen --no-dev fastapi run --host 0.0.0.0 src/main.py
+ExecStart=/opt/honcho-uv/bin/uv run --frozen --no-dev fastapi run --host 127.0.0.1 --port 8010 src/main.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

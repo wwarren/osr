@@ -84,7 +84,7 @@ ROUTER_URL=http://r:8000 HERMES_MODEL=auto HERMES_CONTEXT_LENGTH=65536 HERMES_CH
 # shellcheck disable=SC2034
 HERMES_API_SERVER=true HERMES_API_PORT=8642 HERMES_API_MODEL_NAME=hermes-agent HERMES_DASHBOARD=true unit_sha256=u dashboard_auth_sha256=none
 # shellcheck disable=SC2034
-backend_keys_sha256=none targets_sha256=none HONCHO_URL='' honcho_key_sha256=none
+backend_keys_sha256=none targets_sha256=none honcho_workspace=none HONCHO_URL='' honcho_key_sha256=none
 # shellcheck disable=SC2034
 OPEN_TERMINAL_URL='' ot_key_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
@@ -219,6 +219,16 @@ def refused():
     sys.exit(7)
 router = os.environ.get("FAKE_ROUTER_URL", "http://192.168.11.80:8000")
 terminal = os.environ.get("FAKE_OT_URL", "http://192.0.2.70:8000")
+honcho = os.environ.get("FAKE_HONCHO_URL", "http://192.0.2.85:8000")
+if url and url.startswith(honcho):
+    if os.environ.get("FAKE_HONCHO_DOWN"): refused()
+    if url.endswith("/osr/v1/whoami"):
+        # OSR's Honcho gateway: this CT's own workspace; another Honcho has no such route.
+        if os.environ.get("FAKE_HONCHO_NO_GATEWAY"): reply(404, {"detail": "Not Found"})
+        if auth == os.environ.get("FAKE_HONCHO_BAD_KEY", "-"): reply(401, {"detail": "Invalid API key"})
+        if os.environ.get("FAKE_HONCHO_PER_USER"):
+            reply(200, {"client": "openwebui", "user": None, "workspace": None, "per_user": True})
+        reply(200, {"client": "hermes-282", "user": None, "workspace": "hermes-282", "per_user": False})
 if url.startswith(terminal):
     if os.environ.get("FAKE_OT_DOWN"): refused()
     if url.endswith("/osr/v1/whoami"):
@@ -544,11 +554,13 @@ import json, sys
 data = json.load(open(sys.argv[1]))
 host = data["hosts"]["hermes"]
 assert data["apiKey"] == "honcho-key-A" and data["baseUrl"] == "http://192.0.2.85:8000"
-assert host["workspace"] == "osr" and host["peerName"] == "user" and host["enabled"] is True
+assert host["workspace"] == "hermes-282" and host["peerName"] == "user" and host["enabled"] is True
 PY
 [[ $(stat -c %a "$honcho_json") == 600 ]] || fail 'honcho.json is not private'
 [[ $(kv memory.provider "$home/.hermes/config.kv") == honcho ]] || fail 'Honcho is not the memory provider'
 [[ $(kv HONCHO_URL "$etc/settings") == http://192.0.2.85:8000 ]] || fail 'the settings do not record HONCHO_URL'
+[[ $(kv HONCHO_WORKSPACE "$etc/settings") == hermes-282 ]] || fail 'the settings do not record the workspace'
+grep '^curl ' "$log" | grep -q honcho-key-A && fail 'the Honcho key was passed to curl in argv'
 printf 'honcho-key-B\n' > "$deploy/honcho-api-key"
 out=$(guest HONCHO_URL=http://192.0.2.85:8000 FAKE_CHAT_STATUS=400) && fail 'a failed probe was accepted'
 grep -q honcho-key-A "$honcho_json" || fail 'a failed run did not put the previous honcho.json back'
@@ -560,10 +572,17 @@ out=$(guest) || fail "rerun without Honcho: $out"
 grep -q 'memory.provider' "$log" && fail 'a run that never had Honcho changed the memory provider'
 external_honcho_key=$tmp_root/external-honcho-key
 printf 'external-honcho-key\n' > "$external_honcho_key"
-out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho on: $out"
+out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" FAKE_HONCHO_NO_GATEWAY=1) || fail "external Honcho on: $out"
+grep -q '"workspace": "osr"' "$honcho_json" || fail "a Honcho without OSR's gateway did not get the osr workspace: $(cat "$honcho_json")"
+out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" FAKE_HONCHO_NO_GATEWAY=1 HONCHO_WORKSPACE=lab) || fail "external Honcho with a workspace: $out"
+grep -q '"workspace": "lab"' "$honcho_json" || fail 'HONCHO_WORKSPACE was not used'
 out=$(guest HONCHO_URL= HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho off: $out"
 [[ $(<"$external_honcho_key") == external-honcho-key ]] || fail 'disabling Honcho deleted a caller-supplied key file'
-pass 'Honcho: plugin and osr config as a private file; a failed run restores it; HONCHO_URL= turns it off'
+for case in FAKE_HONCHO_BAD_KEY=external-honcho-key FAKE_HONCHO_PER_USER=1 FAKE_HONCHO_DOWN=1; do
+  out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" "$case") && fail "$case was accepted"
+  [[ $out == *Honcho* ]] || fail "$case: no Honcho error: $out"
+done
+pass 'Honcho: plugin and config with the workspace the gateway names, as a private file; a failed run restores it; HONCHO_URL= turns it off'
 
 # Open Terminal: Hermes's own workspace as MCP server open_terminal.
 ot_key=ot-key-0123456789abcdef

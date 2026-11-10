@@ -10,6 +10,8 @@ note() { printf '%s\n' "$*" >&2; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 # shellcheck source=targets/open-terminal/client-lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/../open-terminal/client-lib.sh"
+# shellcheck source=targets/honcho/client-lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../honcho/client-lib.sh"
 usage() {
   cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run | --reconfigure]
@@ -263,6 +265,9 @@ fi
 # Honcho memory: given, else on a reconfigure the recorded one, else (asked) the
 # Honcho CT on this host. An unattended create never turns it on by itself.
 honcho_mcp=''
+# The recorded endpoint also names the Honcho to revoke this CT's key on when
+# Honcho is turned off or moved.
+honcho_prev_mcp=$(recorded_or DSH_HONCHO_MCP_URL '')
 if [[ -n $HONCHO_MCP_URL ]]; then honcho_mcp=$HONCHO_MCP_URL
 elif [[ -z $honcho_url_set && -z $honcho_mcp_set ]]; then
   honcho_recorded=$(recorded_or DSH_HONCHO_MCP_URL '')
@@ -274,7 +279,7 @@ elif [[ -z $honcho_url_set && -z $honcho_mcp_set ]]; then
     [[ -z $honcho_ip_here ]] || honcho_offer="http://$honcho_ip_here:8000"
   fi
   pve_section 'Honcho memory'
-  pve_note 'Shared long-term memory with Hermes and OpenClaw (the osr workspace).'
+  pve_note 'Long-term memory in a Honcho workspace of Harness'"'"'s own (like its Open Terminal workspace).'
   if [[ -n $honcho_recorded ]]; then
     # A recorded Honcho stays on unattended; "none" turns it off.
     pve_ask HONCHO_URL 'Honcho API URL (none to turn off)' "$honcho_offer" valid_honcho_url
@@ -284,7 +289,7 @@ elif [[ -z $honcho_url_set && -z $honcho_mcp_set ]]; then
 fi
 [[ -n $honcho_mcp || -z $HONCHO_URL ]] || honcho_mcp=$(honcho_mcp_url "$HONCHO_URL")
 if [[ -n $honcho_mcp && -z $HONCHO_CT_ID && -z $HONCHO_API_KEY_FILE ]]; then
-  # The workspace key comes from the Honcho CT at that address, when it is here.
+  # This CT's gateway key comes from the Honcho CT at that address, when it is here.
   [[ ! $honcho_mcp =~ ^https?://([0-9.]+)[:/] ]] || HONCHO_CT_ID=$(pve_ct_with_ip "${BASH_REMATCH[1]}")
 fi
 [[ -z $HONCHO_CT_ID || ( $HONCHO_CT_ID =~ ^[1-9][0-9]{2,8}$ && $HONCHO_CT_ID != "$CT_ID" ) ]] ||
@@ -427,7 +432,7 @@ if (( ! dry_run )); then
   fi
 fi
 
-honcho_key_push=false
+honcho_key_push=false honcho_key_from_ct=false
 if (( ! dry_run )); then
   pct exec "$ROUTER_CT_ID" -- awk -F= '$1=="ROUTER_API_KEY" {sub(/^[^=]*=/,""); print; exit}' \
     /app/router/secrets.env > "$stage/router-api-key" 2>/dev/null || : > "$stage/router-api-key"
@@ -440,11 +445,13 @@ if (( ! dry_run )); then
   positive ROUTER_PORT "$router_port"
   (( router_port <= 65535 )) || die 'Invalid router port.'
   if [[ -n $honcho_mcp ]]; then
-    # The Honcho target's client key is scoped to the shared osr workspace.
+    # This CT's own key for the Honcho CT's gateway, pinned to a workspace
+    # of this CT's own: issued (or a key Honcho still accepts kept) once
+    # the run is confirmed. The gateway is checked now.
     if [[ -n $HONCHO_CT_ID ]]; then
-      pct exec "$HONCHO_CT_ID" -- cat /etc/honcho-target/client-api-key > "$stage/honcho-api-key" 2>/dev/null ||
-        die "Honcho CT $HONCHO_CT_ID has no osr workspace key. Run targets/honcho/provision-lxc.sh --reconfigure for it first."
-      honcho_key_push=true
+      pct exec "$HONCHO_CT_ID" -- test -x "$HC_CLIENTS" ||
+        die "Honcho CT $HONCHO_CT_ID has no client gateway (an install from before per-user memory). Run targets/honcho/provision-lxc.sh --reconfigure for it first."
+      honcho_key_from_ct=true
     elif [[ -n $HONCHO_API_KEY_FILE ]]; then
       cp -- "$HONCHO_API_KEY_FILE" "$stage/honcho-api-key"
       honcho_key_push=true
@@ -471,7 +478,7 @@ else
     if [[ -n $HONCHO_CT_ID ]]; then key_from="Honcho CT $HONCHO_CT_ID"
     elif [[ -n $HONCHO_API_KEY_FILE ]]; then key_from=$HONCHO_API_KEY_FILE
     else key_from="the key already in CT $CT_ID"; fi
-    printf '+ read the osr workspace key from %s into a temporary 0600 file\n' "$key_from"
+    printf '+ take the Honcho gateway key from %s\n' "$key_from"
   fi
 fi
 ROUTER_URL="http://$router_ip:$router_port"
@@ -573,6 +580,12 @@ fi
 
 run pct exec "$CT_ID" -- install -d -m 0700 "$deploy"
 run pct push "$CT_ID" "$stage/router-api-key" "$deploy/router-api-key" --perms 0600
+if [[ $honcho_key_from_ct == true ]]; then
+  honcho_have=''
+  [[ $mode != reconfigure ]] || honcho_have=$(hc_key_sha256 "$CT_ID" /etc/deepseek-harness/honcho-api-key)
+  hc_connect "$HONCHO_CT_ID" "$(hc_client_name deepseek-harness "$CT_ID")" "$honcho_have" "$stage/honcho-api-key"
+  [[ ! -s $stage/honcho-api-key ]] || honcho_key_push=true
+fi
 if [[ $honcho_key_push == true ]] || { (( dry_run )) && [[ -n $honcho_mcp && ( -n $HONCHO_CT_ID || -n $HONCHO_API_KEY_FILE ) ]]; }; then
   run pct push "$CT_ID" "$stage/honcho-api-key" "$deploy/honcho-api-key" --perms 0600
 fi
@@ -662,6 +675,19 @@ if [[ $mode == reconfigure && $dry_run == 0 ]]; then
 fi
 (( guest_status == 0 )) || exit "$guest_status"
 
+# The guest no longer uses the Honcho it was connected to (turned off, or moved
+# to another one): revoke its key there. Its memories stay in osr.
+# (The same Honcho CT at another URL keeps the key it just checked.)
+if [[ -n $honcho_prev_mcp && $honcho_prev_mcp != "$honcho_mcp" ]] &&
+   [[ -z $honcho_mcp || $(hc_url_ip "$honcho_prev_mcp") != "$(hc_url_ip "$honcho_mcp")" ]]; then
+  honcho_prev_ct=$(pve_ct_with_ip "$(hc_url_ip "$honcho_prev_mcp")")
+  if [[ -n $honcho_prev_ct ]]; then
+    hc_disconnect "$honcho_prev_ct" "$(hc_client_name deepseek-harness "$CT_ID")"
+  else
+    note "Revoke client $(hc_client_name deepseek-harness "$CT_ID") on the Honcho at $honcho_prev_mcp by hand (honcho-clients revoke)."
+  fi
+fi
+
 # The guest no longer uses the terminal it was connected to (turned off, or
 # moved to another one): revoke its key and firewall rule there.
 if [[ -n $ot_prev_url && $ot_prev_url != "$OPEN_TERMINAL_URL" ]]; then
@@ -674,6 +700,6 @@ if [[ -n $ot_prev_url && $ot_prev_url != "$OPEN_TERMINAL_URL" ]]; then
 fi
 
 printf 'DeepSeek Harness CT %s: http://%s:%s/\n' "$CT_ID" "${IP_CIDR%/*}" "$DSH_PORT"
-[[ -z $honcho_mcp ]] || printf 'Honcho memory: %s (workspace osr; peers user and deepseek-harness).\n' "$honcho_mcp"
+[[ -z $honcho_mcp ]] || printf 'Honcho memory: %s (its own workspace; peers user and deepseek-harness).\n' "$honcho_mcp"
 [[ -z $OPEN_TERMINAL_URL ]] || printf 'Open Terminal workspace: %s (MCP tools mcp__open_terminal__*).\n' "$OPEN_TERMINAL_URL"
 printf 'Read its tokenized login URL with: pct exec %s -- journalctl -u deepseek-harness.service -b --no-pager | grep "dsh web:" | tail -n1\n' "$CT_ID"

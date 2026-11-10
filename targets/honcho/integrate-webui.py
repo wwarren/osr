@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Register Honcho's MCP endpoint in the router's Open WebUI, idempotently."""
+"""Register Honcho's MCP endpoint in the router's Open WebUI, idempotently.
+
+The connection carries Open WebUI's gateway key and X-User-Id: {{USER_ID}},
+which Open WebUI fills in with the user's ID on every request; the Honcho
+gateway gives each user a workspace of their own.
+"""
 import json
 import os
 import sys
@@ -16,6 +21,44 @@ def request(url, token, payload=None):
                   method="POST" if payload is not None else "GET")
     with urlopen(req, timeout=20) as response:
         return json.load(response)
+
+
+USER_HEADER = "X-User-Id"
+USER_TEMPLATE = "{{USER_ID}}"
+# Headers the gateway sets itself; an older registration sent the workspace.
+MANAGED_HEADERS = ("x-user-id", "x-honcho-workspace-id")
+
+
+def check_gateway_key(mcp_url, key):
+    """Prove KEY against the Honcho gateway before Open WebUI stores it.
+
+    GET /osr/v1/whoami answers 401 to a wrong key and names its client, which
+    must be openwebui with a workspace per user (not an agent's key, which
+    would put every user in the agents' shared memory).
+    """
+    try:
+        body = request(mcp_url.rstrip("/") + "/osr/v1/whoami", key)
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ValueError("the Honcho gateway rejected the key (/etc/honcho-target/openwebui-key "
+                             "and the key given here differ)") from exc
+        if exc.code == 404:
+            raise ValueError("Honcho has no client gateway (an install from before per-user "
+                             "memory): rerun the Honcho provisioner with --reconfigure first") from exc
+        raise
+    if not isinstance(body, dict) or body.get("client") != "openwebui" or body.get("per_user") is not True:
+        raise ValueError(f"the key belongs to Honcho client {body.get('client') if isinstance(body, dict) else body!r}, "
+                         "not openwebui with a workspace per user")
+
+
+def connection_headers(previous):
+    """PREVIOUS headers an admin added, with the user header the gateway needs."""
+    headers = {}
+    if isinstance(previous, dict):
+        headers = {name: value for name, value in previous.items()
+                   if str(name).lower() not in MANAGED_HEADERS}
+    headers[USER_HEADER] = USER_TEMPLATE
+    return headers
 
 
 def is_honcho(item):
@@ -72,14 +115,15 @@ def main():
         return
     honcho = Path(honcho_file).read_text(encoding="utf-8").strip()
     if not honcho:
-        raise ValueError("missing Honcho API token")
+        raise ValueError("missing Honcho gateway key")
+    check_gateway_key(mcp_url, honcho)
     connection = {
         "type": "mcp", "url": mcp_url.rstrip("/") + "/mcp", "path": "/mcp",
         "auth_type": "bearer", "key": honcho,
-        "headers": {"X-Honcho-Workspace-ID": "osr"},
+        "headers": connection_headers(None),
         "config": {"enable": True},
         "info": {"id": "honcho", "name": "Honcho Memory",
-                 "description": "Shared memory tools for agents"},
+                 "description": "Memory tools; every user has a memory of their own"},
     }
     existing = [item for item in connections if is_honcho(item)]
     if existing:
@@ -89,9 +133,7 @@ def main():
                         ("type", "url", "path", "auth_type", "key")})
         updated["config"] = dict(previous.get("config") or connection["config"])
         updated["info"] = dict(previous.get("info") or connection["info"])
-        updated["headers"] = dict(connection["headers"])
-        if isinstance(previous.get("headers"), dict):
-            updated["headers"].update(previous["headers"])
+        updated["headers"] = connection_headers(previous.get("headers"))
         connection = updated
     if len(existing) == 1 and existing[0] == connection:
         print("Honcho MCP is already registered in Open WebUI")

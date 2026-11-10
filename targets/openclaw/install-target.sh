@@ -124,7 +124,7 @@ settings_record() {
   printf 'OPENCLAW_API=%s\n' "$OPENCLAW_API"
   printf 'OPENCLAW_PORT=%s\n' "$OPENCLAW_PORT"
   printf 'OPENCLAW_DASHBOARD=%s\n' "$OPENCLAW_DASHBOARD"
-  printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\n' "$HONCHO_URL" "$honcho_key_sha256"
+  printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\nHONCHO_WORKSPACE=%s\n' "$HONCHO_URL" "$honcho_key_sha256" "$honcho_workspace"
   printf 'OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "$ot_key_sha256"
   printf 'ORIGINS=%s\n' "$origins"
   printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
@@ -562,6 +562,28 @@ if [[ -n $OPEN_TERMINAL_URL ]]; then
   esac
 fi
 
+# --- the Honcho gateway accepts this CT's key and names its workspace -----------
+# OSR's Honcho gives each agent a workspace of its own and says which one at
+# /osr/v1/whoami. A Honcho without that gateway (404) gets HONCHO_WORKSPACE,
+# osr by default.
+honcho_workspace=none
+if [[ -n $HONCHO_URL ]]; then
+  printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' < "$HONCHO_API_KEY_FILE")" > "$stage/honcho-auth"
+  status=$(api "${HONCHO_URL%/}/osr/v1/whoami" "$stage/honcho-auth")
+  case $status in
+    200) honcho_workspace=$(python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+w = d.get("workspace") if isinstance(d, dict) and not d.get("per_user") else None
+print(w if isinstance(w, str) else "")' "$stage/response" 2>/dev/null || true) ;;
+    404) honcho_workspace=${HONCHO_WORKSPACE:-osr} ;;
+    401|403) die "Honcho at $HONCHO_URL rejected this CT's key. Rerun provision-lxc.sh --reconfigure with HONCHO_CT_ID to issue a new one." ;;
+    000) die "Honcho at $HONCHO_URL is unreachable from this CT: $(head -c 300 "$stage/curl-error"). Its firewall must admit this CT (HONCHO_CLIENT_IPS of targets/honcho/provision-lxc.sh)." ;;
+    *) die "Honcho at $HONCHO_URL answered /osr/v1/whoami with HTTP $status." ;;
+  esac
+  [[ $honcho_workspace =~ ^[A-Za-z0-9_-]{1,100}$ ]] ||
+    die "Honcho at $HONCHO_URL names no workspace of its own for this CT's key (Open WebUI's key?). Rerun provision-lxc.sh --reconfigure with HONCHO_CT_ID."
+fi
+
 # --- health checks and the commands they need ---------------------------------
 run_as_oc() {
   runuser -u "$OC_USER" -- env HOME="$OC_USER_HOME" USER="$OC_USER" NVM_DIR="$NVM_DIR" \
@@ -890,7 +912,7 @@ if [[ -n $HONCHO_URL ]]; then
   run_oc plugins enable openclaw-honcho
   run_oc config set plugins.entries.openclaw-honcho.hooks.allowConversationAccess true --strict-json
   run_oc config set plugins.entries.openclaw-honcho.config.baseUrl "$HONCHO_URL"
-  run_oc config set plugins.entries.openclaw-honcho.config.workspaceId osr
+  run_oc config set plugins.entries.openclaw-honcho.config.workspaceId "$honcho_workspace"
   run_oc config set plugins.entries.openclaw-honcho.config.peerName user
   install -d -m 0700 -o "$OC_USER" -g "$OC_USER" "$OC_USER_HOME/.honcho"
   python3 - "$HONCHO_API_KEY_FILE" "$HONCHO_URL" "$OC_USER_HOME/.honcho/config.json" <<'PY'

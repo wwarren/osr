@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Manage who may use this Honcho: client keys and their workspaces.
+
+  honcho-clients list
+  honcho-clients issue NAME [--workspace W | --per-user]
+        Create NAME or give it a new key (the old one stops working at once).
+        Prints the key on stdout, nothing else. An agent client gets one
+        fixed workspace: its own, named NAME, unless --workspace names
+        another (one several clients can share); --per-user is for Open
+        WebUI, which names each user in X-User-Id, and every user gets a
+        workspace of their own.
+  honcho-clients import-key NAME FILE [--workspace W | --per-user]
+        Use the key in FILE for NAME (the installer does this for openwebui).
+  honcho-clients has NAME SHA256 [--workspace W]
+        Exit 0 if NAME's key has that SHA-256 (and, with --workspace, NAME is
+        pinned to W): lets a provisioner keep a working key without the key
+        itself leaving the agent CT.
+  honcho-clients revoke NAME [--missing-ok]
+  honcho-clients workspaces
+        Every per-user workspace: name, client, user, created.
+
+clients.json holds SHA-256 hashes only (root:honcho-gateway, 0640); the
+gateway rereads it on change. A revoked client's memories stay in Honcho.
+To delete one user's memories, find their workspace here and delete it with
+the admin key (/etc/honcho-target/api-key) through the API on 127.0.0.1:8010.
+"""
+
+import argparse
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+
+CLIENT_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+WORKSPACE_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
+PER_USER_RE = re.compile(r".+-u-[0-9a-f]{16}")
+KEY_RE = re.compile(r"[A-Za-z0-9._~+/=-]{16,512}")
+ETC = os.environ.get("HONCHO_ETC", "/etc/honcho-target")
+CLIENTS = os.path.join(ETC, "clients.json")
+RECORDS = os.environ.get("HONCHO_GATEWAY_RECORDS", "/var/lib/honcho-gateway/workspaces")
+GROUP = os.environ.get("HONCHO_GATEWAY_GROUP", "honcho-gateway")
+
+
+def die(message):
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load():
+    try:
+        with open(CLIENTS, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except ValueError as exc:
+        die(f"{CLIENTS} is not valid JSON: {exc}")
+    clients = data.get("clients") if isinstance(data, dict) else None
+    return {"version": 1, "clients": clients if isinstance(clients, dict) else {}}
+
+
+def save(data):
+    try:
+        gid = grp.getgrnam(GROUP).gr_gid
+    except KeyError:
+        die(f"group {GROUP} does not exist (rerun install-target.sh)")
+    tmp = f"{CLIENTS}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        if os.geteuid() == 0:
+            os.chown(tmp, 0, gid)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, CLIENTS)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def locked(func):
+    def wrapper(*args):
+        os.makedirs(ETC, exist_ok=True)
+        with open(os.path.join(ETC, ".clients.lock"), "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            return func(*args)
+    return wrapper
+
+
+def check_name(name):
+    if not CLIENT_RE.fullmatch(name):
+        die("client names are 1-32 characters: a lowercase letter, then lowercase letters, digits or -")
+
+
+def workspace_choice(args):
+    """None for a per-user client, else its fixed workspace (its own name by default)."""
+    if args.per_user:
+        return None
+    workspace = args.workspace or args.name
+    if not WORKSPACE_RE.fullmatch(workspace) or PER_USER_RE.fullmatch(workspace):
+        die("a workspace name is 1-100 letters, digits, _ or -, and may not end in -u- and 16 hex digits")
+    return workspace
+
+
+@locked
+def set_key(name, key, workspace):
+    data = load()
+    entry = {"key_sha256": hashlib.sha256(key.encode()).hexdigest()}
+    if workspace is not None:
+        entry["workspace"] = workspace
+    changed = data["clients"].get(name) != entry
+    data["clients"][name] = entry
+    if changed:
+        save(data)
+    return changed
+
+
+@locked
+def revoke(name, missing_ok=False):
+    data = load()
+    if data["clients"].pop(name, None) is None:
+        if missing_ok:
+            return False
+        die(f"no client named {name}")
+    save(data)
+    return True
+
+
+def add_workspace_options(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--workspace")
+    group.add_argument("--per-user", action="store_true")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("list")
+    issue = sub.add_parser("issue")
+    issue.add_argument("name")
+    add_workspace_options(issue)
+    imp = sub.add_parser("import-key")
+    imp.add_argument("name")
+    imp.add_argument("file")
+    add_workspace_options(imp)
+    has = sub.add_parser("has")
+    has.add_argument("name")
+    has.add_argument("sha256")
+    has.add_argument("--workspace")
+    rev = sub.add_parser("revoke")
+    rev.add_argument("name")
+    rev.add_argument("--missing-ok", action="store_true")
+    sub.add_parser("workspaces")
+    args = parser.parse_args()
+
+    if args.command == "list":
+        for name, entry in sorted(load()["clients"].items()):
+            workspace = entry.get("workspace") if isinstance(entry, dict) else None
+            print(f"{name}\t{'workspace ' + workspace if workspace else 'a workspace per user (X-User-Id)'}")
+    elif args.command == "issue":
+        check_name(args.name)
+        workspace = workspace_choice(args)
+        key = secrets.token_urlsafe(32)
+        set_key(args.name, key, workspace)
+        print(key)
+    elif args.command == "import-key":
+        check_name(args.name)
+        workspace = workspace_choice(args)
+        try:
+            with open(args.file, encoding="utf-8") as f:
+                key = re.sub(r"\s", "", f.read())
+        except OSError as exc:
+            die(f"cannot read {args.file}: {exc.strerror}")
+        if not KEY_RE.fullmatch(key):
+            die(f"{args.file} does not hold a usable key")
+        changed = set_key(args.name, key, workspace)
+        print(f"{args.name}: key {'updated' if changed else 'unchanged'}", file=sys.stderr)
+    elif args.command == "has":
+        check_name(args.name)
+        entry = load()["clients"].get(args.name)
+        entry = entry if isinstance(entry, dict) else {}
+        sys.exit(0 if re.fullmatch(r"[0-9a-f]{64}", args.sha256)
+                 and entry.get("key_sha256") == args.sha256
+                 and (args.workspace is None or entry.get("workspace") == args.workspace) else 1)
+    elif args.command == "revoke":
+        check_name(args.name)
+        if revoke(args.name, args.missing_ok):
+            print(f"{args.name}: revoked; its memories stay in Honcho", file=sys.stderr)
+    elif args.command == "workspaces":
+        try:
+            names = sorted(os.listdir(RECORDS))
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(RECORDS, name), encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                continue
+            print(f"{record.get('workspace', name[:-5])}\t{record.get('client')}\t"
+                  f"{record.get('user')}\t{record.get('created')}")
+
+
+if __name__ == "__main__":
+    main()

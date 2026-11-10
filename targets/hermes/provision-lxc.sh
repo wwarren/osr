@@ -11,6 +11,8 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 # shellcheck source=targets/open-terminal/client-lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/../open-terminal/client-lib.sh"
+# shellcheck source=targets/honcho/client-lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/../honcho/client-lib.sh"
 note() { printf '%s\n' "$*" >&2; }
 usage() {
   cat <<'USAGE'
@@ -573,7 +575,7 @@ if [[ $mode != integrate ]]; then
   # turn it on by themselves.
   if [[ -z ${HONCHO_URL+set} ]]; then
     pve_section 'Honcho memory'
-    pve_note 'Shared long-term memory with OpenClaw and DeepSeek Harness (the osr workspace).'
+    pve_note 'Long-term memory in a Honcho workspace of Hermes'"'"'s own (like its Open Terminal workspace).'
     honcho_recorded=$(recorded_or HONCHO_URL '')
     if [[ -n $honcho_recorded ]]; then
       pve_ask HONCHO_URL 'Honcho API URL (none to turn off)' "$honcho_recorded" valid_honcho_url
@@ -588,7 +590,7 @@ if [[ $mode != integrate ]]; then
   fi
   if [[ -n ${HONCHO_URL:-} && -z ${HONCHO_CT_ID:-} && -z ${HONCHO_API_KEY_FILE:-} &&
         $HONCHO_URL =~ ^https?://([0-9.]+): ]]; then
-    # The workspace key comes from the Honcho CT at that address, when it is here.
+    # This CT's gateway key comes from the Honcho CT at that address, when it is here.
     HONCHO_CT_ID=$(pve_ct_with_ip "${BASH_REMATCH[1]}")
     [[ -n $HONCHO_CT_ID ]] || unset HONCHO_CT_ID
   fi
@@ -830,9 +832,16 @@ else
   ipv4 "$HERMES_IP" || die "Cannot detect CT $CT_ID's IPv4 on eth0."
   # Unset, HONCHO_URL keeps the Honcho memory recorded by the last run, so a
   # plain --reconfigure keeps its firewall rule; HONCHO_URL= turns it off.
+  # The recorded URL also names the Honcho to revoke this CT's key on when
+  # Honcho is turned off or moved.
+  honcho_prev_url=$(pct exec "$CT_ID" -- sh -c 'sed -n "s/^HONCHO_URL=//p" /etc/hermes-target/settings 2>/dev/null | head -n 1' | tr -d '\r')
   if [[ $mode == reconfigure && -z ${HONCHO_URL+set} ]]; then
-    HONCHO_URL=$(pct exec "$CT_ID" -- sh -c 'sed -n "s/^HONCHO_URL=//p" /etc/hermes-target/settings 2>/dev/null | head -n 1' | tr -d '\r')
+    HONCHO_URL=$honcho_prev_url
     [[ -z $HONCHO_URL ]] || note "Keeping Honcho memory at $HONCHO_URL (set HONCHO_URL= to turn it off)."
+    if [[ -n $HONCHO_URL && -z ${HONCHO_CT_ID:-} && -z ${HONCHO_API_KEY_FILE:-} ]]; then
+      HONCHO_CT_ID=$(pve_ct_with_ip "$(hc_url_ip "$HONCHO_URL")")
+      [[ -n $HONCHO_CT_ID ]] || unset HONCHO_CT_ID
+    fi
   fi
   # The same for Open Terminal; the recorded URL also names the terminal to
   # disconnect from when it is turned off or moved.
@@ -846,6 +855,7 @@ OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL:-}
 OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 ot_valid_url "$OPEN_TERMINAL_URL" || die "The recorded OPEN_TERMINAL_URL is invalid: $OPEN_TERMINAL_URL"
 ot_prev_url=${ot_prev_url:-}
+honcho_prev_url=${honcho_prev_url:-}
 if [[ -n $OPEN_TERMINAL_URL && -z ${OPEN_TERMINAL_CT_ID:-} && -z ${OPEN_TERMINAL_KEY_FILE:-} ]]; then
   # The key is issued by the terminal CT at that address, when it is here.
   OPEN_TERMINAL_CT_ID=$(pve_ct_with_ip "$(ot_url_ip "$OPEN_TERMINAL_URL")")
@@ -1068,12 +1078,16 @@ if [[ $mode != integrate ]]; then
   fi
   if [[ -n ${HONCHO_URL:-} ]]; then
     honcho_key_push=true
-    if (( ! dry_run )); then
-      # The Honcho target's client key is scoped to the shared osr workspace.
-      if [[ -n ${HONCHO_CT_ID:-} ]]; then
-        pct exec "$HONCHO_CT_ID" -- cat /etc/honcho-target/client-api-key > "$stage/honcho-api-key" ||
-          die "Honcho CT $HONCHO_CT_ID has no osr workspace key. Run targets/honcho/provision-lxc.sh --reconfigure for it first."
-      elif [[ -n ${HONCHO_API_KEY_FILE:-} ]]; then
+    if [[ -n ${HONCHO_CT_ID:-} ]]; then
+      # This CT's own key for the Honcho CT's gateway, pinned to a workspace
+      # of this CT's own. A key Honcho still accepts is kept, so a
+      # reconfigure does not rotate it.
+      honcho_have=''
+      (( dry_run )) || honcho_have=$(hc_key_sha256 "$CT_ID" "$deploy/honcho-api-key")
+      hc_connect "$HONCHO_CT_ID" "$(hc_client_name hermes "$CT_ID")" "$honcho_have" "$stage/honcho-api-key"
+      if (( ! dry_run )) && [[ ! -s $stage/honcho-api-key ]]; then honcho_key_push=false; fi
+    elif (( ! dry_run )); then
+      if [[ -n ${HONCHO_API_KEY_FILE:-} ]]; then
         cp -- "$HONCHO_API_KEY_FILE" "$stage/honcho-api-key"
       elif pct exec "$CT_ID" -- test -s "$deploy/honcho-api-key"; then
         honcho_key_push=false
@@ -1128,6 +1142,19 @@ if [[ $mode == reconfigure ]]; then
       die "Hermes is reconfigured, but $firewall_file changed meanwhile and still admits the old router address or port. Fix it, then rerun --reconfigure."
     fw_replace "$firewall_file" "$fw_seen" "$fw_new" ||
       die "Hermes is reconfigured, but $firewall_file changed while its old rules were being removed (or could not be written); it still admits the old and new rules. Check it, then rerun --reconfigure."
+  fi
+fi
+
+# The guest no longer uses the Honcho it was connected to (turned off, or moved
+# to another one): revoke its key there. Its memories stay in osr.
+# (The same Honcho CT at another URL keeps the key it just checked.)
+if [[ $mode != integrate && -n $honcho_prev_url && $honcho_prev_url != "${HONCHO_URL:-}" ]] &&
+   [[ -z ${HONCHO_URL:-} || $(hc_url_ip "$honcho_prev_url") != "$(hc_url_ip "$HONCHO_URL")" ]]; then
+  honcho_prev_ct=$(pve_ct_with_ip "$(hc_url_ip "$honcho_prev_url")")
+  if [[ -n $honcho_prev_ct ]]; then
+    hc_disconnect "$honcho_prev_ct" "$(hc_client_name hermes "$CT_ID")"
+  else
+    note "Revoke client $(hc_client_name hermes "$CT_ID") on the Honcho at $honcho_prev_url by hand (honcho-clients revoke)."
   fi
 fi
 

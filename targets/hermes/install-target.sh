@@ -86,7 +86,9 @@ Environment:
   HERMES_API_MODEL_NAME=hermes-agent   model name the API server advertises
   HERMES_DASHBOARD=true       start the authenticated dashboard on all CT IPv4 addresses, port 9119
   HERMES_SKIP_CHAT_PROBE=false true: skip the test chat request
-  HONCHO_URL                   Honcho memory (HONCHO_API_KEY_FILE: its key)
+  HONCHO_URL                   Honcho memory (HONCHO_API_KEY_FILE: its key); OSR's
+                               Honcho names this CT's own workspace, another
+                               Honcho uses HONCHO_WORKSPACE (default osr)
   OPEN_TERMINAL_URL            Open Terminal gateway (http://IP:port): Hermes's
                                own workspace there, as MCP server open_terminal;
                                empty after a run that set it disconnects it
@@ -111,7 +113,7 @@ settings_record() {
   printf 'HERMES_API_MODEL_NAME=%s\n' "$HERMES_API_MODEL_NAME"
   printf 'HERMES_DASHBOARD=%s\n' "$HERMES_DASHBOARD"
   printf 'KINDI_READ_TIMEOUT_SECONDS=%s\n' "${KINDI_READ_TIMEOUT_SECONDS:-3600}"
-  printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\n' "$HONCHO_URL" "$honcho_key_sha256"
+  printf 'HONCHO_URL=%s\nHONCHO_KEY_SHA256=%s\nHONCHO_WORKSPACE=%s\n' "$HONCHO_URL" "$honcho_key_sha256" "$honcho_workspace"
   printf 'OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "$ot_key_sha256"
   printf 'ROUTER_KEY_SHA256=%s\n' "$router_key_sha256"
   printf 'BACKEND_KEYS_SHA256=%s\n' "$backend_keys_sha256"
@@ -443,6 +445,28 @@ if [[ -n $OPEN_TERMINAL_URL ]]; then
   esac
 fi
 
+# --- the Honcho gateway accepts this CT's key and names its workspace -----------
+# OSR's Honcho gives each agent a workspace of its own and says which one at
+# /osr/v1/whoami. A Honcho without that gateway (404) gets HONCHO_WORKSPACE,
+# osr by default.
+honcho_workspace=none
+if [[ -n $HONCHO_URL ]]; then
+  printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' < "$HONCHO_API_KEY_FILE")" > "$stage/honcho-auth"
+  status=$(api "${HONCHO_URL%/}/osr/v1/whoami" "$stage/honcho-auth")
+  case $status in
+    200) honcho_workspace=$(python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+w = d.get("workspace") if isinstance(d, dict) and not d.get("per_user") else None
+print(w if isinstance(w, str) else "")' "$stage/response" 2>/dev/null || true) ;;
+    404) honcho_workspace=${HONCHO_WORKSPACE:-osr} ;;
+    401|403) die "Honcho at $HONCHO_URL rejected this CT's key. Rerun provision-lxc.sh --reconfigure with HONCHO_CT_ID to issue a new one." ;;
+    000) die "Honcho at $HONCHO_URL is unreachable from this CT: $(head -c 300 "$stage/curl-error"). Its firewall must admit this CT (HONCHO_CLIENT_IPS of targets/honcho/provision-lxc.sh)." ;;
+    *) die "Honcho at $HONCHO_URL answered /osr/v1/whoami with HTTP $status." ;;
+  esac
+  [[ $honcho_workspace =~ ^[A-Za-z0-9_-]{1,100}$ ]] ||
+    die "Honcho at $HONCHO_URL names no workspace of its own for this CT's key (Open WebUI's key?). Rerun provision-lxc.sh --reconfigure with HONCHO_CT_ID."
+fi
+
 # --- unchanged and healthy: nothing to do ---------------------------------------
 unit_sha256=none
 if [[ $HERMES_API_SERVER == true ]]; then
@@ -695,11 +719,11 @@ PY
     [[ ! -d $HERMES_HOME/plugins/honcho ]] || plugin_flags+=(--force)
     run_hermes plugins install honcho "${plugin_flags[@]}"
   fi
-  python3 - "$HONCHO_API_KEY_FILE" "$HONCHO_URL" "$HERMES_HOME/honcho.json" <<'PY'
+  python3 - "$HONCHO_API_KEY_FILE" "$HONCHO_URL" "$HERMES_HOME/honcho.json" "$honcho_workspace" <<'PY'
 import json, sys
 key = open(sys.argv[1], encoding="utf-8").read().strip()
 data = {"apiKey": key, "baseUrl": sys.argv[2], "hosts": {"hermes": {
-    "enabled": True, "aiPeer": "hermes", "peerName": "user", "workspace": "osr"}}}
+    "enabled": True, "aiPeer": "hermes", "peerName": "user", "workspace": sys.argv[4]}}}
 with open(sys.argv[3], "w", encoding="utf-8") as f:
     json.dump(data, f)
     f.write("\n")

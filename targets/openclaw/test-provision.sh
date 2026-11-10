@@ -302,7 +302,15 @@ case $cmd in
         sh\ -c\ \[\ -s\ /root/openclaw-deploy/open-terminal-key*)
           [[ -s $FAKE_DIR/ct$id/ot-key ]] && tr -d '\r\n\t ' < "$FAKE_DIR/ct$id/ot-key" | sha256sum | cut -d' ' -f1 ;;
         'test -s /root/openclaw-deploy/honcho-api-key') [[ -s $FAKE_DIR/ct$id/honcho-key ]] ;;
-        'cat /etc/honcho-target/client-api-key') [[ $id == 285 ]] && printf '%s\n' "$FAKE_HONCHO_KEY" ;;
+        # The Honcho CT's gateway clients: a key per client in $FAKE_DIR/honcho-client-<name>.
+        sh\ -c\ *openclaw-deploy/honcho-api-key*)
+          [[ -s $FAKE_DIR/ct$id/honcho-key ]] && tr -d '\r\n\t ' < "$FAKE_DIR/ct$id/honcho-key" | sha256sum | cut -d' ' -f1 ;;
+        'test -x /usr/local/sbin/honcho-clients') [[ $id == 285 ]] ;;
+        '/usr/local/sbin/honcho-clients has '*)
+          [[ -s $FAKE_DIR/honcho-client-$3 ]] && [[ $(tr -d '\n' < "$FAKE_DIR/honcho-client-$3" | sha256sum | cut -d' ' -f1) == "$4" ]] ;;
+        '/usr/local/sbin/honcho-clients issue '*)
+          printf '%s\n' "$FAKE_HONCHO_KEY" | tee "$FAKE_DIR/honcho-client-$3" ;;
+        '/usr/local/sbin/honcho-clients revoke '*) rm -f "$FAKE_DIR/honcho-client-$3" ;;
         'install -d -m 0700 /root/openclaw-deploy') : ;;
         env\ *install-target.sh)
           printf '%s\n' "$all" > "$FAKE_DIR/guest-env"
@@ -457,26 +465,34 @@ grep -q '192.0.2.71/32.*openclaw-model' "$fwfile" && fail 'old model server stil
 # Honcho: given once, kept by a plain --reconfigure, turned off with HONCHO_URL=.
 honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-model'
 : > "$log"; rm -f "$fake"/pushed-*
+honcho_lxc=$fake/honcho-lxc; mkdir -p "$honcho_lxc"
+printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.85/24,gw=192.0.2.1\n' > "$honcho_lxc/285.conf"
 out=$(real --reconfigure HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=285 FAKE_HONCHO_KEY=$honcho_key) || fail "Honcho on: $out"
-grep -q 'pct exec 285 -- cat /etc/honcho-target/client-api-key' "$log" || fail 'the key must be the Honcho osr workspace key'
+grep -q 'pct exec 285 -- /usr/local/sbin/honcho-clients issue openclaw-283 --workspace openclaw-283' "$log" ||
+  fail 'the key must be this CT'"'"'s own gateway key, pinned to its own workspace'
+grep -q 'cat /etc/honcho-target' "$log" && fail 'no key file is read from the Honcho CT'
 [[ $(cat "$fake/pushed-283-honcho-api-key") == "$honcho_key" ]] || fail 'the Honcho key was not pushed as a file'
 grep -qxF "$honcho_rule" "$fwfile" || fail "Honcho egress rule: $(cat "$fwfile")"
 grep -q 'HONCHO_URL=http://192.0.2.85:8000' "$log" || fail 'the guest did not get HONCHO_URL'
 : > "$log"; rm -f "$fake"/pushed-*
-out=$(real --reconfigure) || fail "plain reconfigure: $out"
+out=$(real --reconfigure PVE_LXC_DIR="$honcho_lxc" FAKE_HONCHO_KEY=honcho-rotated-key-0123456789) || fail "plain reconfigure: $out"
 [[ $out == *'Keeping Honcho memory at http://192.0.2.85:8000'* ]] || fail "no keep notice: $out"
+grep -q 'pct exec 285 -- /usr/local/sbin/honcho-clients has openclaw-283 [0-9a-f]* --workspace openclaw-283' "$log" || fail 'the kept key was not checked with the Honcho CT'
+grep -q 'honcho-clients issue' "$log" && fail 'a key Honcho accepts was replaced'
 grep -qxF "$honcho_rule" "$fwfile" || fail 'a plain reconfigure dropped the Honcho egress rule'
 grep -q 'HONCHO_URL=http://192.0.2.85:8000' "$log" || fail 'a plain reconfigure did not pass HONCHO_URL on'
 [[ ! -e $fake/pushed-283-honcho-api-key ]] || fail 'the Honcho key already in the CT should be reused'
 : > "$log"
-out=$(real --reconfigure HONCHO_URL=) || fail "Honcho off: $out"
+out=$(real --reconfigure HONCHO_URL= PVE_LXC_DIR="$honcho_lxc") || fail "Honcho off: $out"
+grep -q 'pct exec 285 -- /usr/local/sbin/honcho-clients revoke openclaw-283 --missing-ok' "$log" || fail 'HONCHO_URL= did not revoke the key'
+[[ ! -e $fake/honcho-client-openclaw-283 ]] || fail 'the revoked key still works'
 grep -q '192.0.2.85/32' "$fwfile" && fail 'HONCHO_URL= kept the Honcho egress rule'
 grep -q 'HONCHO_URL= ' "$log" || fail 'the guest was not told to turn Honcho off'
 : > "$log"
 out=$(real --reconfigure) || fail "reconfigure after Honcho off: $out"
 [[ $out != *'Keeping Honcho memory'* ]] || fail 'Honcho came back after it was turned off'
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
-pass 'Honcho: the osr key as a file and an egress rule; kept by a plain --reconfigure; HONCHO_URL= turns it off'
+pass 'Honcho: its own gateway key and workspace, as a file, and an egress rule; kept by a plain --reconfigure; HONCHO_URL= revokes it'
 
 # Open Terminal: a client key issued by the terminal CT, admitted in its
 # firewall, an egress rule here; kept (not rotated) by a plain --reconfigure;

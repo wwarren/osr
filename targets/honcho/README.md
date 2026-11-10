@@ -3,19 +3,24 @@
 [Honcho](https://github.com/plastic-labs/honcho) stores conversations and
 derives persistent peer memory. This CPU-only target creates an unprivileged
 Debian 13 LXC with PostgreSQL/pgvector, the Honcho API (port 8000) and deriver,
-the upstream Streamable HTTP MCP server (port 3000) and its own embedding
-model, [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF)
+the upstream Streamable HTTP MCP server (port 3000), a client gateway in front
+of both that gives every Open WebUI user a memory of their own, and its own
+embedding model, [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF)
 (Q8_0, 1024 dimensions) on llama.cpp's `llama-server`. No GPU and no external
 embedding server are needed; Honcho's chat model runs on your model servers.
 
 **Access.** The CT firewall admits the router and the selected agent CTs
-(Hermes, OpenClaw, DeepSeek Harness) to ports 8000 and 3000 and blocks other
-inbound traffic. Honcho uses JWTs: `/etc/honcho-target/api-key` is the admin
-key and never leaves the CT; `/etc/honcho-target/client-api-key` is scoped to
-the shared `osr` workspace and is the only key Open WebUI and the agents get.
-Hermes and OpenClaw use the API through their native plugins, DeepSeek Harness
-the MCP server; the same key reaches the same data either way, so agents get
-both ports (an agent's MCP rule is tagged `# osr-honcho-client-mcp`).
+(Hermes, OpenClaw, DeepSeek Harness) to ports 8000 (API) and 3000 (MCP) and
+blocks other inbound traffic. Both ports belong to the client gateway
+(`honcho-gateway.service`); Honcho's API and MCP server listen on
+127.0.0.1:8010 and :3010 behind it. Every client has its own gateway key (the
+CT keeps only SHA-256 hashes, in `/etc/honcho-target/clients.json`) and no
+client ever holds a Honcho key: the gateway forwards each request with a key
+for that client's or user's workspace alone. The admin key
+`/etc/honcho-target/api-key` never leaves the CT. Hermes and OpenClaw use the
+API through their native plugins, DeepSeek Harness the MCP server, so agents
+get both ports (an agent's MCP rule is tagged `# osr-honcho-client-mcp`). See
+[Memory per user and client keys](#memory-per-user-and-client-keys).
 
 ## Requirements
 
@@ -199,6 +204,58 @@ new Honcho CT with the local model, migrate the data with a separately
 verified procedure, and keep the old CT and database until the new search
 results check out.
 
+## Memory per user and client keys
+
+**Open WebUI users.** Open WebUI is the gateway client `openwebui` (its key is
+`/etc/honcho-target/openwebui-key` and the Honcho Memory connection's key).
+The connection sends `X-User-Id: {{USER_ID}}`, which Open WebUI fills in with
+the signed-in user's ID on every request, and the gateway gives each user a
+workspace of their own, `openwebui-u-<16 hex digits>` (a hash of the client
+and the user), created on first use. Honcho itself enforces the separation:
+the gateway's key for a workspace is a Honcho JWT for that workspace alone, so
+any other workspace is refused (a tool call's `workspace_id` is replaced by
+the user's own), and Honcho's MCP server binds each session to its user's key.
+A request that names no user is refused; only `GET /osr/v1/whoami` answers it.
+The connection is admin-only until you grant access to users or groups in
+Open WebUI (Admin Settings, External Tools); everyone granted gets a private
+memory.
+
+**Agents.** Each agent CT is a client `<agent>-<CT>` (for example
+`hermes-282`) with its own key, issued by the agent's provisioner and pinned to
+a workspace of its own with the same name, as its Open Terminal workspace is:
+no agent reaches another agent's memory or an Open WebUI user's, and an agent
+key cannot name users. The agent learns its workspace from the gateway
+(`/osr/v1/whoami`) when it is installed; against a Honcho without this gateway
+it uses `HONCHO_WORKSPACE` (default `osr`). A reconfigure keeps an agent's key
+while the Honcho CT accepts it for that workspace; `HONCHO_URL=` (or moving to
+another Honcho) revokes it. Hermes's own users still share Hermes's memory (the
+agent does not pass them on). To let agents share one workspace on purpose,
+give them one with `honcho-clients issue NAME --workspace W` and their
+configuration follows on the next reconfigure.
+
+**Managing clients.** In the Honcho CT, as root:
+
+```bash
+honcho-clients list                     # clients and their workspaces
+honcho-clients workspaces               # per-user workspaces: name, client, user ID, created
+honcho-clients issue NAME [--workspace W | --per-user]   # a new key (printed once)
+honcho-clients revoke NAME              # that key stops working; memories stay
+```
+
+A key is revoked on its own, without touching the others or the JWT secret.
+To delete one user's memories, find their workspace with
+`honcho-clients workspaces` and delete it with the admin key, which stays in
+the CT:
+
+```bash
+curl -fsS -X DELETE -H "Authorization: Bearer $(cat /etc/honcho-target/api-key)" \
+  http://127.0.0.1:8010/v3/workspaces/openwebui-u-0123456789abcdef
+```
+
+Honcho deletes it in the background and refuses (409) while the workspace has
+active sessions; delete those first. Then `systemctl restart honcho-gateway`,
+so the user's next request creates an empty workspace again.
+
 ## Upgrades, rollback and keys
 
 Move the `HONCHO_REF` default only after `targets/honcho/test-pinned-upstream.py`
@@ -211,7 +268,7 @@ request then, and checks the embedding settings (model, URL, size, no
 
 A reconfigure keeps the database, JWT secret and keys. Before changing an
 installed CT it sets aside the env file, keys, units, Bun and `llama-server`
-in the root-only `/var/lib/honcho-target/rollback/`, stops the five services
+in the root-only `/var/lib/honcho-target/rollback/`, stops the six services
 and dumps the database there (`pg_dump -Fc`; leave room), even if the commit
 is unchanged (embedding configuration can change empty vector columns). If a
 later step fails, the previous commit, dependencies, database (dropped,
@@ -225,26 +282,28 @@ The run says so and keeps `/var/lib/honcho-target/rollback/`; the next
 reconfigure stops at once, so the only copy of the old database cannot be
 overwritten. Inside the Honcho CT:
 
-1. Check `systemctl status honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp`
-   and `journalctl -u honcho-embedding -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp`.
+1. Check `systemctl status honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp honcho-gateway`
+   and `journalctl -u honcho-embedding -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp -u honcho-gateway`.
    Files are already restored; the cause is often outside Honcho (router,
    chat model host, disk space).
 2. If the database is not as it was, restore the dump with services stopped:
 
    ```bash
-   systemctl stop honcho-mcp honcho-deriver honcho-api honcho-proxy honcho-embedding
+   systemctl stop honcho-gateway honcho-mcp honcho-deriver honcho-api honcho-proxy honcho-embedding
    runuser -u postgres -- dropdb --if-exists honcho
    runuser -u postgres -- createdb -O honcho --encoding=UTF8 --template=template0 honcho
    runuser -u postgres -- pg_restore --exit-on-error -d honcho < /var/lib/honcho-target/rollback/honcho.dump
-   systemctl start honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp
+   systemctl start honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp honcho-gateway
    ```
 
    The other files there (`honcho.env`, `budgets.env`, `settings.env`,
-   `embedding.env`, `jwt-secret`, `api-key`, `client-api-key`, proxy settings
-   and credentials, units, proxy scripts, `bun`, `llama-server` and its
-   `build-info`) are the pre-run copies for `/etc/honcho-target/`,
-   `/etc/systemd/system/`, `/opt/honcho-bun/` and `/opt/honcho-llama/` (`bin/`
-   for `llama-server`).
+   `embedding.env`, `jwt-secret`, `api-key`, `openwebui-key`, `clients.json`,
+   `gateway.env`, proxy settings and credentials, units, proxy scripts, `bun`,
+   `llama-server` and its `build-info`, `honcho-gateway.py` and
+   `honcho-clients`) are the pre-run copies for `/etc/honcho-target/`,
+   `/etc/systemd/system/`, `/opt/honcho-bun/`, `/opt/honcho-llama/` (`bin/`
+   for `llama-server`), `/usr/local/lib/honcho-gateway/` and
+   `/usr/local/sbin/`.
 3. Once `curl -fsS http://127.0.0.1:8000/health` and
    `http://127.0.0.1:3000/health` succeed, `rm -r -- /var/lib/honcho-target/rollback`
    and reconfigure again.
@@ -269,25 +328,26 @@ tables or data; inspect it first.
 
 ### Rotating keys
 
-`--reconfigure --rotate-keys` replaces the JWT secret (invalidating every key)
-and creates new admin and `osr` workspace keys; keys do not otherwise expire.
-The provisioner first verifies Open WebUI admin access and keeps copies of the
-old secret, keys and Open WebUI connection until MCP registration succeeds.
-Agents fail to reach Honcho until each is reconfigured with `HONCHO_CT_ID`;
-the run prints those commands. If the run fails, it checks whether the secret
-actually changed:
+`--reconfigure --rotate-keys` replaces the JWT secret (invalidating the admin
+key; the gateway signs its workspace keys again), creates a new admin key and
+gives Open WebUI a new gateway key; keys do not otherwise expire. Agent keys
+are gateway keys, not Honcho JWTs, so the agents keep working; revoke or
+replace one with `honcho-clients`. The provisioner first verifies Open WebUI
+admin access and keeps copies of the old secret, keys, client list and Open
+WebUI connection until MCP registration succeeds. If the run fails, it checks
+whether the secret actually changed:
 
 - **Unchanged:** keys are left alone and the copies removed.
-- **Changed:** the old secret, keys and the `AUTH_JWT_SECRET` line are put back
-  (the rest of `honcho.env` stays as written), Honcho restarts and the saved
-  Open WebUI connection is restored.
+- **Changed:** the old secret, keys, client list and the `AUTH_JWT_SECRET` line
+  are put back (the rest of `honcho.env` stays as written), Honcho and its
+  gateway restart and the saved Open WebUI connection is restored.
 - **That restore fails, or the CT cannot be checked:** recovery stops. The old
   secret and keys stay in `/root/honcho-rotation-<pid>/` in the Honcho CT and
   the old connection in `/root/honcho-integration-<pid>/webui-honcho-snapshot.json`
   in the router CT (both printed); the admin token and new client key are
   removed from the router CT when reachable. Once Honcho is healthy, a plain
-  `--reconfigure` registers Open WebUI with the current key; reconfigure the
-  agents with `HONCHO_CT_ID` if the keys changed, then remove both directories.
+  `--reconfigure` registers Open WebUI with the current key; then remove both
+  directories.
 
 ## Install with the router
 
@@ -297,8 +357,9 @@ registers `http://<honcho-ip>:3000/mcp` as an authenticated Streamable HTTP
 tool server in Open WebUI (admin-only until granted; it does not make every
 conversation a memory session). Selected Hermes and OpenClaw get their native
 Honcho integrations and DeepSeek Harness its MCP connection
-([details](../deepseek-harness/README.md#honcho-memory)), all on the `osr`
-workspace and `user` peer.
+([details](../deepseek-harness/README.md#honcho-memory)), each with its own key
+and workspace (its memory of the `user` peer); every Open WebUI user granted
+the tools gets a workspace of their own.
 
 It asks for Honcho's CT ID (default: the next free ID not taken by this
 install) and static IP/CIDR (never chosen automatically)
@@ -357,10 +418,11 @@ to return it to its default. A CT that never set `HONCHO_REF` follows the pin
 and is upgraded on the first reconfigure after it moves. Agent firewall
 allowances are kept unless `HONCHO_CLIENT_IPS` is set, which replaces the list
 (include every agent). Then run the agents' provisioners with `HONCHO_URL` and
-`HONCHO_CT_ID`; they fetch the workspace key without putting it on a command
-line (`HONCHO_API_KEY_FILE` for an external Honcho). Their later reconfigures
-keep URL, key and rule; set `HONCHO_CT_ID` again for a new key or `HONCHO_URL=`
-to turn Honcho off. A Honcho CT older than the workspace key gets it on its
+`HONCHO_CT_ID`; each has the Honcho CT issue its own key and workspace
+(`honcho-clients issue <agent>-<CT>`), never on a command line (`HONCHO_API_KEY_FILE`
+for an external Honcho). Their later reconfigures keep URL, key and rule (the
+key while Honcho accepts it, else a new one); `HONCHO_URL=` turns Honcho off
+and revokes the key. A Honcho CT installed before the gateway gets it on its
 next reconfigure; run that before reconfiguring the agents.
 
 `install-target.sh` run inside the CT asks for `ROUTER_URL` if unset (set it
@@ -368,8 +430,9 @@ for unattended runs); use the host's `--reconfigure` when keys or router
 integration change.
 
 **Health.** In the CT: `systemctl status honcho-embedding honcho-proxy
-honcho-api honcho-deriver honcho-mcp` and their journals; API
-`http://127.0.0.1:8000/health`, MCP `http://127.0.0.1:3000/health`, proxy
+honcho-api honcho-deriver honcho-mcp honcho-gateway` and their journals; API
+`http://127.0.0.1:8000/health` and MCP `http://127.0.0.1:3000/health` through
+the gateway (Honcho itself on `:8010` and `:3010`), proxy
 `http://127.0.0.1:8765/healthz`. PostgreSQL data is in `/var/lib/postgresql`.
 
 Upstream guidance: [self hosting](https://github.com/plastic-labs/honcho#self-hosting),

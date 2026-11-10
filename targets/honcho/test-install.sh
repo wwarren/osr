@@ -99,7 +99,7 @@ router=http://127.0.0.1:$(<"$fake/port")
 
 # --- stubs ------------------------------------------------------------------------
 stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" > "$bin/$1"; chmod +x "$bin/$1"; }
-stub id 'case $1 in -u) echo 0 ;; honcho|honcho-proxy|honcho-embedding) [[ -e $FAKE_DIR/user-$1 ]] ;; esac'
+stub id 'case $1 in -u) echo 0 ;; honcho|honcho-proxy|honcho-embedding|honcho-gateway) [[ -e $FAKE_DIR/user-$1 ]] ;; esac'
 stub useradd 'echo "useradd $*" >> "$FAKE_LOG"; touch "$FAKE_DIR/user-${@: -1}"'
 stub chown 'echo "chown $*" >> "$FAKE_LOG"'
 stub sleep ':'
@@ -201,7 +201,9 @@ case $url in
   http://127.0.0.1:8765/healthz)
     [[ -e $FAKE_DIR/active-honcho-proxy ]] || exit 7 ;;
   http://127.0.0.1:8000/health|http://127.0.0.1:3000/health)
+    # The gateway answers there once installed (it asks the API and MCP).
     [[ -e $FAKE_DIR/active-honcho-api && -e $FAKE_DIR/active-honcho-mcp ]] || exit 7
+    [[ ! -e $FAKE_UNITS/honcho-gateway.service || -e $FAKE_DIR/active-honcho-gateway ]] || exit 7
     [[ $(cat "$FAKE_OPT/.git/FAKE_HEAD") != "${FAKE_UNHEALTHY_COMMIT:-none}" ]] || exit 22 ;;
   https://github.com/oven-sh/bun/*) cp "$FAKE_BUN_ZIP" "$out" ;;
   *) exit 6 ;;
@@ -251,7 +253,8 @@ fresh() {
   rm -rf -- "$tmp/ct" "$tmp/uv" "$tmp/bun" "$fake"/active-* "$fake"/failed-* "$fake"/pg-* "$fake/db-data" "$fake/db-encoding" "$fake"/user-honcho* "$fake/probe.json" "$fake/tool-probe.json"
   rm -f "$fake/chat-status" "$fake/chat-warning" "$fake/embed-dims"
   mkdir -p "$tmp/ct/deploy" "$tmp/ct/units"
-  cp "$here"/honcho-*.service "$here/budgets.py" "$here/honcho-proxy.py" "$here/direct_dispatch.py" "$tmp/ct/deploy/"
+  cp "$here"/honcho-*.service "$here/budgets.py" "$here/honcho-proxy.py" "$here/direct_dispatch.py" \
+    "$here/honcho-gateway.py" "$here/honcho-clients" "$tmp/ct/deploy/"
   cp "$fake/router-key" "$tmp/ct/deploy/router-api-key"
   : > "$tmp/ct/deploy/backend-keys"
   printf 'flags : fpu sse2 avx avx2\n' > "$tmp/ct/cpuinfo"
@@ -259,6 +262,7 @@ fresh() {
   : > "$FAKE_LOG"
 }
 guest_prefix=() guest_exec=''
+gateway_group=$(id -gn)
 guest() {
   : > "$FAKE_LOG"
   ${guest_exec:+exec} "${guest_prefix[@]}" env PATH="$bin:$PATH" FAKE_OPT="$tmp/ct/opt" \
@@ -266,6 +270,8 @@ guest() {
     HONCHO_STATE_DIR="$tmp/ct/state" HONCHO_HOME="$tmp/ct/home" HONCHO_UV_DIR="$tmp/uv" \
     HONCHO_BUN_DIR="$tmp/bun" HONCHO_UNIT_DIR="$tmp/ct/units" HONCHO_CPUINFO="$tmp/ct/cpuinfo" \
     HONCHO_PROXY_LIB_DIR="$tmp/ct/lib" HONCHO_LLAMA_DIR="$tmp/ct/llama" \
+    HONCHO_GATEWAY_LIB_DIR="$tmp/ct/gateway" HONCHO_SBIN_DIR="$tmp/ct/sbin" \
+    HONCHO_GATEWAY_GROUP="$gateway_group" FAKE_UNITS="$tmp/ct/units" \
     HONCHO_EMBEDDING_DIR="$tmp/ct/embedding" HONCHO_EMBEDDING_FILE_URL=https://models.test/model.gguf \
     HONCHO_EMBEDDING_FILE_SHA256="$model_sha" \
     HONCHO_HEALTH_TRIES=2 ROUTER_URL="$router" \
@@ -311,9 +317,21 @@ assert_contains "btree_gin is created with the other extensions" "CREATE EXTENSI
 assert_contains "the first migration makes the default 1536 columns" "alembic dims=1536" "$(calls)"
 assert_contains "then the columns get the model's size" "configure_embeddings" "$(calls)"
 assert_contains "an admin key is made" "generate_jwt --admin" "$(calls)"
-assert_contains "and a key scoped to the osr workspace" "generate_jwt --workspace osr" "$(calls)"
+assert_not_contains "but no Honcho key for clients" "generate_jwt --workspace" "$(calls)"
 file_mode "the admin key is root-only" 600 "$etc/api-key"
-file_mode "so is the client key" 600 "$etc/client-api-key"
+file_mode "so is Open WebUI's gateway key" 600 "$etc/openwebui-key"
+file_mode "the JWT secret is readable by the gateway's group" 640 "$etc/jwt-secret"
+assert_eq "Open WebUI is a gateway client with a workspace per user" \
+  "{\"key_sha256\": \"$(tr -d '\n' < "$etc/openwebui-key" | sha256sum | cut -d' ' -f1)\"}" \
+  "$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["clients"]["openwebui"]))' "$etc/clients.json")"
+assert_ok "the gateway is installed" cmp -s "$here/honcho-gateway.py" "$tmp/ct/gateway/honcho-gateway.py"
+assert_ok "with its client tool" cmp -s "$here/honcho-clients" "$tmp/ct/sbin/honcho-clients"
+assert_ok "and its unit" cmp -s "$here/honcho-gateway.service" "$tmp/ct/units/honcho-gateway.service"
+assert_contains "and account" "useradd --system --no-create-home --shell /usr/sbin/nologin honcho-gateway" "$(calls)"
+assert_ok "and runs" test -e "$fake/active-honcho-gateway"
+assert_eq "it waits a little longer than Honcho's model calls" "HONCHO_GATEWAY_UPSTREAM_TIMEOUT=7320" "$(<"$etc/gateway.env")"
+assert_contains "the API listens on loopback only" "--host 127.0.0.1 --port 8010" "$(<"$tmp/ct/units/honcho-api.service")"
+assert_contains "and so does MCP" "Environment=HOST=127.0.0.1" "$(<"$tmp/ct/units/honcho-mcp.service")"
 file_mode "the router key is limited to the proxy group" 640 "$etc/router-api-key"
 file_mode "the backend keys are limited to the proxy group" 640 "$etc/backend-keys"
 assert_contains "llama.cpp is fetched by its release tag" "fetch -q --depth 1 origin refs/tags/v0.5.0" "$(calls)"
@@ -348,7 +366,7 @@ assert_fail "and nothing is left set aside" test -e "$tmp/ct/state/rollback"
 assert_eq "a first install sizes its budgets for 65536 tokens" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/budgets.env")"
 assert_contains "and says so" "Honcho budgets for a 65536-token context" "$out"
 assert_contains "the proxy asks for that much context" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/proxy.settings")"
-admin_key=$(<"$etc/api-key") client_key=$(<"$etc/client-api-key")
+admin_key=$(<"$etc/api-key") client_key=$(<"$etc/openwebui-key") clients_json=$(<"$etc/clients.json")
 
 describe honcho_rerun
 out=$(guest) && rc=0 || rc=$?
@@ -357,7 +375,8 @@ assert_not_contains "it migrates with the real vector size" "alembic dims=1536" 
 assert_contains "taken from the env file" "alembic dims=from-env-file" "$(calls)"
 assert_contains "even the same commit gets a rollback dump" "pg_dump -Fc honcho" "$(calls)"
 assert_eq "the admin key is kept" "$admin_key" "$(<"$etc/api-key")"
-assert_eq "and the client key" "$client_key" "$(<"$etc/client-api-key")"
+assert_eq "and Open WebUI's key" "$client_key" "$(<"$etc/openwebui-key")"
+assert_eq "and the client list" "$clients_json" "$(<"$etc/clients.json")"
 assert_eq "and the first install's context" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/budgets.env")"
 assert_not_contains "llama.cpp is not built again" "cmake -S" "$(calls)"
 assert_not_contains "nor the model downloaded again" "download" "$(calls)"
@@ -391,6 +410,8 @@ before_env=$(<"$etc/honcho.env") before_db=$(<"$fake/db-data")
 before_proxy=$(<"$etc/proxy.settings")
 printf '# prior proxy revision\n' >> "$tmp/ct/lib/honcho-proxy.py"
 before_proxy_code=$(<"$tmp/ct/lib/honcho-proxy.py")
+printf '# prior gateway revision\n' >> "$tmp/ct/gateway/honcho-gateway.py"
+before_gateway_code=$(<"$tmp/ct/gateway/honcho-gateway.py") before_clients=$(<"$etc/clients.json")
 out=$(guest HONCHO_CONTEXT_TOKENS=32768 FAKE_MIGRATE_FAIL_COMMIT="$(printf 'a%.0s' {1..40})") && rc=0 || rc=$?
 assert_ne "a failed same-commit migration fails the run" 0 "$rc"
 assert_contains "rollback also recreates the database in UTF8" 'createdb -O honcho --encoding=UTF8 --template=template0 honcho' "$(calls)"
@@ -399,6 +420,9 @@ assert_eq "including the prior data" "$before_db" "$(<"$fake/db-data")"
 assert_eq "and its env file" "$before_env" "$(<"$etc/honcho.env")"
 assert_eq "and its prior proxy settings" "$before_proxy" "$(<"$etc/proxy.settings")"
 assert_eq "and its prior proxy implementation" "$before_proxy_code" "$(<"$tmp/ct/lib/honcho-proxy.py")"
+assert_eq "and its prior gateway" "$before_gateway_code" "$(<"$tmp/ct/gateway/honcho-gateway.py")"
+assert_eq "and client list" "$before_clients" "$(<"$etc/clients.json")"
+assert_ok "with the gateway running again" test -e "$fake/active-honcho-gateway"
 
 describe honcho_upgrade
 out=$(guest HONCHO_REF=v3.6.0) && rc=0 || rc=$?
@@ -458,7 +482,8 @@ secret=$(<"$etc/jwt-secret")
 out=$(guest HONCHO_REF=v3.6.0 HONCHO_ROTATE_KEYS=true FAKE_UNHEALTHY_COMMIT="$(printf 'b%.0s' {1..40})") && rc=0 || rc=$?
 assert_ne "a rotation whose restart fails is undone" 0 "$rc"
 assert_eq "the old secret is back" "$secret" "$(<"$etc/jwt-secret")"
-assert_eq "and the old client key" "$client_key" "$(<"$etc/client-api-key")"
+assert_eq "and the old Open WebUI key" "$client_key" "$(<"$etc/openwebui-key")"
+assert_eq "and client list" "$clients_json" "$(<"$etc/clients.json")"
 # That commit is unhealthy before the rotation too, so the rollback cannot
 # bring Honcho back: it keeps its copies, and the next run waits for them.
 assert_contains "a rollback that cannot come back keeps its copies" "the set-aside copies are in $tmp/ct/state/rollback" "$out"
@@ -475,8 +500,10 @@ out=$(guest HONCHO_REF=v3.6.0 HONCHO_ROTATE_KEYS=true) && rc=0 || rc=$?
 assert_eq "a rotation succeeds" 0 "$rc"
 assert_ne "with a new JWT secret" "$secret" "$(<"$etc/jwt-secret")"
 assert_ne "a new admin key" "$admin_key" "$(<"$etc/api-key")"
-assert_ne "and a new client key" "$client_key" "$(<"$etc/client-api-key")"
-assert_contains "made with the new secret" "jwt-$(head -c 8 "$etc/jwt-secret")" "$(<"$etc/client-api-key")"
+assert_ne "and a new Open WebUI key" "$client_key" "$(<"$etc/openwebui-key")"
+assert_contains "which the gateway accepts instead of the old one" "$(tr -d '\n' < "$etc/openwebui-key" | sha256sum | cut -d' ' -f1)" "$(<"$etc/clients.json")"
+assert_not_contains "and says agent keys stay" "every client needs" "$out"
+assert_contains "it says agents are not affected" "agent keys are not affected" "$out"
 assert_contains "env file uses the new secret" "AUTH_JWT_SECRET=$(<"$etc/jwt-secret")" "$(<"$etc/honcho.env")"
 
 describe honcho_budgets

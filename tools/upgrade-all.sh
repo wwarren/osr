@@ -135,7 +135,7 @@ declare -A UNITS=(
     # The workspace gateway; per-user open-terminal-ws@<id> instances start on
     # demand and stop when idle, so neither they nor their ports are checked.
     [open-terminal]='open-terminal-gateway open-terminal-spawner'
-    [honcho]='postgresql honcho-api honcho-deriver honcho-embedding honcho-mcp honcho-proxy'
+    [honcho]='postgresql honcho-api honcho-deriver honcho-embedding honcho-mcp honcho-proxy honcho-gateway'
     [hermes]='hermes-gateway hermes-direct hermes-dashboard'
     [openclaw]='openclaw-gateway openclaw-direct'
     [deepseek-harness]='deepseek-harness'

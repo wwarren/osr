@@ -23,6 +23,11 @@ unit_dir=${HONCHO_UNIT_DIR:-/etc/systemd/system}
 # path, so nothing else may live beside the proxy.
 proxy_lib_dir=${HONCHO_PROXY_LIB_DIR:-/usr/local/lib/honcho-proxy}
 proxy_url=http://127.0.0.1:8765
+# The client gateway (per-client keys, a workspace per Open WebUI user) owns
+# the public ports 8000 and 3000; Honcho's API and MCP server listen on
+# loopback behind it (8010 and 3010).
+gateway_lib_dir=${HONCHO_GATEWAY_LIB_DIR:-/usr/local/lib/honcho-gateway}
+sbin_dir=${HONCHO_SBIN_DIR:-/usr/local/sbin}
 llama_dir=${HONCHO_LLAMA_DIR:-/opt/honcho-llama}
 embedding_dir=${HONCHO_EMBEDDING_DIR:-/var/lib/honcho-embedding}
 cpuinfo=${HONCHO_CPUINFO:-/proc/cpuinfo}
@@ -76,7 +81,7 @@ if [[ $bun_version == "$default_bun_version" ]]; then
   bun_sha256_baseline=${bun_sha256_baseline:-e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76}
 fi
 bun=$bun_dir/bun
-units=(honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp)
+units=(honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp honcho-gateway)
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 [[ $KINDI_READ_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,5}$ ]] || die 'Invalid KINDI_READ_TIMEOUT_SECONDS.'
@@ -90,7 +95,9 @@ Run as root inside an existing Honcho CT after the Proxmox provisioner has
 staged router-api-key. An interactive run asks for ROUTER_URL when unset; for
 unattended runs set it. Embeddings need no settings: this CT builds llama.cpp
 (llama-server, CPU) and runs Qwen3-Embedding-0.6B (Q8_0, 1024 dimensions) as
-honcho-embedding.service on 127.0.0.1:8766.
+honcho-embedding.service on 127.0.0.1:8766. Clients reach the API (8000) and
+MCP (3000) through honcho-gateway.service with their own keys
+(honcho-clients); every Open WebUI user gets a workspace of their own.
 CT ID and CT IP are chosen by provision-lxc.sh on the Proxmox host.
 USAGE
   exit 0
@@ -113,7 +120,8 @@ done
 [[ $ref =~ ^(main|v[0-9][A-Za-z0-9._-]*|[0-9a-f]{40})$ ]] || die 'HONCHO_REF must be main, a release tag or a full commit SHA.'
 [[ -s $deploy/router-api-key ]] || die "Missing $deploy/router-api-key."
 [[ -s $deploy/budgets.py ]] || die "Missing $deploy/budgets.py."
-for file in honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-embedding.service; do
+for file in honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-embedding.service \
+            honcho-gateway.py honcho-clients honcho-gateway.service; do
   [[ -s $deploy/$file ]] || die "Missing $deploy/$file."
 done
 [[ -f $deploy/backend-keys ]] || : > "$deploy/backend-keys"
@@ -168,14 +176,14 @@ systemctl enable --now postgresql
 if ! id honcho >/dev/null 2>&1; then
   useradd --system --home-dir "$home" --create-home --shell /usr/sbin/nologin honcho
 fi
-for account in honcho-proxy honcho-embedding; do
+for account in honcho-proxy honcho-embedding honcho-gateway; do
   if ! id "$account" >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$account"
   fi
 done
 install -d -m 0750 -o honcho -g honcho "$opt"
 install -d -m 0700 "$state"
-install -d -m 0755 "$proxy_lib_dir"
+install -d -m 0755 "$proxy_lib_dir" "$gateway_lib_dir"
 
 as_honcho() { runuser -u honcho -- env HOME="$home" "$@"; }
 # opt_git: git in the checkout, as root. The checkout belongs to honcho after the
@@ -212,8 +220,9 @@ if [[ -f $unit_dir/honcho-api.service && -d $opt/.git ]]; then
   prev_commit=$(opt_git rev-parse HEAD)
   if [[ -e $backup ]]; then
     die "Previous rollback data remains in $backup: an earlier run's rollback did not complete.
-It holds what that run set aside: honcho.env, the budget and settings records, the keys, the units, Bun, llama-server and, as honcho.dump, the
-database from before that run. Check Honcho (systemctl status honcho-embedding honcho-proxy honcho-api honcho-deriver honcho-mcp).
+It holds what that run set aside: honcho.env, the budget and settings records, the keys and client list, the units, Bun, llama-server,
+the gateway and, as honcho.dump, the database from before that run. Check Honcho (systemctl status honcho-embedding honcho-proxy
+honcho-api honcho-deriver honcho-mcp honcho-gateway).
 If it is healthy, or after restoring from those copies (see 'When a rollback does not complete' in
 targets/honcho/README.md), remove the directory with: rm -r -- $backup
 Then run the reconfigure again. Nothing was changed by this run."
@@ -224,11 +233,13 @@ Then run the reconfigure again. Nothing was changed by this run."
   fi
   install -d -m 0700 "$backup"
   for file in "$etc/honcho.env" "$etc/budgets.env" "$etc/settings.env" "$etc/proxy.settings" \
-              "$etc/router-api-key" "$etc/backend-keys" "$etc/jwt-secret" "$etc/api-key" "$etc/client-api-key" \
+              "$etc/router-api-key" "$etc/backend-keys" "$etc/jwt-secret" "$etc/api-key" \
+              "$etc/openwebui-key" "$etc/clients.json" "$etc/gateway.env" \
               "$etc/embedding.env" "$proxy_lib_dir/honcho-proxy.py" "$proxy_lib_dir/direct_dispatch.py" "$bun" \
+              "$gateway_lib_dir/honcho-gateway.py" "$sbin_dir/honcho-clients" \
               "$llama_dir/bin/llama-server" "$llama_dir/build-info" \
               "$unit_dir/honcho-embedding.service" "$unit_dir/honcho-proxy.service" "$unit_dir/honcho-api.service" \
-              "$unit_dir/honcho-deriver.service" "$unit_dir/honcho-mcp.service"; do
+              "$unit_dir/honcho-deriver.service" "$unit_dir/honcho-mcp.service" "$unit_dir/honcho-gateway.service"; do
     if [[ -f $file ]]; then cp -a -- "$file" "$backup/$(basename "$file")"; fi
   done
 fi
@@ -240,7 +251,8 @@ rollback() {
   trap - EXIT
   note 'Honcho setup failed; restoring the previous installation.'
   systemctl stop "${units[@]/%/.service}" >/dev/null 2>&1 || true
-  for name in honcho.env budgets.env settings.env proxy.settings router-api-key backend-keys jwt-secret api-key client-api-key embedding.env; do
+  for name in honcho.env budgets.env settings.env proxy.settings router-api-key backend-keys jwt-secret api-key \
+              openwebui-key clients.json gateway.env embedding.env; do
     if [[ -f $backup/$name ]]; then cp -a -- "$backup/$name" "$etc/$name"
     else rm -f -- "$etc/$name"; fi
   done
@@ -252,6 +264,10 @@ rollback() {
     if [[ -f $backup/$name ]]; then cp -a -- "$backup/$name" "$proxy_lib_dir/$name"
     else rm -f -- "$proxy_lib_dir/$name"; fi
   done
+  if [[ -f $backup/honcho-gateway.py ]]; then cp -a -- "$backup/honcho-gateway.py" "$gateway_lib_dir/honcho-gateway.py"
+  else rm -f -- "$gateway_lib_dir/honcho-gateway.py"; fi
+  if [[ -f $backup/honcho-clients ]]; then cp -a -- "$backup/honcho-clients" "$sbin_dir/honcho-clients"
+  else rm -f -- "$sbin_dir/honcho-clients"; fi
   install -d -m "$previous_etc_mode" -o "${previous_etc_owner%%:*}" \
     -g "${previous_etc_owner#*:}" "$etc" || ok=false
   if [[ -f $backup/bun ]]; then cp -a -- "$backup/bun" "$bun"; fi
@@ -268,8 +284,8 @@ rollback() {
       runuser -u postgres -- pg_restore --exit-on-error -d honcho < "$backup/honcho.dump"; } || ok=false
   fi
   systemctl daemon-reload || ok=false
-  # The units the previous installation had (an older one had no proxy or
-  # local embedding model).
+  # The units the previous installation had (an older one had no proxy,
+  # local embedding model or gateway).
   local -a restart=()
   for name in "${units[@]}"; do
     [[ ! -f $unit_dir/$name.service ]] || restart+=("$name.service")
@@ -280,7 +296,7 @@ rollback() {
     rm -rf -- "$backup"
     note "The previous Honcho (${prev_commit:0:12}) is running again."
   else
-    note "Honcho did not come back cleanly; the set-aside copies are in $backup. Inspect journalctl -u honcho-embedding -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp."
+    note "Honcho did not come back cleanly; the set-aside copies are in $backup. Inspect journalctl -u honcho-embedding -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp -u honcho-gateway."
   fi
 }
 on_exit() {
@@ -391,6 +407,9 @@ fi
 install -d -m 0711 -o root -g root "$etc"
 install -m 0644 "$deploy/honcho-proxy.py" "$proxy_lib_dir/honcho-proxy.py"
 install -m 0644 "$deploy/direct_dispatch.py" "$proxy_lib_dir/direct_dispatch.py"
+install -m 0644 "$deploy/honcho-gateway.py" "$gateway_lib_dir/honcho-gateway.py"
+install -d -m 0755 "$sbin_dir"
+install -m 0755 "$deploy/honcho-clients" "$sbin_dir/honcho-clients"
 install -m 0640 -o root -g honcho-proxy "$deploy/proxy.settings" "$etc/proxy.settings"
 install -m 0640 -o root -g honcho-proxy "$deploy/router-api-key" "$etc/router-api-key"
 install -m 0640 -o root -g honcho-proxy "$deploy/backend-keys" "$etc/backend-keys"
@@ -421,12 +440,21 @@ for extension in vector pg_trgm btree_gin; do
   runuser -u postgres -- psql -d honcho -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS $extension"
 done
 
-# --rotate-keys: a new JWT secret invalidates every key made with the old one.
+# --rotate-keys: a new JWT secret invalidates every Honcho key made with the
+# old one (the admin key; the gateway makes its workspace keys again), and
+# Open WebUI gets a new gateway key. Agent keys are gateway keys, not Honcho
+# JWTs, so they keep working; honcho-clients revokes one of them on its own.
 if [[ $rotate_keys == true ]]; then
-  note 'Rotating the JWT secret and both Honcho keys; every client needs the new osr key.'
-  rm -f -- "$etc/jwt-secret" "$etc/api-key" "$etc/client-api-key"
+  note "Rotating the JWT secret, the admin key and Open WebUI's gateway key (agent keys are not affected)."
+  rm -f -- "$etc/jwt-secret" "$etc/api-key" "$etc/openwebui-key"
 fi
 if [[ ! -s $etc/jwt-secret ]]; then openssl rand -hex 48 > "$etc/jwt-secret"; fi
+# The gateway signs each workspace's key with it.
+chown root:honcho-gateway "$etc/jwt-secret"
+chmod 0640 "$etc/jwt-secret"
+# The gateway waits a little longer than Honcho's own model calls (llm_timeout).
+printf 'HONCHO_GATEWAY_UPSTREAM_TIMEOUT=%s\n' "$((KINDI_READ_TIMEOUT_SECONDS * 2 + 120))" > "$deploy/gateway.env"
+install -m 0644 "$deploy/gateway.env" "$etc/gateway.env"
 llm_timeout=$((KINDI_READ_TIMEOUT_SECONDS * 2))
 {
   printf 'DB_CONNECTION_URI=postgresql+psycopg://honcho:%s@127.0.0.1:5432/honcho?client_encoding=utf8\n' "$db_password"
@@ -489,22 +517,28 @@ else
 fi
 honcho_run python scripts/configure_embeddings.py --yes
 
-# api-key is the admin key and stays in this CT. client-api-key is scoped to the
-# shared osr workspace; Open WebUI, Hermes and OpenClaw get only that one.
+# api-key is the admin key and stays in this CT. Clients never get a Honcho
+# key: each has a gateway key (clients.json holds their hashes), and the
+# gateway forwards their requests with a key for their own workspace only.
+# openwebui-key is Open WebUI's: a workspace per user. Agents get theirs from
+# their provisioners (honcho-clients issue <agent>-<CT>), pinned to osr.
 generate_key() { honcho_run python scripts/generate_jwt.py "$@" --print-only; }
 if [[ ! -s $etc/api-key ]]; then
   generate_key --admin > "$etc/api-key.new"
   chmod 0600 "$etc/api-key.new"
   mv -f "$etc/api-key.new" "$etc/api-key"
 fi
-if [[ ! -s $etc/client-api-key ]]; then
-  generate_key --workspace osr > "$etc/client-api-key.new"
-  chmod 0600 "$etc/client-api-key.new"
-  mv -f "$etc/client-api-key.new" "$etc/client-api-key"
+if [[ ! -s $etc/openwebui-key ]]; then
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$etc/openwebui-key.new"
+  chmod 0600 "$etc/openwebui-key.new"
+  mv -f "$etc/openwebui-key.new" "$etc/openwebui-key"
 fi
+HONCHO_ETC=$etc python3 "$sbin_dir/honcho-clients" import-key openwebui "$etc/openwebui-key" --per-user ||
+  die 'Could not register the Open WebUI client with the gateway.'
 
-# Bun runs the upstream HTTP MCP package. It forwards each client's bearer key
-# to the authenticated API; the key is never stored in this unit.
+# Bun runs the upstream HTTP MCP package on loopback. It forwards the bearer
+# key of each request (the gateway's key for the caller's workspace) to the
+# API; the key is never stored in this unit.
 if [[ ! -x $bun || $("$bun" --version 2>/dev/null) != "$bun_version" ]]; then
   if grep -qw avx2 "$cpuinfo"; then
     bun_asset=bun-linux-x64 bun_sha256=$bun_sha256_x64 sha_var=HONCHO_BUN_SHA256
@@ -529,7 +563,7 @@ done
 systemctl daemon-reload
 systemctl enable "${units[@]/%/.service}"
 systemctl restart "${units[@]/%/.service}"
-healthy || die 'Honcho did not become healthy. Inspect journalctl -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp.'
+healthy || die 'Honcho did not become healthy. Inspect journalctl -u honcho-proxy -u honcho-api -u honcho-deriver -u honcho-mcp -u honcho-gateway.'
 trap - EXIT
 rm -rf -- "$backup"
 printf 'Honcho API and MCP are healthy.\n'

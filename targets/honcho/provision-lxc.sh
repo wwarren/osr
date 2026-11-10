@@ -37,10 +37,11 @@ honcho_router_fw_update() {
 # End router firewall helper.
 # Honcho firewall helpers
 # honcho_rules ROUTER_IP [AGENT_IP...]: the Honcho CT's inbound rules. The
-# router (Open WebUI) and every agent reach the API (8000) and MCP (3000):
-# Hermes and OpenClaw use the API, DeepSeek Harness the MCP server, and each
-# holds the same workspace key. An agent's MCP rule has its own tag, so the
-# router stays distinguishable when the rules are read back.
+# router (Open WebUI) and every agent reach the API (8000) and MCP (3000), both
+# served by the CT's client gateway: Hermes and OpenClaw use the API, DeepSeek
+# Harness the MCP server, each with its own gateway key. An agent's MCP rule
+# has its own tag, so the router stays distinguishable when the rules are read
+# back.
 honcho_rules() {
   local router=$1 ip
   shift
@@ -191,8 +192,13 @@ existing Honcho CT and the registration without deleting its PostgreSQL data;
 every reconfigure dumps the database before migrations and restores it if the
 guest setup fails. A CT using another embedding model cannot switch to the
 local model through --reconfigure; see the README for migration guidance.
---rotate-keys (with --reconfigure) replaces the JWT secret and
-both keys; reconfigure Hermes, OpenClaw and DeepSeek Harness with HONCHO_CT_ID afterwards.
+Clients reach the API and MCP ports through the CT's client gateway, each with
+its own key: Open WebUI's (registered here) gives every Open WebUI user a
+memory (workspace) of their own; each agent gets a key from its own
+provisioner, pinned to a workspace of that agent's own (as with Open
+Terminal). honcho-clients in the CT lists, issues and revokes keys.
+--rotate-keys (with --reconfigure) replaces the JWT secret, the admin key and
+Open WebUI's gateway key; the agents keep their own keys.
 USAGE
 }
 mode=create; dry_run=0; rotate_keys=false
@@ -440,7 +446,9 @@ for ip in $HONCHO_CLIENT_IPS; do
 done
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -r $source_dir/../pve-firewall-swap.pl ]] || die "Missing $source_dir/../pve-firewall-swap.pl"
-for file in install-target.sh budgets.py honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-api.service honcho-deriver.service honcho-mcp.service honcho-embedding.service integrate-webui.py; do
+for file in install-target.sh budgets.py honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-api.service \
+            honcho-deriver.service honcho-mcp.service honcho-embedding.service honcho-gateway.py honcho-clients \
+            honcho-gateway.service integrate-webui.py; do
   [[ -r $source_dir/$file ]] || die "Missing $source_dir/$file"
 done
 honcho_ip=${IP_CIDR%/*}
@@ -456,7 +464,9 @@ rotation_staged=false
 # Set just before the router CT's staging directory is made: a run that stops
 # earlier (not root, no token, router CT down) has nothing there to clean.
 router_stage_created=false
-rotation_files=(jwt-secret api-key client-api-key)
+# What --rotate-keys replaces: the JWT secret, the admin key and Open WebUI's
+# gateway key (and with it its entry in the client list).
+rotation_files=(jwt-secret api-key openwebui-key clients.json)
 # Rotation recovery helper
 # rotation_applied: the guest replaced the JWT secret. A guest that stopped
 # before rotating (model probe, leftover rollback data, apt) leaves nothing to undo.
@@ -490,7 +500,8 @@ env = etc / "honcho.env"
 lines = env.read_text(encoding="utf-8").splitlines()
 lines = ["AUTH_JWT_SECRET=" + secret if line.startswith("AUTH_JWT_SECRET=") else line for line in lines]
 env.write_text("\n".join(lines) + "\n", encoding="utf-8")' || return 1
-  pct exec "$CT_ID" -- systemctl restart honcho-api.service honcho-deriver.service honcho-mcp.service || return 1
+  pct exec "$CT_ID" -- systemctl restart honcho-api.service honcho-deriver.service honcho-mcp.service \
+    honcho-gateway.service || return 1
   for attempt in {1..30}; do
     if pct exec "$CT_ID" -- curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null &&
        pct exec "$CT_ID" -- curl -fsS --max-time 2 http://127.0.0.1:3000/health >/dev/null; then break; fi
@@ -533,8 +544,8 @@ cleanup() {
       printf 'The previous Open WebUI connection remains in router CT %s:%s/webui-honcho-snapshot.json.\n' \
         "$ROUTER_CT_ID" "$router_stage" >&2
       printf 'Once CT %s is reachable and Honcho is healthy, run this provisioner again with --reconfigure\n' "$CT_ID" >&2
-      printf '(without --rotate-keys): it registers Open WebUI with the key Honcho has then. Reconfigure Hermes\n' >&2
-      printf 'and OpenClaw with HONCHO_CT_ID=%s if the keys did change, then remove both directories.\n' "$CT_ID" >&2
+      printf '(without --rotate-keys): it registers Open WebUI with the key Honcho has then. The agents keep\n' >&2
+      printf 'their own keys either way. Then remove both directories.\n' >&2
     fi
   fi
   if (( rc != 0 )) && [[ $rotation_pending == true && $applied_rc == 0 ]]; then
@@ -549,8 +560,8 @@ cleanup() {
         "$ROUTER_CT_ID" "$router_stage" >&2
       printf 'Open WebUI may hold a key Honcho no longer accepts. Once Honcho is healthy, run this provisioner\n' >&2
       printf 'again with --reconfigure (without --rotate-keys): it registers Open WebUI with the key Honcho has\n' >&2
-      printf 'now. Then reconfigure the agents (Hermes, OpenClaw, DeepSeek Harness) with HONCHO_CT_ID=%s, and remove %s from CT %s.\n' \
-        "$CT_ID" "$rotation_stage" "$CT_ID" >&2
+      printf 'now (the agents keep their own keys). Then remove %s from CT %s.\n' \
+        "$rotation_stage" "$CT_ID" >&2
       printf 'After recovery, also remove %s from router CT %s.\n' "$router_stage" "$ROUTER_CT_ID" >&2
     fi
   fi
@@ -578,7 +589,7 @@ else context_label="$HONCHO_CONTEXT_TOKENS tokens"; fi
 pve_row 'Context window' "$context_label"
 pve_row 'Embedding model' 'Qwen3-Embedding-0.6B (1024 dimensions), llama.cpp on the CT'"'"'s CPU'
 pve_row 'Agents allowed' "${HONCHO_CLIENT_IPS:-none}"
-[[ $rotate_keys == false ]] || pve_row 'Keys' 'replace the JWT secret and both keys'
+[[ $rotate_keys == false ]] || pve_row 'Keys' "replace the JWT secret, the admin key and Open WebUI's key"
 pve_confirm "$( [[ $mode == create ]] && printf 'Create Honcho CT %s?' "$CT_ID" || printf 'Reconfigure Honcho CT %s?' "$CT_ID")"
 if (( dry_run )); then
   ref_label=$HONCHO_REF
@@ -590,7 +601,7 @@ if (( dry_run )); then
   printf 'Agent IPs allowed to Honcho: %s.\n' "${HONCHO_CLIENT_IPS:-none}"
   [[ $HONCHO_ROUTER_FIREWALL == false ]] ||
     printf 'Would admit %s to the router API in %s/firewall/%s.fw, if that file exists.\n' "$honcho_ip" "$PVE_ETC" "$ROUTER_CT_ID"
-  [[ $rotate_keys == false ]] || printf 'Would replace the JWT secret and both Honcho keys.\n'
+  [[ $rotate_keys == false ]] || printf "Would replace the JWT secret, the admin key and Open WebUI's gateway key.\n"
   (( ${#budget_env[@]} == 0 )) || printf 'Would pass these budget settings to the CT: %s\n' "${budget_env[*]}"
   (( ${#kept_env[@]} == 0 )) || printf 'Would pass these settings to the CT: %s\n' "${kept_env[*]}"
   # A dry run does not inspect the CT, so it cannot apply these checks.
@@ -707,7 +718,9 @@ for attempt in {1..60}; do
   sleep 2
 done
 pct exec "$CT_ID" -- install -d -m 0700 /root/honcho-deploy
-for file in install-target.sh budgets.py honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-api.service honcho-deriver.service honcho-mcp.service honcho-embedding.service; do
+for file in install-target.sh budgets.py honcho-proxy.py direct_dispatch.py honcho-proxy.service honcho-api.service \
+            honcho-deriver.service honcho-mcp.service honcho-embedding.service honcho-gateway.py honcho-clients \
+            honcho-gateway.service; do
   pct push "$CT_ID" "$source_dir/$file" "/root/honcho-deploy/$file" --perms 0600
 done
 pct push "$CT_ID" "$stage/router-api-key" /root/honcho-deploy/router-api-key --perms 0600
@@ -730,9 +743,10 @@ pct exec "$CT_ID" -- env "ROUTER_URL=$router_url" \
 pct exec "$ROUTER_CT_ID" -- curl -fsS --max-time 10 "http://${honcho_ip}:3000/health" >/dev/null ||
   die 'Router CT cannot reach Honcho MCP; check the CT firewall.'
 
-# Open WebUI gets the key scoped to the osr workspace, not the admin key.
-pct exec "$CT_ID" -- cat /etc/honcho-target/client-api-key > "$stage/honcho-api-key"
-[[ -s $stage/honcho-api-key ]] || die 'Honcho did not generate its osr workspace key.'
+# Open WebUI gets its own gateway key, not a Honcho key: the gateway gives
+# each Open WebUI user a workspace of their own.
+pct exec "$CT_ID" -- cat /etc/honcho-target/openwebui-key > "$stage/honcho-api-key"
+[[ -s $stage/honcho-api-key ]] || die 'Honcho did not generate a gateway key for Open WebUI.'
 pct push "$ROUTER_CT_ID" "$stage/honcho-api-key" "$router_stage/honcho-api-key" --perms 0600
 pct exec "$ROUTER_CT_ID" -- python3 "$router_stage/integrate-webui.py" \
   "http://127.0.0.1:$OPENWEBUI_PORT" "$router_stage/admin-token" "$router_stage/honcho-api-key" \
@@ -746,9 +760,8 @@ if [[ $rotate_keys == true ]]; then
   rotation_staged=false
 fi
 printf 'Honcho API: http://%s:8000; MCP: http://%s:3000/mcp\n' "$honcho_ip" "$honcho_ip"
+printf 'Every Open WebUI user granted the Honcho Memory tools gets a memory of their own\n'
+printf '(Admin Settings > External Tools grants access; pct exec %s -- honcho-clients workspaces lists them).\n' "$CT_ID"
 if [[ $rotate_keys == true ]]; then
-  printf 'The keys changed: the agents lose Honcho until each is reconfigured, e.g.\n'
-  printf '  CT_ID=<agent CT> ROUTER_CT_ID=%s HONCHO_CT_ID=%s bash targets/hermes/provision-lxc.sh --reconfigure\n' "$ROUTER_CT_ID" "$CT_ID"
-  printf '  CT_ID=<agent CT> ROUTER_CT_ID=%s HONCHO_CT_ID=%s bash targets/openclaw/provision-lxc.sh --reconfigure\n' "$ROUTER_CT_ID" "$CT_ID"
-  printf '  CT_ID=<agent CT> ROUTER_CT_ID=%s HONCHO_CT_ID=%s bash targets/deepseek-harness/provision-lxc.sh --reconfigure\n' "$ROUTER_CT_ID" "$CT_ID"
+  printf 'The JWT secret, the admin key and Open WebUI'"'"'s key changed; the agents keep their own keys.\n'
 fi

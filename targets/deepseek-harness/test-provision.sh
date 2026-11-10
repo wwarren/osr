@@ -91,7 +91,7 @@ assert_contains "the installer's names are read too" 'DSH_MODEL=code-model DSH_C
 describe dsh_provision_honcho
 plan=$(env "${common[@]}" HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=285 bash "$provision" --dry-run 2>&1)
 assert_contains "the MCP URL is derived from the API URL" 'DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp' "$plan"
-assert_contains "the workspace key is read from the Honcho CT" 'read the osr workspace key from Honcho CT 285' "$plan"
+assert_contains "its own gateway key comes from the Honcho CT" 'take the Honcho gateway key from Honcho CT 285' "$plan"
 assert_contains "and pushed as a private file" 'honcho-api-key /root/deepseek-harness-deploy/honcho-api-key --perms 0600' "$plan"
 plan=$(env "${common[@]}" HONCHO_MCP_URL=https://honcho.example/mcp HONCHO_API_KEY_FILE=/dev/null bash "$provision" --dry-run 2>&1)
 assert_contains "an external Honcho MCP URL is used as given" 'DSH_HONCHO_MCP_URL=https://honcho.example/mcp' "$plan"
@@ -99,7 +99,10 @@ assert_fail "Honcho needs a 32k window" env "${common[@]}" HONCHO_URL=http://192
 assert_fail "a Honcho URL with a path is refused" env "${common[@]}" HONCHO_URL=http://192.0.2.85:8000/v3 bash "$provision" --dry-run
 assert_fail "HONCHO_CT_ID cannot be this CT" env "${common[@]}" HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=281 bash "$provision" --dry-run
 assert_fail "an unreadable key file is refused" env "${common[@]}" HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE=/nonexistent bash "$provision" --dry-run
-assert_contains "the agent takes the workspace key" '/etc/honcho-target/client-api-key' "$(cat "$provision")"
+assert_contains "the agent gets its own gateway key, pinned to osr" 'hc_connect "$HONCHO_CT_ID" "$(hc_client_name deepseek-harness "$CT_ID")"' "$(cat "$provision")"
+assert_not_contains "and reads no key file in the Honcho CT" '/etc/honcho-target/' "$(cat "$provision")"
+assert_contains "it is issued after the run is confirmed, beside the other pushes" 'honcho_key_from_ct == true' "$(sed -n '/install -d -m 0700 "$deploy"/,$p' "$provision")"
+assert_contains "turning Honcho off revokes it" 'hc_disconnect "$honcho_prev_ct" "$(hc_client_name deepseek-harness "$CT_ID")"' "$(cat "$provision")"
 assert_not_contains "never the Honcho admin key" 'cat /etc/honcho-target/api-key' "$(cat "$provision")"
 
 describe dsh_provision_open_terminal
@@ -142,7 +145,7 @@ assert_contains "the router's gateway is offered" 'Harness gateway [192.0.2.1]' 
 assert_contains "the Web UI range defaults to the CT's network" 'Web UI allowed from (IPv4 CIDR) [192.0.2.0/24]' "$out"
 assert_contains "the Honcho CT on this host is offered" 'Honcho API URL (none to skip) [http://192.0.2.85:8000]' "$out"
 assert_contains "Enter took it: memory through Honcho's MCP" 'DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp' "$out"
-assert_contains "and its key comes from that CT" 'read the osr workspace key from Honcho CT 285' "$out"
+assert_contains "and its key comes from that CT" 'take the Honcho gateway key from Honcho CT 285' "$out"
 assert_contains "the Open Terminal CT on this host is offered" 'Open Terminal URL (none to skip) [http://192.0.2.70:8000]' "$out"
 assert_contains "Enter took it" 'DSH_OPEN_TERMINAL_URL=http://192.0.2.70:8000' "$out"
 assert_contains "and that CT issues the key" "admit 192.0.2.81 in Open Terminal CT 270's firewall" "$out"

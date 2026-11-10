@@ -142,7 +142,7 @@ ROUTER_URL=http://r:8000 OPENCLAW_MODEL=auto OPENCLAW_CONTEXT_LENGTH=65536 OPENC
 # shellcheck disable=SC2034
 OPENCLAW_NODE_VERSION=24 NVM_VERSION=v0.40.4 OPENCLAW_API=true OPENCLAW_PORT=18789 OPENCLAW_DASHBOARD=true origins='[]'
 # shellcheck disable=SC2034
-backend_keys_sha256=none targets_sha256=none providers_sha256=p unit_sha256=u HONCHO_URL='' honcho_key_sha256=none
+backend_keys_sha256=none targets_sha256=none honcho_workspace=none providers_sha256=p unit_sha256=u HONCHO_URL='' honcho_key_sha256=none
 # shellcheck disable=SC2034
 OPEN_TERMINAL_URL='' ot_key_sha256=none
 router_key_sha256=$(printf 'sk-secret-key' | sha256sum | cut -d' ' -f1)
@@ -347,6 +347,16 @@ def refused():
     sys.exit(7)
 router = os.environ.get("FAKE_ROUTER_URL", "http://192.168.11.80:8000")
 terminal = os.environ.get("FAKE_OT_URL", "http://192.0.2.70:8000")
+honcho = os.environ.get("FAKE_HONCHO_URL", "http://192.0.2.85:8000")
+if url and url.startswith(honcho):
+    if os.environ.get("FAKE_HONCHO_DOWN"): refused()
+    if url.endswith("/osr/v1/whoami"):
+        # OSR's Honcho gateway: this CT's own workspace; another Honcho has no such route.
+        if os.environ.get("FAKE_HONCHO_NO_GATEWAY"): reply(404, {"detail": "Not Found"})
+        if auth == os.environ.get("FAKE_HONCHO_BAD_KEY", "-"): reply(401, {"detail": "Invalid API key"})
+        if os.environ.get("FAKE_HONCHO_PER_USER"):
+            reply(200, {"client": "openwebui", "user": None, "workspace": None, "per_user": True})
+        reply(200, {"client": "openclaw-283", "user": None, "workspace": "openclaw-283", "per_user": False})
 if url and url.startswith(terminal):
     if os.environ.get("FAKE_OT_DOWN"): refused()
     if url.endswith("/osr/v1/whoami"):
@@ -707,7 +717,7 @@ out=$(guest HONCHO_URL=http://192.0.2.85:8000/) || fail "Honcho on: $out"
 [[ $(kv plugins.entries.openclaw-honcho.enabled "$config") == true ]] || fail 'the plugin is not enabled'
 [[ $(kv plugins.entries.openclaw-honcho.hooks.allowConversationAccess "$config") == true ]] || fail 'no conversation access'
 [[ $(kv plugins.entries.openclaw-honcho.config.baseUrl "$config") == http://192.0.2.85:8000 ]] || fail 'baseUrl (trailing slash kept?)'
-[[ $(kv plugins.entries.openclaw-honcho.config.workspaceId "$config") == osr &&
+[[ $(kv plugins.entries.openclaw-honcho.config.workspaceId "$config") == openclaw-283 &&
    $(kv plugins.entries.openclaw-honcho.config.peerName "$config") == user ]] || fail 'workspace or peer'
 honcho_cfg=$home/.honcho/config.json
 grep -q '"apiKey": "honcho-key-A"' "$honcho_cfg" || fail "Honcho key file: $(cat "$honcho_cfg")"
@@ -723,10 +733,13 @@ out=$(guest HONCHO_URL=) || fail "Honcho off: $out"
 [[ ! -e $honcho_cfg && ! -e $deploy/honcho-api-key ]] || fail 'HONCHO_URL= left the Honcho key behind'
 external_honcho_key=$tmp_root/external-honcho-key
 printf 'external-honcho-key\n' > "$external_honcho_key"
-out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho on: $out"
+out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" FAKE_HONCHO_NO_GATEWAY=1) || fail "external Honcho on: $out"
+[[ $(kv plugins.entries.openclaw-honcho.config.workspaceId "$config") == osr ]] || fail 'a Honcho without OSR'"'"'s gateway did not get the osr workspace'
+out=$(guest HONCHO_URL=http://192.0.2.85:8000 HONCHO_API_KEY_FILE="$external_honcho_key" FAKE_HONCHO_BAD_KEY=external-honcho-key) && fail 'a rejected Honcho key was accepted'
+[[ $out == *"rejected this CT's key"* ]] || fail "no rejected-key error: $out"
 out=$(guest HONCHO_URL= HONCHO_API_KEY_FILE="$external_honcho_key") || fail "external Honcho off: $out"
 [[ $(<"$external_honcho_key") == external-honcho-key ]] || fail 'disabling Honcho deleted a caller-supplied key file'
-pass 'Honcho: the plugin installed once, enabled with the osr workspace; a failed run restores it; HONCHO_URL= disables it'
+pass 'Honcho: the plugin installed once, enabled with the workspace the gateway names; a failed run restores it; HONCHO_URL= disables it'
 
 # Open Terminal: OpenClaw's own workspace as MCP server open-terminal.
 ot_key=ot-key-0123456789abcdef

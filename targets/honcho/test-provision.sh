@@ -29,7 +29,7 @@ assert_contains "a release is pinned by default" "with v3.5.0" "$plan"
 assert_fail "a moving branch other than main is refused" env "${common[@]}" HONCHO_REF=develop bash "$provision" --dry-run
 assert_fail "--rotate-keys needs an existing CT" env "${common[@]}" bash "$provision" --dry-run --rotate-keys
 plan=$(env "${common[@]}" bash "$provision" --dry-run --reconfigure --rotate-keys)
-assert_contains "a reconfigure can rotate the keys" "Would replace the JWT secret and both Honcho keys" "$plan"
+assert_contains "a reconfigure can rotate the keys" "Would replace the JWT secret, the admin key and Open WebUI's gateway key" "$plan"
 assert_contains "a dry-run reconfigure names the checks it cannot make" "Not checked by a dry run: CT 285 must be running, tagged honcho, and embed with qwen3-embedding-0.6b" "$plan"
 assert_not_contains "a dry-run create has no such check" "Not checked by a dry run" "$(env "${common[@]}" bash "$provision" --dry-run)"
 assert_contains "and admits Honcho in the router's firewall" "Would admit 192.0.2.85 to the router API in /etc/pve/firewall/280.fw" "$plan"
@@ -174,7 +174,7 @@ source <(awk '/^# Rotation recovery helper$/{c=1;next} /^# End rotation recovery
 stage=$(mktemp -d "${TMPDIR:-/tmp}/honcho-rotation-test.XXXXXX")
 # Read by the sourced helpers.
 # shellcheck disable=SC2034
-CT_ID=285 ROUTER_CT_ID=280 OPENWEBUI_PORT=8080 rotation_files=(jwt-secret api-key client-api-key)
+CT_ID=285 ROUTER_CT_ID=280 OPENWEBUI_PORT=8080 rotation_files=(jwt-secret api-key openwebui-key clients.json)
 # shellcheck disable=SC2034
 rotation_stage=/root/honcho-rotation-test router_stage=/root/honcho-integration-test
 # pct: logs each call; FAKE_SAME_SECRET makes cmp report an unchanged secret,
@@ -201,11 +201,13 @@ assert_eq "an unreachable CT cannot prove the keys stayed unchanged" 2 "$rc"
 unset FAIL_CT
 : > "$stage/calls"
 assert_ok "old credentials and the Open WebUI connection can be restored" restore_rotation
-for file in jwt-secret api-key client-api-key; do
+assert_ok "the provisioner sets aside the same files" grep -qx 'rotation_files=(jwt-secret api-key openwebui-key clients.json)' "$provision"
+for file in jwt-secret api-key openwebui-key clients.json; do
   assert_contains "$file is put back" "exec 285 -- cp -a -- $rotation_stage/$file /etc/honcho-target/$file" "$(calls)"
 done
 assert_not_contains "the rest of honcho.env is not rolled back" "/etc/honcho-target/honcho.env" "$(calls | grep -v '^exec 285 -- python3 -c')"
 assert_contains "only its JWT secret line is set, inside the CT" 'lines = ["AUTH_JWT_SECRET=" + secret' "$(calls)"
+assert_contains "the gateway restarts with Honcho (it rereads the secret)" "honcho-gateway.service" "$(calls | grep 'systemctl restart')"
 restart=$(calls | grep -n 'systemctl restart' | cut -d: -f1)
 restore=$(calls | grep -n 'integrate-webui.py --restore' | cut -d: -f1)
 assert_ok "Honcho restarts before Open WebUI gets its old connection back" test "${restart:-999}" -lt "${restore:-0}"
@@ -415,8 +417,14 @@ install=$here/install-target.sh
 assert_contains "the guest pins a release too" 'ref=${HONCHO_REF:-v3.5.0}' "$(cat "$install")"
 assert_contains "Bun comes from a checksum-pinned release zip" 'sha256sum -c --quiet' "$(cat "$install")"
 assert_not_contains "and never from a piped install script" 'bun.sh/install' "$(cat "$install")"
-assert_contains "clients get a key scoped to the osr workspace" 'generate_key --workspace osr' "$(cat "$install")"
-assert_contains "Open WebUI is given that key" '/etc/honcho-target/client-api-key' "$(cat "$provision")"
+assert_not_contains "clients get no Honcho key" 'generate_key --workspace' "$(cat "$install")"
+assert_contains "Open WebUI gets its own gateway key" '/etc/honcho-target/openwebui-key' "$(cat "$provision")"
+assert_contains "the gateway is pushed with the guest installer" "honcho-gateway.py honcho-clients" "$(cat "$provision")"
+assert_contains "with its unit" "honcho-gateway.service; do" "$(cat "$provision")"
+assert_contains "the API listens on loopback behind the gateway" '--host 127.0.0.1 --port 8010' "$(cat "$here/honcho-api.service")"
+assert_contains "and MCP" 'Environment=PORT=3010' "$(cat "$here/honcho-mcp.service")"
+assert_contains "the gateway runs as its own user" 'User=honcho-gateway' "$(cat "$here/honcho-gateway.service")"
+assert_not_contains "and is not given the database" 'honcho.env' "$(cat "$here/honcho-gateway.service")"
 assert_contains "Honcho uses a stable local chat endpoint" '%s_MODEL_CONFIG__OVERRIDES__BASE_URL=%s/v1' "$(cat "$install")"
 assert_contains "Honcho asks its own embedding model" 'EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=%s/v1' "$(cat "$install")"
 assert_contains "which listens on loopback only" '--host 127.0.0.1 --port 8766' "$(cat "$here/honcho-embedding.service")"

@@ -20,9 +20,10 @@ Options:
   --api-key-env NAME    Environment variable holding the router key (default: OSR_API_KEY)
   --honcho-mcp-url URL  Honcho MCP endpoint (http(s)://host:port/mcp); adds Honcho memory
   --honcho-key-env NAME Environment variable holding the Honcho key (default: HONCHO_API_KEY)
-  --honcho-workspace ID Honcho workspace (default: osr)
+  --honcho-workspace ID Honcho workspace (default: the one OSR's Honcho gateway
+                        names for this key, this agent's own; osr for another Honcho)
   --honcho-peer ID      This agent's Honcho peer (default: deepseek-harness)
-  --user-peer ID        The user's Honcho peer, shared with Hermes and OpenClaw (default: user)
+  --user-peer ID        The user's Honcho peer (default: user)
   --instructions FILE   Harness user-global AGENTS.md: write the Honcho block into it,
                         or remove that block when no --honcho-mcp-url is given
   --skip-honcho-check   Do not contact Honcho (the overlay is still written)
@@ -64,6 +65,7 @@ export function parseArgs(argv) {
     const key = names.get(arg);
     if (!key || i + 1 >= argv.length) throw new Error(`Unknown or incomplete option: ${arg}`);
     options[key] = argv[++i];
+    if (key === 'honchoWorkspace') options.honchoWorkspaceGiven = true;
   }
   for (const key of ['routerUrl', 'model', 'output']) {
     if (!options[key]) throw new Error(`Missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`);
@@ -171,6 +173,31 @@ async function readMcpInitialize(response, label = 'Honcho') {
   throw new Error(`${label} MCP initialize returned no response`);
 }
 
+// honchoWorkspace: the workspace OSR's Honcho gateway names for this key at
+// /osr/v1/whoami (this agent's own). A Honcho without the gateway answers 404
+// and keeps the default (osr).
+export async function honchoWorkspace(options, key) {
+  const url = new URL('/osr/v1/whoami', options.honchoMcpUrl).href;
+  let response;
+  try {
+    response = await fetch(url, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
+  } catch (error) {
+    throw new Error(`Honcho at ${url} is unreachable (${error.cause?.code ?? error.message}); the Honcho CT firewall must admit this CT`);
+  }
+  if (response.status === 404) return options.honchoWorkspace;
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`Honcho rejected the key (HTTP ${response.status}); reconfigure with HONCHO_CT_ID to get a new Honcho gateway key`);
+  }
+  if (!response.ok) throw new Error(`Honcho ${url}: HTTP ${response.status}`);
+  let body;
+  try { body = await response.json(); } catch { body = null; }
+  const workspace = body && !body.per_user ? body.workspace : null;
+  if (typeof workspace !== 'string' || !ID.test(workspace)) {
+    throw new Error("Honcho names no workspace of this agent's own for the key (Open WebUI's key?); reconfigure with HONCHO_CT_ID");
+  }
+  return workspace;
+}
+
 // checkHoncho: one MCP initialize with the key and workspace header, so a
 // wrong key, workspace or address fails the install instead of the first chat.
 async function checkHoncho(options, key) {
@@ -194,7 +221,7 @@ async function checkHoncho(options, key) {
     throw new Error(`Honcho MCP at ${options.honchoMcpUrl} is unreachable (${error.cause?.code ?? error.message}); the Honcho CT firewall must admit this CT`);
   }
   if (response.status === 401 || response.status === 403) {
-    throw new Error(`Honcho MCP rejected the key (HTTP ${response.status}); reconfigure with HONCHO_CT_ID to fetch the osr workspace key`);
+    throw new Error(`Honcho MCP rejected the key (HTTP ${response.status}); reconfigure with HONCHO_CT_ID to get a new Honcho gateway key`);
   }
   if (!response.ok) throw new Error(`Honcho MCP initialize: HTTP ${response.status}`);
   const message = await readMcpInitialize(response);
@@ -312,9 +339,8 @@ export function instructionsBlock(options) {
   return `${BLOCK_BEGIN}
 ## Long-term memory (Honcho)
 
-The \`mcp__honcho__*\` tools are this assistant's long-term memory. They are
-shared with the other agents of this Ollama Smart Router install (Hermes and
-OpenClaw), so use Honcho's memory-store mode, not recall only.
+The \`mcp__honcho__*\` tools are this assistant's long-term memory, in a
+workspace of its own, so use Honcho's memory-store mode, not recall only.
 
 - Workspace: \`${w}\`. The person you work with is peer \`${user}\`; you are peer \`${me}\`.
 - At the start of a task where earlier context may matter, call
@@ -357,7 +383,10 @@ async function main() {
   if (options.honchoMcpUrl) {
     const key = process.env[options.honchoKeyEnv];
     if (!key) throw new Error(`Set ${options.honchoKeyEnv} with --honcho-mcp-url`);
-    if (!options.skipHonchoCheck) await checkHoncho(options, key);
+    if (!options.skipHonchoCheck) {
+      if (!options.honchoWorkspaceGiven) options.honchoWorkspace = await honchoWorkspace(options, key);
+      await checkHoncho(options, key);
+    }
   }
   if (options.openTerminalMcpUrl) {
     const key = process.env[options.openTerminalKeyEnv];

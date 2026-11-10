@@ -15,8 +15,9 @@ tools; the relay key stays in an account Harness cannot read). With the
 workspace there as MCP tools ([Open Terminal workspace](#open-terminal-workspace)).
 
 **Trust.** Harness's shell tools inherit the service environment, so the agent
-and anything it runs can read the router key and, with Honcho, the `osr`
-workspace key. Limit Web UI access to people trusted to operate OSR.
+and anything it runs can read the router key and, with Honcho, this CT's
+Honcho key (which reaches only Harness's own Honcho workspace, never another
+agent's or an Open WebUI user's memory). Limit Web UI access to people trusted to operate OSR.
 
 ## Requirements
 
@@ -86,9 +87,11 @@ Honcho's MCP server through `@deepseek-ai/dsh-mcp-client` (DeepSeek's route
 for third-party memory), so the tools appear as `mcp__honcho__*` and the
 model decides when to call them:
 
-- **Same memory.** The shared `osr` workspace and `user` peer, so what Hermes
-  or OpenClaw learned is available to Harness and vice versa; Harness writes as
-  peer `deepseek-harness`.
+- **Its own memory.** A Honcho workspace of Harness's own
+  (`deepseek-harness-<CT>`, named by the Honcho gateway for its key), as its
+  Open Terminal workspace is: the `user` peer there is what Harness learned;
+  Hermes, OpenClaw and Open WebUI users have workspaces of their own. Harness
+  writes as peer `deepseek-harness`.
 - **Model-driven.** Honcho's MCP instructions and a managed block (between
   `osr-honcho` markers) in the user-global
   `/var/lib/deepseek-harness/home/AGENTS.md` tell the model to look up context,
@@ -103,7 +106,7 @@ existing install:
 # Admit Harness in the Honcho firewall (list every agent's IP).
 CT_ID=285 ROUTER_CT_ID=280 HONCHO_CLIENT_IPS='192.0.2.82 192.0.2.83 192.0.2.81' \
   bash targets/honcho/provision-lxc.sh --reconfigure
-# Turn Honcho on for Harness; the osr workspace key is fetched from CT 285.
+# Turn Honcho on for Harness; CT 285 issues its own key (client deepseek-harness-281).
 CT_ID=281 ROUTER_CT_ID=280 HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=285 \
   bash targets/deepseek-harness/provision-lxc.sh --reconfigure
 ```
@@ -114,9 +117,12 @@ provisioner refuses, before changing anything, if Honcho's firewall does not
 admit this CT (and prints the Honcho command); the guest checks the key with an
 MCP `initialize` before writing the overlay. The key lives only in
 `/etc/deepseek-harness/service.env` (root-only) and the service environment,
-read by the overlay with a `!!js` expression. Reconfigures keep Honcho on;
-`HONCHO_URL=` removes the MCP entry, key and `AGENTS.md` block. After a Honcho
-`--rotate-keys`, reconfigure with `HONCHO_CT_ID` again.
+read by the overlay with a `!!js` expression. The key is this CT's own client
+key for the Honcho gateway, pinned to Harness's own workspace; it is
+issued once the run is confirmed and kept by later reconfigures while Honcho
+accepts it (a Honcho `--rotate-keys` does not change it). Reconfigures keep
+Honcho on; `HONCHO_URL=` removes the MCP entry, key and `AGENTS.md` block and
+revokes the key in the Honcho CT.
 
 To verify: ask Harness to remember something unique, watch for an
 `mcp__honcho__add_messages_to_session` or `create_conclusions` call, then ask

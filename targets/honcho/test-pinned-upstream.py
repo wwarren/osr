@@ -24,6 +24,10 @@ Honcho's settings loader must also read the local embedding model's block as
 written: its model, URL, vector size, no dimensions= field, float vectors,
 the timeout and the CPU-sized input and request limits.
 
+The client gateway's workspace keys must be read by Honcho's own JWT check as
+keys for one workspace, and the MCP server must still bind each session to
+its key (what keeps one Open WebUI user out of another's session).
+
 Change the target's HONCHO_REF default only after this passes against it.
 """
 import asyncio
@@ -127,6 +131,15 @@ class SilentKindi(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def gateway_module():
+    """The target's client gateway (honcho-gateway.py)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("osr_honcho_gateway", HERE / "honcho-gateway.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def dispatcher_module():
@@ -256,6 +269,26 @@ def main(checkout):
     check(error is not None and SilentKindi.requests == 1,
           f"a Kindi that never answers gets one POST through the dispatcher, the SDK and Honcho's "
           f"retries ({SilentKindi.requests} sent; {type(error).__name__ if error else 'no error'}, HTTP {status})")
+
+    # The client gateway signs each workspace's key itself. Honcho must read it
+    # as a key for that one workspace (never admin, peer or session scoped),
+    # accept a per-user workspace name, and its MCP server must bind a session
+    # to its key and take the workspace from X-Honcho-Workspace-ID.
+    from src.schemas import WorkspaceCreate  # noqa: E402
+    from src.security import verify_jwt  # noqa: E402
+    gateway = gateway_module()
+    workspace = gateway.workspace_name("openwebui", "a" * 128)
+    params = verify_jwt(gateway.mint_jwt(settings.AUTH.JWT_SECRET.encode(), workspace))
+    check(params.w == workspace and not params.ad and params.p is None and params.s is None
+          and params.sc is None and params.exp is None,
+          f"Honcho reads the gateway's key as a key for workspace {workspace} alone")
+    check(WorkspaceCreate(name=workspace).name == workspace, "Honcho accepts a per-user workspace name")
+    http_ts = (checkout / "mcp" / "src" / "http.ts").read_text()
+    config_ts = (checkout / "mcp" / "src" / "config.ts").read_text()
+    check("config.apiKey !== existing.apiKey" in http_ts,
+          "Honcho's MCP server refuses a session's requests made with another key")
+    check('request.headers.get("X-Honcho-Workspace-ID")' in config_ts and 'process.env.HOST' in http_ts,
+          "Honcho's MCP server takes the workspace header and listens where HOST says")
 
     print(f"{'FAILED' if failures else 'OK'}: {len(failures)} failure(s) against Honcho {pinned_ref()}")
     return 1 if failures else 0

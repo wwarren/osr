@@ -23,10 +23,11 @@ a separate account, `openclaw-direct`, which alone can read the router and
 backend keys (Hermes's dispatcher shares its agent's account).
 
 **Integrations.** With the [Honcho target](../honcho/README.md) the installer
-adds the official OpenClaw Honcho plugin (conversation access, shared `osr`
-workspace) beside OpenClaw's own memory plugin; for a separate Honcho set
-`HONCHO_URL` and `HONCHO_CT_ID`. `--reconfigure` keeps the URL, key and egress
-rule; `HONCHO_URL=` turns it off. The [hcom target](../hcom/README.md) adds
+adds the official OpenClaw Honcho plugin (conversation access, with this CT's
+own Honcho key and workspace, `openclaw-<CT>`) beside
+OpenClaw's own memory plugin; for a separate Honcho set `HONCHO_URL` and
+`HONCHO_CT_ID`. `--reconfigure` keeps the URL, key (while Honcho accepts it)
+and egress rule; `HONCHO_URL=` turns it off and revokes the key. The [hcom target](../hcom/README.md) adds
 `osr-bus` and managed workspace instructions (OpenClaw polls through its
 terminal tool; hcom has no native OpenClaw hooks) and opens this CT's egress to
 the broker. With the [Open Terminal target](../open-terminal/README.md),

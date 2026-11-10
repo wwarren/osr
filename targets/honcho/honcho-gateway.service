@@ -1,0 +1,31 @@
+[Unit]
+Description=Honcho client gateway (per-client keys, a workspace per Open WebUI user)
+After=network-online.target honcho-api.service honcho-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=honcho-gateway
+Group=honcho-gateway
+EnvironmentFile=-/etc/honcho-target/gateway.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/honcho-gateway/honcho-gateway.py
+# Owner records of the per-user workspaces (honcho-clients workspaces).
+StateDirectory=honcho-gateway
+StateDirectoryMode=0700
+Environment=HONCHO_GATEWAY_RECORDS=/var/lib/honcho-gateway/workspaces
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
