@@ -238,7 +238,7 @@ if [[ -s $MM_TARGET_ETC/webhook-url ]]; then
   saved=$(tr -d '\r\n' < "$MM_TARGET_ETC/webhook-url")
   saved_id=${saved##*/hooks/}
   if [[ $saved == "$site_url/hooks/$saved_id" && -n $saved_id ]] &&
-     mm_json webhook list-incoming | json_find id "$saved_id" channel_id | grep -qx "$channel_id"; then
+     mm_json webhook show "$saved_id" 2>/dev/null | json_find id "$saved_id" channel_id | grep -qx "$channel_id"; then
     hook_id=$saved_id
     note "The webhook in $MM_TARGET_ETC/webhook-url still exists; kept."
   fi

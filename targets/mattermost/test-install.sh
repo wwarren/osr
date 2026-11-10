@@ -109,15 +109,28 @@ elif cmd == "channel create":
     st["channels"].append({"id": new_id(), "name": opt("--name"), "team_id": team["id"]})
 elif cmd == "channel users":
     pass
-elif cmd == "webhook list-incoming":
-    out(st["hooks"])
+elif cmd == "webhook show":
+    hook = next((h for h in st["hooks"] if h["id"] == args[2]), None)
+    if hook is None:
+        sys.exit(f"Error: Webhook with id '{args[2]}' not found")
+    out(hook)
 elif cmd == "webhook create-incoming":
     channel, user = opt("--channel"), opt("--user")
     if not any(c["id"] == channel for c in st["channels"]) or not any(u["id"] == user for u in st["users"]):
         sys.exit("Error: unable to find channel or user (IDs required)")
-    hook = {"id": new_id(), "channel_id": channel, "user_id": user, "display_name": opt("--display-name")}
+    hook = {"id": new_id(), "channel_id": channel, "user_id": user, "display_name": opt("--display-name"),
+            "channel_locked": "--lock-to-channel" in args}
     st["hooks"].append(hook)
     out(hook)
+elif cmd == "webhook modify-incoming":
+    hook = next((h for h in st["hooks"] if h["id"] == args[2]), None)
+    if hook is None:
+        sys.exit(f"Error: Unable to find webhook '{args[2]}'")
+    hook["channel_locked"] = "--lock-to-channel" in args
+elif args[:1] == ["webhook"]:
+    # Real mmctl prints the group's help, exit 0, for a subcommand it lacks.
+    print("Management of webhooks\n\nUsage:\n  mmctl webhook [command]")
+    sys.exit(0)
 else:
     sys.exit(f"fake mmctl: unexpected {args}")
 json.dump(st, open(state_file, "w"))
