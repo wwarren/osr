@@ -51,13 +51,14 @@ CT (tag osr-target plus the target's name) and every CT with hcom installed,
 then upgrades them in dependency order:
 
   router -> Open WebUI -> Gitea, Mattermost -> model targets -> ComfyUI,
-  Open Terminal -> Honcho -> Hermes, OpenClaw, DeepSeek Harness -> MQTT -> hcom
+  Open Terminal -> Honcho -> Hermes, OpenClaw, DeepSeek Harness, OpenCode ->
+  MQTT -> hcom
 
 Settings are kept. The router updater never touches env/*.env, tiers,
 litellm_config.yaml, router.ini, monitor.ini or secrets; target installers
 reuse their settings records; provisioners take their recorded answers. Only
 versions move to this repository's pins; an interactive run asks before moving
-a Honcho or DeepSeek Harness release you pinned, and --yes accepts the move.
+a Honcho, DeepSeek Harness or OpenCode release you pinned, and --yes accepts the move.
 Open WebUI and ComfyUI are
 never downgraded. Gitea and Mattermost releases are not pinned here: their setup
 is re-applied (accounts, token and webhook kept) and their version stays.
@@ -120,7 +121,7 @@ USAGE
 # Upgrade order of the tagged targets: services the others use first, Honcho
 # before the agents that use it, the broker before hcom.
 TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi
-              comfyui open-terminal honcho hermes openclaw deepseek-harness mqtt)
+              comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
 MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
 
 # Services that must be active afterwards if they were active before.
@@ -139,6 +140,9 @@ declare -A UNITS=(
     [hermes]='hermes-gateway hermes-direct hermes-dashboard'
     [openclaw]='openclaw-gateway openclaw-direct'
     [deepseek-harness]='deepseek-harness'
+    # opencode-api (the Open WebUI chat endpoint) runs only when it is on; a
+    # unit that was not active before is not checked afterwards.
+    [opencode]='opencode opencode-direct opencode-api'
     [gitea]='gitea'
     [mattermost]='mattermost'
     [mqtt]='mosquitto'
@@ -177,7 +181,7 @@ method_of() {
         router) echo router ;;
         open-webui) echo webui ;;
         hcom) echo hcom ;;
-        gitea|mattermost|honcho|hermes|openclaw|deepseek-harness|mqtt) echo reconfigure ;;
+        gitea|mattermost|honcho|hermes|openclaw|deepseek-harness|opencode|mqtt) echo reconfigure ;;
         *) if [[ -n ${GUEST_DIR[$1]:-} ]]; then echo guest; else echo unknown; fi ;;
     esac
 }
@@ -408,11 +412,12 @@ has() { systemctl list-unit-files --no-legend "$1.service" 2>/dev/null | grep -q
 has osr-hcom-relay || exit 3
 t=$(cat "$r/etc/osr-hcom/target" 2>/dev/null | tr -d "[:space:]")
 case $t in
-  hermes|openclaw|deepseek-harness|observer) ;;
+  hermes|openclaw|deepseek-harness|opencode|observer) ;;
   *) if has osr-hcom-mattermost; then t=observer
      elif has hermes-gateway; then t=hermes
      elif has openclaw-gateway; then t=openclaw
      elif has deepseek-harness; then t=deepseek-harness
+     elif has opencode; then t=opencode
      else t=observer; fi ;;
 esac
 echo "target=$t"
@@ -427,6 +432,7 @@ case $t in
   hermes) d=$r/home/hermes/AGENTS.md ;;
   openclaw) d=$r/home/openclaw/.openclaw/workspace/AGENTS.md ;;
   deepseek-harness) d=$r/var/lib/deepseek-harness/home/AGENTS.md ;;
+  opencode) d=$r/home/opencode/.config/opencode/AGENTS.md ;;
   *) d= ;;
 esac
 if [ -n "$d" ] && ! grep -qsF "<!-- osr-hcom:start -->" "$d"; then
@@ -572,7 +578,7 @@ check_nodes() {
         if ! node_usable "${I_CT[$i]}"; then
             I_RESULT[i]=not-run; I_NOTE[i]=$(node_problem "${I_CT[$i]}")
         elif [[ -n $ROUTER_CT ]] && ! node_usable "$ROUTER_CT" &&
-             [[ $t == honcho || $t == hermes || $t == openclaw || $t == deepseek-harness ]]; then
+             [[ $t == honcho || $t == hermes || $t == openclaw || $t == deepseek-harness || $t == opencode ]]; then
             I_RESULT[i]=not-run; I_NOTE[i]="needs the router CT $ROUTER_CT: $(node_problem "$ROUTER_CT")"
         fi
     done
@@ -812,7 +818,7 @@ run_guest() {  # run_guest ITEM MODE
 # Does the router URL this CT recorded point at the router CT found here?
 uses_router_ct() {
     local url host ip
-    url=$(pct exec "$1" -- sh -c 'cat /etc/hermes-target/settings /etc/openclaw-target/settings /etc/deepseek-harness/settings /etc/honcho-target/proxy.settings /etc/honcho-target/settings.env 2>/dev/null' |
+    url=$(pct exec "$1" -- sh -c 'cat /etc/hermes-target/settings /etc/openclaw-target/settings /etc/deepseek-harness/settings /etc/opencode-target/settings /etc/honcho-target/proxy.settings /etc/honcho-target/settings.env 2>/dev/null' |
           sed -n 's/^\(DSH_\)\{0,1\}ROUTER_URL=//p' | head -n 1 | tr -d '"'\''\r')
     [[ -n $url ]] || return 0
     host=${url#*://}; host=${host%%[:/]*}
@@ -858,16 +864,16 @@ run_reconfigure() {  # run_reconfigure ITEM MODE
         auto) envs+=(PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false) ;;
     esac
     case $t in
-        honcho|hermes|openclaw|deepseek-harness)
+        honcho|hermes|openclaw|deepseek-harness|opencode)
             if [[ -n $ROUTER_CT ]] && uses_router_ct "$id"; then envs+=("ROUTER_CT_ID=$ROUTER_CT"); fi ;;
     esac
     # Through the environment, not env's arguments, which ps would show.
     # run_item runs in its own subshell, so this export ends with it.
     case $t in
-        honcho|hermes|openclaw) [[ -z $WEBUI_TOKEN ]] || export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN ;;
+        honcho|hermes|openclaw|opencode) [[ -z $WEBUI_TOKEN ]] || export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN ;;
     esac
     for word in ${I_INFO[$i]}; do
-        case $word in DSH_VERSION=*|HONCHO_REF=*) envs+=("$word") ;; esac
+        case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*) envs+=("$word") ;; esac
     done
     if [[ $t == mqtt ]]; then
         settings=$(mqtt_env "$id" "$RUN_DIR/mqtt-$id") || return 1
@@ -979,7 +985,7 @@ describe_item() {  # what run_item does, for the plan
             if unpinned_service "$t"; then
                 echo "targets/$t/provision-lxc.sh --reconfigure (re-applies its setup; this repository does not pin the $t release, so it stays as it is)"
             else
-                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure$([[ $t != hermes ]] || echo "; $(hermes_plan "$i")")"
+                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF|OPENCODE_VERSION)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure$([[ $t != hermes ]] || echo "; $(hermes_plan "$i")")"
             fi ;;
         hcom) echo "targets/hcom/provision-lxc.sh as $(info_value "$i" target) (broker CT ${HCOM_MQTT_CT:-?})" ;;
     esac
@@ -1014,9 +1020,10 @@ hermes_outcome() {
 
 # --- Decisions made before anything changes ------------------------------------------
 
-repo_default() {  # repo_default dsh|honcho
+repo_default() {  # repo_default dsh|honcho|opencode
     case $1 in
         dsh) sed -n 's/^DEFAULT_DSH_VERSION=//p' "$REPO_ROOT/targets/deepseek-harness/provision-lxc.sh" | head -n 1 ;;
+        opencode) sed -n 's/^DEFAULT_OPENCODE_VERSION=//p' "$REPO_ROOT/targets/opencode/provision-lxc.sh" | head -n 1 ;;
         honcho) sed -n 's/^HONCHO_REF=\${HONCHO_REF:-\([^}]*\)}$/\1/p' "$REPO_ROOT/targets/honcho/provision-lxc.sh" | head -n 1 ;;
     esac
 }
@@ -1073,14 +1080,15 @@ decide_webui() {
 
 # needs_webui_token ITEM: does this item's reconfigure register with Open
 # WebUI, and so stop without OPENWEBUI_ADMIN_TOKEN when nobody can be asked?
-# Honcho always registers its MCP server; Hermes and OpenClaw do when their
-# API server (the Open WebUI connection) is on.
+# Honcho always registers its MCP server; Hermes, OpenClaw and OpenCode do
+# when their API server (the Open WebUI connection) is on.
 needs_webui_token() {
     local id=${I_CT[$1]}
     case ${I_TARGET[$1]} in
         honcho) return 0 ;;
         hermes) pct exec "$id" -- grep -qx 'HERMES_API_SERVER=true' /etc/hermes-target/settings 2>/dev/null ;;
         openclaw) pct exec "$id" -- grep -qx 'OPENCLAW_API=true' /etc/openclaw-target/settings 2>/dev/null ;;
+        opencode) pct exec "$id" -- grep -qx 'OPENCODE_API=true' /etc/opencode-target/settings 2>/dev/null ;;
         *) return 1 ;;
     esac
 }
@@ -1101,6 +1109,9 @@ prepare() {
             deepseek-harness)
                 recorded=$(pct exec "$id" -- sed -n 's/^DSH_VERSION=//p' /etc/deepseek-harness/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" DSH_VERSION "$recorded" "$(repo_default dsh)" ;;
+            opencode)
+                recorded=$(pct exec "$id" -- sed -n 's/^OPENCODE_VERSION=//p' /etc/opencode-target/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
+                decide_pin "$i" OPENCODE_VERSION "$recorded" "$(repo_default opencode)" ;;
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" ;;
@@ -1157,7 +1168,7 @@ check_webui_token() {
 token_needed() {
     local i
     for i in "${!I_TARGET[@]}"; do
-        case ${I_TARGET[$i]} in honcho|hermes|openclaw) ;; *) continue ;; esac
+        case ${I_TARGET[$i]} in honcho|hermes|openclaw|opencode) ;; *) continue ;; esac
         [[ -z ${I_RESULT[$i]} ]] && ct_running "${I_CT[$i]}" && needs_webui_token "$i" && return 0
     done
     return 1

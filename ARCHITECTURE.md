@@ -46,6 +46,7 @@ flowchart LR
     hermes["Hermes Agent LXC<br/>API server :8642"]
     openclaw["OpenClaw LXC<br/>Gateway :18789"]
     deepseek["DeepSeek Harness LXC<br/>Web UI :3080"]
+    opencode["OpenCode LXC<br/>web UI and API :4096, chat endpoint :4097"]
     honcho["Honcho LXC<br/>gateway :8000 API, :3000 MCP; a memory per user"]
     comfy["ComfyUI LXC<br/>:8188"]
     gitea["Gitea"]
@@ -59,6 +60,7 @@ flowchart LR
     webui -->|terminal tool| term
     webui -->|"OpenAI API (hermes-agent)"| hermes
     webui -->|"OpenAI API (openclaw)"| openclaw
+    webui -->|"OpenAI API (opencode)"| opencode
     webui -->|"image generation"| comfy
     hermes -.->|inventory and ranking :8000| router
     hermes -->|direct inference| pool
@@ -67,6 +69,10 @@ flowchart LR
     browser -->|authenticated Web UI| deepseek
     deepseek -->|OpenAI API| router
     deepseek -.->|"MCP memory (optional)"| honcho
+    browser -->|password-protected web UI| opencode
+    opencode -.->|inventory and ranking :8000| router
+    opencode -->|direct inference| pool
+    opencode -.->|"memory plugin (optional)"| honcho
     hermes -.->|"memory plugin (optional)"| honcho
     openclaw -.->|"memory plugin (optional)"| honcho
     webui -.->|"MCP tools (optional)"| honcho
@@ -79,6 +85,7 @@ flowchart LR
     hermes <-->|hcom relay| mqtt
     openclaw <-->|hcom relay| mqtt
     deepseek <-->|hcom relay| mqtt
+    opencode <-->|hcom relay| mqtt
     observer <-->|hcom relay| mqtt
     observer -->|handoff webhook: agent-handoffs| mm
     gitea -.->|clone at provisioning| ct
@@ -93,6 +100,7 @@ flowchart LR
 | Hermes API server (`:8642`) | Optional | `hermes-agent` unavailable in Open WebUI |
 | OpenClaw Gateway (`:18789`) | Optional | `openclaw` unavailable in Open WebUI |
 | DeepSeek Harness Web UI (`:3080`) | Optional | Its agent UI is unavailable |
+| OpenCode server (`:4096`), chat endpoint (`:4097`) | Optional | Its web UI and API, and `opencode` in Open WebUI, are unavailable |
 | Honcho (`:8000`, `:3000`) | Optional | Agent memory and Open WebUI MCP tools unavailable; chat unaffected |
 | ComfyUI (`:8188`) | Optional | Image generation fails; chat unaffected |
 | Cloud provider APIs (HTTPS) | Optional | Only explicitly chosen cloud models fail |
@@ -454,14 +462,14 @@ Addresses are never chosen automatically.
 Selected model targets become the first server entries and are provisioned
 after the router starts; Strata-style keys are passed on stdin to
 `set-<kind>-token`, followed by one `apply`. Honcho is provisioned before the
-agents; companions that register with Open WebUI wait for its admin API key;
-DeepSeek Harness needs none. Each target uses its own CT settings; a target
+agents; companions that register with Open WebUI (OpenCode included, for its
+chat endpoint) wait for its admin API key; DeepSeek Harness needs none. Each target uses its own CT settings; a target
 failure leaves the router running with a retry summary.
 `NONINTERACTIVE=true` refuses selected targets (they need interactive steps).
 
 MQTT and hcom are standalone follow-ups: `tools/install-mqtt.sh` provisions the
 broker, then `tools/install-hcom.sh` attaches each existing agent CT
-(`HCOM_TARGET` = `hermes`, `openclaw`, `deepseek-harness` or `observer`;
+(`HCOM_TARGET` = `hermes`, `openclaw`, `deepseek-harness`, `opencode` or `observer`;
 creates no CT). The observer can share the broker CT and needs a configured
 Mattermost CT. All offer a dry run; the broker bundle moves through private
 `pct` files; reruns keep credentials, repair drift and restore managed files on
@@ -488,6 +496,7 @@ service account before its venv is built.
 | 9119 | Hermes dashboard | `0.0.0.0` in its CT, when enabled | Authenticated browser UI |
 | 18789 / 8765 | OpenClaw Gateway (API, Control UI) / dispatcher | `0.0.0.0` (loopback without Open WebUI and Control UI) / `127.0.0.1` | Open WebUI and browsers → OpenClaw; dispatcher as for Hermes |
 | 3080 | DeepSeek Harness | CT IPv4 address | Browser UI; inbound limited by `DSH_ACCESS_CIDR` |
+| 4096 / 4097 / 8765 | OpenCode server (web UI, API) / chat endpoint / dispatcher | `0.0.0.0` (loopback with `OPENCODE_WEB=false`) / `0.0.0.0` when Open WebUI is on / `127.0.0.1` | Browsers (Basic auth) → OpenCode, inbound limited by `OPENCODE_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → OpenCode on loopback, inbound from the router only; dispatcher as for Hermes |
 | 8000 / 3000 / 8010, 3010 / 8765, 8766 | Honcho gateway (API / MCP) / Honcho API, MCP / proxy, embeddings | In its CT / in its CT / `127.0.0.1` / `127.0.0.1` | Open WebUI and selected agents → gateway (own keys; a workspace per Open WebUI user) → Honcho; source-restricted firewall |
 | 8188 | ComfyUI | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
 | 3000 / 8065 | Gitea / Mattermost | CT addresses | Configuration repository / alerts and handoffs |
@@ -500,16 +509,17 @@ firewall sets the input policy to drop). Target CTs are created with
 `# osr-open-terminal-client <agent>-<ct>` rule each, kept by the agent's
 provisioner); Hermes, OpenClaw and ComfyUI admit only the router's address (ComfyUI also `UI_ALLOW_CIDR`; Hermes's dashboard and
 OpenClaw's Control UI anyone); Honcho admits the router and selected agents;
-DeepSeek Harness `DSH_ACCESS_CIDR`; model targets leave rules to the operator.
-Hermes and OpenClaw also restrict egress by default to the router API, the
+DeepSeek Harness `DSH_ACCESS_CIDR`, OpenCode `OPENCODE_ACCESS_CIDR` (and the
+router to its chat endpoint); model
+targets leave rules to the operator. Hermes, OpenClaw and OpenCode also restrict egress by default to the router API, the
 registered model servers, Honcho and Open Terminal when set, DNS and internet
-HTTP(S) (§17.1, §17.4). Honcho and
+HTTP(S) (§17.1, §17.4, §17.8). Honcho and
 DeepSeek Harness keep one tagged rule each in the router CT's firewall file so
 they can reach its API. hcom adds owned outbound rules to the broker (and, for
 an observer, Mattermost) before an agent's private-address drops. The MQTT
 target installs its own inbound allowlist, effective only with the host or
 datacenter firewall enabled. Provisioners that rewrite an existing firewall
-file (Hermes, OpenClaw, Honcho, DeepSeek Harness, hcom, MQTT, and the agents'
+file (Hermes, OpenClaw, OpenCode, Honcho, DeepSeek Harness, hcom, MQTT, and the agents'
 rule in the Open Terminal CT's file) go through
 `targets/pve-firewall-swap.pl`, under the CT's lock and only if the file is
 unchanged. No agent coordination API is added to the router.
@@ -534,7 +544,7 @@ unchanged. No agent coordination API is added to the router.
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | `secrets.env` | `set-cloud-key`; never forwarded to clients |
 | Codex/Claude Code logins, gateway virtual keys | Not kept by OSR | Sent per request and passed through to the subscription gateway |
 | Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT; also Xolotl's `/etc/xolotl/xolotl-ds41.json`, Avalon's `/etc/avalon/api-key` and Kindi's `/etc/kindi/kindi.conf` (0640, service group) | Generated in the CT; never in a unit, log or the router's process list |
-| Open Terminal client keys | Open WebUI's: `/etc/open-terminal/api-key` (0600) and the Open WebUI connection; each agent's: its CT (`~hermes/.hermes/.env`, `~openclaw/.openclaw/.env`, `/etc/deepseek-harness/` and service env); the terminal keeps only SHA-256 hashes (`clients.json`, 0640 root:ot-gateway) | Open WebUI's generated by the terminal provisioner; agents' issued by `open-terminal-clients` and kept while valid |
+| Open Terminal client keys | Open WebUI's: `/etc/open-terminal/api-key` (0600) and the Open WebUI connection; each agent's: its CT (`~hermes/.hermes/.env`, `~openclaw/.openclaw/.env`, `/etc/deepseek-harness/` and service env, `/etc/opencode-target/opencode.env`); the terminal keeps only SHA-256 hashes (`clients.json`, 0640 root:ot-gateway) | Open WebUI's generated by the terminal provisioner; agents' issued by `open-terminal-clients` and kept while valid |
 | Open Terminal workspace keys | `/etc/open-terminal/ws/<id>.env` (0600 root) | One per workspace, generated by the spawner; reaches only that workspace |
 | Hermes API server key | `/etc/hermes-target/api-key` (0600), `~hermes/.hermes/.env` (0600); Open WebUI connection | Generated in the Hermes CT |
 | Router and backend keys in the Hermes CT | `~hermes/.hermes/.env` (router key); `/etc/hermes-target/backend-keys` (0640) | Pushed as 0600 files; `--reconfigure` after rotation |
@@ -543,6 +553,9 @@ unchanged. No agent coordination API is added to the router.
 | Honcho JWT secret, admin key | `/etc/honcho-target/` in the Honcho CT (the secret 0640 root:honcho-gateway) | Never leave the CT; the gateway signs a key per workspace with the secret; `--rotate-keys` |
 | Honcho client keys | Open WebUI's: `/etc/honcho-target/openwebui-key` (0600) and the Open WebUI connection; each agent's: its CT (`honcho-api-key` in its deploy directory and Honcho settings); Honcho keeps only SHA-256 hashes (`clients.json`, 0640 root:honcho-gateway) | Open WebUI's generated by the Honcho installer (`--rotate-keys` replaces it); agents' issued by `honcho-clients` and kept while valid |
 | Router key in the DeepSeek Harness CT | `/etc/deepseek-harness/service.env` (root-only), service environment | Readable by the agent's tools (§17.6) |
+| OpenCode server password | `/etc/opencode-target/password` (0600), `/etc/opencode-target/opencode.env` (root-only, read by systemd; `OPENCODE_PASSWORD`) | Web UI login as `opencode`; in the server environment, so the agent's shell tool can read it |
+| Router and backend keys in the OpenCode CT | `/etc/opencode-target/router.env`, `backend-keys` (0640 root:opencode-direct) | Readable only by the dispatcher's account |
+| OpenCode chat endpoint key | `/etc/opencode-target/api-key` (0600), `/etc/opencode-target/api.env` (root-only, read by systemd, with the server password); Open WebUI connection | Generated once in the CT and kept while the endpoint is off; the endpoint runs as `opencode-api` |
 | Hugging Face token (ComfyUI `klein-9b`) | Not kept: installer memory, a 0600 stage file and, during the guest step only, `/root/comfyui-target-deploy/hf-token` (0600) | Never in argv or the CT's environment; removed also on failure |
 | MQTT password and hcom relay key/group | `/etc/mqtt-target/relay.json` (0600 root); each CT's `/var/lib/osr-hcom/.osr-hcom/config.toml` (0600 `osr-hcom`; `hermes` in native mode) | Per-group topic ACL; private `pct` transfer; never committed |
 | Mattermost handoff webhook | `/etc/mattermost-target/agent-handoffs-webhook-url`, observer `/etc/osr-hcom/mattermost-webhook` (0600 root) | Given only to the observer via systemd `LoadCredential` |
@@ -562,6 +575,8 @@ unchanged. No agent coordination API is added to the router.
 | OpenClaw's chat token is full Gateway operator access; users share one agent | Token only in Open WebUI and root-only files; keep `openclaw` admin-only or one group; router and backend keys are out of the agent's reach |
 | OpenClaw's installer chain is unpinned beyond nvm (Node, npm `latest`) | nvm's `install.sh` SHA-256-checked; Node checked against nodejs.org checksums; `OPENCLAW_VERSION`, `OPENCLAW_NODE_VERSION` pin releases |
 | DeepSeek Harness tools can read the router and Honcho keys | Limit its Web UI (`DSH_ACCESS_CIDR`) to people trusted to operate OSR |
+| OpenCode's web UI is one shared account; its tools can read the server password, Open Terminal and Honcho keys | `OPENCODE_ACCESS_CIDR` narrow, plain HTTP only on a trusted LAN or VPN; router and backend keys are out of the agent's reach |
+| Open WebUI chats with `opencode` run tools unattended (permission requests allowed once) in the shared workspace | Keep `opencode` admin-only or one group; `OPENCODE_API_PERMISSIONS=reject`; the endpoint admits only the router and its bearer key |
 | MQTT on 1883 authenticates without TLS | Trusted segment and source allowlist; `mqtts://` for untrusted networks; hcom encrypts payloads |
 | Any holder of a group's key can send hcom remote requests to every peer | Key owned by `osr-hcom`; agents use a send-only socket that stamps the sender; one group per trusted set; native Hermes mode opts in |
 | Agent memory plugins may capture bus content the agent reads | Separate stores, no bus-to-memory archive; absolute exclusion needs plugin capture-policy changes |
@@ -875,8 +890,8 @@ WebUI (MCP tool server, admin-only until granted) a workspace per user: the
 connection sends `X-User-Id: {{USER_ID}}`, Open WebUI fills it in, and the
 gateway forwards with a Honcho JWT for `openwebui-u-<hash of client and user>`
 alone, so Honcho itself refuses every other workspace (it also binds an MCP
-session to its key, and tool calls' `workspace_id` is pinned). Hermes, OpenClaw
-and DeepSeek Harness each get their own key (`<agent>-<CT>`, issued by their
+session to its key, and tool calls' `workspace_id` is pinned). Hermes, OpenClaw,
+DeepSeek Harness and OpenCode each get their own key (`<agent>-<CT>`, issued by their
 provisioners via `targets/honcho/client-lib.sh`) pinned to a workspace of its
 own named after the client, as with Open Terminal; the guest learns it from
 the gateway's `/osr/v1/whoami` (`osr`, or `HONCHO_WORKSPACE`, for a Honcho
@@ -939,16 +954,17 @@ keeps its own database and event IDs.
 
 `osr-bus` sends short JSON envelopes with hcom's `send --from ... --go --intent
 request -- ...`, addressing stable OSR target names (`hermes`, `openclaw`,
-`deepseek-harness`, `all`) without native hcom identities. `inbox` filters
+`deepseek-harness`, `opencode`, `all`) without native hcom identities. `inbox` filters
 recent envelopes for this target and shows native messages; `follow` streams
 new events from a local `--after-id` cursor. The 2,000-character limit and
 recent-event inbox suit handoffs, not transcript archival or durable task
 acknowledgements.
 
-**Framework integration.** Hermes, OpenClaw and DeepSeek Harness poll `osr-bus
-inbox` through their terminal tools, as managed instruction blocks tell them
-(Hermes reads `/home/hermes/AGENTS.md`, its working directory's). hcom 0.7.31
-has no native hooks or wakeups for OpenClaw and DeepSeek. Hermes's native plugin
+**Framework integration.** Hermes, OpenClaw, DeepSeek Harness and OpenCode poll
+`osr-bus inbox` through their terminal tools, as managed instruction blocks tell
+them (Hermes reads `/home/hermes/AGENTS.md`, its working directory's; OpenCode
+its global `~/.config/opencode/AGENTS.md`). hcom 0.7.31 has no native hooks or
+wakeups for OpenClaw, DeepSeek and OpenCode. Hermes's native plugin
 is opt-in (`HCOM_HERMES_NATIVE=true`): the relay then runs as `hermes`, which
 holds the key, and `/hcom start hermes` works only in messaging-platform chats
 (the plugin treats Open WebUI's API-server sessions as not a chat). Tool use
@@ -981,6 +997,39 @@ managed files and check previous services; a failed rollback retains
 installs. Apt packages and runtime databases are outside the snapshots. Rerun
 clients after changing the broker's advertised host or port, and supply TLS
 files on every TLS broker reconfigure.
+
+### 17.8 OpenCode (`targets/opencode/`)
+
+[OpenCode](targets/opencode/README.md) (`anomalyco/opencode`, npm
+`@opencode/cli`, pinned to 2.2.7) is a coding agent with its own web UI and
+HTTP API (`opencode serve`, 4096, HTTP Basic auth as `opencode` with a
+generated `OPENCODE_PASSWORD`). It has no OpenAI-compatible endpoint of its
+own, so the target adds one (`openai-proxy.py` as `opencode-api.service`, 4097,
+its own account, standard library only), registered in Open WebUI as
+`opencode` by `integrate-webui.py` like OpenClaw's Gateway. Each chat request
+becomes a prompt in an OpenCode session: the proxy subscribes to
+`/api/event`, posts the prompt and streams the session's text deltas as
+content (reasoning and tool activity as `reasoning_content`) until its
+execution ends; permission requests in the session and its subagents are
+answered with `OPENCODE_API_PERMISSIONS` (allow once, or reject) and questions
+are cancelled. Open WebUI sends no chat ID, so sessions are keyed by a hash of
+the normalised conversation: a request that continues a session's last state
+reuses it, anything else (a regenerated or edited reply) starts a new session
+seeded with the transcript. Like OpenClaw it runs
+the Hermes dispatcher as a separate account (`opencode-direct`) and gets one
+`@opencode/ai/providers/openai-compatible` provider per dispatcher endpoint
+(`osr`, and one per model server) in `~/.config/opencode/opencode.json`, whose
+other keys the installer keeps. OpenCode 2 is one native binary: the installer
+does the npm package's own platform choice (AVX2 or baseline), downloads the
+platform package from the registry and checks its `sha512` integrity, without
+Node. Releases sit under `/opt/opencode/releases/` behind a `current` link;
+OpenCode's updater is off. A run sets aside the config, environment files,
+Honcho config, units, dispatcher and endpoint files and the link, and on a failed health
+check (`/api/info` and the default model `osr/<OPENCODE_MODEL>`) restores
+them and the previous release. With Honcho the installer adds the official
+`@honcho-ai/opencode-honcho` plugin (hooks, like Hermes's and OpenClaw's) and
+its `~/.honcho/config.json`; with Open Terminal a remote MCP server whose key
+OpenCode substitutes from its environment.
 
 ## 18. Verification and CI
 

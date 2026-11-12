@@ -28,7 +28,7 @@ from bus_config import make_bundle
 with open(sys.argv[2], 'w') as output:
     json.dump(make_bundle('mqtt://127.0.0.1:1883'), output)
 PY
-for target in hermes openclaw deepseek-harness observer; do
+for target in hermes openclaw deepseek-harness opencode observer; do
   output=$(HCOM_TARGET=$target HCOM_RELAY_BUNDLE=$stage/bundle bash "$here/install-target.sh" --dry-run)
   [[ $output == *"configure $target"* ]] || { echo 'FAIL: dry run lost the target'; exit 1; }
 done
@@ -113,7 +113,7 @@ chmod +x "$stage/bin/pct"
 # Not a dry run (that reads nothing from the CT), so answer "n" at the
 # confirmation: it stops before any change, even on a real Proxmox host.
 output=$(printf '282\n\n\n\nn\n' | PATH="$stage/bin:$PATH" asked --reconfigure) && { echo 'FAIL: declined plan ran'; exit 1; }
-[[ $output == *'(hermes, openclaw, deepseek-harness, observer) [hermes]'* && $output == *'MQTT broker CT ID [286]'* &&
+[[ $output == *'(hermes, openclaw, deepseek-harness, opencode, observer) [hermes]'* && $output == *'MQTT broker CT ID [286]'* &&
    $output == *'native hcom plugin? [Y/n]'* && $output == *'Native Hermes plugin       true'* &&
    $output == *'nothing was changed'* ]] ||
   { echo 'FAIL: reconfigure defaults to the recorded settings'; printf '%s\n' "$output"; exit 1; }

@@ -15,7 +15,7 @@ dry_run=0
 for arg in "$@"; do
   case $arg in
     --dry-run) dry_run=1 ;;
-    -h|--help) echo 'Usage: HCOM_TARGET=hermes|openclaw|deepseek-harness|observer HCOM_RELAY_BUNDLE=<file> [HCOM_HERMES_NATIVE=true] bash install-target.sh [--dry-run]'; exit 0 ;;
+    -h|--help) echo 'Usage: HCOM_TARGET=hermes|openclaw|deepseek-harness|opencode|observer HCOM_RELAY_BUNDLE=<file> [HCOM_HERMES_NATIVE=true] bash install-target.sh [--dry-run]'; exit 0 ;;
     *) die "Unknown argument: $arg" ;;
   esac
 done
@@ -33,8 +33,10 @@ case $target in
             old_state=/home/openclaw/.osr-hcom ;;
   deepseek-harness) agent=deepseek-harness; instructions=/var/lib/deepseek-harness/home/AGENTS.md; unit=deepseek-harness.service
                     old_state=/var/lib/deepseek-harness/hcom ;;
+  # OpenCode loads its global AGENTS.md into every session.
+  opencode) agent=opencode; instructions=/home/opencode/.config/opencode/AGENTS.md; unit=opencode.service ;;
   observer) agent=''; instructions=''; unit='' ;;
-  *) die 'Set HCOM_TARGET to hermes, openclaw, deepseek-harness or observer.' ;;
+  *) die 'Set HCOM_TARGET to hermes, openclaw, deepseek-harness, opencode or observer.' ;;
 esac
 [[ $native == false || $target == hermes ]] || die 'HCOM_HERMES_NATIVE applies only to the hermes target.'
 if [[ $native == true ]]; then

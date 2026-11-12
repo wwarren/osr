@@ -120,7 +120,7 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"
 INSTALL_GITEA="${INSTALL_GITEA:-false}"
 INSTALL_MATTERMOST="${INSTALL_MATTERMOST:-false}"
 # Optional targets from targets/ (the Gitea and Mattermost services, model
-# servers, Honcho memory, the Hermes / OpenClaw agents and the Open Terminal /
+# servers, Honcho memory, the Hermes / OpenClaw / DeepSeek / OpenCode agents and the Open Terminal /
 # ComfyUI tools), each in its own LXC. Interactive installs ask which to create
 # (names or menu numbers). INSTALL_TARGETS pre-fills the answer with target
 # names, comma-separated, e.g. INSTALL_TARGETS=ollama,hermes; menu numbers are
@@ -1010,6 +1010,7 @@ target_table() {
     'hermes|companion|Hermes Agent: offered in Open WebUI as the model hermes-agent|||' \
     'openclaw|companion|OpenClaw: agent offered in Open WebUI as the model openclaw|||' \
     'deepseek-harness|companion|DeepSeek Harness: agent Web UI in its own LXC, using OSR models|||' \
+    'opencode|companion|OpenCode: coding agent with its own web UI, also offered in Open WebUI as the model opencode|||' \
     'open-terminal|companion|Open Terminal: a private workspace per user, for Open WebUI and the agents|||' \
     'comfyui|companion|ComfyUI: image generation for Open WebUI (NVIDIA, AMD or Intel Arc GPU when present)|||optional:nvidia,amd,intel'
 }
@@ -1540,7 +1541,7 @@ target_menu_group() {
         model) echo 'Model servers (GPU required by default):' ;;
         companion)
           case "$1" in
-            hermes|openclaw|deepseek-harness) echo 'Agents (CPU): OSR-backed, with optional Honcho memory.' ;;
+            hermes|openclaw|deepseek-harness|opencode) echo 'Agents (CPU): OSR-backed, with optional Honcho memory.' ;;
             open-terminal) echo 'Open WebUI tools (CPU):' ;;
             comfyui) echo 'Image generation (GPU optional):' ;;
           esac ;;
@@ -1585,7 +1586,7 @@ prompt_target_selection() {
     printf '  %d) %-14s %s\n' "$i" "$name" "$label"
     prev_group="$group"
   done < <(target_table)
-  echo "Target-specific settings (GPU_DEVICES, BACKEND, STRATA_MODEL, HERMES_MODEL, OPENCLAW_MODEL, COMFYUI_MODEL_URL, ...) are read"
+  echo "Target-specific settings (GPU_DEVICES, BACKEND, STRATA_MODEL, HERMES_MODEL, OPENCLAW_MODEL, OPENCODE_MODEL, COMFYUI_MODEL_URL, ...) are read"
   echo "from the environment as each target's README describes."
   prompt_until_valid "Targets to create (numbers or names, comma-separated; none)" \
     INSTALL_TARGETS "${INSTALL_TARGETS:-none}" valid_target_selection || return 1
@@ -1760,6 +1761,10 @@ prompt_target_settings() {
     if [[ $name == deepseek-harness ]]; then
       echo "    DeepSeek runs its own tools; choose an OSR model that supports tool calls."
       prompt_until_valid "    Model or tier" DEEPSEEK_HARNESS_MODEL "${DEEPSEEK_HARNESS_MODEL:-auto}" valid_honcho_model || return 1
+    fi
+    if [[ $name == opencode ]]; then
+      echo "    OpenCode runs its own tools; choose an OSR model that supports tool calls."
+      prompt_until_valid "    Model or tier" OPENCODE_MODEL "${OPENCODE_MODEL:-auto}" valid_honcho_model || return 1
     fi
     if [[ $name == comfyui ]]; then
       echo "    Image model; the CT install downloads its diffusion model, text encoder and VAE:"
@@ -1950,6 +1955,7 @@ context_agent_needs() {
       openclaw) echo "  OpenClaw needs 32768 tokens or more (65536 by default)." ;;
       honcho) echo "  Honcho fits its budgets to its model's window; 131072 or more runs its full budgets." ;;
       deepseek-harness) echo "  DeepSeek Harness needs 16384 tokens or more." ;;
+      opencode) echo "  OpenCode needs 32768 tokens or more (65536 by default); it does not use a server with less." ;;
     esac
   done
 }
@@ -1960,6 +1966,9 @@ context_shortfall() {
   fi
   if [[ " ${TARGETS:-} " == *" openclaw "* ]] && (( $1 < 32768 )); then
     echo "    Note: OpenClaw will not fit on this server (it needs 32768 tokens or more)."
+  fi
+  if [[ " ${TARGETS:-} " == *" opencode "* ]] && (( $1 < 32768 )); then
+    echo "    Note: OpenCode will not use this server (it needs 32768 tokens or more)."
   fi
   return 0
 }
@@ -2113,7 +2122,7 @@ run_target_provisioner() {
   # Only ComfyUI's gated klein-9b weights need the Hugging Face token.
   if [[ $name == comfyui && $image_variant == klein-9b ]]; then hf_token="${TARGET_HF_TOKEN:-}"; fi
   if [[ $name == honcho ]]; then
-    for client in hermes openclaw deepseek-harness; do
+    for client in hermes openclaw deepseek-harness opencode; do
       if [[ " ${TARGETS:-} " == *" ${client} "* ]]; then
         client_ips+="${client_ips:+ }$(target_setting "$client" IP_CIDR | cut -d/ -f1)"
       fi
@@ -2123,7 +2132,7 @@ run_target_provisioner() {
   case "$name" in
     ollama|airllm) flags=(--install-target) ;;
     llamacpp) if llamacpp_model_given; then flags=(--install-target); fi ;;
-    open-terminal|hermes|openclaw|deepseek-harness) template="${template:-${TEMPLATE_REF:-}}" ;;
+    open-terminal|hermes|openclaw|deepseek-harness|opencode) template="${template:-${TEMPLATE_REF:-}}" ;;
     honcho)
       if [[ -z $template && ${TEMPLATE_REF:-} == *:vztmpl/debian-13-* ]]; then
         template=$TEMPLATE_REF
@@ -2173,14 +2182,14 @@ run_target_provisioner() {
         [[ -z ${HONCHO_CONTEXT_TOKENS+set} ]] || export HONCHO_CONTEXT_TOKENS
       fi
       # Only the agents use Honcho, and only once its CT was provisioned.
-      if [[ ( "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness ) && "${HONCHO_READY:-false}" == true ]]; then
+      if [[ ( "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness || "$name" == opencode ) && "${HONCHO_READY:-false}" == true ]]; then
         local honcho_ct
         honcho_ct="$(target_setting honcho CT_ID)"
         export HONCHO_URL="http://${HONCHO_IP_CIDR%/*}:8000" HONCHO_CT_ID="$honcho_ct"
       fi
       # The same for Open Terminal: each agent gets its own workspace there,
       # with a client key the terminal CT issues.
-      if [[ ( "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness ) && "${OPEN_TERMINAL_READY:-false}" == true ]]; then
+      if [[ ( "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness || "$name" == opencode ) && "${OPEN_TERMINAL_READY:-false}" == true ]]; then
         local ot_ct ot_ip
         ot_ct="$(target_setting open-terminal CT_ID)"
         ot_ip="$(target_setting open-terminal IP_CIDR)"
@@ -2192,6 +2201,12 @@ run_target_provisioner() {
         export DEEPSEEK_HARNESS_CONTEXT_WINDOW="${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-65536}"
         export DSH_ACCESS_CIDR="${DEEPSEEK_HARNESS_ACCESS_CIDR:-${API_ALLOW_CIDR:-$ip}}"
         exec bash "$script" "${flags[@]}"
+      fi
+      # OpenCode: its own web UI for the access range, and its chat endpoint
+      # registered in Open WebUI with the admin token (below).
+      if [[ "$name" == opencode ]]; then
+        export OPENCODE_MODEL="${OPENCODE_MODEL:-auto}"
+        export OPENCODE_ACCESS_CIDR="${OPENCODE_ACCESS_CIDR:-${API_ALLOW_CIDR:-$ip}}"
       fi
       OPENWEBUI_ADMIN_TOKEN="$admin_token" exec bash "$script" "${flags[@]}"
     fi
@@ -2378,7 +2393,7 @@ provision_selected_targets() {
       status=1
       if [[ "${result[$name]}" == "failed (OSR key apply)" ]]; then
         echo "                 run pct exec ${CT_ID} -- /usr/local/bin/manage-model-servers apply"
-      elif [[ ( "$name" == honcho || "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness ) && "${result[$name]}" == failed ]]; then
+      elif [[ ( "$name" == honcho || "$name" == hermes || "$name" == openclaw || "$name" == deepseek-harness || "$name" == opencode ) && "${result[$name]}" == failed ]]; then
         echo "                 see targets/${name}/README.md; if CT ${id} exists, resume on the Proxmox host with:"
         echo "                 CT_ID=${id} ROUTER_CT_ID=${CT_ID} bash targets/${name}/provision-lxc.sh --reconfigure"
       else

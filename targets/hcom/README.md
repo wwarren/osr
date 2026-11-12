@@ -1,7 +1,7 @@
 # hcom tool target
 
-Adds [hcom](https://github.com/aannoo/hcom) to existing OSR Hermes, OpenClaw and
-DeepSeek Harness CTs, plus one optional Mattermost observer. These standalone
+Adds [hcom](https://github.com/aannoo/hcom) to existing OSR Hermes, OpenClaw,
+DeepSeek Harness and OpenCode CTs, plus one optional Mattermost observer. These standalone
 tool targets are installed after the agents, create no CT and do not change
 model routing. The installer pins **hcom 0.7.31** (upstream commit
 `de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf`) and verifies the Linux x86_64 or
@@ -23,7 +23,7 @@ bash tools/install-hcom.sh --help           # every setting and option
 
 | Setting | When | Meaning (offered default) |
 |---|---|---|
-| `HCOM_TARGET` | always | `hermes`, `openclaw` or `deepseek-harness` (the agent the CT runs), or `observer` (no agent; posts handoffs to Mattermost). A reconfigure offers the recorded one. |
+| `HCOM_TARGET` | always | `hermes`, `openclaw`, `deepseek-harness` or `opencode` (the agent the CT runs), or `observer` (no agent; posts handoffs to Mattermost). A reconfigure offers the recorded one. |
 | `CT_ID` | always | The existing CT to add hcom to (the CT tagged with the target; observer: the broker CT). A reconfigure asks for it first. |
 | `MQTT_CT_ID` | always | The broker CT from `targets/mqtt` (the CT at the recorded broker address, else the one tagged `mqtt`). |
 | `MATTERMOST_CT_ID` | observer | Where the agent-handoffs webhook is created (tag `mattermost`); `none` keeps an observer's current webhook, or posts nothing. |
@@ -96,7 +96,7 @@ kept from the agents:
 `osr-hcom-bus.socket` admits root and the CT's agent (socket group plus a
 peer-credential check); each connection runs `osr-hcom-bus@.service` as the
 relay account. It accepts four requests: send a handoff (up to 2,000
-characters, to `hermes`, `openclaw`, `deepseek-harness` or `all`), read the
+characters, to `hermes`, `openclaw`, `deepseek-harness`, `opencode` or `all`), read the
 inbox, follow, or show status. It stamps the sender as `osr-<target>` and runs
 no shell. Agents never start hcom, so they never start a stray relay worker;
 the relay unit also stops one before starting (relevant in native mode). Root
@@ -108,6 +108,7 @@ trusted set of CTs.
 | Hermes | `hermes` | `/home/hermes/AGENTS.md` (Hermes's working directory) |
 | OpenClaw | `openclaw` | `/home/openclaw/.openclaw/workspace/AGENTS.md` |
 | DeepSeek Harness | `deepseek-harness` | `/var/lib/deepseek-harness/home/AGENTS.md` |
+| OpenCode | `opencode` | `/home/opencode/.config/opencode/AGENTS.md` (OpenCode's global instructions) |
 | Observer | — | — |
 
 `HCOM_INSTRUCTIONS_FILE` selects a custom workspace or profile. Only the
@@ -145,7 +146,7 @@ handoffs; it covers the latest 100 message events by default (`--last`
 1–10000), not a durable task queue. Agents use event IDs to avoid repeating
 work.
 
-**OpenClaw and DeepSeek Harness.** hcom 0.7.31 has no native hooks for them.
+**OpenClaw, DeepSeek Harness and OpenCode.** hcom 0.7.31 has no native hooks for them.
 Managed instructions tell their terminal tools to run `osr-bus inbox` before
 substantial tasks and between major steps and to send short handoffs; messages
 do not start turns, and compliance depends on the model. If OpenClaw's tool

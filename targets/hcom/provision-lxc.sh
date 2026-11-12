@@ -15,8 +15,8 @@ Proxmox host. In a terminal it asks for every setting below that is not set,
 offering CTs by their tags. Unattended runs must preset the required ones.
 
 Settings (environment variables):
-  HCOM_TARGET         required  What the CT runs: hermes, openclaw or
-                                deepseek-harness (an agent), or observer (no
+  HCOM_TARGET         required  What the CT runs: hermes, openclaw,
+                                deepseek-harness or opencode (an agent), or observer (no
                                 agent; forwards handoffs to Mattermost).
   CT_ID               required  The existing CT to add hcom to. Offered: the CT
                                 tagged with HCOM_TARGET (observer: the broker).
@@ -53,13 +53,13 @@ for arg in "$@"; do
   esac
 done
 
-valid_target() { [[ $1 =~ ^(hermes|openclaw|deepseek-harness|observer)$ ]]; }
+valid_target() { [[ $1 =~ ^(hermes|openclaw|deepseek-harness|opencode|observer)$ ]]; }
 valid_optional_ct() { [[ -z $1 ]] || pve_valid_ct_id "$1"; }
 for setting in CT_ID MQTT_CT_ID MATTERMOST_CT_ID; do
   [[ -z ${!setting:-} ]] || pve_valid_ct_id "${!setting}" || die "$setting must be a CT ID (100 or more), not '${!setting}'."
 done
 [[ -z ${HCOM_TARGET:-} ]] || valid_target "$HCOM_TARGET" ||
-  die "HCOM_TARGET must be hermes, openclaw, deepseek-harness or observer, not '$HCOM_TARGET'."
+  die "HCOM_TARGET must be hermes, openclaw, deepseek-harness, opencode or observer, not '$HCOM_TARGET'."
 [[ -z ${HCOM_HERMES_NATIVE:-} || $HCOM_HERMES_NATIVE =~ ^(true|false)$ ]] ||
   die "HCOM_HERMES_NATIVE must be true or false, not '$HCOM_HERMES_NATIVE'."
 if ! pve_interactive; then
@@ -67,7 +67,7 @@ if ! pve_interactive; then
   [[ -n ${CT_ID:-} ]] || missing+=('CT_ID (the existing CT)')
   [[ -n ${MQTT_CT_ID:-} ]] || missing+=('MQTT_CT_ID (the broker CT)')
   # A reconfigure can take the target the CT recorded.
-  [[ -n ${HCOM_TARGET:-} ]] || (( reconfigure )) || missing+=('HCOM_TARGET (hermes, openclaw, deepseek-harness or observer)')
+  [[ -n ${HCOM_TARGET:-} ]] || (( reconfigure )) || missing+=('HCOM_TARGET (hermes, openclaw, deepseek-harness, opencode or observer)')
   if (( ${#missing[@]} )); then
     printf 'Error: not running in a terminal, so nothing can be asked. Set:\n' >&2
     printf '  %s\n' "${missing[@]}" >&2
@@ -102,15 +102,15 @@ if (( reconfigure )); then
   read_recorded
 fi
 pve_section 'hcom target'
-pve_note 'hermes, openclaw or deepseek-harness: the agent this CT runs.'
+pve_note 'hermes, openclaw, deepseek-harness or opencode: the agent this CT runs.'
 pve_note 'observer: no agent; forwards handoffs to Mattermost (one per relay group).'
 if [[ -n $(recorded_value target) ]]; then
-  pve_ask HCOM_TARGET 'Target (hermes, openclaw, deepseek-harness, observer)' "$(recorded_value target)" valid_target 'Use hermes, openclaw, deepseek-harness or observer.'
+  pve_ask HCOM_TARGET 'Target (hermes, openclaw, deepseek-harness, opencode, observer)' "$(recorded_value target)" valid_target 'Use hermes, openclaw, deepseek-harness, opencode or observer.'
 else
-  pve_suggest HCOM_TARGET 'Target (hermes, openclaw, deepseek-harness, observer)' '' valid_target 'Use hermes, openclaw, deepseek-harness or observer.'
+  pve_suggest HCOM_TARGET 'Target (hermes, openclaw, deepseek-harness, opencode, observer)' '' valid_target 'Use hermes, openclaw, deepseek-harness, opencode or observer.'
 fi
 case $HCOM_TARGET in
-  hermes) name=Hermes ;; openclaw) name=OpenClaw ;; deepseek-harness) name='DeepSeek Harness' ;; *) name=Observer ;;
+  hermes) name=Hermes ;; openclaw) name=OpenClaw ;; deepseek-harness) name='DeepSeek Harness' ;; opencode) name=OpenCode ;; *) name=Observer ;;
 esac
 if (( ! reconfigure )); then
   pve_section "$name container"

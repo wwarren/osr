@@ -12,7 +12,7 @@ import signal
 import socket
 import sys
 
-PEERS = ("hermes", "openclaw", "deepseek-harness", "all")
+PEERS = ("hermes", "openclaw", "deepseek-harness", "opencode", "all")
 SOCKET = "/run/osr-hcom/bus.sock"
 SETTINGS = "/etc/osr-hcom/bus.json"
 

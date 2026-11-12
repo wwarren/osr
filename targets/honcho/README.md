@@ -355,9 +355,10 @@ Select `honcho` in `ollama-smart-router-install.sh` with the agents (Honcho is
 always created first). The installer gives it the router's URL and key and
 registers `http://<honcho-ip>:3000/mcp` as an authenticated Streamable HTTP
 tool server in Open WebUI (admin-only until granted; it does not make every
-conversation a memory session). Selected Hermes and OpenClaw get their native
-Honcho integrations and DeepSeek Harness its MCP connection
-([details](../deepseek-harness/README.md#honcho-memory)), each with its own key
+conversation a memory session). Selected Hermes, OpenClaw and OpenCode get
+their native Honcho integrations
+([OpenCode's plugin](../opencode/README.md#honcho-memory)) and DeepSeek Harness
+its MCP connection ([details](../deepseek-harness/README.md#honcho-memory)), each with its own key
 and workspace (its memory of the `user` peer); every Open WebUI user granted
 the tools gets a workspace of their own.
 

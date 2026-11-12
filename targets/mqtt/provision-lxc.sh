@@ -37,11 +37,11 @@ client_suggestion=$(python3 -c 'import ipaddress, sys; print(ipaddress.IPv4Inter
 agent_ips=()
 pve_section 'MQTT client access'
 pve_note "The broker's firewall drops every connection to TCP $MQTT_PORT except from this one IPv4 range."
-pve_note 'Enter a range covering every agent CT that will run hcom (Hermes, OpenClaw, DeepSeek Harness,'
+pve_note 'Enter a range covering every agent CT that will run hcom (Hermes, OpenClaw, DeepSeek Harness, OpenCode,'
 pve_note 'and an observer on another CT). An observer on this broker CT needs no entry.'
 pve_note 'Examples: 192.168.1.0/24 = the whole 192.168.1.x subnet; 192.168.1.82/32 = one CT only.'
 pve_note 'Clients still need the generated broker password; this range is an extra layer.'
-for agent in hermes openclaw deepseek-harness; do
+for agent in hermes openclaw deepseek-harness opencode; do
   agent_ct=$(pve_tagged_ct "$agent")
   [[ -n $agent_ct ]] || continue
   agent_ip=$(pve_ct_net "$agent_ct" ip)

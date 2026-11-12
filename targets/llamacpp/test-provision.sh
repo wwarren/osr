@@ -130,6 +130,64 @@ for bad in 'TEMPLATE=local:vztmpl/debian-12-standard_test_amd64.tar.zst|Debian 1
 done
 vcheck 'Vulkan refuses a Debian 12 template, a missing or non-render device, and unknown backends'
 
+out=$(env -i "PATH=$PATH" CT_ID=250 CONTEXT_SIZE=32768 MODEL_CAPABILITIES=completion,tools \
+    "$bash_bin" "$provision" --reconfigure --dry-run 2>&1) || { printf 'FAIL reconfigure plan\n%s\n' "$out" >&2; exit 1; }
+[[ $out == *'+ pct push 250 '* && $out == *'bash /root/llama-target-deploy/install-target.sh --reconfigure'* &&
+   $out == *'CONTEXT_SIZE=32768'* && $out == *'MODEL_CAPABILITIES=completion\,tools'* &&
+   $out == *'+ tag CT 250 ai;ai-model;osr-target;llamacpp'* &&
+   $out != *'+ pct create '* && $out != *'MODEL_ALIAS='* ]] ||
+    { printf 'FAIL reconfigure did not retain omitted settings or avoid CT creation\n%s\n' "$out" >&2; exit 1; }
+vcheck 'reconfigure plans an existing CT update and forwards only supplied settings'
+for bad in 'TEMPLATE=local:vztmpl/debian-12-standard_test_amd64.tar.zst' 'GPU_DEVICES=/dev/nvidia0'; do
+    if out=$(env -i "PATH=$PATH" CT_ID=250 "$bad" "$bash_bin" "$provision" --reconfigure --dry-run 2>&1); then
+        printf 'FAIL reconfigure accepted CT hardware setting %s\n' "$bad" >&2; exit 1
+    fi
+    [[ $out != *'+ pct push '* ]] || { printf 'FAIL reconfigure validated too late\n' >&2; exit 1; }
+done
+vcheck 'reconfigure rejects CT hardware changes before copying files'
+
+# A real --reconfigure run against a stand-in pct: needs root (it refuses
+# otherwise), so it runs in CI or under unshare -r; nothing reaches a real CT.
+if (( EUID == 0 )); then
+    pct_dir=$(mktemp -d "${TMPDIR:-/tmp}/llama-reconfigure-pct.XXXXXX")
+    pct_log=$pct_dir/calls.log
+    cat > "$pct_dir/pct" <<'PCT'
+#!/usr/bin/env bash
+echo "pct $*" >> "$PCT_LOG"
+case $1 in
+    config) printf 'hostname: llama-target\n'; [[ -z ${FAKE_TAGS:-} ]] || printf 'tags: %s\n' "$FAKE_TAGS" ;;
+    status) echo 'status: running' ;;
+    exec) [[ $* != *' test -x /opt/llama-target/bin/llama-server'* || ${FAKE_INSTALLED:-yes} == yes ]] ;;
+esac
+PCT
+    chmod +x "$pct_dir/pct"
+    real_reconfigure() {
+        : > "$pct_log"
+        env -i "PATH=$pct_dir:$PATH" PCT_LOG="$pct_log" FAKE_TAGS="${FAKE_TAGS:-}" FAKE_INSTALLED="${FAKE_INSTALLED:-yes}" \
+            CT_ID=250 CONTEXT_SIZE=16384 "$bash_bin" "$provision" --reconfigure 2>&1
+    }
+    out=$(FAKE_TAGS='' real_reconfigure) || { printf 'FAIL untagged reconfigure\n%s\n' "$out" >&2; exit 1; }
+    grep -qx 'pct set 250 --tags ai;ai-model;osr-target;llamacpp' "$pct_log" &&
+        grep -q 'install-target.sh --reconfigure' "$pct_log" ||
+        { printf 'FAIL an untagged llama.cpp CT was not tagged and reconfigured\n%s\n' "$(cat "$pct_log")" >&2; exit 1; }
+    out=$(FAKE_TAGS='onboot;ai' real_reconfigure) || { printf 'FAIL partly tagged reconfigure\n%s\n' "$out" >&2; exit 1; }
+    grep -qx 'pct set 250 --tags onboot;ai;ai-model;osr-target;llamacpp' "$pct_log" ||
+        { printf 'FAIL existing tags were not kept\n%s\n' "$(cat "$pct_log")" >&2; exit 1; }
+    out=$(FAKE_TAGS='ai;ai-model;osr-target;llamacpp' real_reconfigure) || { printf 'FAIL tagged reconfigure\n%s\n' "$out" >&2; exit 1; }
+    ! grep -q 'pct set' "$pct_log" || { printf 'FAIL a fully tagged CT was re-tagged\n' >&2; exit 1; }
+    vcheck 'reconfigure accepts an untagged llama.cpp CT and adds only the missing tags'
+    if out=$(FAKE_TAGS='ai;osr-router' real_reconfigure); then printf 'FAIL the router CT was reconfigured\n' >&2; exit 1; fi
+    [[ $out == *'smart router'* ]] && ! grep -qE 'pct (push|set|exec)' "$pct_log" ||
+        { printf 'FAIL router refusal\n%s\n%s\n' "$out" "$(cat "$pct_log")" >&2; exit 1; }
+    if out=$(FAKE_INSTALLED=no real_reconfigure); then printf 'FAIL a CT without the target was reconfigured\n' >&2; exit 1; fi
+    [[ $out == *'no llama.cpp target installation'* ]] && ! grep -qE 'pct (push|set)' "$pct_log" ||
+        { printf 'FAIL missing-installation refusal\n%s\n%s\n' "$out" "$(cat "$pct_log")" >&2; exit 1; }
+    vcheck 'reconfigure refuses the router CT and a CT without the target before changing anything'
+    rm -rf -- "$pct_dir"
+else
+    printf 'SKIP real reconfigure runs against a stand-in pct (need root)\n'
+fi
+
 "$bash_bin" -n "$provision"
 "$bash_bin" -n "$script_dir/install-target.sh"
 "$bash_bin" -n "$nvidia_installer"

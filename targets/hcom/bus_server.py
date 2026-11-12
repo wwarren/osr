@@ -17,7 +17,7 @@ import struct
 import subprocess
 import sys
 
-PEERS = ("hermes", "openclaw", "deepseek-harness", "all")
+PEERS = ("hermes", "openclaw", "deepseek-harness", "opencode", "all")
 MAX_REQUEST = 16384
 MAX_MESSAGE = 2000
 
@@ -160,7 +160,7 @@ def send_line(connection, value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True, choices=("hermes", "openclaw", "deepseek-harness", "observer"))
+    parser.add_argument("--target", required=True, choices=("hermes", "openclaw", "deepseek-harness", "opencode", "observer"))
     parser.add_argument("--allow-user", help="agent account allowed besides root")
     args = parser.parse_args()
     connection = socket.socket(fileno=sys.stdin.fileno())

@@ -13,6 +13,9 @@ Usage: GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-
        GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' \
        bash provision-lxc.sh --install-target [--dry-run]
 
+       CT_ID=<existing-llamacpp-CT> CONTEXT_SIZE=32768 \
+       bash provision-lxc.sh --reconfigure [--dry-run]
+
 Missing settings are prompted on a terminal: CT ID, template, name, IPv4/CIDR
 or DHCP, bridge/gateway, CPU cores, RAM (MiB), root disk storage ID and size (GiB).
 The CT ID defaults to the cluster's next free ID (set CT_ID to choose another);
@@ -60,8 +63,18 @@ MODEL_PATH or a direct public huggingface.co MODEL_DOWNLOAD_URL. A URL-only
 install uses the guest's default model store; set MODEL_PATH to choose its
 destination.
 Deployment files are copied to /root/llama-target-deploy either way.
---dry-run validates inputs and prints commands without creating a CT.
-Only a new unprivileged CT is created. No host drivers or host configuration change.
+--dry-run prints commands without changing a CT. Creation inputs are validated;
+reconfiguration settings are fully validated by the guest on the actual run.
+--reconfigure updates an existing, running llama.cpp CT (one with the target
+installed; the router CT is refused) and adds any missing osr-target/llamacpp
+tags. CT_ID is required. Model and runtime settings supplied as environment
+variables are applied; omitted settings retain their installed values. Supported
+settings: MODEL_ALIAS, MODEL_PATH, MODEL_DOWNLOAD_URL, CONTEXT_SIZE,
+PARALLEL_SLOTS, THREADS, GPU_LAYERS, MODEL_PARAMETER_SIZE, MODEL_FAMILY,
+MODEL_QUANTIZATION, MODEL_CAPABILITIES, REQUEST_TIMEOUT_SECONDS,
+LLAMA_EXTRA_ARGS. BACKEND may be supplied
+only to verify the installed backend. Use --upgrade in the CT to change builds.
+Creation makes an unprivileged CT. No host drivers or host configuration change.
 USAGE
 }
 
@@ -77,6 +90,34 @@ ipv4() {
     done
 }
 valid_container_id() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 >= 100 )); }
+# ensure_ct_tags ID TAG...: add each TAG the CT lacks, keeping its other tags.
+# The same rules as pve_ensure_tags in targets/pve-select.sh (this provisioner
+# keeps its own prompts and has no copy of that file): tools/upgrade-all.sh
+# finds a target by osr-target plus its name, and a CT made by hand or before
+# the tags existed has none. A failure is reported, not fatal.
+ensure_ct_tags() {
+    local id=$1 current tag
+    local -a have=() missing=() merged=()
+    shift
+    if [[ ${dry_run:-0} != 0 ]]; then
+        printf '+ tag CT %s %s (pct set --tags, keeping its other tags)\n' "$id" "$(IFS=';'; printf '%s' "$*")"
+        return 0
+    fi
+    current=$(pct config "$id" 2>/dev/null | sed -n 's/^tags:[[:space:]]*//p' | head -n 1) || current=''
+    read -r -a have <<< "${current//[;,]/ }"
+    for tag in "$@"; do
+        [[ " ${have[*]} " == *" $tag "* ]] || missing+=("$tag")
+    done
+    (( ${#missing[@]} )) || return 0
+    merged=(${have[@]+"${have[@]}"} "${missing[@]}")
+    if pct set "$id" --tags "$(IFS=';'; printf '%s' "${merged[*]}")" >/dev/null; then
+        printf 'Tagged CT %s %s.\n' "$id" "$(IFS=';'; printf '%s' "${missing[*]}")" >&2
+    else
+        printf 'Warning: could not tag CT %s; tools/upgrade-all.sh does not find it until: pct set %s --tags %q\n' \
+            "$id" "$id" "$(IFS=';'; printf '%s' "${merged[*]}")" >&2
+    fi
+    return 0
+}
 # The Debian releases of the template: 12 or 13 for CUDA (NVIDIA's repository:
 # 13.0 on 12, 13.1 on 13) and CPU builds, 13 for Vulkan (Mesa 25 and Vulkan 1.4
 # from Debian itself).
@@ -484,17 +525,57 @@ configure_container() {
 
 dry_run=0
 create_only=0
+reconfigure=0
 INSTALL_TARGET=${INSTALL_TARGET:-0}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
         --create-only) create_only=1 ;;
         --install-target) INSTALL_TARGET=1 ;;
+        --reconfigure) reconfigure=1 ;;
         --help|-h) usage; exit 0 ;;
         *) die "Unknown argument: $1" ;;
     esac
     shift
 done
+if (( reconfigure )); then
+    (( ! create_only )) || die '--reconfigure cannot be combined with --create-only.'
+    [[ $INSTALL_TARGET == 0 ]] || die '--reconfigure cannot be combined with --install-target or INSTALL_TARGET=1.'
+    [[ -n ${CT_ID:-} ]] && valid_container_id "$CT_ID" || die 'Set CT_ID to the existing llama.cpp CT ID for --reconfigure.'
+    for name in TEMPLATE STORAGE CT_HOSTNAME BRIDGE IP_CIDR GATEWAY CORES MEMORY_MB ROOTFS_GB SWAP_MB ONBOOT NAMESERVER VLAN_TAG SSH_PUBLIC_KEY GPU_DEVICES; do
+        [[ ! -v $name ]] || die "$name changes CT hardware; --reconfigure accepts guest model settings only. Use pct set or pct resize for CT changes."
+    done
+    source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example)
+    for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
+    if (( ! dry_run )); then
+        [[ $EUID -eq 0 ]] || die 'Run as root on the intended PVE host.'
+        command -v pct >/dev/null || die 'Missing PVE command: pct'
+        config=$(pct config "$CT_ID") || die "CT $CT_ID is unavailable."
+        tags=$(sed -n 's/^tags:[[:space:]]*//p' <<< "$config" | head -n 1)
+        [[ ";${tags//,/;};" != *';osr-router;'* ]] || die "CT $CT_ID is the smart router (tagged osr-router), not a llama.cpp target."
+        [[ $(pct status "$CT_ID") == *running* ]] || die "CT $CT_ID must be running for --reconfigure."
+        # The installation itself identifies the target, so a CT made before
+        # the target tags existed qualifies too; it is tagged below.
+        pct exec "$CT_ID" -- test -x /opt/llama-target/bin/llama-server -a -f /etc/llama-target/llama-server.env </dev/null ||
+            die "CT $CT_ID has no llama.cpp target installation (/opt/llama-target/bin/llama-server, /etc/llama-target/llama-server.env)."
+    fi
+    ensure_ct_tags "$CT_ID" ai ai-model osr-target llamacpp
+    guest_env=(env NONINTERACTIVE=true)
+    for name in BACKEND MODEL_ALIAS MODEL_PATH MODEL_DOWNLOAD_URL CONTEXT_SIZE PARALLEL_SLOTS THREADS GPU_LAYERS MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION MODEL_CAPABILITIES REQUEST_TIMEOUT_SECONDS LLAMA_EXTRA_ARGS UPGRADE_HEALTH_TIMEOUT; do
+        if [[ -v $name ]]; then guest_env+=("$name=${!name}"); fi
+    done
+    run() {
+        printf '+'; printf ' %q' "$@"; printf '\n'
+        if (( ! dry_run )); then "$@"; fi
+    }
+    run pct exec "$CT_ID" -- install -d -m 0700 /root/llama-target-deploy
+    for file in "${files[@]}"; do
+        run pct push "$CT_ID" "$source_dir/$file" "/root/llama-target-deploy/$file" --perms 0644
+    done
+    run pct exec "$CT_ID" -- "${guest_env[@]}" bash /root/llama-target-deploy/install-target.sh --reconfigure
+    exit 0
+fi
 if (( create_only )); then INSTALL_TARGET=0; fi
 [[ $INSTALL_TARGET =~ ^[01]$ ]] || die 'INSTALL_TARGET must be 0 or 1.'
 LLAMA_CPP_REF=${LLAMA_CPP_REF:-}

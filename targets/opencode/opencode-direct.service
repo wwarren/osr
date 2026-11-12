@@ -1,0 +1,34 @@
+[Unit]
+Description=OpenCode direct model dispatch (router inventory, model servers called directly)
+Documentation=https://opencode.ai/docs/providers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A separate account from the agent: the router and backend keys it reads
+# (root:opencode-direct, 0640) are not readable by OpenCode's tools.
+User=opencode-direct
+Group=opencode-direct
+# The Hermes target's dispatcher, run with this target's files.
+Environment=DIRECT_ETC=/etc/opencode-target
+Environment=DIRECT_SECRETS_FILE=/etc/opencode-target/router.env
+Environment=DIRECT_CONTEXT_SETTING=OPENCODE_CONTEXT_LENGTH
+EnvironmentFile=-/etc/opencode-target/settings
+ExecStart=/usr/bin/python3 /usr/local/lib/opencode-direct.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -38,8 +38,8 @@ bash ollama-smart-router-install.sh
 
 The installer's menu offers, grouped by purpose: Gitea and Mattermost
 services; Ollama, AirLLM, Kindi, llama.cpp, Strata, Basalt, Maya, Xolotl and
-Avalon model servers; Honcho memory; Hermes, OpenClaw and DeepSeek Harness
-agents; Open Terminal and ComfyUI tools. Enter names or menu numbers
+Avalon model servers; Honcho memory; Hermes, OpenClaw, DeepSeek Harness and
+OpenCode agents; Open Terminal and ComfyUI tools. Enter names or menu numbers
 (comma-separated), or Enter for none. MQTT and hcom are installed afterwards
 ([Agent coordination targets](#agent-coordination-targets)).
 
@@ -68,7 +68,7 @@ passwords are in `/etc/<service>-target/admin-password` in their CTs.
 | LXC | Default | Other supported releases |
 |---|---|---|
 | Router, Gitea, ComfyUI, Honcho | Debian 13 | — |
-| Open Terminal, Hermes, OpenClaw, DeepSeek Harness | Debian 13 | Debian 12 |
+| Open Terminal, Hermes, OpenClaw, DeepSeek Harness, OpenCode | Debian 13 | Debian 12 |
 | MQTT broker | Debian 13 | Debian 12 |
 | hcom | Existing agent/observer CT with Python 3.11+ | No new CT; x86_64/aarch64 |
 | Ollama | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 (`OLLAMA_CT_OS`, `OLLAMA_CT_VERSION`) |
@@ -126,7 +126,7 @@ accept `auto`; Kindi defaults to it). The recommendation weighs the GPU's
 memory (from `nvidia-smi` or amdgpu sysfs; unknown before the driver is set
 up), the engine (Xolotl's 128k needs 24 GB; Strata, Basalt and Maya keep a small
 KV cache; Ollama and llama.cpp are sized for full-attention models) and the
-agents: Hermes needs 64000+, OpenClaw 32768+, DeepSeek Harness 16384+, and
+agents: Hermes needs 64000+, OpenClaw and OpenCode 32768+, DeepSeek Harness 16384+, and
 Honcho runs its full budgets at 131072. Too-small windows are flagged.
 Honcho's and DeepSeek Harness's windows are asked last, defaulting to the
 smallest chosen. A llama.cpp window is multiplied by `PARALLEL_SLOTS` for
@@ -290,11 +290,12 @@ Services and companions use separate CTs and stay out of the model pool:
 | [Hermes](targets/hermes/README.md) | Open WebUI agent `hermes-agent`; direct dispatch needs tools and 64K context. Reconfigure after key rotation or host changes |
 | [OpenClaw](targets/openclaw/README.md) | Open WebUI agent `openclaw` and Control UI on :18789; same dispatcher. Reconfigure after key rotation or host changes |
 | [DeepSeek Harness](targets/deepseek-harness/README.md) | Agent Web UI on :3080 using OSR as provider; no Open WebUI token needed |
+| [OpenCode](targets/opencode/README.md) | Coding agent with its own web UI on :4096 (password-protected), also offered in Open WebUI as `opencode` through an OpenAI-compatible chat endpoint (:4097); Hermes's dispatcher, needs tools and 32K context. Reconfigure after key rotation or host changes |
 | [Open Terminal](targets/open-terminal/README.md) | Open WebUI terminal connection with an isolated workspace per user; agents get their own through `OPEN_TERMINAL_URL` (MCP) |
 | [ComfyUI](targets/comfyui/README.md) | Open WebUI image engine on :8188; FLUX.2 Klein 9B needs an accepted Hugging Face license and token |
 
-Honcho reaches Hermes and OpenClaw through their memory plugins and DeepSeek
-Harness through MCP tools.
+Honcho reaches Hermes, OpenClaw and OpenCode through their memory plugins and
+DeepSeek Harness through MCP tools.
 
 ### Proxmox tags
 
@@ -306,7 +307,7 @@ alongside the router; the last tag is the target's directory name under
 |---|---|
 | Router | `ai`, `ai-tools`, `osr-router`, `openwebui` |
 | Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | `ai`, `ai-model`, `osr-target`, `<target>` |
-| Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
+| Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, OpenCode, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
 
 `tools/upgrade-all.sh` finds CTs only by these tags (`osr-router`, and
 `osr-target` plus the target's name), so every provisioner makes sure they are
@@ -317,7 +318,7 @@ there:
   `community-script`. Because the script's menus can change or drop the tags it
   was given, the provisioner adds any that are missing once the script is done.
 - `--reconfigure` (Gitea, Mattermost, Honcho, Hermes, OpenClaw, DeepSeek Harness,
-  MQTT) adds any missing tags to the existing CT, so a CT made by hand or by an
+  OpenCode, MQTT, llama.cpp) adds any missing tags to the existing CT, so a CT made by hand or by an
   older version becomes visible to the upgrade.
 
 Missing tags are added and the CT's other tags are kept (`pve_ensure_tags` in
@@ -371,6 +372,11 @@ Create Hermes CT 282? [Y/n]:
   `PVE_CONFIRM=false` skips the confirmation; the router installer runs
   provisioners with `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`.
 
+The llama.cpp provisioner also supports `--reconfigure` for an installed
+target's model and runtime settings. Set `CT_ID` and pass only the settings to
+change as environment variables; it keeps omitted settings. See
+[llama.cpp reconfiguration](targets/llamacpp/README.md#upgrading).
+
 The shared helpers are `targets/pve-select.sh`; each provisioner using them
 keeps an identical copy (checked by `targets/test-pve-select.sh`). llama.cpp
 and AirLLM keep their own container prompts in the same order; MQTT prompts
@@ -381,8 +387,8 @@ CT IDs (offered by tag; a reconfigure defaults to the CT's recorded settings). R
 
 [MQTT](targets/mqtt/README.md) provides an authenticated Mosquitto broker in its
 own CPU-only Debian LXC (1 core, 512 MB, 4 GB). [hcom](targets/hcom/README.md)
-installs the checksum-pinned 0.7.31 CLI into existing Hermes, OpenClaw and
-DeepSeek Harness CTs; each keeps its own SQLite state and MQTT relays encrypted
+installs the checksum-pinned 0.7.31 CLI into existing Hermes, OpenClaw,
+DeepSeek Harness and OpenCode CTs; each keeps its own SQLite state and MQTT relays encrypted
 events between them. Neither joins the model pool or needs an Open WebUI token.
 Install the agents first, then the broker, then hcom in each agent; the
 optional Mattermost observer also needs a configured Mattermost CT. From a full
@@ -416,6 +422,7 @@ certificate.
 | Hermes | `osr-bus` and a managed `/home/hermes/AGENTS.md` block. The opt-in native plugin (`HCOM_HERMES_NATIVE=true`) gives Hermes the relay key and works only in messaging-platform chats, not Open WebUI |
 | OpenClaw | Managed workspace instructions use `osr-bus` through its terminal tool; no native hooks or wakeups |
 | DeepSeek Harness | Managed `AGENTS.md` block, same `osr-bus`; polling depends on the model |
+| OpenCode | Managed block in its global `~/.config/opencode/AGENTS.md`, same `osr-bus` through its shell tool |
 | Mattermost | One observer posts short handoffs to a dedicated `agent-handoffs` webhook, separate from health alerts |
 
 ```bash
@@ -721,7 +728,7 @@ settings or rollback changes:
 | llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin) | Each target's settings record or env files |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request) | Its recorded port, passed back; workspace limits kept by the installer |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
-| Honcho, Hermes, OpenClaw, DeepSeek Harness | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true` | Recorded answers; an Open WebUI admin key is requested once when needed |
+| Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true` | Recorded answers; an Open WebUI admin key is requested once when needed |
 | Hermes Agent itself | Not pinned here: the reconfigure upgrades its integration (units, dispatcher, settings) and Hermes stays at its installed version. `--update-hermes` also runs `hermes update` as the hermes user and restarts `hermes-gateway` and `hermes-dashboard`, unless `HERMES_COMMIT` pins it | The plan and summary say which: Hermes stayed, was updated (old and new commit), or stays at its pin |
 | MQTT | `provision-lxc.sh --reconfigure` | Address, client CIDR, host, port and TLS files read back from the broker |
 | hcom | `provision-lxc.sh` per CT | Role, native mode, instructions file and observer webhook read back from the CT |
@@ -754,7 +761,7 @@ without quorum usually has a read-only cluster filesystem. The wrapper also
 works directly, for example
 `bash tools/pct-cluster.sh exec 205 -- uptime` on any node.
 
-A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`) is offered the
+A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`, `OPENCODE_VERSION`) is offered the
 repository's pin in an interactive run; `--yes` accepts it and `--keep-pins`
 preserves it. A `HERMES_COMMIT` pin is always kept. `latest`, `main` and releases newer than the repository's pin
 are kept. Stopped CTs are left alone unless `--include-stopped`.
@@ -786,8 +793,8 @@ what broke and asks:
 
 A component may restore its own files after a failed upgrade; check its log.
 A target installer or the router updater restores what it changed; a
-provisioner (Honcho, Hermes, OpenClaw, DeepSeek Harness, Gitea, Mattermost,
-MQTT, hcom) can stop after it has changed the CT, so after its failure rolling
+provisioner (Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode, Gitea,
+Mattermost, MQTT, hcom) can stop after it has changed the CT, so after its failure rolling
 back is the default, and `--on-failure rollback` rolls back even when every
 check still passes. A failed upgrade that is skipped keeps its snapshot, and
 the summary gives the `pct rollback` and `pct delsnapshot` commands for it.
@@ -799,9 +806,9 @@ after success unless `--keep-snapshots`, and after a verified rollback.
 `--yes` runs unattended: provisioners get `NONINTERACTIVE=true`, and failures
 are handled with `--on-failure rollback` (default), `skip` or `abort`.
 
-**Open WebUI admin token.** Honcho, and Hermes and OpenClaw with an Open WebUI
-connection, register with Open WebUI again when reconfigured. When one of them
-is included and `OPENWEBUI_ADMIN_TOKEN` is not set, an unattended run asks for
+**Open WebUI admin token.** Honcho, and Hermes, OpenClaw and OpenCode with an
+Open WebUI connection, register with Open WebUI again when reconfigured. When
+one of them is included and `OPENWEBUI_ADMIN_TOKEN` is not set, an unattended run asks for
 the token on the terminal once, at the start, before its plan and before
 anything changes. The token is checked against Open WebUI in the router CT
 (`/openai/config` answers only an admin), with three tries. It is kept in

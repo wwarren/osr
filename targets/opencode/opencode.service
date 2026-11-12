@@ -1,0 +1,46 @@
+[Unit]
+Description=OpenCode server (agent, web UI and HTTP API)
+Documentation=https://opencode.ai/docs/cli/web
+After=network-online.target opencode-direct.service
+Wants=network-online.target
+Requires=opencode-direct.service
+
+[Service]
+Type=simple
+User=opencode
+Group=opencode
+# The server's default project location; the web UI can open others.
+WorkingDirectory=/home/opencode/workspace
+Environment=HOME=/home/opencode
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Releases are installed by install-target.sh (OPENCODE_VERSION), never by
+# OpenCode's own updater: /opt/opencode is root's.
+Environment=OPENCODE_DISABLE_AUTOUPDATE=1
+# OPENCODE_PASSWORD (Basic auth, user "opencode"), OSR_OPENCODE_BIND,
+# OSR_OPENCODE_PORT and, with Open Terminal, OSR_OPEN_TERMINAL_KEY. Root-only
+# file, read by systemd; providers, model and MCP servers are in
+# /home/opencode/.config/opencode/opencode.json.
+EnvironmentFile=/etc/opencode-target/opencode.env
+ExecStart=/usr/local/bin/opencode serve --hostname ${OSR_OPENCODE_BIND} --port ${OSR_OPENCODE_PORT}
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+# --- sandboxing (same model as the other target units) ---
+# The agent's shell and file tools run inside this sandbox too: they can write
+# only to the opencode home and a private /tmp. No MemoryDenyWriteExecute: the
+# JavaScript runtime's JIT needs writable executable memory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/opencode
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

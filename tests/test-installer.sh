@@ -148,7 +148,7 @@ unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL 
 # and restored by re-sourcing the extracted functions at the end.
 _tt="$(mktemp -d)"
 TARGETS_DIR="$_tt/targets"
-for _name in gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness open-terminal comfyui; do
+for _name in gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui; do
   mkdir -p "$TARGETS_DIR/$_name"
   # The fake provisioner records what it was given: settings, flags, and
   # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
@@ -177,6 +177,8 @@ printf 'prompt-env %s|%s|%s\n' "${PVE_ACCEPT_DEFAULTS:-}" "${PVE_CONFIRM:-}" "${
 _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_CONTEXT:-}|${HONCHO_CONTEXT_TOKENS-unset}|${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-}"
 [[ $_ctx == '||||unset|' ]] || printf 'context-env %s\n' "$_ctx" >> "$MOCK_LOG"
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
+[[ $(basename "$(dirname "$0")") != opencode ]] ||
+  printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
 [[ -z ${KINDI_BACKEND:-}${KINDI_CONTEXT:-} ]] ||
   printf 'kindi-env %s|%s|%s\n' "${KINDI_BACKEND:-}" "${GPU_DEVICES:-}" "${KINDI_CONTEXT:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
@@ -190,8 +192,8 @@ done
 unset _name
 
 describe target_table
-assert_eq "lists the seventeen targets in menu order" \
-  "gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness open-terminal comfyui" \
+assert_eq "lists the eighteen targets in menu order" \
+  "gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui" \
   "$(target_table | cut -d'|' -f1 | paste -sd' ')"
 
 describe target_field
@@ -202,6 +204,9 @@ assert_eq "and not a model server" "" "$(target_field comfyui entry)"
 assert_eq "OpenClaw is a companion" companion "$(target_field openclaw phase)"
 assert_eq "DeepSeek Harness is a separate companion" companion "$(target_field deepseek-harness phase)"
 assert_eq "and not a model server" "" "$(target_field deepseek-harness entry)"
+assert_eq "OpenCode is a separate companion" companion "$(target_field opencode phase)"
+assert_eq "not a model server" "" "$(target_field opencode entry)"
+assert_eq "and needs no GPU" "" "$(target_field opencode gpu)"
 assert_eq "Honcho is a CPU memory companion" companion "$(target_field honcho phase)"
 assert_eq "and has no GPU requirement" "" "$(target_field honcho gpu)"
 assert_eq "and runs without a GPU" "" "$(target_field openclaw gpu)"
@@ -627,13 +632,14 @@ assert_fail "llama.cpp prompts for its own" target_needs_template llamacpp
 assert_fail "Hermes uses the router's" target_needs_template hermes
 assert_fail "OpenClaw uses the router's" target_needs_template openclaw
 assert_fail "DeepSeek Harness uses the router's" target_needs_template deepseek-harness
+assert_fail "OpenCode uses the router's" target_needs_template opencode
 assert_fail "ComfyUI's community script picks its own" target_needs_template comfyui
 
 describe valid_target_selection
-for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "comfyui" "xolotl" "avalon" "kindi" "openclaw"; do
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "comfyui" "xolotl" "avalon" "kindi" "openclaw" "opencode"; do
   assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
 done
-for _sel in 0 18 bogus "ollama,bogus"; do
+for _sel in 0 19 bogus "ollama,bogus"; do
   assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
 done
 unset _sel
@@ -660,15 +666,17 @@ assert_fail "also when the menu would be shown" prompt_target_selection <<< $'\n
 NONINTERACTIVE=true
 NONINTERACTIVE=false; INSTALL_TARGETS=""
 _out="$(mktemp)"
-prompt_target_selection > "$_out" 2>&1 <<< $'18\n6,hermes\n'
+prompt_target_selection > "$_out" 2>&1 <<< $'19\n6,hermes\n'
 assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
 assert_contains "the menu lists the model servers" "10) xolotl" "$(cat "$_out")"
 assert_contains "Avalon among them" "11) avalon" "$(cat "$_out")"
 assert_contains "Kindi with the CPU or optional-GPU servers" "5) kindi" "$(sed -n '/CPU or optional GPU/,/GPU required/p' "$_out")"
 assert_contains "the menu lists the companions" "13) hermes" "$(cat "$_out")"
-assert_contains "ComfyUI among them" "17) comfyui" "$(cat "$_out")"
+assert_contains "ComfyUI among them" "18) comfyui" "$(cat "$_out")"
 assert_contains "OpenClaw is grouped with agents" "14) openclaw" "$(cat "$_out")"
 assert_contains "DeepSeek Harness has its own menu choice" "15) deepseek-harness" "$(cat "$_out")"
+assert_contains "OpenCode follows the other agents" "16) opencode" "$(cat "$_out")"
+assert_contains "and Open Terminal after them" "17) open-terminal" "$(cat "$_out")"
 assert_contains "memory comes before agents" "Memory infrastructure (CPU)" "$(cat "$_out")"
 assert_contains "the GPU model group is explicit" "Model servers (GPU required by default)" "$(cat "$_out")"
 assert_contains "the CPU model group is explicit" "Model servers (CPU or optional GPU)" "$(cat "$_out")"
@@ -1128,6 +1136,7 @@ assert_eq "GPU model servers" 'Model servers (GPU required by default):' "$(targ
 assert_eq "Honcho alone" 'Memory infrastructure (CPU): created before agents.' "$(target_menu_group honcho)"
 assert_eq "the agents" "$(target_menu_group hermes)" "$(target_menu_group openclaw)"
 assert_eq "DeepSeek Harness is grouped with agents" "$(target_menu_group hermes)" "$(target_menu_group deepseek-harness)"
+assert_eq "OpenCode is grouped with agents" "$(target_menu_group hermes)" "$(target_menu_group opencode)"
 assert_contains "Open Terminal's group" "Open WebUI tools" "$(target_menu_group open-terminal)"
 assert_contains "ComfyUI's group" "Image generation" "$(target_menu_group comfyui)"
 _groups=""
@@ -1303,8 +1312,9 @@ TARGETS=""
 describe context_agent_needs
 TARGETS="ollama open-terminal"
 assert_eq "nothing without agents" "" "$(context_agent_needs)"
-TARGETS="ollama honcho hermes openclaw deepseek-harness"
+TARGETS="ollama honcho hermes openclaw deepseek-harness opencode"
 _out="$(context_agent_needs)"
+assert_contains "OpenCode's" "OpenCode needs 32768 tokens or more" "$_out"
 assert_contains "Hermes's minimum" "Hermes needs 64000 tokens or more" "$_out"
 assert_contains "OpenClaw's" "OpenClaw needs 32768 tokens or more" "$_out"
 assert_contains "Honcho's budgets" "131072 or more runs its full budgets" "$_out"
@@ -1317,6 +1327,9 @@ assert_eq "nothing when the window fits every agent" "" "$(context_shortfall 655
 assert_contains "Hermes skips a server under 64000" "Hermes will not use this server" "$(context_shortfall 32768)"
 assert_not_contains "OpenClaw fits 32768" "OpenClaw" "$(context_shortfall 32768)"
 assert_contains "but not 16384" "OpenClaw will not fit" "$(context_shortfall 16384)"
+TARGETS="ollama opencode"
+assert_eq "OpenCode fits 32768" "" "$(context_shortfall 32768)"
+assert_contains "but not 16384" "OpenCode will not use this server" "$(context_shortfall 16384)"
 TARGETS="ollama"
 assert_eq "no agents, no notes" "" "$(context_shortfall 8192)"
 TARGETS=""
@@ -1426,6 +1439,7 @@ LLAMACPP_CT_ID=913; LLAMACPP_IP_CIDR=192.0.2.93/24; LLAMACPP_STORAGE=t-store
 HERMES_CT_ID=914; HERMES_IP_CIDR=192.0.2.94/24; HERMES_STORAGE=t-store
 OPENCLAW_CT_ID=918; OPENCLAW_IP_CIDR=192.0.2.98/24; OPENCLAW_STORAGE=t-store
 DEEPSEEK_HARNESS_CT_ID=921; DEEPSEEK_HARNESS_IP_CIDR=192.0.2.101/24; DEEPSEEK_HARNESS_STORAGE=t-store
+OPENCODE_CT_ID=922; OPENCODE_IP_CIDR=192.0.2.102/24; OPENCODE_STORAGE=t-store
 HONCHO_CT_ID=920; HONCHO_IP_CIDR=192.0.2.100/24; HONCHO_STORAGE=t-store
 TARGET_ADMIN_TOKEN=owui-admin-secret; export EXPECT_TOKEN=owui-admin-secret
 mock_reset_log
@@ -1505,6 +1519,14 @@ mock_reset_log
 DEEPSEEK_HARNESS_CONTEXT_WINDOW=32768 run_target_provisioner deepseek-harness
 assert_contains "and the window chosen for it" "context-env ||||unset|32768" "$(mock_calls)"
 mock_reset_log
+run_target_provisioner opencode
+assert_eq "OpenCode gets its own CT and router, its model and web UI range, and the token (Open WebUI)" \
+  "provision opencode|922|192.0.2.102/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|
+opencode-env auto|192.0.2.102/24" "$(mock_calls)"
+mock_reset_log
+OPENCODE_MODEL=fast API_ALLOW_CIDR=192.0.2.0/24 run_target_provisioner opencode
+assert_contains "the chosen model, and the router's API range for the web UI" "opencode-env fast|192.0.2.0/24" "$(mock_calls)"
+mock_reset_log
 STRATA_CONTEXT=131072 run_target_provisioner strata
 assert_contains "a model target gets its chosen window" "context-env ||131072||unset|" "$(mock_calls)"
 assert_not_contains "no KV cache was chosen, none is passed" "strata-kv" "$(mock_calls)"
@@ -1523,13 +1545,13 @@ mock_reset_log
 LLAMACPP_CONTEXT=65536 PARALLEL_SLOTS=2 run_target_provisioner llamacpp
 assert_contains "llama.cpp as CONTEXT_SIZE for all its slots" "context-env |131072|||unset|" "$(mock_calls)"
 
-TARGETS="honcho hermes openclaw deepseek-harness"; HONCHO_READY=false
+TARGETS="honcho hermes openclaw deepseek-harness opencode"; HONCHO_READY=false
 mock_reset_log
 run_target_provisioner honcho
 assert_contains "Honcho reuses the router's Debian 13 template" \
   "provision honcho|920|192.0.2.100/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst" "$(mock_calls)"
 assert_contains "Honcho gets every selected agent address" \
-  "honcho-env 192.0.2.94 192.0.2.98 192.0.2.101||" "$(mock_calls)"
+  "honcho-env 192.0.2.94 192.0.2.98 192.0.2.101 192.0.2.102||" "$(mock_calls)"
 assert_not_contains "and no embedding settings: it embeds in its own CT" "embedding-env" "$(mock_calls)"
 assert_contains "Honcho gets the router IP entered earlier" "router-ip 192.0.2.80" "$(mock_calls)"
 assert_contains "Honcho gets the selected router chat model" "chat-model fast" "$(mock_calls)"
@@ -1552,9 +1574,12 @@ mock_reset_log
 run_target_provisioner deepseek-harness
 assert_contains "and DeepSeek Harness (for Honcho's MCP server)" "honcho-env |http://192.0.2.100:8000|920" "$(mock_calls)"
 assert_contains "still without the Open WebUI admin token" "|no|" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner opencode
+assert_contains "and OpenCode (for Honcho's OpenCode plugin)" "honcho-env |http://192.0.2.100:8000|920" "$(mock_calls)"
 assert_not_contains "no Open Terminal before it is provisioned" "open-terminal-env" "$(mock_calls)"
 OPEN_TERMINAL_CT_ID=919; OPEN_TERMINAL_IP_CIDR=192.0.2.99/24; OPEN_TERMINAL_READY=true
-for _agent in hermes openclaw deepseek-harness; do
+for _agent in hermes openclaw deepseek-harness opencode; do
   mock_reset_log
   run_target_provisioner "$_agent"
   assert_contains "$_agent gets the provisioned Open Terminal gateway and CT" \
@@ -1750,6 +1775,22 @@ mock_reset_log
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "DeepSeek still runs when Open WebUI has no admin key" "$(printf '%s\n' wait token 'run deepseek-harness')" "$(mock_calls)"
 assert_contains "Hermes is skipped" "skipped (no Open WebUI admin key)" "$(cat "$_out")"
+TARGETS="opencode"
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "OpenCode alone succeeds" 0 "$_rc"
+assert_eq "after the Open WebUI admin setup (its chat endpoint is registered there)" \
+  "$(printf '%s\n' wait token 'run opencode')" "$(mock_calls)"
+TARGETS="hermes opencode"
+mock_reset_log
+FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "without an admin key OpenCode is not run" "$(printf '%s\n' wait token)" "$(mock_calls)"
+assert_contains "but skipped like Hermes" "opencode       CT 922    skipped (no Open WebUI admin key)" "$(cat "$_out")"
+TARGETS="ollama opencode"
+FAKE_FAIL=opencode provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed OpenCode companion fails the run" 1 "$_rc"
+assert_contains "and gives its partial CT recovery command" \
+  "CT_ID=922 ROUTER_CT_ID=910 bash targets/opencode/provision-lxc.sh --reconfigure" "$(cat "$_out")"
 TARGETS="ollama strata hermes"
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "no admin key fails the run" 1 "$_rc"

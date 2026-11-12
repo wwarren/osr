@@ -436,7 +436,7 @@ for unit in honcho-api honcho-deriver; do
   assert_contains "$unit runs the locked environment" 'uv run --frozen --no-dev' "$(cat "$here/$unit.service")"
 done
 assert_contains "the MCP unit runs the pinned Bun" 'ExecStart=/opt/honcho-bun/bun run http' "$(cat "$here/honcho-mcp.service")"
-for agent in hermes openclaw deepseek-harness; do
+for agent in hermes openclaw deepseek-harness opencode; do
   assert_not_contains "$agent never takes the Honcho admin key" '/etc/honcho-target/api-key' "$(cat "$here/../$agent/provision-lxc.sh")"
 done
 summary

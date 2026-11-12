@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenCode OpenAI-compatible chat endpoint (for Open WebUI)
+Documentation=https://opencode.ai/docs/cli/web
+After=network-online.target opencode.service
+Wants=network-online.target
+Requires=opencode.service
+
+[Service]
+Type=simple
+# Its own account: it holds the server password and its bearer key (from the
+# root-only environment file, read by systemd), and nothing of the agent's or
+# the dispatcher's.
+User=opencode-api
+Group=opencode-api
+# OPENCODE_PASSWORD, OPENCODE_API_KEY, OPENCODE_PORT, OPENCODE_API_PORT and
+# OPENCODE_API_PERMISSIONS, written by install-target.sh. Root-only.
+EnvironmentFile=/etc/opencode-target/api.env
+Environment=OPENCODE_API_STATE=/var/lib/opencode-api/sessions.json
+Environment=OPENCODE_API_DIRECTORY=/home/opencode/workspace
+StateDirectory=opencode-api
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/opencode-api.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

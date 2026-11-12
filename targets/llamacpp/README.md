@@ -260,6 +260,37 @@ stream ends with an NDJSON error; client disconnects close the upstream.
 
 ## Upgrading
 
+To change the served model or runtime settings of an existing target, run on
+the Proxmox host (or run the copied `install-target.sh --reconfigure` in the CT):
+
+```bash
+CT_ID=<existing-llamacpp-CT> CONTEXT_SIZE=32768 MODEL_CAPABILITIES=completion,tools \
+  bash targets/llamacpp/provision-lxc.sh --reconfigure
+```
+
+`--reconfigure` needs the CT running with the target installed; it refuses
+the router CT and adds any missing `ai;ai-model;osr-target;llamacpp` tags, so
+a CT made before the tags existed becomes visible to `tools/upgrade-all.sh`.
+It keeps every setting you omit. You can set `MODEL_ALIAS`, `MODEL_PATH`,
+`MODEL_DOWNLOAD_URL`, `CONTEXT_SIZE`, `PARALLEL_SLOTS`, `THREADS`,
+`GPU_LAYERS`, `MODEL_PARAMETER_SIZE`, `MODEL_FAMILY`, `MODEL_QUANTIZATION`,
+`MODEL_CAPABILITIES`, `REQUEST_TIMEOUT_SECONDS`, and `LLAMA_EXTRA_ARGS`. A new GGUF must already be
+readable by the `llama-target` account, or you can supply a public Hugging Face
+`MODEL_DOWNLOAD_URL`. With no `MODEL_PATH`, the URL's GGUF filename is placed
+in the current model directory. The guest saves both prior env files as
+`*.prev` and restarts running or failed services (clearing a crashed unit's
+start limit first, which systemd otherwise enforces even on a manual restart).
+If the target does not become healthy within `UPGRADE_HEALTH_TIMEOUT` seconds
+(default 300), it restores both files, restarts on them and reports whether the
+target is running again. Stopped services stay stopped.
+Changing the alias or GGUF path resets model size, family, quantization and
+capabilities to `unknown` or `completion` unless you supply their new values;
+the same GGUF reached through a symlink is not a change. After an alias change,
+point the router tiers at the new name (the script prints the command):
+`manage-model-servers set-model <tier> <new-alias> --apply`.
+Changing the build or backend uses `--upgrade` inside the CT. CT hardware and
+GPU device mappings are changed with Proxmox commands.
+
 ```bash
 LLAMA_CPP_REF=<tag-or-commit> bash install-target.sh --upgrade   # in the CT, from an updated copy
 ```

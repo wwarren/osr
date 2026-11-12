@@ -52,7 +52,7 @@ Usage: bash install-target.sh                 # prompt for model and storage
        MODEL_ALIAS=<name:tag> \\
        MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/revision/model.gguf bash install-target.sh
 
-Without --upgrade: fresh installations only. Missing model settings are prompted on a terminal.
+With no mode flag: fresh installations only. Missing model settings are prompted on a terminal.
 MODEL_ALIAS accepts a model name or name:tag (a bare name gets :latest).
 Set MODEL_PATH, or MODEL_DIR plus MODEL_FILE, to skip the storage prompts.
 MODEL_DIR defaults to /var/lib/llama-target/models; MODEL_FILE is a GGUF basename.
@@ -94,6 +94,19 @@ Rebuilds llama.cpp only when the ref resolves to a different commit
 (FORCE_REBUILD=true to force), always refreshes bridge.py, its venv and the
 units, restarts services that were running and waits for them to be healthy.
 Everything replaced is kept as *.prev and restored if the upgrade fails.
+
+Reconfigure an installed target's model and runtime settings:
+       CONTEXT_SIZE=32768 MODEL_CAPABILITIES=completion,tools bash install-target.sh --reconfigure
+Omitted settings keep their installed values. MODEL_ALIAS, MODEL_PATH,
+MODEL_DOWNLOAD_URL, CONTEXT_SIZE, PARALLEL_SLOTS, THREADS, GPU_LAYERS,
+MODEL_PARAMETER_SIZE, MODEL_FAMILY, MODEL_QUANTIZATION, MODEL_CAPABILITIES,
+REQUEST_TIMEOUT_SECONDS and LLAMA_EXTRA_ARGS may be changed. The GGUF must be
+readable by llama-target, or MODEL_DOWNLOAD_URL may fetch it. A new alias or
+GGUF resets the size, family, quantization and capabilities unless they are
+given too. Running (or failed) services are restarted and checked; if the
+target does not become ready, the previous settings are restored and checked
+in turn. Stopped services stay stopped. Use --upgrade to change the llama.cpp
+build or backend.
 
 CUDA requires host-matched userspace driver libraries inside the CT, with GPU
 devices passed through. If nvcc is missing, the CUDA toolkit is installed from
@@ -761,6 +774,7 @@ case "${1:-}" in
     '') ;;
     --help) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; usage; exit 0 ;;
     --upgrade) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; MODE=upgrade ;;
+    --reconfigure) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; MODE=reconfigure ;;
     --rebuild) [[ $# -eq 1 ]] || { usage >&2; exit 2; }; MODE=rebuild ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -781,6 +795,138 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for file in bridge.py requirements.txt llama-server.service llama-ollama-bridge.service; do
     [[ $MODE == rebuild || -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
+
+if [[ $MODE == reconfigure ]]; then
+    server_env=$TARGET_ETC/llama-server.env
+    bridge_env=$TARGET_ETC/bridge.env
+    model_path_explicit=${MODEL_PATH+x}
+    parameter_size_explicit=${MODEL_PARAMETER_SIZE+x}
+    family_explicit=${MODEL_FAMILY+x}
+    quantization_explicit=${MODEL_QUANTIZATION+x}
+    capabilities_explicit=${MODEL_CAPABILITIES+x}
+    [[ -x $TARGET_ROOT/bin/llama-server && -f $server_env && -f $bridge_env ]] ||
+        die "No existing installation under $TARGET_ROOT and $TARGET_ETC; run without --reconfigure to install."
+    getent passwd llama-target >/dev/null || die 'The llama-target user is missing.'
+    current_backend=$(build_info backend)
+    [[ -z ${BACKEND:-} || $BACKEND == "$current_backend" ]] ||
+        die 'Changing BACKEND requires --upgrade and matching CT GPU devices.'
+    for name in MODEL_ALIAS MODEL_PATH CONTEXT_SIZE PARALLEL_SLOTS; do
+        if [[ ! -v $name ]]; then
+            case $name in
+                MODEL_ALIAS|MODEL_PATH) file=$bridge_env ;;
+                *) file=$server_env ;;
+            esac
+            printf -v "$name" '%s' "$(env_key_value "$file" "$name")"
+        fi
+    done
+    for name in THREADS GPU_LAYERS LLAMA_EXTRA_ARGS; do
+        if [[ ! -v $name ]]; then printf -v "$name" '%s' "$(env_key_value "$server_env" "$name")"; fi
+    done
+    for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION MODEL_CAPABILITIES REQUEST_TIMEOUT_SECONDS; do
+        if [[ ! -v $name ]]; then printf -v "$name" '%s' "$(env_key_value "$bridge_env" "$name")"; fi
+    done
+    REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-600}
+    if [[ -n ${MODEL_DOWNLOAD_URL:-} && -z $model_path_explicit ]]; then
+        download_filename=$(huggingface_gguf_filename "$MODEL_DOWNLOAD_URL") || die 'Invalid MODEL_DOWNLOAD_URL.'
+        MODEL_PATH=${MODEL_PATH%/*}/$download_filename
+    fi
+    [[ -n $MODEL_ALIAS && -n $MODEL_PATH ]] || die 'The installed model alias or path is missing.'
+    valid_model_alias "$MODEL_ALIAS" || die 'Invalid MODEL_ALIAS.'
+    [[ $MODEL_ALIAS == *:* ]] || MODEL_ALIAS+=:latest
+    [[ $MODEL_PATH == /* && $MODEL_PATH != */ ]] || die 'MODEL_PATH must be an absolute GGUF filename.'
+    valid_model_dir "${MODEL_PATH%/*}" && valid_model_file "${MODEL_PATH##*/}" || die 'Invalid MODEL_PATH.'
+    installed_alias=$(env_key_value "$bridge_env" MODEL_ALIAS)
+    installed_path=$(env_key_value "$bridge_env" MODEL_PATH)
+    # The same file counts as the same model however it is spelled; keep the
+    # installed spelling then, so a path through a symlink is no change.
+    resolved_path=$(realpath -m -- "$MODEL_PATH")
+    if [[ -n $installed_path && $resolved_path == "$(realpath -m -- "$installed_path")" ]]; then
+        MODEL_PATH=$installed_path
+    else
+        MODEL_PATH=$resolved_path
+    fi
+    MODEL_DIR=${MODEL_PATH%/*}
+    valid_model_dir "${resolved_path%/*}" && valid_model_file "${resolved_path##*/}" || die 'MODEL_PATH resolves outside an allowed model directory.'
+    if [[ $MODEL_ALIAS != "$installed_alias" || $MODEL_PATH != "$installed_path" ]]; then
+        [[ -n $parameter_size_explicit ]] || MODEL_PARAMETER_SIZE=unknown
+        [[ -n $family_explicit ]] || MODEL_FAMILY=unknown
+        [[ -n $quantization_explicit ]] || MODEL_QUANTIZATION=unknown
+        [[ -n $capabilities_explicit ]] || MODEL_CAPABILITIES=completion
+    fi
+    for name in CONTEXT_SIZE PARALLEL_SLOTS THREADS; do
+        [[ ${!name} =~ ^[1-9][0-9]{0,8}$ ]] || die "$name must be a positive integer."
+    done
+    [[ $GPU_LAYERS == auto || $GPU_LAYERS == all || $GPU_LAYERS =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'Invalid GPU_LAYERS.'
+    [[ $current_backend != cpu || $GPU_LAYERS == 0 ]] || die 'A CPU build requires GPU_LAYERS=0.'
+    valid_extra_args "$LLAMA_EXTRA_ARGS" || die 'Invalid LLAMA_EXTRA_ARGS.'
+    for name in MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION; do
+        [[ ${!name} =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid $name."
+    done
+    [[ $MODEL_CAPABILITIES =~ ^(completion|tools|vision|embedding)(,(completion|tools|vision|embedding))*$ ]] || die 'Invalid MODEL_CAPABILITIES.'
+    [[ $REQUEST_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,8}$ ]] || die 'REQUEST_TIMEOUT_SECONDS must be a positive integer.'
+    MODEL_DOWNLOAD_URL=${MODEL_DOWNLOAD_URL:-}
+    if [[ -n $MODEL_DOWNLOAD_URL ]]; then
+        MODEL_DOWNLOAD_URL=$(normalize_huggingface_gguf_url "$MODEL_DOWNLOAD_URL") || die 'Invalid MODEL_DOWNLOAD_URL.'
+    fi
+    [[ ! -e $MODEL_DIR || -d $MODEL_DIR ]] || die 'MODEL_PATH parent is not a directory.'
+    if [[ ! -d $MODEL_DIR ]]; then install -d -o llama-target -g llama-target -m 0750 "$MODEL_DIR"; fi
+    runuser -u llama-target -- test -x "$MODEL_DIR" || die "llama-target cannot traverse $MODEL_DIR."
+    download_requested_gguf
+    [[ -f $MODEL_PATH ]] || die "GGUF is missing: $MODEL_PATH"
+    runuser -u llama-target -- test -r "$MODEL_PATH" || die "llama-target cannot read $MODEL_PATH."
+    changed=false
+    for name in MODEL_ALIAS MODEL_PATH CONTEXT_SIZE PARALLEL_SLOTS THREADS GPU_LAYERS LLAMA_EXTRA_ARGS; do
+        [[ ${!name} == "$(env_key_value "$server_env" "$name")" ]] || changed=true
+    done
+    for name in MODEL_ALIAS MODEL_PATH MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION MODEL_CAPABILITIES CONTEXT_SIZE PARALLEL_SLOTS REQUEST_TIMEOUT_SECONDS; do
+        [[ ${!name} == "$(env_key_value "$bridge_env" "$name")" ]] || changed=true
+    done
+    if ! $changed; then printf 'llama.cpp settings are unchanged; nothing to do.\n'; exit 0; fi
+    was_active=false
+    [[ $(systemctl show llama-server.service -p ActiveState --value) == inactive ]] || was_active=true
+    cp -a -- "$server_env" "$server_env.prev"
+    cp -a -- "$bridge_env" "$bridge_env.prev"
+    # A unit that crashed repeatedly is held by its start limit (5 starts in
+    # 300 s), and systemd refuses even a manual restart until reset-failed.
+    restart_target() {
+        systemctl reset-failed llama-server.service llama-ollama-bridge.service 2>/dev/null || true
+        systemctl restart llama-server.service llama-ollama-bridge.service
+    }
+    # Put both settings files back, then check that the target serves again.
+    rollback_settings() {
+        cp -a -- "$server_env.prev" "$server_env"
+        cp -a -- "$bridge_env.prev" "$bridge_env"
+        if ! $was_active; then
+            printf 'Reconfigure failed; the previous settings are restored and the services stay stopped.\n' >&2
+        elif restart_target && target_healthy "${UPGRADE_HEALTH_TIMEOUT:-300}"; then
+            printf 'Reconfigure failed; the previous settings are restored and the target is running again.\n' >&2
+        else
+            printf 'Reconfigure failed, and the target did not become healthy on the previous settings either; see journalctl -u llama-server -u llama-ollama-bridge.\n' >&2
+        fi
+    }
+    trap '[[ $BASHPID == "$$" ]] || exit 1; rollback_settings; exit 1' ERR
+    for name in MODEL_PATH MODEL_ALIAS CONTEXT_SIZE PARALLEL_SLOTS THREADS GPU_LAYERS LLAMA_EXTRA_ARGS; do
+        set_env_key "$server_env" "$name" "${!name}"
+    done
+    for name in MODEL_ALIAS MODEL_PATH MODEL_PARAMETER_SIZE MODEL_FAMILY MODEL_QUANTIZATION MODEL_CAPABILITIES CONTEXT_SIZE PARALLEL_SLOTS REQUEST_TIMEOUT_SECONDS; do
+        set_env_key "$bridge_env" "$name" "${!name}"
+    done
+    if $was_active; then
+        restart_target
+        printf 'Waiting for the target to report ready...\n'
+        target_healthy "${UPGRADE_HEALTH_TIMEOUT:-300}" || false
+        trap - ERR
+        printf 'Reconfigured llama.cpp settings; the target is healthy. Previous files are kept as *.prev.\n'
+    else
+        trap - ERR
+        printf 'Reconfigured llama.cpp settings; the services were stopped and stay stopped. Previous files are kept as *.prev.\n'
+    fi
+    if [[ $MODEL_ALIAS != "$installed_alias" ]]; then
+        printf 'The model is now served as %s (was %s). Point the router tiers at it, e.g.: manage-model-servers set-model <tier> %s --apply\n' \
+            "$MODEL_ALIAS" "${installed_alias:-unknown}" "$MODEL_ALIAS"
+    fi
+    exit 0
+fi
 
 if [[ $MODE == upgrade ]]; then
     # Upgrade an existing target in place: new llama.cpp ref and/or new bridge

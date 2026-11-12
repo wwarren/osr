@@ -135,7 +135,9 @@ stub systemctl 'case "$1" in
     is-active) [[ ${FAKE_ACTIVE_STATE:-} == failed ]] && exit 3; exit "${FAKE_ACTIVE_RC:-0}" ;;
 esac; exit 0'
 # FAKE_HEALTH: ok, down, or old-only (only the previous build answers).
-stub curl 'case ${FAKE_HEALTH:-ok} in ok) exit 0;; old-only) "$TARGET_ROOT/bin/llama-server" | grep -q "version old";; *) exit 1;; esac'
+# FAKE_HEALTH=ctx:N: healthy unless llama-server.env sets CONTEXT_SIZE=N.
+stub curl 'case ${FAKE_HEALTH:-ok} in ok) exit 0;; old-only) "$TARGET_ROOT/bin/llama-server" | grep -q "version old";;
+    ctx:*) ! grep -qx "CONTEXT_SIZE=${FAKE_HEALTH#ctx:}" "$TARGET_ETC/llama-server.env";; *) exit 1;; esac'
 stub git 'case "$*" in *"init -q "*) mkdir -p "${@: -1}";; *rev-parse*) echo "$FAKE_COMMIT";; esac; exit 0'
 stub cmake 'if [[ $1 == --build ]]; then mkdir -p "$2/bin"; printf "#!/bin/sh\necho version $FAKE_COMMIT\n" > "$2/bin/llama-server"; chmod +x "$2/bin/llama-server"; fi; [[ ${FAKE_BUILD:-ok} == ok ]]'
 # python3 -m venv DIR creates a venv whose python accepts pip / py_compile.
@@ -170,6 +172,105 @@ upgrade() {
         NVIDIA_VERSION_FILE="${NVIDIA_VERSION_FILE:-$tmp_root/nvidia-version}" \
         bash "$script_dir/install-target.sh" "${MODE_FLAG:---upgrade}"
 }
+
+# A settings reconfigure uses the installed model and bridge metadata, without
+# fetching or rebuilding llama.cpp. The GGUF must sit where the model-store
+# rules allow (not /tmp, /var/tmp, /root or /home); /dev/shm is writable by
+# anyone and is not a system directory.
+model_fixture=$(mktemp -d /dev/shm/llama-reconfigure-test.XXXXXX)
+cleanup_model_fixture() {
+    [[ $model_fixture == /dev/shm/llama-reconfigure-test.* ]] && rm -rf -- "$model_fixture"
+}
+trap 'cleanup_model_fixture; cleanup' EXIT
+printf 'GGUF' > "$model_fixture/model.gguf"
+printf 'GGUF' > "$model_fixture/second.gguf"
+ln -s "$model_fixture" "$model_fixture/via"
+reconfigure() {
+    env -i "PATH=$bin:/usr/bin:/bin" TARGET_ROOT="$tmp_root/opt" TARGET_ETC="$tmp_root/etc" \
+        SYSTEMD_RUN_DIR="$tmp_root/run" OS_RELEASE_FILE="$tmp_root/os-release" \
+        FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" FAKE_HEALTH="${FAKE_HEALTH:-ok}" \
+        UPGRADE_HEALTH_TIMEOUT=10 "$@" bash "$script_dir/install-target.sh" --reconfigure
+}
+reconfigure_install() {
+    make_install
+    sed -i "s|/m.gguf|$model_fixture/model.gguf|g" "$tmp_root/etc/llama-server.env" "$tmp_root/etc/bridge.env"
+    printf 'THREADS=4\nGPU_LAYERS=0\nLLAMA_EXTRA_ARGS=\n' >> "$tmp_root/etc/llama-server.env"
+    printf 'MODEL_PATH=%s/model.gguf\nMODEL_PARAMETER_SIZE=8B\nMODEL_FAMILY=llama\nMODEL_QUANTIZATION=Q4_K_M\nMODEL_CAPABILITIES=completion\nCONTEXT_SIZE=8192\nPARALLEL_SLOTS=2\nREQUEST_TIMEOUT_SECONDS=600\n' "$model_fixture" >> "$tmp_root/etc/bridge.env"
+    cp "$tmp_root/etc/llama-server.env" "$tmp_root/server-before"
+    cp "$tmp_root/etc/bridge.env" "$tmp_root/bridge-before"
+}
+settings_unchanged() {
+    cmp -s "$tmp_root/etc/llama-server.env" "$tmp_root/server-before" && cmp -s "$tmp_root/etc/bridge.env" "$tmp_root/bridge-before"
+}
+
+reconfigure_install
+out=$(reconfigure CONTEXT_SIZE=32768 MODEL_CAPABILITIES=completion,tools 2>&1) || die "settings reconfigure failed: $out"
+grep -q '^CONTEXT_SIZE=32768$' "$tmp_root/etc/llama-server.env" || die 'server context not reconfigured'
+grep -q '^CONTEXT_SIZE=32768$' "$tmp_root/etc/bridge.env" || die 'bridge context not reconfigured'
+grep -q '^MODEL_CAPABILITIES=completion,tools$' "$tmp_root/etc/bridge.env" || die 'bridge capabilities not reconfigured'
+grep -q '^THREADS=4$' "$tmp_root/etc/llama-server.env" && grep -q '^MODEL_FAMILY=llama$' "$tmp_root/etc/bridge.env" || die 'omitted setting was lost'
+[[ $("$tmp_root/opt/bin/llama-server") == 'version old' ]] || die 'reconfigure rebuilt the server'
+grep -A1 'systemctl reset-failed llama-server.service' "$log" | grep -q 'systemctl restart llama-server.service' ||
+    die "a restart did not clear the start limit first: $(cat "$log")"
+[[ $out == *'the target is healthy'* && $out != *'Point the router'* ]] || die "settings reconfigure output: $out"
+cmp -s "$tmp_root/etc/llama-server.env.prev" "$tmp_root/server-before" || die 'previous server settings not kept as .prev'
+pass 'reconfigure changes selected settings, keeps the rest, the model and binary, and restarts after reset-failed'
+
+cp "$tmp_root/etc/llama-server.env" "$tmp_root/server-before"; cp "$tmp_root/etc/bridge.env" "$tmp_root/bridge-before"
+: > "$log"
+out=$(reconfigure CONTEXT_SIZE=32768 2>&1) || die "unchanged reconfigure failed: $out"
+[[ $out == *'unchanged; nothing to do'* ]] || die "unchanged reconfigure: $out"
+grep -q 'systemctl restart' "$log" && die 'an unchanged reconfigure restarted the services'
+out=$(reconfigure "MODEL_PATH=$model_fixture/via/model.gguf" 2>&1) || die "symlinked path reconfigure failed: $out"
+[[ $out == *'unchanged; nothing to do'* ]] && settings_unchanged || die "the same GGUF through a symlink counted as a new model: $out"
+pass 'reconfigure with nothing new, or the same GGUF through a symlink, does nothing'
+
+reconfigure_install
+out=$(reconfigure MODEL_DOWNLOAD_URL=https://huggingface.co/org/repo/resolve/main/second.gguf 2>&1) || die "URL-only reconfigure failed: $out"
+grep -q "^MODEL_PATH=$model_fixture/second.gguf$" "$tmp_root/etc/llama-server.env" || die 'URL-only reconfigure did not select the new GGUF'
+grep -q '^MODEL_PARAMETER_SIZE=unknown$' "$tmp_root/etc/bridge.env" || die 'new model kept stale size'
+grep -q '^MODEL_CAPABILITIES=completion$' "$tmp_root/etc/bridge.env" || die 'new model kept stale tool support'
+pass 'URL-only reconfigure selects the new GGUF and resets old model metadata'
+
+reconfigure_install
+out=$(reconfigure MODEL_ALIAS=other MODEL_CAPABILITIES=completion,tools MODEL_PARAMETER_SIZE=7B 2>&1) || die "alias reconfigure failed: $out"
+grep -q '^MODEL_ALIAS=other:latest$' "$tmp_root/etc/llama-server.env" && grep -q '^MODEL_ALIAS=other:latest$' "$tmp_root/etc/bridge.env" ||
+    die 'the new alias was not written to both files'
+grep -q '^MODEL_CAPABILITIES=completion,tools$' "$tmp_root/etc/bridge.env" && grep -q '^MODEL_PARAMETER_SIZE=7B$' "$tmp_root/etc/bridge.env" ||
+    die 'metadata given with the new model was reset'
+grep -q '^MODEL_FAMILY=unknown$' "$tmp_root/etc/bridge.env" || die 'metadata not given kept the old model value'
+[[ $out == *'now served as other:latest (was m:latest)'*'set-model <tier> other:latest'* ]] || die "no router reminder: $out"
+pass 'a new alias keeps the metadata given with it, resets the rest, and reminds to update the router'
+
+reconfigure_install
+: > "$log"
+out=$(FAKE_ACTIVE_RC=3 reconfigure CONTEXT_SIZE=16384 2>&1) || die "stopped reconfigure failed: $out"
+grep -q '^CONTEXT_SIZE=16384$' "$tmp_root/etc/llama-server.env" || die 'stopped target not reconfigured'
+grep -qE 'systemctl (restart|start)' "$log" && die 'stopped services were started'
+[[ $out == *'stay stopped'* ]] || die "stopped reconfigure output: $out"
+pass 'stopped services stay stopped; the settings are still changed'
+
+reconfigure_install
+out=$(reconfigure BACKEND=cuda CONTEXT_SIZE=16384 2>&1) && die 'a backend change was accepted'
+[[ $out == *'Changing BACKEND requires --upgrade'* ]] && settings_unchanged || die "backend change: $out"
+out=$(reconfigure MODEL_PATH=/root/models/model.gguf 2>&1) && die 'a model under /root was accepted'
+[[ $out == *'Invalid MODEL_PATH'* ]] && settings_unchanged || die "model under /root: $out"
+out=$(reconfigure "MODEL_PATH=$model_fixture/missing.gguf" 2>&1) && die 'a missing GGUF was accepted'
+[[ $out == *'GGUF is missing'* ]] && settings_unchanged || die "missing GGUF: $out"
+pass 'reconfigure refuses a backend change, a model under /root and a missing GGUF before changing anything'
+
+reconfigure_install
+: > "$log"
+out=$(FAKE_HEALTH=ctx:65536 reconfigure CONTEXT_SIZE=65536 2>&1) && die 'unhealthy reconfigure reported success'
+settings_unchanged || die 'settings were not restored after an unhealthy reconfigure'
+[[ $out == *'previous settings are restored and the target is running again'* ]] || die "rollback report: $out"
+[[ $(grep -c 'systemctl reset-failed' "$log") -ge 2 && $(grep -c 'systemctl restart' "$log") -ge 2 ]] ||
+    die "the rollback did not clear the start limit and restart: $(cat "$log")"
+reconfigure_install
+out=$(FAKE_HEALTH=down reconfigure CONTEXT_SIZE=16384 2>&1) && die 'unhealthy reconfigure reported success'
+settings_unchanged || die 'settings were not restored when the rollback stayed unhealthy too'
+[[ $out == *'did not become healthy on the previous settings either'* ]] || die "failed rollback report: $out"
+pass 'unhealthy reconfigure restores both settings files, restarts them after reset-failed and reports whether they serve'
 
 make_install
 out=$(upgrade 2>&1) || die "healthy upgrade failed: $out"

@@ -170,7 +170,7 @@ a pinned 639 MB download) on 127.0.0.1:8766. Nothing outside the CT is needed
 for embeddings. The proxy selects a chat model from router inventory and
 contacts model targets directly; HONCHO_MODEL=fast by default. HONCHO_REF
 (default v3.5.0) may select another upstream tag, main, or a commit. HONCHO_CLIENT_IPS is a space-separated list of agent CT addresses (Hermes,
-OpenClaw, DeepSeek Harness) allowed to the API and MCP ports through the
+OpenClaw, DeepSeek Harness, OpenCode) allowed to the API and MCP ports through the
 Proxmox firewall. The router CT is always allowed.
 
 HONCHO_CONTEXT_TOKENS sets Honcho's token budgets for the model's context
@@ -361,7 +361,7 @@ fi
 [[ -z ${inventory_file:-} ]] || rm -f -- "$inventory_file" "$inventory_file.skipped"
 
 pve_section 'Agents allowed to Honcho'
-pve_note 'Hermes, OpenClaw and DeepSeek Harness CTs reach Honcho through its firewall.'
+pve_note 'Hermes, OpenClaw, DeepSeek Harness and OpenCode CTs reach Honcho through its firewall.'
 if [[ -z $honcho_clients_explicit ]]; then
   if [[ $mode == reconfigure ]]; then
     if [[ -n ${recorded_clients+set} ]]; then
@@ -372,7 +372,7 @@ if [[ -z $honcho_clients_explicit ]]; then
     fi
   else
     agent_offer=''
-    for agent in hermes openclaw deepseek-harness; do
+    for agent in hermes openclaw deepseek-harness opencode; do
       agent_ct=$(pve_tagged_ct "$agent")
       [[ -z $agent_ct ]] || agent_offer+="${agent_offer:+ }$(pve_ct_net "$agent_ct" ip)"
     done

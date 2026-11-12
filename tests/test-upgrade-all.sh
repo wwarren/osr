@@ -64,6 +64,7 @@ done
 describe 'repository pins are found'
 assert_ne 'DeepSeek Harness pin' '' "$(tables repo_default dsh)"
 assert_ne 'Honcho pin' '' "$(tables repo_default honcho)"
+assert_eq 'OpenCode pin' "$(sed -n 's/^DEFAULT_OPENCODE_VERSION=//p' "$ROOT/targets/opencode/install-target.sh")" "$(tables repo_default opencode)"
 
 # --- Mocked runs ---------------------------------------------------------------------
 
@@ -404,6 +405,13 @@ assert_eq 'nothing when already pinned' '|' "$(pin_result 0.2.1-rc.5)"
 assert_contains 'never downgrades' 'newer than the pin' "$(pin_result 0.3.0)"
 assert_contains 'a final release is newer than its rc' 'newer than the pin' "$(pin_result 0.2.1)"
 assert_contains 'an older rc moves' 'DSH_VERSION=0.2.1-rc.5' "$(pin_result 0.2.1-rc.4)"
+opencode_pin_case() {
+    add_item opencode 284
+    decide_pin 0 OPENCODE_VERSION "$1" 2.2.7
+    echo "${I_INFO[0]}|${I_NOTE[0]}"
+}
+assert_contains 'an older OpenCode pin moves' 'OPENCODE_VERSION=2.2.7' "$(in_tool opencode_pin_case 2.2.5)"
+assert_contains 'OpenCode on latest stays there' 'keeps OPENCODE_VERSION=latest' "$(in_tool opencode_pin_case latest)"
 
 describe 'router configuration is pushed only after a good router step'
 reset_mock
@@ -461,6 +469,14 @@ out=$(probe osr-hcom-relay deepseek-harness)
 assert_contains 'a custom instructions file is kept, as a CT path' 'instructions=/root/profiles/CUSTOM.md' "$out"
 assert_contains 'native mode is only for Hermes' 'native=false' "$out"
 reset_probe
+assert_contains 'an OpenCode CT without a target record is found by its unit' 'target=opencode' "$(probe osr-hcom-relay opencode)"
+echo opencode > "$probe_root/etc/osr-hcom/target"
+mkdir -p "$probe_root/home/opencode/.config/opencode"
+printf '<!-- osr-hcom:start -->\nblock\n<!-- osr-hcom:end -->\n' > "$probe_root/home/opencode/.config/opencode/AGENTS.md"
+out=$(probe osr-hcom-relay opencode)
+assert_contains 'OpenCode from the target record' 'target=opencode' "$out"
+assert_not_contains 'its global AGENTS.md is the default instructions file' 'instructions=' "$out"
+reset_probe
 echo observer > "$probe_root/etc/osr-hcom/target"; touch "$probe_root/etc/osr-hcom/mattermost-webhook"
 out=$(probe osr-hcom-relay)
 assert_contains 'an observer' 'target=observer' "$out"
@@ -477,6 +493,13 @@ assert_contains 'runs with the token' 'provision-lxc.sh --reconfigure' "$out"
 rm "$tmp/mock/282.webui-api"
 run_tool '' --dry-run --only hermes
 assert_contains 'runs without an Open WebUI connection' 'provision-lxc.sh --reconfigure' "$out"
+conf 284 'ai;ai-tools;osr-target;opencode'; state 284 opencode opencode-direct
+touch "$tmp/mock/284.webui-api"
+run_tool '' --dry-run --only opencode
+assert_contains 'OpenCode with its chat endpoint on needs the token too' 'not-run: set OPENWEBUI_ADMIN_TOKEN' "$out"
+rm "$tmp/mock/284.webui-api"
+run_tool '' --dry-run --only opencode
+assert_contains 'OpenCode without it (or made before it existed) runs without one' 'provision-lxc.sh --reconfigure' "$out"
 conf 285 'ai;ai-tools;osr-target;honcho'; state 285 honcho-api
 run_tool '' --dry-run --only honcho
 assert_contains 'Honcho always registers' 'not-run: set OPENWEBUI_ADMIN_TOKEN' "$out"
@@ -556,6 +579,11 @@ assert_eq 'not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secr
 assert_contains 'the export ends with the provisioner' 'AFTER 0' "$out"
 out=$(in_tool reconf_case gitea 2>&1)
 assert_contains 'Gitea does not get it' $'GOT \nAFTER' "$out"
+out=$(in_tool reconf_case opencode 2>&1)
+assert_contains 'OpenCode gets it (its chat endpoint is registered in Open WebUI)' 'GOT secret-token' "$out"
+assert_eq 'not on its command line either' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"
+out=$(in_tool reconf_case deepseek-harness 2>&1)
+assert_contains 'DeepSeek Harness does not get it (no Open WebUI connection)' $'GOT \nAFTER' "$out"
 out=$(in_tool reconf_case hermes 2>&1)
 assert_eq 'Hermes gets no pin, channel, port or name, so it keeps what the CT records' '' \
     "$(grep '^ARGS' <<< "$out" | grep -E 'HERMES_(COMMIT|CHANNEL|API_PORT|API_MODEL_NAME)=')"

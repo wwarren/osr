@@ -18,7 +18,7 @@ v1_start='# Signal rollback helper' v1_end='# End signal rollback helper.'
 v2_start='# Upgrade signal guard' v2_end='# End upgrade signal guard.'
 
 describe signal_rollback_copies
-for t in airllm comfyui hermes llamacpp ollama open-terminal openclaw; do
+for t in airllm comfyui hermes llamacpp ollama open-terminal openclaw opencode; do
   assert_eq "$t carries the shared signal rollback helper" "$(block "$targets/signal-rollback.sh" "$v1_start" "$v1_end")" \
     "$(block "$targets/$t/install-target.sh" "$v1_start" "$v1_end")"
 done

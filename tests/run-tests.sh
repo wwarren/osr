@@ -90,6 +90,8 @@ add_suite open-terminal-webui-probe python "${ROOT}/targets/open-terminal/test-w
 add_suite hermes-integration        python "${ROOT}/targets/hermes/test-integration.py"        python3
 add_suite hermes-direct-dispatch    python "${ROOT}/targets/hermes/test-direct-dispatch.py"    python3
 add_suite openclaw-integration      python "${ROOT}/targets/openclaw/test-integration.py"      python3
+add_suite opencode-integration      python "${ROOT}/targets/opencode/test-integration.py"      python3
+add_suite opencode-openai-proxy     python "${ROOT}/targets/opencode/test-openai-proxy.py"     python3
 add_suite comfyui-integration       python "${ROOT}/targets/comfyui/test-integration.py"       python3
 add_suite honcho-integration        python "${ROOT}/targets/honcho/test-integrate.py"          python3
 add_suite honcho-gateway            python "${ROOT}/targets/honcho/test-gateway.py"            python3
