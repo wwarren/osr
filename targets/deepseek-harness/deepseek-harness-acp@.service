@@ -1,0 +1,30 @@
+[Unit]
+Description=DeepSeek Harness ACP server for the OpenAI-compatible endpoint (connection %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The same account, keys, configuration, home and workspace as the Web UI
+# (deepseek-harness.service), so its sessions and tools are the same; ACP
+# speaks on the connection (stdin and stdout), logs go to the journal.
+User=deepseek-harness
+Group=deepseek-harness
+EnvironmentFile=/etc/deepseek-harness/service.env
+WorkingDirectory=/var/lib/deepseek-harness/workspace
+ExecStart=/usr/bin/node /opt/deepseek-harness/current/node_modules/@deepseek-ai/dsh/lib/bin.js --profile acp --patch /etc/deepseek-harness/osr.patch.yml --patch /etc/deepseek-harness/acp.patch.yml
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deepseek-harness
+UMask=0027
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

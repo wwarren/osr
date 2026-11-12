@@ -51,6 +51,24 @@ final=$(deepseek_fw_final "$fw" "$new_rule")
 assert_eq "success leaves one DeepSeek firewall rule" 1 "$(grep -c '# osr-deepseek-harness$' <<< "$final")"
 assert_not_contains "the old port closes after success" '-dport 3080 -log nolog # osr-deepseek-harness' "$final"
 assert_contains "the new port remains after success" '-dport 3081 -log nolog # osr-deepseek-harness' "$final"
+# The chat endpoint's rule (from the router only) moves with the same transaction.
+printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3080 -log nolog # osr-deepseek-harness\nIN ACCEPT -source 192.0.2.50/32 -p tcp -dport 3081 -log nolog # osr-deepseek-harness-api\nIN ACCEPT -source 192.0.2.9/32 -p tcp -dport 22 -log nolog\n' > "$fw"
+web_rule='IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3080 -log nolog # osr-deepseek-harness'
+api_rule='IN ACCEPT -source 192.0.2.50/32 -p tcp -dport 3082 -log nolog # osr-deepseek-harness-api'
+transition=$(deepseek_fw_transition "$fw" "$web_rule" "$api_rule")
+assert_eq "an unchanged Web UI rule is not repeated" 1 "$(grep -c -- '-dport 3080 -log nolog # osr-deepseek-harness$' <<< "$transition")"
+assert_contains "the old endpoint rule stays during guest install" '-dport 3081 -log nolog # osr-deepseek-harness-api' "$transition"
+assert_contains "and the new one is added" '-dport 3082 -log nolog # osr-deepseek-harness-api' "$transition"
+assert_contains "other rules remain" '-source 192.0.2.9/32 -p tcp -dport 22' "$transition"
+printf '%s\n' "$transition" > "$fw"
+assert_eq "a rerun of the transition changes nothing" "$transition" "$(deepseek_fw_transition "$fw" "$web_rule" "$api_rule")"
+final=$(deepseek_fw_final "$fw" "$web_rule" "$api_rule")
+assert_eq "success leaves the two owned rules" "$(printf '%s\n' "$web_rule" "$api_rule")" "$(grep 'osr-deepseek-harness' <<< "$final")"
+assert_eq "first in [RULES]" "$(printf '[RULES]\n%s\n%s' "$web_rule" "$api_rule")" "$(grep -A2 -x '\[RULES\]' <<< "$final")"
+final=$(deepseek_fw_final "$fw" "$web_rule")
+assert_not_contains "with the endpoint off, its rule goes" 'osr-deepseek-harness-api' "$final"
+printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.50/32 -p tcp -dport 3081 -log nolog # osr-deepseek-harness-api\n' > "$fw"
+assert_fail "a file with only the endpoint rule is not recognized" deepseek_fw_transition "$fw" "$web_rule"
 rm -f "$fw"
 seen=$(mktemp) new=$(mktemp) target=$(mktemp)
 printf 'old\n' > "$seen"; printf 'new\n' > "$new"; cp "$seen" "$target"
@@ -87,6 +105,36 @@ assert_contains "the default Web UI range is the CT's network, not its host addr
 assert_not_contains "the router firewall can be left alone" 'admit' "$(env "${common[@]}" DSH_ROUTER_FIREWALL=false bash "$provision" --dry-run 2>&1)"
 plan=$(env "${common[@]}" DEEPSEEK_HARNESS_MODEL=code-model DEEPSEEK_HARNESS_CONTEXT_WINDOW=65536 bash "$provision" --dry-run 2>&1)
 assert_contains "the installer's names are read too" 'DSH_MODEL=code-model DSH_CONTEXT_WINDOW=65536' "$plan"
+
+describe dsh_provision_openwebui
+plan=$(env "${common[@]}" bash "$provision" --dry-run 2>&1)
+assert_contains "a new CT offers itself in Open WebUI" 'DSH_API=true DSH_API_PORT=3081 DSH_API_PERMISSIONS=allow' "$plan"
+assert_contains "its endpoint is admitted from the router only" 'IN ACCEPT -source <router-ct-ip>/32 -p tcp -dport 3081 -log nolog # osr-deepseek-harness-api' "$plan"
+for file in openai-proxy.py deepseek-harness-api.service deepseek-harness-acp.socket deepseek-harness-acp@.service; do
+  assert_contains "$file is pushed" "/root/deepseek-harness-deploy/$file --perms 0644" "$plan"
+done
+assert_contains "the key the guest made is read back" 'pct pull 281 /etc/deepseek-harness/api-key' "$plan"
+assert_contains "and registered from the router" \
+  'integrate-webui.py --webui-url http://127.0.0.1:8080 --endpoint-url http://192.0.2.81:3081/v1 --model-name deepseek-harness --task-model fast' "$plan"
+assert_contains "with the key and token as files" '--admin-token-file \<router-stage\>/admin-token --endpoint-key-file \<router-stage\>/dsh-api-key' "$plan"
+assert_contains "the summary says so" 'offered as deepseek-harness (chat endpoint port 3081, from <router-ct-ip>; permissions: allow)' "$plan"
+plan=$(env "${common[@]}" OPENWEBUI=false DSH_API_PERMISSIONS=reject bash "$provision" --dry-run 2>&1)
+assert_contains "OPENWEBUI=false: no endpoint" 'DSH_API=false' "$plan"
+assert_not_contains "no endpoint rule" 'osr-deepseek-harness-api' "$plan"
+assert_not_contains "and no registration" 'integrate-webui.py' "$plan"
+plan=$(env "${common[@]}" OPENWEBUI_PORT=3000 TASK_MODEL= DSH_API_PORT=4000 bash "$provision" --dry-run 2>&1)
+assert_contains "the ports and task model can be set" "--webui-url http://127.0.0.1:3000 --endpoint-url http://192.0.2.81:4000/v1 --model-name deepseek-harness --task-model ''" "$plan"
+assert_fail "the endpoint port cannot be the Web UI's" env "${common[@]}" DSH_API_PORT=3080 bash "$provision" --dry-run
+assert_ok "unless the endpoint is off" env "${common[@]}" OPENWEBUI=false DSH_API_PORT=3080 bash "$provision" --dry-run
+assert_fail "the agent is no task model" env "${common[@]}" TASK_MODEL=deepseek-harness:x bash "$provision" --dry-run
+assert_fail "OPENWEBUI is true or false" env "${common[@]}" OPENWEBUI=yes bash "$provision" --dry-run
+assert_fail "permissions are allow or reject" env "${common[@]}" DSH_API_PERMISSIONS=ask bash "$provision" --dry-run
+assert_fail "--reconfigure and --integrate-only exclude each other" env "${common[@]}" bash "$provision" --dry-run --reconfigure --integrate-only
+assert_fail "--integrate-only needs OPENWEBUI" env ROUTER_CT_ID=250 CT_ID=281 OPENWEBUI=false bash "$provision" --dry-run --integrate-only
+plan=$(env ROUTER_CT_ID=250 CT_ID=281 bash "$provision" --dry-run --integrate-only 2>&1)
+assert_contains "--integrate-only registers the endpoint" 'integrate-webui.py' "$plan"
+assert_not_contains "and runs no guest install" 'install-target.sh' "$plan"
+assert_not_contains "nor touches a firewall" 'firewall' "$plan"
 
 describe dsh_provision_honcho
 plan=$(env "${common[@]}" HONCHO_URL=http://192.0.2.85:8000 HONCHO_CT_ID=285 bash "$provision" --dry-run 2>&1)
@@ -134,12 +182,16 @@ lxc=$(mktemp -d)
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.80/24\ntags: ai;osr-router\n' > "$lxc/250.conf"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: ai;osr-target;honcho\n' > "$lxc/285.conf"
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.70/24\ntags: ai;osr-target;open-terminal\n' > "$lxc/270.conf"
-answers=$'\n281\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.81/24\n\n\n\n\n\n\n\n\n\n'
+# Router, CT ID, template, storage, address; then Enter for gateway and the
+# settings (7), then Honcho and Open Terminal, then Open WebUI (3).
+answers_head=$'\n281\nlocal:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst\nlocal-lvm\n192.0.2.81/24\n\n\n\n\n\n\n\n'
+answers="$answers_head"$'\n\n\n\n\n'
 out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "$answers")
-order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL|Open Terminal URL' <<< "$out" | paste -sd'|')
-assert_eq "create asks router, then container, then settings, then Honcho" \
-  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== DeepSeek Harness: create ==' \
+order=$(grep -oE '== [A-Za-z: ]+ ==|Router CT ID|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|Honcho API URL|Open Terminal URL|Offer DeepSeek Harness in Open WebUI|Chat endpoint port|Tool permission requests' <<< "$out" | paste -sd'|')
+assert_eq "create asks router, then container, then settings, then Honcho, Open Terminal and Open WebUI" \
+  '== Router ==|Router CT ID|== DeepSeek Harness container ==|New DeepSeek Harness CT ID|amd64 template|Root disk storage|DeepSeek IP/CIDR|DeepSeek gateway|== DeepSeek Harness settings ==|OSR model or tier|Context window|Max reply tokens|Web UI port|Web UI allowed from|npm release|== Honcho memory ==|Honcho API URL|== Open Terminal workspace ==|Open Terminal URL|== Open WebUI ==|Offer DeepSeek Harness in Open WebUI|Chat endpoint port|Tool permission requests|== DeepSeek Harness: create ==' \
   "$order"
+assert_contains "Open WebUI is offered by default" 'Offer DeepSeek Harness in Open WebUI (as deepseek-harness)? [Y/n]' "$out"
 assert_contains "the tagged router is offered" 'Router CT ID [250]' "$out"
 assert_contains "the router's gateway is offered" 'DeepSeek gateway [192.0.2.1]' "$out"
 assert_contains "the Web UI range defaults to the CT's network" 'Web UI allowed from (IPv4 CIDR) [192.0.2.0/24]' "$out"
@@ -150,20 +202,27 @@ assert_contains "the Open Terminal CT on this host is offered" 'Open Terminal UR
 assert_contains "Enter took it" 'DSH_OPEN_TERMINAL_URL=http://192.0.2.70:8000' "$out"
 assert_contains "and that CT issues the key" "admit 192.0.2.81 in Open Terminal CT 270's firewall" "$out"
 assert_contains "the summary lists the plan" 'Network                    192.0.2.81/24 via 192.0.2.1 on vmbr0' "$out"
-out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "${answers%$'\n\n'}"$'none\nnone\n')
+out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< "$answers_head"$'none\nnone\nn\n')
 assert_contains '"none" leaves Honcho off' 'Honcho memory              off' "$out"
 assert_contains "and the guest gets no MCP URL" 'DSH_HONCHO_MCP_URL= DSH_OPEN_TERMINAL_URL' "$out"
-out=$(env "${common[@]}" PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< $'\n\n\n\n\n\n\n')
+assert_contains '"n" leaves Open WebUI out' 'DSH_API=false' "$out"
+assert_not_contains "without asking for its port" 'Chat endpoint port' "$out"
+out=$(env "${common[@]}" PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run 2>&1 <<< $'\n\n\n\n\n\n\n\n\n\n\n\n')
 assert_not_contains "preset values are not asked again" 'Router CT ID' "$out"
 assert_not_contains "(nor the address)" 'DeepSeek IP/CIDR' "$out"
 # A reconfigure starts with the CT to change, offered by its tag, then Router.
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.81/24\ntags: ai;osr-target;deepseek-harness\n' > "$lxc/281.conf"
-out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n\n\nnone\nnone\n')
+out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --reconfigure 2>&1 <<< $'\n\n\n\n\n\n\n\n\nnone\nnone\n\n')
 order=$(grep -oE '== [A-Za-z: ]+ ==|DeepSeek Harness CT ID|Router CT ID' <<< "$out" | paste -sd'|')
 assert_eq "reconfigure asks the CT first, then Router, then settings" \
-  '== DeepSeek Harness container to reconfigure ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness settings ==|== Honcho memory ==|== Open Terminal workspace ==|== DeepSeek Harness: reconfigure ==' "$order"
+  '== DeepSeek Harness container to reconfigure ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness settings ==|== Honcho memory ==|== Open Terminal workspace ==|== Open WebUI ==|== DeepSeek Harness: reconfigure ==' "$order"
+assert_contains "a CT without a recorded endpoint keeps it off by default" 'Offer DeepSeek Harness in Open WebUI (as deepseek-harness)? [y/N]' "$out"
 assert_contains "the tagged DeepSeek CT is offered" 'DeepSeek Harness CT ID [281]' "$out"
 assert_not_contains "and never a new address" 'DeepSeek IP/CIDR' "$out"
+out=$(PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc bash "$provision" --dry-run --integrate-only 2>&1 <<< $'\n\n')
+order=$(grep -oE '== [A-Za-z: ]+ ==|DeepSeek Harness CT ID|Router CT ID' <<< "$out" | paste -sd'|')
+assert_eq "--integrate-only asks only the CT and the router" \
+  '== DeepSeek Harness container to register ==|DeepSeek Harness CT ID|== Router ==|Router CT ID|== DeepSeek Harness: register in Open WebUI ==' "$order"
 rm -rf -- "$lxc"
 
 describe dsh_reconfigure_firewall
@@ -178,9 +237,16 @@ case $1 in
   status) echo 'status: running' ;;
   config) echo "description: DeepSeek Harness for Ollama Smart Router$(cat "$FAKE/description-suffix" 2>/dev/null)" ;;
   push) cp -- "$3" "$FAKE/pushed-$(basename "$4")" ;;
+  pull) printf 'dsh-api-key-0123\n' > "$4" ;;
   exec)
     id=$2; shift 3
     case "$*" in
+      'python3 -c '*) echo 0.12.4 ;;
+      'mktemp -d /root/deepseek-harness-integration.XXXXXX') echo /root/deepseek-harness-integration.Ab12Cd ;;
+      'python3 /root/deepseek-harness-integration.'*)
+        echo "$*" >> "$FAKE/integrate-calls"
+        [[ ! -e $FAKE/integrate-fail ]] || exit 1 ;;
+      'rm -rf -- /root/deepseek-harness-integration.'*) echo "$*" >> "$FAKE/router-cleanup" ;;
       'test -x /usr/local/sbin/open-terminal-clients') exit 0 ;;
       *OPEN_TERMINAL_PORT*) echo 8000 ;;
       '/usr/local/sbin/open-terminal-clients has '*) exit 1 ;;
@@ -193,6 +259,7 @@ case $1 in
         [[ ! -e $FAKE/settings-unreadable ]] || exit 1
         [[ ! -e $FAKE/settings ]] || cat "$FAKE/settings" ;;
       *install-target.sh*)
+        echo "$*" > "$FAKE/guest-args"
         cp -- "$FAKE/pve/firewall/281.fw" "$FAKE/fw-during"
         [[ ! -e $FAKE/edit ]] || printf 'IN ACCEPT -source 192.0.2.7/32 -p tcp -dport 22\n' >> "$FAKE/pve/firewall/281.fw"
         if [[ -e $FAKE/slow ]]; then touch "$FAKE/guest-started"; sleep 2; fi
@@ -209,6 +276,7 @@ printf '#!/bin/sh\nexit 0\n' > "$fake/bin/pvesh"; cp "$fake/bin/pvesh" "$fake/bi
 chmod +x "$fake/bin/"*
 reset_fake() {
   rm -f -- "$fake"/{edit,slow,commit,commit-model,break-settings,settings-unreadable,rollback-pending,swap-fail,guest-status,guest-started,fw-during,terminal-calls,pushed-open-terminal-key}
+  rm -f -- "$fake"/{integrate-calls,integrate-fail,router-cleanup,guest-args,pushed-admin-token,pushed-dsh-api-key}
   printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 3080 -log nolog # osr-deepseek-harness\nIN ACCEPT -source 192.0.2.9/32 -p tcp -dport 22\n' > "$fake/pve/firewall/281.fw"
   printf '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 8000\n' > "$fake/pve/firewall/250.fw"
   printf 'DSH_VERSION=0.2.1-rc.5\nDSH_MODEL=fast\nDSH_PORT=3080\n' > "$fake/settings"
@@ -339,6 +407,85 @@ assert_eq "disconnecting succeeds" 0 "$status"
 assert_file_contains "the key is revoked" 'revoke deepseek-harness-281 --missing-ok' "$fake/terminal-calls"
 assert_eq "and the terminal firewall forgets this CT" 0 "$(grep -c deepseek-harness-281 "$fake/pve/firewall/270.fw")"
 assert_eq "no staging directory is left" 0 "$(stages)"
+
+# Open WebUI on a reconfigure: the endpoint's rule moves with the Web UI's, the
+# key the guest made is registered from the router, and the admin token only
+# ever travels as a file.
+api_ports() { sed -nE 's/.*-source 192\.0\.2\.50\/32 -p tcp -dport ([0-9]+) .*# osr-deepseek-harness-api$/\1/p' "${1:-$fake/pve/firewall/281.fw}" | paste -sd' '; }
+reset_fake
+status=0; out=$(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp" NONINTERACTIVE=true \
+  CT_ID=281 ROUTER_CT_ID=250 OPENWEBUI=true bash "$provision" --reconfigure 2>&1) || status=$?
+assert_eq "turning Open WebUI on unattended needs the admin token" 1 "$status"
+assert_contains "and says so" 'Set OPENWEBUI_ADMIN_TOKEN' "$out"
+assert_ok "before the firewall changes" cmp -s "$fake/ct.orig" "$fake/pve/firewall/281.fw"
+assert_ok "or the guest runs" test ! -e "$fake/guest-args"
+api_reconf=(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp" NONINTERACTIVE=true
+  "OSR_FW_SWAP_TEST_FAIL_FILE=$fake/swap-fail"
+  CT_ID=281 ROUTER_CT_ID=250 DSH_PORT=3081 OPENWEBUI=true DSH_API_PORT=3082 OPENWEBUI_ADMIN_TOKEN=admin-secret
+  bash "$provision" --reconfigure)
+reset_fake
+status=0; out=$("${api_reconf[@]}" 2>&1) || status=$?
+assert_eq "turning the chat endpoint on succeeds" 0 "$status"
+assert_eq "its rule is open while the guest installs" 3082 "$(api_ports "$fake/fw-during")"
+assert_eq "and stays" 3082 "$(api_ports)"
+assert_eq "beside the new Web UI port" 3081 "$(deepseek_ports)"
+assert_contains "the guest runs the endpoint" 'DSH_API=true DSH_API_PORT=3082 DSH_API_PERMISSIONS=allow' "$(cat "$fake/guest-args")"
+assert_contains "it is registered with Open WebUI" \
+  '--webui-url http://127.0.0.1:8080 --endpoint-url http://192.0.2.81:3082/v1 --model-name deepseek-harness --task-model fast' "$(cat "$fake/integrate-calls")"
+assert_eq "the admin token goes to the router as a file" admin-secret "$(cat "$fake/pushed-admin-token")"
+assert_eq "and so does the endpoint key" dsh-api-key-0123 "$(cat "$fake/pushed-dsh-api-key")"
+assert_not_contains "never in a command line" admin-secret "$(cat "$fake/guest-args" "$fake/integrate-calls")"
+assert_file_contains "the router's staging directory is removed" 'rm -rf -- /root/deepseek-harness-integration.Ab12Cd' "$fake/router-cleanup"
+assert_eq "and the local one" 0 "$(stages)"
+assert_contains "the run explains who the model acts as" 'runs tools as the deepseek-harness account in CT 281' "$out"
+reset_fake
+touch "$fake/swap-fail"
+status=0; out=$("${api_reconf[@]}" 2>&1) || status=$?
+kept=$(find "$fake/tmp" -mindepth 1 -maxdepth 1)
+assert_eq "a firewall failure after the token was read fails" 1 "$status"
+assert_ok "the kept firewall backup" test -s "$kept/deepseek.fw.before"
+assert_ok "is kept without the admin token" test ! -e "$kept/admin-token"
+rm -rf -- "${fake:?}/tmp/"*
+reset_fake
+echo 1 > "$fake/guest-status"
+status=0; out=$("${api_reconf[@]}" 2>&1) || status=$?
+assert_eq "a failed guest run with the endpoint fails" 1 "$status"
+assert_ok "its firewall is back as it was" cmp -s "$fake/ct.orig" "$fake/pve/firewall/281.fw"
+assert_ok "and nothing is registered" test ! -e "$fake/integrate-calls"
+reset_fake
+touch "$fake/integrate-fail"
+status=0; out=$("${api_reconf[@]}" 2>&1) || status=$?
+assert_eq "a failed registration fails the run" 1 "$status"
+assert_contains "naming the rerun" '--integrate-only' "$out"
+assert_eq "the guest's endpoint rule stays (it runs)" 3082 "$(api_ports)"
+assert_file_contains "the router's staging directory is still removed" 'rm -rf -- /root/deepseek-harness-integration.Ab12Cd' "$fake/router-cleanup"
+assert_eq "and the local one" 0 "$(stages)"
+reset_fake
+printf 'DSH_VERSION=0.2.1-rc.5\nDSH_MODEL=fast\nDSH_PORT=3080\nDSH_API=true\nDSH_API_PORT=3082\nDSH_API_PERMISSIONS=reject\n' > "$fake/settings"
+printf 'IN ACCEPT -source 192.0.2.50/32 -p tcp -dport 3082 -log nolog # osr-deepseek-harness-api\n' >> "$fake/pve/firewall/281.fw"
+cp "$fake/pve/firewall/281.fw" "$fake/ct.orig"
+status=0; out=$("${reconf[@]}" 2>&1) || status=$?
+assert_eq "a recorded endpoint stays on, and needs the token" 1 "$status"
+assert_contains "saying so" 'Set OPENWEBUI_ADMIN_TOKEN' "$out"
+status=0; out=$(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp" NONINTERACTIVE=true \
+  CT_ID=281 ROUTER_CT_ID=250 OPENWEBUI_ADMIN_TOKEN=admin-secret bash "$provision" --integrate-only 2>&1) || status=$?
+assert_eq "--integrate-only registers the recorded endpoint" 0 "$status"
+assert_contains "at its recorded port" '--endpoint-url http://192.0.2.81:3082/v1' "$(cat "$fake/integrate-calls")"
+assert_contains "with its recorded permissions in the note" 'permission requests: reject' "$out"
+assert_ok "without running the guest" test ! -e "$fake/guest-args"
+assert_ok "or changing the firewall" cmp -s "$fake/ct.orig" "$fake/pve/firewall/281.fw"
+status=0; out=$(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp" NONINTERACTIVE=true \
+  CT_ID=281 ROUTER_CT_ID=250 OPENWEBUI=false bash "$provision" --reconfigure 2>&1) || status=$?
+assert_eq "turning the endpoint off needs no token" 0 "$status"
+assert_contains "the guest turns it off" 'DSH_API=false' "$(cat "$fake/guest-args")"
+assert_eq "its rule goes after the guest is healthy" '' "$(api_ports)"
+assert_eq "it was kept while the guest ran" 3082 "$(api_ports "$fake/fw-during")"
+assert_contains "and the run says to remove the connection" 'Remove its connection (http://192.0.2.81:3082/v1)' "$out"
+reset_fake
+status=0; out=$(env -i "PATH=$fake/bin:$PATH" "FAKE=$fake" "PVE_ETC=$fake/pve" "TMPDIR=$fake/tmp" NONINTERACTIVE=true \
+  CT_ID=281 ROUTER_CT_ID=250 OPENWEBUI_ADMIN_TOKEN=admin-secret bash "$provision" --integrate-only 2>&1) || status=$?
+assert_eq "--integrate-only refuses a CT without the endpoint" 1 "$status"
+assert_contains "naming the way to turn it on" 'chat endpoint off; use --reconfigure' "$out"
 
 rm -rf -- "$fake"
 

@@ -2195,12 +2195,17 @@ run_target_provisioner() {
         ot_ip="$(target_setting open-terminal IP_CIDR)"
         export OPEN_TERMINAL_URL="http://${ot_ip%/*}:${OPEN_TERMINAL_PORT:-8000}" OPEN_TERMINAL_CT_ID="$ot_ct"
       fi
-      # DeepSeek talks to the router, never to Open WebUI: no admin token.
+      # DeepSeek Harness: its own Web UI for the access range, and its chat
+      # endpoint registered in Open WebUI with the admin token (below). A run
+      # without the token installs it without Open WebUI.
       if [[ "$name" == deepseek-harness ]]; then
         export DEEPSEEK_HARNESS_MODEL="${DEEPSEEK_HARNESS_MODEL:-auto}"
         export DEEPSEEK_HARNESS_CONTEXT_WINDOW="${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-65536}"
         export DSH_ACCESS_CIDR="${DEEPSEEK_HARNESS_ACCESS_CIDR:-${API_ALLOW_CIDR:-$ip}}"
-        exec bash "$script" "${flags[@]}"
+        if [[ ${TARGET_WEBUI_READY:-true} != true || -z "$admin_token" ]]; then
+          export OPENWEBUI=false
+          exec bash "$script" "${flags[@]}"
+        fi
       fi
       # OpenCode: its own web UI for the access range, and its chat endpoint
       # registered in Open WebUI with the admin token (below).
@@ -2313,7 +2318,7 @@ provision_selected_targets() {
   local name id companions=false webui_companions=false webui_ready=true status=0
   local -a key_targets=()
   declare -A result=()
-  HONCHO_READY=false OPEN_TERMINAL_READY=false
+  HONCHO_READY=false OPEN_TERMINAL_READY=false TARGET_WEBUI_READY=true
   [[ -n "${TARGETS:-}" ]] || return 0
   for name in $TARGETS; do
     case "$(target_field "$name" phase)" in
@@ -2321,8 +2326,7 @@ provision_selected_targets() {
         if [[ " ${SERVICES_DONE:-} " == *" ${name} "* ]]; then result[$name]="ok (created before OSR)"; fi
         continue ;;
       companion)
-        companions=true
-        [[ $name == deepseek-harness ]] || webui_companions=true
+        companions=true webui_companions=true
         continue ;;
     esac
     id="$(target_setting "$name" CT_ID)"
@@ -2358,7 +2362,7 @@ provision_selected_targets() {
   fi
   if $companions; then
     if $webui_companions && ! { wait_for_openwebui && prompt_openwebui_admin_token; }; then
-      webui_ready=false
+      webui_ready=false TARGET_WEBUI_READY=false
     fi
     # Honcho and Open Terminal first: the agents connect to both.
     local ordered=""
@@ -2376,6 +2380,8 @@ provision_selected_targets() {
       echo "=== Target ${name} (CT $(target_setting "$name" CT_ID)) ==="
       if run_target_provisioner "$name"; then
         result[$name]=ok
+        # DeepSeek Harness runs without Open WebUI when there is no admin key.
+        [[ "$name" != deepseek-harness ]] || $webui_ready || result[$name]="ok (without Open WebUI)"
         [[ "$name" != honcho ]] || HONCHO_READY=true
         [[ "$name" != open-terminal ]] || OPEN_TERMINAL_READY=true
       else result[$name]=failed; fi

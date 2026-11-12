@@ -19,7 +19,10 @@ Environment: DSH_ROUTER_URL, DSH_BIND_IP, DSH_MODEL=auto,
   DSH_VERSION=0.2.1-rc.5 (an exact npm release, or latest),
   DSH_HONCHO_MCP_URL (Honcho memory through its MCP server; empty = off),
   DSH_OPEN_TERMINAL_URL (this agent's own Open Terminal workspace, the
-  gateway as http://IP:port, as MCP tools; empty = off).
+  gateway as http://IP:port, as MCP tools; empty = off),
+  DSH_API=false (true: an OpenAI-compatible chat endpoint, model
+  "deepseek-harness", bearer key in api-key, for Open WebUI), DSH_API_PORT=3081,
+  DSH_API_PERMISSIONS=allow (its answer to Harness's permission requests).
 An unchanged rerun does nothing. A failed upgrade or reconfigure restores the
 previous release, configuration and unit and restarts them.
 USAGE
@@ -49,6 +52,9 @@ PORT=${DSH_PORT:-3080}
 VERSION=${DSH_VERSION:-$DEFAULT_VERSION}
 HONCHO_MCP_URL=${DSH_HONCHO_MCP_URL:-}
 OPEN_TERMINAL_URL=${DSH_OPEN_TERMINAL_URL:-}
+API=${DSH_API:-false}
+API_PORT=${DSH_API_PORT:-3081}
+API_PERMISSIONS=${DSH_API_PERMISSIONS:-allow}
 ETC_DIR=${DSH_ETC_DIR:-/etc/deepseek-harness}
 OPT_DIR=${DSH_OPT_DIR:-/opt/deepseek-harness}
 STATE_DIR=${DSH_STATE_DIR:-/var/lib/deepseek-harness}
@@ -59,6 +65,17 @@ SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DSH_HOME_DIR=$STATE_DIR/home
 UNIT=$UNIT_DIR/deepseek-harness.service
 PACKAGE=@deepseek-ai/dsh
+# The OpenAI-compatible endpoint: its account, program and units, and the ACP
+# server systemd starts per connection to its socket.
+API_USER=${DSH_API_USER:-deepseek-harness-api}
+API_LIB=${DSH_API_LIB:-/usr/local/lib/deepseek-harness-api.py}
+API_UNIT=deepseek-harness-api.service
+ACP_SOCKET=deepseek-harness-acp.socket
+ACP_UNIT=deepseek-harness-acp@.service
+API_ENV=$ETC_DIR/api.env
+API_KEY_FILE=$ETC_DIR/api-key
+ACP_PATCH=$ETC_DIR/acp.patch.yml
+API_MODEL=deepseek-harness
 
 [[ $ROUTER_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?$ ]] || die 'DSH_ROUTER_URL must be an HTTP(S) origin.'
 [[ $BIND_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die 'DSH_BIND_IP must be the CT IPv4 address.'
@@ -77,11 +94,17 @@ fi
 [[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
   die 'DSH_OPEN_TERMINAL_URL must be the Open Terminal gateway, such as http://<terminal-ip>:8000.'
 OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
-for path in "$ETC_DIR" "$OPT_DIR" "$STATE_DIR" "$ROLLBACK_DIR" "$UNIT_DIR"; do
+[[ $API =~ ^(true|false)$ ]] || die 'DSH_API must be true or false.'
+# While the endpoint is off its port is only recorded, so it may equal DSH_PORT.
+[[ $API_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( API_PORT <= 65535 )) && [[ $API == false || $API_PORT != "$PORT" ]] ||
+  die 'DSH_API_PORT must be a port other than DSH_PORT.'
+[[ $API_PERMISSIONS =~ ^(allow|reject)$ ]] || die 'DSH_API_PERMISSIONS must be allow or reject.'
+for path in "$ETC_DIR" "$OPT_DIR" "$STATE_DIR" "$ROLLBACK_DIR" "$UNIT_DIR" "$API_LIB"; do
   [[ $path == /* && $path != *..* ]] || die "Invalid path: $path"
 done
-[[ -r $SOURCE_DIR/configure.mjs && -r $SOURCE_DIR/deepseek-harness.service ]] ||
-  die 'Missing configure.mjs or deepseek-harness.service.'
+for file in configure.mjs deepseek-harness.service openai-proxy.py "$API_UNIT" "$ACP_SOCKET" "$ACP_UNIT"; do
+  [[ -r $SOURCE_DIR/$file ]] || die "Missing $file next to this script."
+done
 
 # Install helpers
 # record_get FILE KEY: KEY's value in a KEY=VALUE record; the record is
@@ -98,6 +121,8 @@ settings_record() {
   printf 'DSH_ROUTER_URL=%s\nDSH_BIND_IP=%s\nDSH_HONCHO_MCP_URL=%s\n' "$ROUTER_URL" "$BIND_IP" "$HONCHO_MCP_URL"
   printf 'ROUTER_KEY_SHA256=%s\nHONCHO_KEY_SHA256=%s\nFILES_SHA256=%s\n' "$2" "$3" "$4"
   printf 'DSH_OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "${ot_key_sha:-none}"
+  printf 'DSH_API=%s\nDSH_API_PORT=%s\nDSH_API_PERMISSIONS=%s\nAPI_KEY_SHA256=%s\n' \
+    "$API" "$API_PORT" "$API_PERMISSIONS" "${api_key_sha:-none}"
 }
 # release_version DIR: the dsh version installed in a release directory.
 release_version() {
@@ -128,6 +153,34 @@ wait_healthy() {
     sleep 2
   done
   return 1
+}
+# api_healthy: the chat endpoint answers /healthz (it has reached Harness's
+# ACP server) and lists its model to the bearer key, which stays out of argv.
+api_healthy() {
+  local code key
+  [[ -s $API_KEY_FILE ]] || return 1
+  code=$(curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' "http://$BIND_IP:$API_PORT/healthz" 2>/dev/null) || true
+  [[ $code == 200 ]] || return 1
+  key=$(tr -d '\r\n' < "$API_KEY_FILE")
+  curl --silent --max-time 10 --header @<(printf 'Authorization: Bearer %s\n' "$key") \
+    "http://$BIND_IP:$API_PORT/v1/models" 2>/dev/null | grep -q "\"id\": \"$API_MODEL\""
+}
+wait_api() {
+  local attempt
+  for (( attempt=0; attempt<45; attempt++ )); do
+    api_healthy && return 0
+    sleep 2
+  done
+  return 1
+}
+# api_state_ok: the endpoint is as this run wants it: running and healthy, or
+# not running.
+api_state_ok() {
+  if [[ $API == true ]]; then
+    systemctl is-active --quiet "$API_UNIT" && api_healthy
+  else
+    ! systemctl is-active --quiet "$API_UNIT"
+  fi
 }
 node_ok() {
   command -v node >/dev/null 2>&1 &&
@@ -172,6 +225,12 @@ if (( dry_run )); then
     printf '+ connect this agent'\''s Open Terminal workspace at %s/mcp (MCP initialize with this CT'\''s key)\n' "$OPEN_TERMINAL_URL"
   fi
   printf '+ install and start deepseek-harness.service on %s:%s; roll back on failure\n' "$BIND_IP" "$PORT"
+  if [[ $API == true ]]; then
+    printf '+ OpenAI-compatible endpoint: %s and %s (account %s) on %s:%s, model %s, permissions %s; %s starts Harness'\''s ACP server per connection\n' \
+      "$API_UNIT" "$API_LIB" "$API_USER" "$BIND_IP" "$API_PORT" "$API_MODEL" "$API_PERMISSIONS" "$ACP_SOCKET"
+  else
+    printf '+ no OpenAI-compatible endpoint (%s is removed if present; its key is kept)\n' "$API_UNIT"
+  fi
   exit 0
 fi
 
@@ -222,7 +281,14 @@ key_sha() { if [[ -n $1 ]]; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; e
 router_key_sha=$(key_sha "$router_key")
 honcho_key_sha=$(key_sha "$honcho_key")
 ot_key_sha=$(key_sha "$ot_key")
-files_sha=$(cat "$SOURCE_DIR/configure.mjs" "$SOURCE_DIR/deepseek-harness.service" | sha256sum | cut -d' ' -f1)
+files_sha=$(cd "$SOURCE_DIR" && cat configure.mjs deepseek-harness.service openai-proxy.py "$API_UNIT" "$ACP_SOCKET" "$ACP_UNIT" |
+  sha256sum | cut -d' ' -f1)
+# The endpoint's key is made once, in the CT; a missing or replaced one is a change.
+api_key_sha=none
+if [[ $API == true ]]; then
+  api_key_sha=missing
+  [[ ! -s $API_KEY_FILE ]] || api_key_sha=$(key_sha "$(tr -d '\r\n' < "$API_KEY_FILE")")
+fi
 
 previous_record=''
 [[ ! -r $ETC_DIR/settings ]] || previous_record=$(< "$ETC_DIR/settings")
@@ -237,7 +303,7 @@ installed=false
 unchanged() {
   [[ -n $previous_record && $previous_version == "$1" ]] || return 1
   [[ $(settings_record "$1" "$router_key_sha" "$honcho_key_sha" "$files_sha") == "$previous_record" ]] || return 1
-  healthy || return 1
+  healthy && api_state_ok || return 1
   note "DeepSeek Harness $1 is installed with these settings and running: nothing to do."
 }
 if [[ $VERSION != latest ]] && unchanged "$VERSION"; then exit 0; fi
@@ -256,10 +322,17 @@ if ! node_ok; then
 fi
 node_ok || die 'DeepSeek Harness requires Node.js 24.9 or newer.'
 command -v npm >/dev/null || die 'npm was not installed with Node.js.'
+if [[ $API == true ]] && ! command -v python3 >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends python3
+fi
 
 id "$SERVICE_USER" >/dev/null 2>&1 ||
   useradd --system --create-home --home-dir "$STATE_DIR" --shell /bin/bash "$SERVICE_USER"
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR" "$DSH_HOME_DIR" "$STATE_DIR/workspace" "$STATE_DIR/npm-cache"
+if [[ $API == true ]] && ! id "$API_USER" >/dev/null 2>&1; then
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$API_USER"
+fi
 install -d -m 0755 "$OPT_DIR" "$OPT_DIR/releases"
 install -d -m 0700 "$(dirname -- "$ROLLBACK_DIR")"
 chown "root:$SERVICE_USER" "$ETC_DIR"
@@ -304,7 +377,11 @@ chmod -R a+rX,go-w -- "$release"
 # Everything below is put back on failure when a previous install exists.
 snapshot_files=("$ETC_DIR/osr.patch.yml" "$ETC_DIR/service.env" "$ETC_DIR/settings"
   "$ETC_DIR/router-api-key" "$ETC_DIR/honcho-api-key" "$UNIT" "$DSH_HOME_DIR/AGENTS.md"
-  "$ETC_DIR/open-terminal-key")
+  "$ETC_DIR/open-terminal-key" "$ACP_PATCH" "$API_ENV" "$API_KEY_FILE" "$API_LIB"
+  "$UNIT_DIR/$API_UNIT" "$UNIT_DIR/$ACP_SOCKET" "$UNIT_DIR/$ACP_UNIT")
+# Whether the endpoint ran before this run: a rollback puts it back that way.
+api_was_active=false
+if systemctl is-active --quiet "$API_UNIT" 2>/dev/null; then api_was_active=true; fi
 take_snapshot() {
   local file i=0
   install -d -m 0700 "$ROLLBACK_DIR"
@@ -333,6 +410,21 @@ restore_snapshot() {
   systemctl daemon-reload
 }
 clear_snapshot() { rm -rf -- "$ROLLBACK_DIR"; }
+# api_quiesce: before a rollback puts the files back, stop and disable the
+# endpoint while its units still exist (a unit file removed first would leave
+# its enablement links behind). api_restore: once Harness runs again, start
+# the endpoint again if it ran before this run.
+api_quiesce() {
+  systemctl disable --now "$API_UNIT" "$ACP_SOCKET" >/dev/null 2>&1 || true
+  systemctl stop 'deepseek-harness-acp@*.service' >/dev/null 2>&1 || true
+}
+api_restore() {
+  $api_was_active && [[ -f $UNIT_DIR/$API_UNIT ]] || return 0
+  systemctl enable "$ACP_SOCKET" "$API_UNIT" >/dev/null 2>&1 &&
+    systemctl restart "$ACP_SOCKET" "$API_UNIT" && wait_api && return 0
+  note "The chat endpoint did not come back; check: journalctl -u $API_UNIT"
+  return 1
+}
 
 phase=prepare restarted=false
 on_exit() {
@@ -344,6 +436,8 @@ on_exit() {
   # A failed upgrade goes back to the previous release; a failed first
   # install keeps its release for inspection (a rerun reuses it).
   [[ -z $new_release || $installed == false || $phase == finished ]] || rm -rf -- "$new_release"
+  # The endpoint is only changed after Harness restarted.
+  if [[ $phase == restart && $installed == true ]]; then api_quiesce; fi
   if [[ $phase == finished ]]; then
     note 'DeepSeek Harness is installed and running; only removing old releases failed.'
   elif [[ $phase == prepare ]]; then
@@ -360,6 +454,7 @@ on_exit() {
     note "Rolling back to ${previous_version:-the previous release}."
     if systemctl restart deepseek-harness.service && wait_healthy; then
       note "DeepSeek Harness ${previous_version:-(previous release)} is running again."
+      api_restore || true
       clear_snapshot
     else
       journalctl -u deepseek-harness.service -n 40 --no-pager >&2 || true
@@ -391,6 +486,18 @@ fi
 [[ ! -f $DSH_HOME_DIR/AGENTS.md ]] || { chown "$SERVICE_USER:$SERVICE_USER" "$DSH_HOME_DIR/AGENTS.md"; chmod 0640 "$DSH_HOME_DIR/AGENTS.md"; }
 install -m 0640 -g "$SERVICE_USER" "$overlay_tmp" "$ETC_DIR/osr.patch.yml"
 rm -f -- "$overlay_tmp"
+# The ACP server (the endpoint's) gives every session the OSR model; it reads
+# the same overlay first. MODEL was checked above, so it is safe in quotes.
+if [[ $API == true ]]; then
+  acp_tmp=$(mktemp "$ETC_DIR/acp.patch.yml.XXXXXX")
+  printf '%s\n' '# Generated for DeepSeek Harness by OSR: ACP sessions (the OpenAI-compatible' \
+    '# endpoint) use the OSR provider and model. No API key is stored here.' \
+    '- id: acp' '  config:' '    provider: osr' "    model: \"$MODEL\"" > "$acp_tmp"
+  install -m 0640 -g "$SERVICE_USER" "$acp_tmp" "$ACP_PATCH"
+  rm -f -- "$acp_tmp"
+else
+  rm -f -- "$ACP_PATCH"
+fi
 
 # systemd reads this root-only file and sets the keys in the unprivileged
 # process environment. They never reach argv, the unit or the patch.
@@ -407,13 +514,17 @@ mv -f -- "$service_env" "$ETC_DIR/service.env"
 # A configuration dump with the new release validates DeepSeek's patch syntax
 # without a model request. Keep the dump private: it shows the composition.
 dump=$(mktemp)
-if ! runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR" \
-    node "$release/node_modules/@deepseek-ai/dsh/lib/bin.js" \
-    --profile web --patch "$ETC_DIR/osr.patch.yml" --dump-config > "$dump" 2>&1; then
-  tail -n 40 "$dump" >&2
-  rm -f -- "$dump"
-  die 'DeepSeek rejected the generated patch.'
-fi
+profiles=("--profile web --patch $ETC_DIR/osr.patch.yml")
+[[ $API != true ]] || profiles+=("--profile acp --patch $ETC_DIR/osr.patch.yml --patch $ACP_PATCH")
+for profile in "${profiles[@]}"; do
+  read -r -a args <<< "$profile"
+  if ! runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR" \
+      node "$release/node_modules/@deepseek-ai/dsh/lib/bin.js" "${args[@]}" --dump-config > "$dump" 2>&1; then
+    tail -n 40 "$dump" >&2
+    rm -f -- "$dump"
+    die "DeepSeek rejected the generated patch (${args[1]} profile)."
+  fi
+done
 rm -f -- "$dump"
 
 install -m 0644 "$SOURCE_DIR/deepseek-harness.service" "$UNIT"
@@ -425,6 +536,45 @@ systemctl restart deepseek-harness.service
 if ! wait_healthy; then
   journalctl -u deepseek-harness.service -n 60 --no-pager >&2 || true
   die "DeepSeek Harness $resolved did not become healthy within 90 seconds."
+fi
+
+# The OpenAI-compatible endpoint for Open WebUI: its own account gets its bearer
+# key only through a root-only environment file systemd reads. The key is made
+# once and kept, also while the endpoint is off, so Open WebUI's connection
+# stays valid. Running ACP servers belong to the previous release or
+# configuration: restarting the endpoint closes its connection, and a new one
+# starts a new server.
+if [[ $API == true ]]; then
+  if [[ ! -s $API_KEY_FILE ]]; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$API_KEY_FILE.new"
+    chmod 0600 "$API_KEY_FILE.new"
+    mv -f -- "$API_KEY_FILE.new" "$API_KEY_FILE"
+  fi
+  api_key_sha=$(key_sha "$(tr -d '\r\n' < "$API_KEY_FILE")")
+  api_env=$(mktemp "$ETC_DIR/api.env.XXXXXX")
+  printf 'DSH_API_KEY=%s\nDSH_API_BIND=%s\nDSH_API_PORT=%s\nDSH_API_PERMISSIONS=%s\nDSH_API_MODEL=%s\n' \
+    "$(tr -d '\r\n' < "$API_KEY_FILE")" "$BIND_IP" "$API_PORT" "$API_PERMISSIONS" "$API_MODEL" > "$api_env"
+  chmod 0600 "$api_env"
+  mv -f -- "$api_env" "$API_ENV"
+  install -d -m 0755 "$(dirname -- "$API_LIB")"
+  install -m 0644 "$SOURCE_DIR/openai-proxy.py" "$API_LIB"
+  for file in "$API_UNIT" "$ACP_SOCKET" "$ACP_UNIT"; do
+    install -m 0644 "$SOURCE_DIR/$file" "$UNIT_DIR/$file"
+  done
+  systemctl daemon-reload
+  systemctl enable "$ACP_SOCKET" "$API_UNIT" >/dev/null
+  systemctl stop "$API_UNIT" 'deepseek-harness-acp@*.service' >/dev/null 2>&1 || true
+  systemctl restart "$ACP_SOCKET" "$API_UNIT"
+  if ! wait_api; then
+    journalctl -u "$API_UNIT" -u 'deepseek-harness-acp@*' -n 60 --no-pager >&2 || true
+    die "$API_UNIT did not answer /healthz and /v1/models on $BIND_IP:$API_PORT within 90 seconds."
+  fi
+elif [[ -f $UNIT_DIR/$API_UNIT || -f $API_ENV ]]; then
+  systemctl disable --now "$API_UNIT" "$ACP_SOCKET" >/dev/null 2>&1 || true
+  systemctl stop 'deepseek-harness-acp@*.service' >/dev/null 2>&1 || true
+  rm -f -- "$UNIT_DIR/$API_UNIT" "$UNIT_DIR/$ACP_SOCKET" "$UNIT_DIR/$ACP_UNIT" "$API_LIB" "$API_ENV"
+  systemctl daemon-reload
+  note "The OpenAI-compatible chat endpoint is off ($API_UNIT removed; Open WebUI's connection to it no longer answers)."
 fi
 
 settings_record "$resolved" "$router_key_sha" "$honcho_key_sha" "$files_sha" > "$ETC_DIR/settings.new"
@@ -442,3 +592,6 @@ fi
 note "DeepSeek Harness $resolved is serving on http://$BIND_IP:$PORT/ (open the tokenized URL from its journal)."
 if [[ -n $HONCHO_MCP_URL ]]; then note "Honcho memory: $HONCHO_MCP_URL (its own workspace, peer user)."; fi
 if [[ -n $OPEN_TERMINAL_URL ]]; then note "Open Terminal workspace: $OPEN_TERMINAL_URL (tools mcp__open_terminal__*)."; fi
+if [[ $API == true ]]; then
+  note "Chat endpoint: http://$BIND_IP:$API_PORT/v1, model $API_MODEL (bearer key in $API_KEY_FILE; tool permissions: $API_PERMISSIONS)."
+fi

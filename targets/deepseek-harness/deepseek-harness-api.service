@@ -1,0 +1,38 @@
+[Unit]
+Description=DeepSeek Harness OpenAI-compatible chat endpoint (for Open WebUI)
+After=network-online.target deepseek-harness-acp.socket
+Wants=network-online.target
+Requires=deepseek-harness-acp.socket
+
+[Service]
+Type=simple
+# Its own account: it holds the endpoint's bearer key (from the root-only
+# environment file, read by systemd) and nothing of the agent's. It reaches
+# Harness only through the ACP socket, whose group it is.
+User=deepseek-harness-api
+Group=deepseek-harness-api
+# DSH_API_KEY, DSH_API_BIND, DSH_API_PORT and DSH_API_PERMISSIONS, written by
+# install-target.sh. Root-only.
+EnvironmentFile=/etc/deepseek-harness/api.env
+Environment=DSH_API_STATE=/var/lib/deepseek-harness-api/sessions.json
+Environment=DSH_API_WORKSPACE=/var/lib/deepseek-harness/workspace
+Environment=DSH_API_ACP_SOCKET=/run/deepseek-harness-acp/acp.sock
+StateDirectory=deepseek-harness-api
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/deepseek-harness-api.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

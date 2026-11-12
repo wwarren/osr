@@ -45,7 +45,7 @@ flowchart LR
     term["Open Terminal LXC<br/>gateway :8000, a workspace per user"]
     hermes["Hermes Agent LXC<br/>API server :8642"]
     openclaw["OpenClaw LXC<br/>Gateway :18789"]
-    deepseek["DeepSeek Harness LXC<br/>Web UI :3080"]
+    deepseek["DeepSeek Harness LXC<br/>Web UI :3080, chat endpoint :3081"]
     opencode["OpenCode LXC<br/>web UI and API :4096, chat endpoint :4097"]
     honcho["Honcho LXC<br/>gateway :8000 API, :3000 MCP; a memory per user"]
     comfy["ComfyUI LXC<br/>:8188"]
@@ -61,6 +61,7 @@ flowchart LR
     webui -->|"OpenAI API (hermes-agent)"| hermes
     webui -->|"OpenAI API (openclaw)"| openclaw
     webui -->|"OpenAI API (opencode)"| opencode
+    webui -->|"OpenAI API (deepseek-harness)"| deepseek
     webui -->|"image generation"| comfy
     hermes -.->|inventory and ranking :8000| router
     hermes -->|direct inference| pool
@@ -99,7 +100,7 @@ flowchart LR
 | Open Terminal (`:8000`) | Optional | Terminal tool and agents' workspace tools unavailable; chat unaffected |
 | Hermes API server (`:8642`) | Optional | `hermes-agent` unavailable in Open WebUI |
 | OpenClaw Gateway (`:18789`) | Optional | `openclaw` unavailable in Open WebUI |
-| DeepSeek Harness Web UI (`:3080`) | Optional | Its agent UI is unavailable |
+| DeepSeek Harness Web UI (`:3080`), chat endpoint (`:3081`) | Optional | Its agent UI, and `deepseek-harness` in Open WebUI, are unavailable |
 | OpenCode server (`:4096`), chat endpoint (`:4097`) | Optional | Its web UI and API, and `opencode` in Open WebUI, are unavailable |
 | Honcho (`:8000`, `:3000`) | Optional | Agent memory and Open WebUI MCP tools unavailable; chat unaffected |
 | ComfyUI (`:8188`) | Optional | Image generation fails; chat unaffected |
@@ -462,8 +463,9 @@ Addresses are never chosen automatically.
 Selected model targets become the first server entries and are provisioned
 after the router starts; Strata-style keys are passed on stdin to
 `set-<kind>-token`, followed by one `apply`. Honcho is provisioned before the
-agents; companions that register with Open WebUI (OpenCode included, for its
-chat endpoint) wait for its admin API key; DeepSeek Harness needs none. Each target uses its own CT settings; a target
+agents; companions that register with Open WebUI (OpenCode and DeepSeek
+Harness included, for their chat endpoints) wait for its admin API key; without
+one DeepSeek Harness is installed without its endpoint. Each target uses its own CT settings; a target
 failure leaves the router running with a retry summary.
 `NONINTERACTIVE=true` refuses selected targets (they need interactive steps).
 
@@ -495,7 +497,7 @@ service account before its venv is built.
 | 8642 / 8765 | Hermes API / local dispatcher | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI → Hermes; dispatcher → router metadata and model servers |
 | 9119 | Hermes dashboard | `0.0.0.0` in its CT, when enabled | Authenticated browser UI |
 | 18789 / 8765 | OpenClaw Gateway (API, Control UI) / dispatcher | `0.0.0.0` (loopback without Open WebUI and Control UI) / `127.0.0.1` | Open WebUI and browsers → OpenClaw; dispatcher as for Hermes |
-| 3080 | DeepSeek Harness | CT IPv4 address | Browser UI; inbound limited by `DSH_ACCESS_CIDR` |
+| 3080 / 3081 | DeepSeek Harness Web UI / chat endpoint | CT IPv4 address / CT IPv4 address when Open WebUI is on | Browser UI, inbound limited by `DSH_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → Harness's ACP server on a local socket, inbound from the router only |
 | 4096 / 4097 / 8765 | OpenCode server (web UI, API) / chat endpoint / dispatcher | `0.0.0.0` (loopback with `OPENCODE_WEB=false`) / `0.0.0.0` when Open WebUI is on / `127.0.0.1` | Browsers (Basic auth) → OpenCode, inbound limited by `OPENCODE_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → OpenCode on loopback, inbound from the router only; dispatcher as for Hermes |
 | 8000 / 3000 / 8010, 3010 / 8765, 8766 | Honcho gateway (API / MCP) / Honcho API, MCP / proxy, embeddings | In its CT / in its CT / `127.0.0.1` / `127.0.0.1` | Open WebUI and selected agents → gateway (own keys; a workspace per Open WebUI user) → Honcho; source-restricted firewall |
 | 8188 | ComfyUI | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
@@ -509,8 +511,8 @@ firewall sets the input policy to drop). Target CTs are created with
 `# osr-open-terminal-client <agent>-<ct>` rule each, kept by the agent's
 provisioner); Hermes, OpenClaw and ComfyUI admit only the router's address (ComfyUI also `UI_ALLOW_CIDR`; Hermes's dashboard and
 OpenClaw's Control UI anyone); Honcho admits the router and selected agents;
-DeepSeek Harness `DSH_ACCESS_CIDR`, OpenCode `OPENCODE_ACCESS_CIDR` (and the
-router to its chat endpoint); model
+DeepSeek Harness `DSH_ACCESS_CIDR` and OpenCode `OPENCODE_ACCESS_CIDR` (and
+each the router to its chat endpoint); model
 targets leave rules to the operator. Hermes, OpenClaw and OpenCode also restrict egress by default to the router API, the
 registered model servers, Honcho and Open Terminal when set, DNS and internet
 HTTP(S) (§17.1, §17.4, §17.8). Honcho and
@@ -553,6 +555,7 @@ unchanged. No agent coordination API is added to the router.
 | Honcho JWT secret, admin key | `/etc/honcho-target/` in the Honcho CT (the secret 0640 root:honcho-gateway) | Never leave the CT; the gateway signs a key per workspace with the secret; `--rotate-keys` |
 | Honcho client keys | Open WebUI's: `/etc/honcho-target/openwebui-key` (0600) and the Open WebUI connection; each agent's: its CT (`honcho-api-key` in its deploy directory and Honcho settings); Honcho keeps only SHA-256 hashes (`clients.json`, 0640 root:honcho-gateway) | Open WebUI's generated by the Honcho installer (`--rotate-keys` replaces it); agents' issued by `honcho-clients` and kept while valid |
 | Router key in the DeepSeek Harness CT | `/etc/deepseek-harness/service.env` (root-only), service environment | Readable by the agent's tools (§17.6) |
+| DeepSeek Harness chat endpoint key | `/etc/deepseek-harness/api-key` (0600), `/etc/deepseek-harness/api.env` (root-only, read by systemd); Open WebUI connection | Generated once in the CT and kept while the endpoint is off; the endpoint runs as `deepseek-harness-api`, which the agent's account cannot read |
 | OpenCode server password | `/etc/opencode-target/password` (0600), `/etc/opencode-target/opencode.env` (root-only, read by systemd; `OPENCODE_PASSWORD`) | Web UI login as `opencode`; in the server environment, so the agent's shell tool can read it |
 | Router and backend keys in the OpenCode CT | `/etc/opencode-target/router.env`, `backend-keys` (0640 root:opencode-direct) | Readable only by the dispatcher's account |
 | OpenCode chat endpoint key | `/etc/opencode-target/api-key` (0600), `/etc/opencode-target/api.env` (root-only, read by systemd, with the server password); Open WebUI connection | Generated once in the CT and kept while the endpoint is off; the endpoint runs as `opencode-api` |
@@ -575,6 +578,7 @@ unchanged. No agent coordination API is added to the router.
 | OpenClaw's chat token is full Gateway operator access; users share one agent | Token only in Open WebUI and root-only files; keep `openclaw` admin-only or one group; router and backend keys are out of the agent's reach |
 | OpenClaw's installer chain is unpinned beyond nvm (Node, npm `latest`) | nvm's `install.sh` SHA-256-checked; Node checked against nodejs.org checksums; `OPENCLAW_VERSION`, `OPENCLAW_NODE_VERSION` pin releases |
 | DeepSeek Harness tools can read the router and Honcho keys | Limit its Web UI (`DSH_ACCESS_CIDR`) to people trusted to operate OSR |
+| Open WebUI chats with `deepseek-harness` run tools unattended (permission requests allowed once) as the agent, sharing its workspace and memory | Keep `deepseek-harness` admin-only or one group; `DSH_API_PERMISSIONS=reject`; the endpoint admits only the router and its bearer key |
 | OpenCode's web UI is one shared account; its tools can read the server password, Open Terminal and Honcho keys | `OPENCODE_ACCESS_CIDR` narrow, plain HTTP only on a trusted LAN or VPN; router and backend keys are out of the agent's reach |
 | Open WebUI chats with `opencode` run tools unattended (permission requests allowed once) in the shared workspace | Keep `opencode` admin-only or one group; `OPENCODE_API_PERMISSIONS=reject`; the endpoint admits only the router and its bearer key |
 | MQTT on 1883 authenticates without TLS | Trusted segment and source allowlist; `mqtts://` for untrusted networks; hcom encrypts payloads |
@@ -916,7 +920,21 @@ connection if a later step fails.
 
 [DeepSeek Harness](targets/deepseek-harness/README.md) (`dsh`, npm
 `@deepseek-ai/dsh`, pinned to 0.2.1-rc.5) is a third agent with its own Web UI
-(3080) instead of an Open WebUI registration, so it needs no admin token. A
+(3080). Harness has no OpenAI-compatible endpoint, so with Open WebUI on the
+target adds one (`openai-proxy.py` as `deepseek-harness-api.service`, 3081,
+its own account, standard library only), registered in Open WebUI as
+`deepseek-harness` by `integrate-webui.py` like OpenCode's. The endpoint talks
+to Harness's documented Agent Client Protocol server (`dsh --profile acp`,
+JSON-RPC over stdio): `deepseek-harness-acp.socket` (0660, the endpoint's
+group) starts one `deepseek-harness-acp@` instance per connection as the agent
+account, with the service environment, the overlay and an ACP patch that
+names the OSR model. The endpoint's key therefore never reaches the agent's
+account. Each chat request becomes an ACP prompt; committed messages stream
+as content, thoughts and tool activity as `reasoning_content`, and permission
+requests are answered with `DSH_API_PERMISSIONS` (allow once, or reject).
+Sessions are keyed by a hash of the normalised conversation, as in OpenCode's
+endpoint, and resumed with `session/resume` after a restart; a regenerated or
+edited reply starts a new session seeded with the transcript. A
 generated Cordis overlay (`--patch`) adds an `osr` provider (`llm-pi-ai`,
 `openai-completions`, `system` role, `max_tokens`) with one model as the
 default; the router key is a service environment variable the overlay names,
@@ -927,6 +945,10 @@ overlay, env, keys, unit, `AGENTS.md` and profiles, validates the patch with
 the new release (`--dump-config`) and on a failed restart restores and
 health-checks the previous release and files. A settings record lets
 `--reconfigure` keep unspecified settings and an unchanged rerun do nothing.
+The endpoint's units, program, environment and ACP patch are part of that
+snapshot; a rollback runs the endpoint again only if it ran before, and the
+provisioner moves its firewall rule (from the router only) with the Web UI's.
+`--integrate-only` registers an existing endpoint again.
 With Honcho the overlay adds a Streamable HTTP `dsh-mcp-client` entry and a
 managed `AGENTS.md` block; unlike the Hermes and OpenClaw plugins, recording
 and recall are tool calls the model makes.

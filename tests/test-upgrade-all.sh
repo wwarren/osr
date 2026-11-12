@@ -500,6 +500,13 @@ assert_contains 'OpenCode with its chat endpoint on needs the token too' 'not-ru
 rm "$tmp/mock/284.webui-api"
 run_tool '' --dry-run --only opencode
 assert_contains 'OpenCode without it (or made before it existed) runs without one' 'provision-lxc.sh --reconfigure' "$out"
+conf 286 'ai;ai-tools;osr-target;deepseek-harness'; state 286 deepseek-harness deepseek-harness-api
+touch "$tmp/mock/286.webui-api"
+run_tool '' --dry-run --only deepseek-harness
+assert_contains 'DeepSeek Harness with its chat endpoint on needs the token too' 'not-run: set OPENWEBUI_ADMIN_TOKEN' "$out"
+rm "$tmp/mock/286.webui-api"
+run_tool '' --dry-run --only deepseek-harness
+assert_contains 'DeepSeek Harness without it runs without one' 'provision-lxc.sh --reconfigure' "$out"
 conf 285 'ai;ai-tools;osr-target;honcho'; state 285 honcho-api
 run_tool '' --dry-run --only honcho
 assert_contains 'Honcho always registers' 'not-run: set OPENWEBUI_ADMIN_TOKEN' "$out"
@@ -583,7 +590,8 @@ out=$(in_tool reconf_case opencode 2>&1)
 assert_contains 'OpenCode gets it (its chat endpoint is registered in Open WebUI)' 'GOT secret-token' "$out"
 assert_eq 'not on its command line either' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"
 out=$(in_tool reconf_case deepseek-harness 2>&1)
-assert_contains 'DeepSeek Harness does not get it (no Open WebUI connection)' $'GOT \nAFTER' "$out"
+assert_contains 'DeepSeek Harness gets it (its chat endpoint is registered in Open WebUI)' 'GOT secret-token' "$out"
+assert_eq 'and not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"
 out=$(in_tool reconf_case hermes 2>&1)
 assert_eq 'Hermes gets no pin, channel, port or name, so it keeps what the CT records' '' \
     "$(grep '^ARGS' <<< "$out" | grep -E 'HERMES_(COMMIT|CHANNEL|API_PORT|API_MODEL_NAME)=')"

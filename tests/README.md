@@ -48,7 +48,8 @@ fails instead of blocking.
 | `runner-skips`, `skip-report` | Skip detection and strict-mode behavior |
 
 The runner also registers target Python tests for the llama.cpp bridge,
-AirLLM, Open Terminal, Hermes, OpenClaw, ComfyUI, Honcho and hcom. The complete
+AirLLM, Open Terminal, Hermes, OpenClaw, OpenCode, DeepSeek Harness, ComfyUI,
+Honcho and hcom. The complete
 suite list is the `add_suite` registry in `tests/run-tests.sh`; use `--list`
 for exact names. Network-dependent pinned-upstream tests run in separate CI
 jobs. `targets/hcom/test-live.py` is optional and uses local hcom, Mosquitto

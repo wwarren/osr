@@ -1,0 +1,17 @@
+[Unit]
+Description=DeepSeek Harness ACP server socket (for the OpenAI-compatible endpoint)
+Documentation=https://agentclientprotocol.com
+
+[Socket]
+# Each connection gets its own `dsh --profile acp` (deepseek-harness-acp@.service)
+# with the socket as its stdin and stdout. Only the endpoint's account may connect.
+ListenStream=/run/deepseek-harness-acp/acp.sock
+Accept=yes
+SocketUser=root
+SocketGroup=deepseek-harness-api
+SocketMode=0660
+DirectoryMode=0755
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

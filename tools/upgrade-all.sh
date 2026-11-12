@@ -139,9 +139,10 @@ declare -A UNITS=(
     [honcho]='postgresql honcho-api honcho-deriver honcho-embedding honcho-mcp honcho-proxy honcho-gateway'
     [hermes]='hermes-gateway hermes-direct hermes-dashboard'
     [openclaw]='openclaw-gateway openclaw-direct'
-    [deepseek-harness]='deepseek-harness'
-    # opencode-api (the Open WebUI chat endpoint) runs only when it is on; a
-    # unit that was not active before is not checked afterwards.
+    # deepseek-harness-api and opencode-api (the Open WebUI chat endpoints) run
+    # only when they are on; a unit that was not active before is not checked
+    # afterwards.
+    [deepseek-harness]='deepseek-harness deepseek-harness-api'
     [opencode]='opencode opencode-direct opencode-api'
     [gitea]='gitea'
     [mattermost]='mattermost'
@@ -870,7 +871,7 @@ run_reconfigure() {  # run_reconfigure ITEM MODE
     # Through the environment, not env's arguments, which ps would show.
     # run_item runs in its own subshell, so this export ends with it.
     case $t in
-        honcho|hermes|openclaw|opencode) [[ -z $WEBUI_TOKEN ]] || export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN ;;
+        honcho|hermes|openclaw|deepseek-harness|opencode) [[ -z $WEBUI_TOKEN ]] || export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN ;;
     esac
     for word in ${I_INFO[$i]}; do
         case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*) envs+=("$word") ;; esac
@@ -1080,14 +1081,15 @@ decide_webui() {
 
 # needs_webui_token ITEM: does this item's reconfigure register with Open
 # WebUI, and so stop without OPENWEBUI_ADMIN_TOKEN when nobody can be asked?
-# Honcho always registers its MCP server; Hermes, OpenClaw and OpenCode do
-# when their API server (the Open WebUI connection) is on.
+# Honcho always registers its MCP server; Hermes, OpenClaw, DeepSeek Harness
+# and OpenCode do when their API server (the Open WebUI connection) is on.
 needs_webui_token() {
     local id=${I_CT[$1]}
     case ${I_TARGET[$1]} in
         honcho) return 0 ;;
         hermes) pct exec "$id" -- grep -qx 'HERMES_API_SERVER=true' /etc/hermes-target/settings 2>/dev/null ;;
         openclaw) pct exec "$id" -- grep -qx 'OPENCLAW_API=true' /etc/openclaw-target/settings 2>/dev/null ;;
+        deepseek-harness) pct exec "$id" -- grep -qx 'DSH_API=true' /etc/deepseek-harness/settings 2>/dev/null ;;
         opencode) pct exec "$id" -- grep -qx 'OPENCODE_API=true' /etc/opencode-target/settings 2>/dev/null ;;
         *) return 1 ;;
     esac

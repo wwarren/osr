@@ -105,18 +105,42 @@ stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
 stub journalctl 'echo "fake journal line"'
 # systemctl: the unit is active when $FAKE_DIR/active exists. A restart runs
 # the release the current link points to; a version listed in $FAKE_DIR/bad
-# starts but never answers (inactive).
-stub systemctl 'case $1 in
-  is-active) [[ -e $FAKE_DIR/active ]] ;;
-  restart)
+# starts but never answers (inactive). The chat endpoint is active when
+# $FAKE_DIR/api-active exists; it fails to start while its api.env has the
+# line in $FAKE_DIR/api-bad.
+stub systemctl 'api=false
+for arg in "$@"; do [[ $arg != deepseek-harness-api.service ]] || api=true; done
+case $1 in
+  is-active) if $api; then [[ -e $FAKE_DIR/api-active ]]; exit; fi ;;
+  stop|disable) if $api && [[ $1 == stop || " $* " == *" --now "* ]]; then rm -f "$FAKE_DIR/api-active"; fi ;;
+  restart) if $api; then
+    if [[ -s $FAKE_DIR/api-bad ]] && grep -qxF -- "$(cat "$FAKE_DIR/api-bad")" "$DSH_ETC_DIR/api.env" 2>/dev/null; then
+      rm -f "$FAKE_DIR/api-active"; else : > "$FAKE_DIR/api-active"; fi
+    exit 0
+  fi
     version=$(basename "$(readlink -f "$DSH_OPT_DIR/current")" | sed "s/_.*//")
     echo "$version" >> "$FAKE_DIR/restarts"
     # A signal test needs this restart to take a moment.
     [[ $version != "$(cat "$FAKE_DIR/slow-restart" 2>/dev/null)" ]] || /bin/sleep 2
     if grep -qx -- "$version" "$FAKE_DIR/bad" 2>/dev/null; then rm -f "$FAKE_DIR/active"; else echo "$version" > "$FAKE_DIR/active"; fi ;;
 esac; exit 0'
-# curl: only the Web UI health check reaches it; 401 is an answer.
-stub curl 'if [[ -e $FAKE_DIR/active ]]; then if [[ -e $FAKE_DIR/http-code ]]; then cat "$FAKE_DIR/http-code"; else printf 401; fi; else printf 000; exit 7; fi'
+# curl: the Web UI health check (401 is an answer) and the chat endpoint's
+# (port 3081): /healthz, and /v1/models for the bearer key in api-key, given
+# as a header file.
+stub curl 'url="" header=""
+while (( $# )); do case $1 in --header) header=$2; shift 2 ;; http*) url=$1; shift ;; *) shift ;; esac; done
+if [[ $url == *:3081/* ]]; then
+  [[ -e $FAKE_DIR/api-active ]] || { printf 000; exit 7; }
+  case $url in
+    */healthz) printf 200 ;;
+    */v1/models)
+      [[ $header == @* ]] && grep -qxF "Authorization: Bearer $(cat "$DSH_ETC_DIR/api-key")" "${header#@}" &&
+        printf "{\"object\": \"list\", \"data\": [{\"id\": \"deepseek-harness\", \"object\": \"model\"}]}" ||
+        printf "{\"error\": \"unauthorized\"}" ;;
+  esac
+  exit 0
+fi
+if [[ -e $FAKE_DIR/active ]]; then if [[ -e $FAKE_DIR/http-code ]]; then cat "$FAKE_DIR/http-code"; else printf 401; fi; else printf 000; exit 7; fi'
 # npm: view answers $FAKE_DIR/latest; install writes a stub release (unless
 # $FAKE_DIR/npm-fail exists) whose bin.js fails --dump-config when
 # $FAKE_DIR/dump-fail exists.
@@ -147,13 +171,15 @@ export PATH="$bin:$PATH"
 # --- the tree --------------------------------------------------------------
 export DSH_ETC_DIR=$tmp/etc DSH_OPT_DIR=$tmp/opt DSH_STATE_DIR=$tmp/state
 export DSH_ROLLBACK_DIR=$tmp/target/rollback DSH_UNIT_DIR=$tmp/units
+export DSH_API_LIB=$tmp/lib/deepseek-harness-api.py
 mkdir -p "$DSH_UNIT_DIR"
 deploy=$tmp/deploy
 # push_deploy [HONCHO]: what provision-lxc.sh pushes before each run.
 push_deploy() {
   rm -rf -- "$deploy"
   mkdir -p "$deploy"
-  cp "$here/install-target.sh" "$here/configure.mjs" "$here/deepseek-harness.service" "$deploy/"
+  cp "$here/install-target.sh" "$here/configure.mjs" "$here/deepseek-harness.service" "$here/openai-proxy.py" \
+    "$here/deepseek-harness-api.service" "$here/deepseek-harness-acp.socket" "$here/deepseek-harness-acp@.service" "$deploy/"
   printf 'router-secret\n' > "$deploy/router-api-key"
   if [[ ${1:-} == honcho ]]; then printf 'honcho-client-key\n' > "$deploy/honcho-api-key"; fi
   if [[ ${1:-} == open-terminal ]]; then printf 'ot-client-key-0123456789\n' > "$deploy/open-terminal-key"; fi
@@ -441,6 +467,114 @@ assert_ok "the MCP server is gone from the overlay" bash -c "! grep -q open_term
 assert_ok "the key from the service env" bash -c "! grep -q OSR_OPEN_TERMINAL_KEY '$DSH_ETC_DIR/service.env'"
 assert_ok "and from /etc" test ! -e "$DSH_ETC_DIR/open-terminal-key"
 assert_status "a URL with a path is refused" 1 env "${base_env[@]}" DSH_OPEN_TERMINAL_URL="http://127.0.0.1:$port/mcp" bash "$deploy/install-target.sh" --dry-run
+
+describe install_api_dry_run
+plan=$(env "${base_env[@]}" DSH_API=true bash "$script" --dry-run 2>&1)
+assert_contains "the dry run plans the chat endpoint" "OpenAI-compatible endpoint: deepseek-harness-api.service" "$plan"
+assert_contains "on its port, with its model" "on 127.0.0.1:3081, model deepseek-harness, permissions allow" "$plan"
+plan=$(env "${base_env[@]}" bash "$script" --dry-run 2>&1)
+assert_contains "and says when it is off" "no OpenAI-compatible endpoint" "$plan"
+assert_fail "DSH_API must be true or false" env "${base_env[@]}" DSH_API=yes bash "$script" --dry-run
+assert_fail "its port must differ from the Web UI's" env "${base_env[@]}" DSH_API=true DSH_API_PORT=3080 bash "$script" --dry-run
+assert_fail "and be a port" env "${base_env[@]}" DSH_API=true DSH_API_PORT=70000 bash "$script" --dry-run
+assert_fail "permissions are allow or reject" env "${base_env[@]}" DSH_API=true DSH_API_PERMISSIONS=ask bash "$script" --dry-run
+mkdir -p "$tmp/partial"
+cp "$script" "$here/configure.mjs" "$here/deepseek-harness.service" "$tmp/partial/"
+assert_fail "the proxy and its units must be next to the script" env "${base_env[@]}" bash "$tmp/partial/install-target.sh" --dry-run
+
+describe install_api
+api_env=(DSH_VERSION=0.2.4 DSH_MODEL=auto DSH_API=true)
+push_deploy
+assert_ok "the chat endpoint can be turned on" install_run "${api_env[@]}"
+assert_contains "and the run names it" "Chat endpoint: http://127.0.0.1:3081/v1, model deepseek-harness" "$out"
+api_key=$(cat "$DSH_ETC_DIR/api-key")
+assert_ok "a 64-hex-digit key is made" bash -c "[[ '$api_key' =~ ^[0-9a-f]{64}$ ]]"
+assert_file_mode "which is root-only" 600 "$DSH_ETC_DIR/api-key"
+assert_file_contains "the endpoint gets it from its env file" "DSH_API_KEY=$api_key" "$DSH_ETC_DIR/api.env"
+assert_file_mode "which is root-only too" 600 "$DSH_ETC_DIR/api.env"
+assert_file_contains "with the bind address" 'DSH_API_BIND=127.0.0.1' "$DSH_ETC_DIR/api.env"
+assert_file_contains "the port" 'DSH_API_PORT=3081' "$DSH_ETC_DIR/api.env"
+assert_file_contains "and the permission answer" 'DSH_API_PERMISSIONS=allow' "$DSH_ETC_DIR/api.env"
+assert_file_contains "ACP sessions use the OSR provider" 'provider: osr' "$DSH_ETC_DIR/acp.patch.yml"
+assert_file_contains "and the model" 'model: "auto"' "$DSH_ETC_DIR/acp.patch.yml"
+assert_ok "the ACP patch never holds a key" bash -c "! grep -q -e router-secret -e '$api_key' '$DSH_ETC_DIR/acp.patch.yml'"
+assert_contains "DeepSeek checked the ACP profile too" "--profile acp --patch $DSH_ETC_DIR/osr.patch.yml --patch $DSH_ETC_DIR/acp.patch.yml --dump-config" "$(calls)"
+assert_ok "the proxy is installed" cmp -s "$here/openai-proxy.py" "$DSH_API_LIB"
+for unit in deepseek-harness-api.service deepseek-harness-acp.socket deepseek-harness-acp@.service; do
+  assert_ok "and $unit" cmp -s "$here/$unit" "$DSH_UNIT_DIR/$unit"
+done
+assert_contains "the socket and the endpoint are enabled" "systemctl enable deepseek-harness-acp.socket deepseek-harness-api.service" "$(calls)"
+assert_contains "and restarted" "systemctl restart deepseek-harness-acp.socket deepseek-harness-api.service" "$(calls)"
+assert_contains "after the old ACP servers stop" "systemctl stop deepseek-harness-api.service deepseek-harness-acp@*.service" "$(calls)"
+assert_file_contains "the record has the endpoint" 'DSH_API=true' "$DSH_ETC_DIR/settings"
+assert_file_contains "and the key's hash" "API_KEY_SHA256=$(printf %s "$api_key" | sha256sum | cut -d' ' -f1)" "$DSH_ETC_DIR/settings"
+assert_ok "not the key" bash -c "! grep -q '$api_key' '$DSH_ETC_DIR/settings'"
+push_deploy
+assert_ok "a rerun with the same settings" install_run "${api_env[@]}"
+assert_contains "does nothing" "nothing to do" "$out"
+rm -f "$fake/api-active"
+push_deploy
+assert_ok "with the endpoint down, the same settings" install_run "${api_env[@]}"
+assert_not_contains "are applied again" "nothing to do" "$out"
+assert_ok "and it runs again" test -e "$fake/api-active"
+push_deploy
+assert_ok "the permission answer can change" install_run "${api_env[@]}" DSH_API_PERMISSIONS=reject
+assert_file_contains "in its env file" 'DSH_API_PERMISSIONS=reject' "$DSH_ETC_DIR/api.env"
+assert_eq "the key is kept" "$api_key" "$(cat "$DSH_ETC_DIR/api-key")"
+printf 'wrong
+' > "$tmp/wrong-key"
+# shellcheck disable=SC1090
+source <(awk '/^# Install helpers$/{c=1;next} /^# End install helpers\.$/{c=0} c' "$script")
+# shellcheck disable=SC2034  # read by the sourced api_healthy()
+BIND_IP=127.0.0.1 API_PORT=3081 API_MODEL=deepseek-harness API_KEY_FILE=$DSH_ETC_DIR/api-key
+assert_ok "the health check passes with the key" api_healthy
+# shellcheck disable=SC2034
+API_KEY_FILE=$tmp/wrong-key
+assert_fail "and fails with another" api_healthy
+
+describe install_api_rollback
+# The endpoint ran before; a run whose endpoint never answers puts back its
+# files and runs it again.
+push_deploy
+echo 'DSH_API_PERMISSIONS=allow' > "$fake/api-bad"
+run_fails "an endpoint that does not answer fails the run" "${api_env[@]}"
+assert_contains "and rolls back" "Rolling back to 0.2.4" "$out"
+assert_file_contains "its previous env file is back" 'DSH_API_PERMISSIONS=reject' "$DSH_ETC_DIR/api.env"
+assert_contains "it was restarted after the rollback" "systemctl restart deepseek-harness-acp.socket deepseek-harness-api.service" "$(sed -n '/systemctl disable --now deepseek-harness-api.service/,$p' "$FAKE_LOG")"
+assert_ok "and runs again" test -e "$fake/api-active"
+assert_eq "with its key" "$api_key" "$(cat "$DSH_ETC_DIR/api-key")"
+assert_ok "the snapshot is cleared" test ! -e "$DSH_ROLLBACK_DIR"
+rm -f "$fake/api-bad"
+
+describe install_api_off
+push_deploy
+assert_ok "the endpoint can be turned off" install_run DSH_VERSION=0.2.4 DSH_MODEL=auto
+assert_contains "and the run says so" "chat endpoint is off" "$out"
+assert_contains "it is stopped and disabled" "systemctl disable --now deepseek-harness-api.service deepseek-harness-acp.socket" "$(calls)"
+assert_ok "not running" test ! -e "$fake/api-active"
+for file in "$DSH_UNIT_DIR/deepseek-harness-api.service" "$DSH_UNIT_DIR/deepseek-harness-acp.socket" \
+    "$DSH_UNIT_DIR/deepseek-harness-acp@.service" "$DSH_API_LIB" "$DSH_ETC_DIR/api.env" "$DSH_ETC_DIR/acp.patch.yml"; do
+  assert_ok "$(basename "$file") is removed" test ! -e "$file"
+done
+assert_eq "the key is kept for Open WebUI's connection" "$api_key" "$(cat "$DSH_ETC_DIR/api-key")"
+assert_file_contains "the record says off" 'DSH_API=false' "$DSH_ETC_DIR/settings"
+push_deploy
+assert_ok "off again" install_run DSH_VERSION=0.2.4 DSH_MODEL=auto
+assert_contains "does nothing" "nothing to do" "$out"
+# The endpoint did not run before; a failed turn-on leaves it off.
+push_deploy
+echo 'DSH_API_PERMISSIONS=allow' > "$fake/api-bad"
+run_fails "a failed turn-on fails the run" "${api_env[@]}"
+assert_contains "Harness runs again" "DeepSeek Harness 0.2.4 is running again" "$out"
+assert_ok "the endpoint is not running" test ! -e "$fake/api-active"
+assert_ok "and its units are gone again" test ! -e "$DSH_UNIT_DIR/deepseek-harness-api.service"
+assert_contains "after it was disabled" "systemctl disable --now deepseek-harness-api.service deepseek-harness-acp.socket" "$(calls)"
+assert_file_contains "the record still says off" 'DSH_API=false' "$DSH_ETC_DIR/settings"
+assert_eq "the key is the same" "$api_key" "$(cat "$DSH_ETC_DIR/api-key")"
+rm -f "$fake/api-bad"
+push_deploy
+assert_ok "turned on again, it reuses the key" install_run "${api_env[@]}"
+assert_file_contains "in its env file" "DSH_API_KEY=$api_key" "$DSH_ETC_DIR/api.env"
 
 describe install_first_layout
 # The first version of this target installed into /opt/deepseek-harness

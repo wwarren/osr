@@ -179,6 +179,8 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != opencode ]] ||
   printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
+[[ $(basename "$(dirname "$0")") != deepseek-harness ]] ||
+  printf 'dsh-env openwebui=%s\n' "${OPENWEBUI:-default}" >> "$MOCK_LOG"
 [[ -z ${KINDI_BACKEND:-}${KINDI_CONTEXT:-} ]] ||
   printf 'kindi-env %s|%s|%s\n' "${KINDI_BACKEND:-}" "${GPU_DEVICES:-}" "${KINDI_CONTEXT:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
@@ -1512,9 +1514,14 @@ assert_eq "OpenClaw too gets the router CT, the router's template and the token"
   "provision openclaw|918|192.0.2.98/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner deepseek-harness
-assert_eq "DeepSeek gets its own CT and router, without the Open WebUI admin token" \
-  "provision deepseek-harness|921|192.0.2.101/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|no|
-context-env ||||unset|65536" "$(mock_calls)"
+assert_eq "DeepSeek gets its own CT and router, and the token (its chat endpoint is registered in Open WebUI)" \
+  "provision deepseek-harness|921|192.0.2.101/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|
+context-env ||||unset|65536
+dsh-env openwebui=default" "$(mock_calls)"
+mock_reset_log
+TARGET_WEBUI_READY=false run_target_provisioner deepseek-harness
+assert_contains "without an admin key it is installed without Open WebUI" "dsh-env openwebui=false" "$(mock_calls)"
+assert_contains "and gets no token" "|8080|no|" "$(mock_calls)"
 mock_reset_log
 DEEPSEEK_HARNESS_CONTEXT_WINDOW=32768 run_target_provisioner deepseek-harness
 assert_contains "and the window chosen for it" "context-env ||||unset|32768" "$(mock_calls)"
@@ -1573,7 +1580,7 @@ assert_contains "OpenClaw gets it too" "honcho-env |http://192.0.2.100:8000|920"
 mock_reset_log
 run_target_provisioner deepseek-harness
 assert_contains "and DeepSeek Harness (for Honcho's MCP server)" "honcho-env |http://192.0.2.100:8000|920" "$(mock_calls)"
-assert_contains "still without the Open WebUI admin token" "|no|" "$(mock_calls)"
+assert_contains "with the Open WebUI admin token for its chat endpoint" "|match|" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner opencode
 assert_contains "and OpenCode (for Honcho's OpenCode plugin)" "honcho-env |http://192.0.2.100:8000|920" "$(mock_calls)"
@@ -1724,6 +1731,7 @@ assert_fail "blank skips the companions" prompt_openwebui_admin_token <<< $'\n'
 describe provision_selected_targets
 run_target_provisioner() {
   echo "run $1" >> "$MOCK_LOG"
+  [[ $1 != deepseek-harness ]] || echo "dsh-webui ${TARGET_WEBUI_READY:-unset}" >> "$MOCK_LOG"
   [[ ${HONCHO_READY:-false} != true || $1 == honcho ]] || echo "honcho-ready $1" >> "$MOCK_LOG"
   [[ ${OPEN_TERMINAL_READY:-false} != true || $1 == open-terminal ]] || echo "open-terminal-ready $1" >> "$MOCK_LOG"
   [[ " ${FAKE_FAIL:-} " != *" $1 "* ]]
@@ -1768,12 +1776,15 @@ assert_contains "and gives its partial CT recovery command" \
 TARGETS="deepseek-harness"
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1; _rc=$?
-assert_eq "DeepSeek alone succeeds without Open WebUI admin setup" 0 "$_rc"
-assert_eq "it provisions directly" "run deepseek-harness" "$(mock_calls)"
+assert_eq "DeepSeek alone succeeds" 0 "$_rc"
+assert_eq "after the Open WebUI admin setup (its chat endpoint is registered there)" \
+  "$(printf '%s\n' wait token 'run deepseek-harness' 'dsh-webui true')" "$(mock_calls)"
 TARGETS="hermes deepseek-harness"
 mock_reset_log
 FAKE_NO_TOKEN=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
-assert_eq "DeepSeek still runs when Open WebUI has no admin key" "$(printf '%s\n' wait token 'run deepseek-harness')" "$(mock_calls)"
+assert_eq "DeepSeek still runs when Open WebUI has no admin key, without Open WebUI" \
+  "$(printf '%s\n' wait token 'run deepseek-harness' 'dsh-webui false')" "$(mock_calls)"
+assert_contains "the summary says so" "deepseek-harness CT 921    ok (without Open WebUI)" "$(cat "$_out")"
 assert_contains "Hermes is skipped" "skipped (no Open WebUI admin key)" "$(cat "$_out")"
 TARGETS="opencode"
 mock_reset_log
@@ -1814,7 +1825,7 @@ TARGETS="hermes deepseek-harness open-terminal comfyui"
 mock_reset_log
 provision_selected_targets > "$_out" 2>&1
 assert_eq "Open Terminal goes first, so the agents (in menu order) get it" \
-  "$(printf '%s\n' wait token 'run open-terminal' 'run hermes' 'open-terminal-ready hermes' 'run deepseek-harness' \
+  "$(printf '%s\n' wait token 'run open-terminal' 'run hermes' 'open-terminal-ready hermes' 'run deepseek-harness' 'dsh-webui true' \
      'open-terminal-ready deepseek-harness' 'run comfyui' 'open-terminal-ready comfyui')" "$(mock_calls)"
 TARGETS="honcho hermes openclaw"
 mock_reset_log

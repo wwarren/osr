@@ -4,8 +4,10 @@ Runs [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`) as a separate CPU-only agent in its own unprivileged Debian 12/13 LXC,
 with its Web UI, sessions, shell tools and workspace there. DeepSeek uses the
 router as a custom OpenAI-compatible provider (no direct dispatcher); it is
-not a model in OSR's pool and not an Open WebUI tool, so it needs **no Open
-WebUI admin token**. The provisioner reads the router key from the router CT
+not a model in OSR's pool. With Open WebUI on (the default for a new CT), the
+CT also runs an OpenAI-compatible chat endpoint in front of DeepSeek, added to
+Open WebUI as the model `deepseek-harness` ([Open WebUI](#open-webui)); that
+needs an Open WebUI admin API key or JWT. The provisioner reads the router key from the router CT
 into a root-only systemd environment file; the generated DeepSeek patch names
 only the variable. With Honcho, DeepSeek gets the shared long-term memory
 ([Honcho memory](#honcho-memory)). The [hcom target](../hcom/README.md) adds
@@ -18,6 +20,8 @@ workspace there as MCP tools ([Open Terminal workspace](#open-terminal-workspace
 and anything it runs can read the router key and, with Honcho, this CT's
 Honcho key (which reaches only DeepSeek's own Honcho workspace, never another
 agent's or an Open WebUI user's memory). Limit Web UI access to people trusted to operate OSR.
+Whoever can chat with `deepseek-harness` in Open WebUI runs tools as the same
+account, in the same workspace and memory.
 
 ## Requirements
 
@@ -72,12 +76,87 @@ is ever deleted.
 | `DSH_ROUTER_FIREWALL` | `true` | Keep this CT's rule in the router's firewall file |
 | `HONCHO_URL`, `HONCHO_CT_ID` | Unset | Honcho memory |
 | `OPEN_TERMINAL_URL`, `OPEN_TERMINAL_CT_ID` | Unset | Open Terminal workspace (`OPEN_TERMINAL_KEY_FILE` for a key issued by hand) |
+| `OPENWEBUI` | `true` for a new CT; a reconfigure keeps the recorded choice (`false` for a CT made before the endpoint) | Run the chat endpoint and register it in Open WebUI; needs `OPENWEBUI_ADMIN_TOKEN` unattended |
+| `DSH_API_PORT` | `3081` | Chat endpoint port, other than `DSH_PORT`; admitted from the router only |
+| `DSH_API_PERMISSIONS` | `allow` | What the endpoint answers DeepSeek's permission requests with (`allow` once, or `reject`) |
+| `OPENWEBUI_PORT`, `TASK_MODEL` | Read from the router; `fast` | Open WebUI's port; the router model Open WebUI uses for titles and tags (blank leaves that setting alone) |
 | `CORES`, `MEMORY_MB`, `ROOTFS_GB` | 2, 4096, 32 | Each release takes ~860 MB in `/opt/deepseek-harness/releases/`; an upgrade briefly holds two |
 
 The main installer accepts `DEEPSEEK_HARNESS_*` equivalents (`_MODEL`,
-`_CONTEXT_WINDOW`, `_VERSION`, `_PORT`, `_ACCESS_CIDR`), prompts for model and
-context (at least 16384), and uses its `API_ALLOW_CIDR` as the Web UI range
-when none is given.
+`_CONTEXT_WINDOW`, `_VERSION`, `_PORT`, `_ACCESS_CIDR`, `_API_PORT`,
+`_API_PERMISSIONS`), prompts for model and context (at least 16384), and uses
+its `API_ALLOW_CIDR` as the Web UI range when none is given. It passes the
+Open WebUI admin key it asks for once; without one DeepSeek is installed with
+`OPENWEBUI=false`.
+
+## Open WebUI
+
+DeepSeek has no OpenAI-compatible endpoint of its own, so the target adds one,
+the counterpart of [OpenCode's](../opencode/README.md#open-webui):
+`openai-proxy.py` (standard library only) as `deepseek-harness-api.service` on
+`DSH_API_PORT`, under its own account `deepseek-harness-api` with a generated
+bearer key (`/etc/deepseek-harness/api-key`, 0600; `api.env`, root-only, read
+by systemd). The endpoint drives DeepSeek through its documented
+[Agent Client Protocol](https://agentclientprotocol.com/) server (`dsh
+--profile acp`, JSON-RPC over stdio), not the Web UI's private API:
+
+- `deepseek-harness-acp.socket` listens on `/run/deepseek-harness-acp/acp.sock`
+  (0660, group `deepseek-harness-api`) and starts one
+  `deepseek-harness-acp@.service` per connection, as the `deepseek-harness`
+  account with the service environment, the OSR overlay and
+  `/etc/deepseek-harness/acp.patch.yml` (the OSR provider and `DSH_MODEL` for
+  ACP sessions). The endpoint's key never reaches the agent's account, and
+  the agent's keys never reach the endpoint's. Sessions are stored with the
+  Web UI's in `/var/lib/deepseek-harness/home` and work in the same
+  workspace.
+- Each chat request becomes an ACP `session/prompt`. Committed messages stream
+  as the reply; thoughts and tool activity (`[tool: …]`) stream as
+  `reasoning_content`, which Open WebUI shows as a collapsible block
+  (`Environment=DSH_API_ACTIVITY=false` in a `systemctl edit
+  deepseek-harness-api` drop-in hides them; `api.env` is rewritten by each
+  run). DeepSeek's permission
+  requests are answered with `DSH_API_PERMISSIONS`, since nobody is there to
+  ask; the reply notes each one.
+- Open WebUI sends no chat ID, so sessions are keyed by a hash of the
+  normalised conversation: a request that continues a session's last state
+  reuses it (after an endpoint restart through `session/resume`), anything
+  else (a regenerated or edited reply) starts a new session seeded with the
+  transcript. One ACP connection serves every session; sessions idle for 30
+  minutes are closed in the ACP server (they stay in DeepSeek's store and
+  resume when their chat continues). At most four turns run at once (`DSH_API_MAX_TURNS`, HTTP 429 beyond it) and a second request
+  for a busy session gets HTTP 409. A closed browser tab cancels its turn.
+
+The provisioner admits only the router to the endpoint
+(`# osr-deepseek-harness-api` in the CT firewall), then registers it in Open
+WebUI with the [OpenCode target's](../opencode/README.md) method:
+`integrate-webui.py`, run in the router CT from a private staging directory,
+checks the key against the endpoint, has Open WebUI's backend verify it (which
+also proves the firewall admits the router), adds or updates one OpenAI
+connection that shows only `deepseek-harness`, and points Open WebUI's
+external task model at `TASK_MODEL` unless an admin already chose one. The
+admin token and endpoint key reach the router only as 0600 files that are
+removed when the run ends.
+
+```bash
+# Turn it on for an existing CT (the token is read from the terminal when unset).
+CT_ID=281 ROUTER_CT_ID=280 OPENWEBUI=true bash targets/deepseek-harness/provision-lxc.sh --reconfigure
+# Register it again, e.g. after reinstalling Open WebUI.
+CT_ID=281 ROUTER_CT_ID=280 bash targets/deepseek-harness/provision-lxc.sh --integrate-only
+# Turn it off (the key stays, so turning it on again keeps the connection valid).
+CT_ID=281 ROUTER_CT_ID=280 OPENWEBUI=false bash targets/deepseek-harness/provision-lxc.sh --reconfigure
+```
+
+Turning it off stops and removes the units, program, environment file and ACP
+patch, and closes its firewall rule; remove the connection in Open WebUI's
+Admin Settings > Connections if it is no longer wanted. Before sharing the
+model, check its visibility under Admin Settings > Models.
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `deepseek-harness` missing from the model list | Not registered, or Open WebUI was reinstalled | `--integrate-only` (above) |
+| "DeepSeek Harness error: … turn failed" in a reply | The router or model failed the turn | `pct exec <CT> -- journalctl -u 'deepseek-harness-acp@*' -n 60` |
+| HTTP 429 or 409 | Four turns already running, or the same conversation busy | Wait for the running turn, or raise `DSH_API_MAX_TURNS` in a `systemctl edit deepseek-harness-api` drop-in |
+| Open WebUI cannot reach the connection | The endpoint is down or the firewall changed | `pct exec <CT> -- systemctl status deepseek-harness-api deepseek-harness-acp.socket`; `--reconfigure` repairs both |
 
 ## Honcho memory
 
@@ -188,13 +267,15 @@ ROUTER_CT_ID=280 CT_ID=281 DSH_MODEL=code-model bash targets/deepseek-harness/pr
 It refreshes the key and guest files, regenerates the overlay and restarts the
 service, touching only a CT with this target's description and firewall rule
 (other rules are kept). Settings not given (`DSH_MODEL`,
-`DSH_CONTEXT_WINDOW`, `DSH_MAX_TOKENS`, `DSH_VERSION`, `DSH_PORT`, Honcho) keep
+`DSH_CONTEXT_WINDOW`, `DSH_MAX_TOKENS`, `DSH_VERSION`, `DSH_PORT`, Honcho,
+`OPENWEBUI`, `DSH_API_PORT`, `DSH_API_PERMISSIONS`) keep
 the values in `/etc/deepseek-harness/settings` from the last completed run (the
 run says which); a recorded release is kept too, so set `DSH_VERSION` to move
 to the pin. An unchanged rerun with a healthy service does nothing.
 
-**Firewall during reconfigure.** A port change admits both old and new ports
-until the guest is healthy, then only the new one. A failed guest run restores
+**Firewall during reconfigure.** A port change (the Web UI's or the chat
+endpoint's) admits both old and new ports until the guest is healthy, then
+only the new one. A failed guest run restores
 the DeepSeek and router firewall files once the previous service is back; if the
 new service is running the new rule stays (the run still fails); if rollback is
 incomplete or unreadable, or the run was interrupted (Ctrl-C, closed SSH), both
@@ -207,13 +288,15 @@ is).
 Each release goes into its own `/opt/deepseek-harness/releases/<version>_<time>_<pid>`
 beside the running one, with `/opt/deepseek-harness/current` pointing at the
 active one, so an npm failure changes nothing. Before an installed CT changes,
-the overlay, service env, settings record, keys, unit, `AGENTS.md` and
-profiles (`home/profiles/`) are copied to the root-only
+the overlay, service env, settings record, keys, unit, `AGENTS.md`,
+profiles (`home/profiles/`) and the chat endpoint's files are copied to the root-only
 `/var/lib/deepseek-harness-target/rollback/`. If the router or Honcho check
 fails or the new release rejects the patch (`--dump-config`), the files are
 restored and the service is never restarted. If the new release does not answer
 within 90 seconds of the restart, the previous release and files are restored,
-restarted and health-checked, and the run says whether it runs again. After
+restarted and health-checked, and the run says whether it runs again; the
+chat endpoint runs again only if it ran before the run (it is checked with
+`/healthz` and `/v1/models`, and a failed endpoint rolls back the same way). After
 success, the copies and previous release are deleted. Session logs are not
 snapshotted: a newer DeepSeek may upgrade sessions it opened beyond what an
 older release can read.
@@ -225,9 +308,11 @@ journal, then restore from `/var/lib/deepseek-harness-target/rollback/`:
 back, in order, to `/etc/deepseek-harness/osr.patch.yml`, `service.env`,
 `settings`, `router-api-key`, `honcho-api-key`,
 `/etc/systemd/system/deepseek-harness.service`,
-`/var/lib/deepseek-harness/home/AGENTS.md` and
-`/etc/deepseek-harness/open-terminal-key` (an `absent.<n>` marker means it did
-not exist); `profiles.tar` unpacks into `/var/lib/deepseek-harness/home`. Run
+`/var/lib/deepseek-harness/home/AGENTS.md`,
+`/etc/deepseek-harness/open-terminal-key`, then the chat endpoint's
+`acp.patch.yml`, `api.env`, `api-key`, `/usr/local/lib/deepseek-harness-api.py`
+and its three units in `/etc/systemd/system/` (an `absent.<n>` marker means it
+did not exist); `profiles.tar` unpacks into `/var/lib/deepseek-harness/home`. Run
 `systemctl daemon-reload`, restart, and once healthy remove the directory and
 reconfigure.
 
@@ -241,8 +326,13 @@ layout on its first reconfigure; pass `DSH_MODEL` and the other settings then.
 ```bash
 bash tests/run-tests.sh deepseek-harness-provision   # helpers, plans, guest dry run, unit, configure.test.mjs (Node 20+)
 bash tests/run-tests.sh deepseek-harness-install     # end to end against a fake router and Honcho MCP
+bash tests/run-tests.sh deepseek-harness-openai-proxy  # the chat endpoint against a scripted ACP server
+bash tests/run-tests.sh deepseek-harness-integration   # registration against a mock Open WebUI
 ```
 
 The install suite covers fresh install, unchanged rerun, reconfigure, both
-rollback paths, npm and patch failures, `latest`, Honcho on and off and the
-first layout. Neither needs root or Proxmox.
+rollback paths, npm and patch failures, `latest`, Honcho on and off, the chat
+endpoint on, off and rolled back, and the first layout. The proxy suite runs
+`openai-proxy.py` against itself as a fake ACP server (`--fake-acp`): new,
+continued, regenerated and resumed sessions, streaming, permissions, failures,
+cancellation and limits. None needs root or Proxmox.
