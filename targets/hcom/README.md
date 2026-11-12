@@ -126,7 +126,9 @@ provisioner.
 
 ## Agent integrations
 
-Through an agent's terminal tool, or as root:
+Inside a CT that hcom was installed in, through the agent's terminal tool or as
+root. `osr-bus` is not installed on the Proxmox host; from there, prefix
+`pct exec <CT_ID> --` (for example `pct exec 152 -- osr-bus status`):
 
 ```bash
 osr-bus status

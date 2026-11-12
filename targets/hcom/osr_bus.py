@@ -27,6 +27,14 @@ def request_for(args):
     return {"op": "status"}
 
 
+def not_installed_here():
+    """Where osr-bus works, for someone running it where hcom is not installed."""
+    where = "This is a Proxmox host. " if Path("/etc/pve").is_dir() else ""
+    return ("osr-bus: hcom is not installed here. " + where +
+            "osr-bus runs inside a CT that the hcom provisioner set up; from the "
+            "Proxmox host use: pct exec <CT_ID> -- osr-bus status")
+
+
 def run(request, path):
     """Send one request and print the answer. Returns the exit status."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -35,6 +43,13 @@ def run(request, path):
         except PermissionError:
             print("osr-bus: this account may not use the bus (only root and this CT's agent)", file=sys.stderr)
             return 77
+        except FileNotFoundError:
+            if path == SOCKET and not Path(SETTINGS).exists():
+                print(not_installed_here(), file=sys.stderr)
+                return 69
+            print(f"osr-bus: no bus socket at {path}; start it with: "
+                  "systemctl start osr-hcom-bus.socket", file=sys.stderr)
+            return 69
         except OSError as error:
             print(f"osr-bus: cannot reach the bus at {path} ({error.strerror}); "
                   "is osr-hcom-bus.socket running?", file=sys.stderr)

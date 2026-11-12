@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Configuration, routing, bus socket and delivery semantics. No dependencies or root."""
+import contextlib
 import importlib.util
+import io
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
@@ -260,6 +262,21 @@ class BusTests(unittest.TestCase):
         missing = subprocess.run([sys.executable, str(HERE / "osr_bus.py"), "status"],
                                  env=dict(os.environ, OSR_BUS_SOCKET=path), capture_output=True, text=True)
         self.assertEqual(69, missing.returncode)
+
+    def test_client_says_where_osr_bus_works_when_hcom_is_not_installed(self):
+        saved = client.SOCKET, client.SETTINGS
+        self.addCleanup(lambda: setattr(client, "SOCKET", saved[0]) or setattr(client, "SETTINGS", saved[1]))
+        client.SOCKET, client.SETTINGS = str(self.root / "bus.sock"), str(self.root / "bus.json")
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(69, client.run({"op": "status"}, client.SOCKET))
+        self.assertIn("hcom is not installed here", error.getvalue())
+        self.assertIn("pct exec <CT_ID> -- osr-bus status", error.getvalue())
+        Path(client.SETTINGS).write_text("{}")  # Installed, but the socket unit is down.
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(69, client.run({"op": "status"}, client.SOCKET))
+        self.assertIn("systemctl start osr-hcom-bus.socket", error.getvalue())
 
     # ── Mattermost notifier ─────────────────────────────────────────
 
