@@ -13,8 +13,8 @@ The router gives clients one OpenAI-compatible endpoint for 1–20 configured
 model hosts. It inventories their models and picks a host per request by size,
 capabilities and a load-spreading score. The router CT also runs Open WebUI,
 a LiteLLM fallback and health monitoring. Optional `targets/` LXCs provide model
-servers, Gitea, Mattermost, Honcho memory, the Hermes, OpenClaw and DeepSeek
-Harness agents, Open Terminal and ComfyUI. Standalone MQTT and hcom tool
+servers, Gitea, Mattermost, Honcho memory, the Hermes, OpenClaw, OpenCode and DeepSeek
+Harness agent frameworks, Open Terminal and ComfyUI. Standalone MQTT and hcom tool
 targets coordinate the agent CTs, with optional Mattermost handoffs (§17.7).
 
 GPU workloads stay out of the router CT, configuration lives in a Gitea
