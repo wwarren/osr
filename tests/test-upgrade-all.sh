@@ -174,7 +174,31 @@ case $cmd in
 esac
 exit 0
 MOCK
+# Upstream release lookups: curl serves $MOCK/upstream/<the URL, every
+# character but letters and digits as _>; anything else is an HTTP error.
+# UPSTREAM_DOWN=1 is a network that cannot be reached. The arguments and the
+# headers read from files (@FILE) are logged apart.
+cat > "$tmp/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+url='' headers=''
+for a; do
+    case $a in
+        https://*) url=$a ;;
+        @*) [[ ! -r ${a#@} ]] || headers+=$(cat -- "${a#@}") ;;
+    esac
+done
+printf '%s\n' "$*" >> "$MOCK/curl.log"
+printf '%s\n' "$headers" >> "$MOCK/curl-headers.log"
+[[ -z ${UPSTREAM_DOWN:-} ]] || exit 7
+f=$MOCK/upstream/$(printf '%s' "$url" | tr -c 'A-Za-z0-9' _)
+[[ -f $f ]] || exit 22
+cat -- "$f"
+MOCK
 chmod +x "$tmp/bin/"*
+upstream() {  # upstream URL BODY: what the (fake) upstream serves at URL
+    mkdir -p "$tmp/mock/upstream"
+    printf '%s\n' "$2" > "$tmp/mock/upstream/$(printf '%s' "$1" | tr -c 'A-Za-z0-9' _)"
+}
 
 conf() {  # conf ID TAGS [NODE]: a CT configuration on NODE (pve1, this node)
     rm -f "$tmp"/nodes/*/lxc/"$1".conf
@@ -405,6 +429,16 @@ assert_eq 'nothing when already pinned' '|' "$(pin_result 0.2.1-rc.5)"
 assert_contains 'never downgrades' 'newer than the pin' "$(pin_result 0.3.0)"
 assert_contains 'a final release is newer than its rc' 'newer than the pin' "$(pin_result 0.2.1)"
 assert_contains 'an older rc moves' 'DSH_VERSION=0.2.1-rc.5' "$(pin_result 0.2.1-rc.4)"
+pinned_no_prompt_case() {
+    # shellcheck disable=SC2034  # read by decide_pin
+    INTERACTIVE=true PINNED_ONLY=true DRY_RUN=${1:-false}
+    ask_yes() { echo ASKED; return 1; }
+    add_item deepseek-harness 281
+    decide_pin 0 DSH_VERSION 0.2.0 0.2.1-rc.5
+    echo "${I_INFO[0]}|${I_NOTE[0]}"
+}
+assert_eq '--pinned moves an older CT pin without asking' ' DSH_VERSION=0.2.1-rc.5|0.2.0 -> 0.2.1-rc.5' "$(in_tool pinned_no_prompt_case)"
+assert_eq '--dry-run --pinned plans the pin without a question' ' DSH_VERSION=0.2.1-rc.5|0.2.0 -> 0.2.1-rc.5' "$(in_tool pinned_no_prompt_case true)"
 opencode_pin_case() {
     add_item opencode 284
     decide_pin 0 OPENCODE_VERSION "$1" 2.2.7
@@ -412,6 +446,112 @@ opencode_pin_case() {
 }
 assert_contains 'an older OpenCode pin moves' 'OPENCODE_VERSION=2.2.7' "$(in_tool opencode_pin_case 2.2.5)"
 assert_contains 'OpenCode on latest stays there' 'keeps OPENCODE_VERSION=latest' "$(in_tool opencode_pin_case latest)"
+latest_pin_case() {  # latest_pin_case RECORDED KEEP_PINS: the latest upstream 0.3.0 was chosen
+    # shellcheck disable=SC2034  # read by decide_pin
+    KEEP_PINS=${2:-false}
+    add_item deepseek-harness 281
+    decide_pin 0 DSH_VERSION "$1" 0.2.1-rc.5 0.3.0
+    echo "${I_INFO[0]}|${I_NOTE[0]}"
+}
+assert_eq 'the chosen latest replaces the pin, unasked' ' DSH_VERSION=0.3.0|0.2.1-rc.5 -> 0.3.0 (latest upstream)' "$(in_tool latest_pin_case 0.2.1-rc.5)"
+assert_contains 'and an older pin of your own' 'DSH_VERSION=0.3.0' "$(in_tool latest_pin_case 0.2.0)"
+assert_contains 'but not with --keep-pins' 'keeps DSH_VERSION=0.2.0 (--keep-pins)' "$(in_tool latest_pin_case 0.2.0 true)"
+assert_contains 'a channel stays' 'keeps DSH_VERSION=latest' "$(in_tool latest_pin_case latest)"
+assert_contains 'a newer release stays' 'newer than the latest upstream 0.3.0' "$(in_tool latest_pin_case 0.4.0)"
+assert_eq 'nothing when already there' '|' "$(in_tool latest_pin_case 0.3.0)"
+
+describe 'upstream releases: shown beside the pin, asked, and given to the installer'
+ollama_pin=$(sed -n 's/^readonly OLLAMA_DEFAULT_VERSION=//p' "$ROOT/targets/ollama/install-target.sh")
+strata_pin=$(sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$ROOT/targets/strata/install-target.sh")
+strata_tip=$(printf 'c%.0s' {1..40})
+upstream_fixtures() {
+    upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' \
+        '[{"tag_name": "v99.1.0-rc1", "prerelease": true}, {"tag_name": "v99.0.0"}, {"tag_name": "v9.9.9"}, {"tag_name": "v100.0.0", "draft": true}]'
+    upstream https://api.github.com/repos/Niko1221/Strata/commits/main "$strata_tip"
+}
+reset_mock; upstream_fixtures
+run_tool '' --dry-run
+table=$(sed -n '/==== Upstream releases ====/,/==== Plan ====/p' <<< "$out")
+assert_contains 'Ollama: the pin and the newest release (no pre-release or draft)' "$(printf '%-18s %-24s %s' ollama "$ollama_pin" v99.0.0)" "$table"
+assert_contains 'Strata: the pinned commit and the tip of main' "$(printf '%-18s %-24s %s' strata "${strata_pin:0:12}" "main @ ${strata_tip:0:12}")" "$table"
+assert_not_contains 'a dry run plans the pins' 'latest upstream)' "$(sed -n '/==== Plan ====/,$p' <<< "$out")"
+reset_mock; upstream_fixtures
+run_tool 'l\np\ny\n'
+assert_eq 'asked, then upgraded' 0 "$rc"
+assert_contains 'asks with the pin as the default' "ollama: install the pinned $ollama_pin (p) or the latest upstream v99.0.0 (l)? [P/l]" "$out"
+assert_contains 'the plan shows the choice' 'install-target.sh --upgrade with OLLAMA_VERSION=v99.0.0 (latest upstream)' "$out"
+assert_contains 'and warns it is untested' 'ollama: installing the latest upstream release v99.0.0, which this repository has not tested' "$out"
+assert_file_contains 'the installer gets the latest' 'INSTALL 252 env OLLAMA_VERSION=v99.0.0 bash /root/ollama-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
+assert_eq 'the pinned one gets nothing' '' "$(grep '^INSTALL 251' "$tmp/mock/installs.log" | grep STRATA_COMMIT)"
+reset_mock; upstream_fixtures
+run_tool '' --yes
+assert_eq 'unattended: the pins, unasked' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
+assert_not_contains 'and no question' '[P/l]' "$out"
+reset_mock; upstream_fixtures
+run_tool '' --yes --latest strata
+assert_file_contains '--latest names one' "INSTALL 251 env STRATA_COMMIT=$strata_tip bash" "$tmp/mock/installs.log"
+assert_eq 'and only that one' '' "$(grep OLLAMA_VERSION "$tmp/mock/installs.log")"
+reset_mock; upstream_fixtures
+run_tool '' --dry-run --latest all
+assert_contains '--latest all' 'with OLLAMA_VERSION=v99.0.0 (latest upstream)' "$out"
+assert_contains 'every one' "with STRATA_COMMIT=$strata_tip (latest upstream)" "$out"
+reset_mock; upstream_fixtures
+run_tool 'y\n' --pinned
+assert_eq '--pinned: no question either' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
+assert_not_contains '--pinned asks nothing' '[P/l]' "$out"
+reset_mock
+upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
+run_tool 'y\n' --only ollama
+assert_contains 'a current pin is said so' '(the pin is current)' "$out"
+assert_not_contains 'and not asked about' '[P/l]' "$out"
+assert_eq 'ollama upgraded on its pin' upgraded "$(summary_line ollama 252)"
+reset_mock
+export UPSTREAM_DOWN=1
+run_tool '' --dry-run
+unset UPSTREAM_DOWN
+assert_contains 'no network: said so' 'unknown: upstream not reachable' "$out"
+assert_eq 'and asked only once' 1 "$(wc -l < "$tmp/mock/curl.log")"
+assert_contains 'the plan goes on with the pins' 'install-target.sh --upgrade' "$out"
+reset_mock; upstream_fixtures
+export GITHUB_TOKEN=ghp_testtoken0123456789
+run_tool '' --dry-run
+unset GITHUB_TOKEN
+assert_not_contains 'GITHUB_TOKEN never on curl'"'"'s command line' ghp_testtoken "$(cat "$tmp/mock/curl.log")"
+assert_file_contains 'but in a header file' 'Authorization: Bearer ghp_testtoken0123456789' "$tmp/mock/curl-headers.log"
+# A commit the installer checks: the tag's, looked up with it.
+reset_mock
+conf 157 'ai;osr-target;comfyui'; state 157 comfyui
+comfy_commit=$(printf 'd%.0s' {1..40})
+upstream 'https://api.github.com/repos/Comfy-Org/ComfyUI/releases?per_page=50' '[{"tag_name": "v0.50.0"}]'
+run_tool '' --yes --only comfyui --latest comfyui
+assert_contains 'no commit, nothing offered' 'unknown: the lookup failed' "$out"
+assert_eq 'so the pin is installed' '' "$(grep COMFYUI_ "$tmp/mock/installs.log")"
+upstream https://api.github.com/repos/Comfy-Org/ComfyUI/commits/v0.50.0 "$comfy_commit"
+run_tool '' --yes --only comfyui --latest comfyui
+assert_file_contains 'ComfyUI gets the tag and its commit' "INSTALL 157 env COMFYUI_VERSION=v0.50.0 COMFYUI_COMMIT=$comfy_commit bash" "$tmp/mock/installs.log"
+# Open WebUI, Honcho, DeepSeek Harness and OpenCode: the chosen release replaces the pin.
+reset_mock
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router open-webui
+echo 0.11.0 > "$tmp/mock/280.webui"; echo 0.11.0 > "$tmp/mock/280.ctpin"
+upstream https://pypi.org/pypi/open-webui/json '{"info": {"version": "0.99.1"}}'
+run_tool '' --dry-run --skip router --latest open-webui
+assert_contains 'Open WebUI moves to the latest' 'set-webui-version 0.99.1 --apply' "$out"
+upstream https://registry.npmjs.org/-/package/@opencode%2Fcli/dist-tags '{"latest": "9.0.0"}'
+conf 284 'ai;ai-tools;osr-target;opencode'; state 284 opencode
+run_tool '' --dry-run --only opencode --latest opencode
+assert_contains 'npm: the scoped package'"'"'s latest tag' 'OPENCODE_VERSION=9.0.0 targets/opencode/provision-lxc.sh --reconfigure' "$out"
+# Hermes: no pin here; the choice is hermes update.
+reset_mock
+conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
+run_tool '' --dry-run --only hermes
+assert_contains 'Hermes is listed' 'hermes update (never past a HERMES_COMMIT pin)' "$out"
+assert_contains 'and stays by default' 'Hermes itself stays at its installed version' "$out"
+run_tool '' --dry-run --only hermes --latest hermes
+assert_contains '--latest hermes is --update-hermes' 'then hermes update and a restart' "$out"
+# Components with no pin here are shown, not asked about.
+conf 286 'ai;ai-tools;osr-target;openclaw'; state 286 openclaw-gateway
+run_tool '' --dry-run --only openclaw
+assert_contains 'OpenClaw follows npm latest' 'follows npm latest (openclaw)' "$out"
 
 describe 'router configuration is pushed only after a good router step'
 reset_mock
@@ -518,6 +658,13 @@ assert_contains 'a dry run with a terminal says it will ask' 'asks for the Open 
 assert_not_contains 'and does not ask' 'admin API key or session JWT' "$out"
 
 describe 'unattended runs ask for the token at the start'
+token_needed_case() {
+    add_item deepseek-harness 286
+    ct_running() { return 0; }
+    needs_webui_token() { return 0; }
+    if token_needed; then echo needed; else echo omitted; fi
+}
+assert_eq 'DeepSeek Harness is included in the upfront token request' needed "$(in_tool token_needed_case)"
 # token_case TTY_LINES...: ask_token_unattended for router 280 and Hermes 282
 # with an Open WebUI connection; prints the token it kept and whether it is
 # exported.
@@ -927,6 +1074,9 @@ assert_status 'unknown option' 2 env PATH="$tmp/bin:$PATH" bash "$TOOL" --bogus
 assert_status 'bad --on-failure' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --on-failure maybe
 assert_status 'snapshot options conflict' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --no-snapshot --require-snapshot
 assert_status 'empty --only is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --only=
+assert_status '--pinned with --latest is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --pinned --latest all
+assert_status '--latest with an unknown component is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --latest gitea --list
+assert_status 'empty --latest is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --latest=
 assert_status 'empty --node is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --node=
 assert_status 'unknown --node is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --node=pve9 --list
 assert_status 'unknown --only is refused' 1 env PATH="$tmp/bin:$PATH" "${CLUSTER_ENV[@]}" bash "$TOOL" --only=unknown --list

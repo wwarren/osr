@@ -70,7 +70,8 @@ PERMISSION_REJECTED = ("This chat runs without a person to approve actions, so t
                        "Continue without this action.")
 QUESTION_CANCELLED = ("This chat cannot ask the user questions, so the question was cancelled. Continue "
                       "without an answer; make reasonable assumptions and state them.")
-KEEPALIVE_SECONDS = 15
+KEEPALIVE_SECONDS = 2
+EVENT_READ_TIMEOUT_SECONDS = 45
 STATE_LIMIT = 5000
 
 
@@ -282,7 +283,7 @@ class Upstream:
         """An open /api/event subscription: (connection, line reader)."""
         query = urllib.parse.urlencode([("types", t) for t in EVENT_TYPES])
         conn = http.client.HTTPConnection(self.config.upstream_host, self.config.upstream_port,
-                                          timeout=KEEPALIVE_SECONDS * 3)
+                                          timeout=EVENT_READ_TIMEOUT_SECONDS)
         try:
             conn.request("GET", f"/api/event?{query}",
                          headers={"Authorization": self.auth, "Accept": "text/event-stream"})

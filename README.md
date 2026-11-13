@@ -761,6 +761,30 @@ without quorum usually has a read-only cluster filesystem. The wrapper also
 works directly, for example
 `bash tools/pct-cluster.sh exec 205 -- uptime` on any node.
 
+**Pinned or latest upstream.** Before the plan the run lists, for each component
+it will upgrade that comes from a public repository, the release pinned here
+(tested with this repository) and the newest upstream release, looked up on
+GitHub, PyPI or npm (`GITHUB_TOKEN` raises GitHub's rate limit; it goes in a
+header file, never on a command line):
+
+| Component | Pin | Latest upstream | Given to its installer |
+|---|---|---|---|
+| Open WebUI | `services/open-webui/requirements.txt` | PyPI `open-webui` | `set-webui-version` |
+| Ollama, llama.cpp, Honcho | the installer's (provisioner's) default | highest `vX.Y.Z` GitHub release, no pre-releases | `OLLAMA_VERSION`, `LLAMA_CPP_REF`, `HONCHO_REF` |
+| ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT` |
+| Strata, Xolotl, Avalon, Kindi | the tested commit | the tip of `main` | `*_COMMIT` |
+| DeepSeek Harness, OpenCode | the provisioner's default | npm `latest` tag | `DSH_VERSION`, `OPENCODE_VERSION` |
+| Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
+
+Where the upstream release is newer (or a different commit), a run on a
+terminal asks `[P/l]` for each; the pin is the default and the answer for
+`--yes`. `--latest ollama,comfyui` (or `all`) takes the latest without asking,
+and `--pinned` takes every pin. The latest is untested here, and a commit the
+installer checks is the one upstream names at that moment, not a reviewed one;
+the snapshot and checks still cover it. An unreachable upstream is reported
+and the pins are used. Basalt, Maya, OpenClaw, Gitea and Mattermost follow
+upstream with no pin here; they are listed, not asked about.
+
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`, `OPENCODE_VERSION`) is offered the
 repository's pin in an interactive run; `--yes` accepts it and `--keep-pins`
 preserves it. A `HERMES_COMMIT` pin is always kept. `latest`, `main` and releases newer than the repository's pin

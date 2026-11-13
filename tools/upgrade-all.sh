@@ -67,6 +67,14 @@ settings) is upgraded and Hermes stays at its installed version unless
 --update-hermes is given (never past a HERMES_COMMIT pin).
 Stopped CTs are left alone unless --include-stopped.
 
+Before the plan it lists, for every component it will upgrade that comes from
+a public repository, the release pinned here (tested with this repository)
+and the newest upstream release (looked up on GitHub, PyPI or npm). Where the
+upstream one is newer, a run on a terminal asks which to install; the pin is
+the default, and the answer for --yes. A commit the installer must check
+(ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
+names at that moment, not one reviewed here.
+
 Everything runs from this node. CTs on other nodes are reached as root over
 SSH, the way Proxmox reaches its nodes (pvecm sets up the keys), through
 tools/pct-cluster.sh. A node that is offline or does not answer is reported,
@@ -96,6 +104,10 @@ Options:
   --update-hermes       also run `hermes update` in each Hermes CT (not one
                         pinned with HERMES_COMMIT) and restart its gateway and
                         dashboard; checked and rolled back like the rest
+  --latest LIST         install the latest upstream release instead of the pin
+                        for these components (comma-separated, or all) without
+                        asking; hermes here means --update-hermes
+  --pinned              install the pinned releases without asking
   --include-stopped     start stopped CTs, upgrade them, then stop them again
   --no-snapshot         take no Proxmox snapshots
   --require-snapshot    skip a CT that cannot be snapshotted
@@ -111,7 +123,8 @@ OPENWEBUI_ADMIN_TOKEN (otherwise asked once, and checked against Open WebUI,
 when Honcho, or Hermes or OpenClaw with an Open WebUI connection, will be
 reconfigured: with --yes or without stdin at the start of the run, on the
 terminal; with no terminal at all, as under cron, those are not run without
-it), HCOM_EXTRA_CTS (untagged CTs to check for hcom).
+it), HCOM_EXTRA_CTS (untagged CTs to check for hcom), GITHUB_TOKEN (optional,
+for GitHub's API rate limit when looking up upstream releases).
 Logs: /var/log/osr-upgrade/<time>/, one file per component plus summary.txt.
 USAGE
 }
@@ -385,6 +398,9 @@ ct_identity() {
 # --- Discovery -----------------------------------------------------------------------
 
 I_TARGET=() I_CT=() I_INFO=() I_RESULT=() I_NOTE=()
+# I_ENV: KEY=VALUE words for an item's installer (an upstream release chosen
+# instead of the pin), set after discovery has ordered the items.
+I_ENV=()
 ROUTER_CT=''
 add_item() {
     I_TARGET+=("$1"); I_CT+=("$2"); I_INFO+=("${3:-}"); I_RESULT+=(''); I_NOTE+=('')
@@ -808,6 +824,10 @@ run_guest() {  # run_guest ITEM MODE
         port=$(pct exec "$id" -- sed -n 's/^OPEN_TERMINAL_PORT=//p' /etc/open-terminal/service.env 2>/dev/null | tail -n 1)
         [[ -z $port ]] || envs+=("OPEN_TERMINAL_PORT=$port")
     fi
+    # The latest upstream release, when it was chosen instead of the pin.
+    local -a release=()
+    read -r -a release <<< "${I_ENV[$i]:-}"
+    envs+=(${release[@]+"${release[@]}"})
     if [[ $(child_mode "$2") == interactive ]]; then
         # On another node the installer gets a terminal only when asked for.
         OSR_PCT_TTY=1 pct exec "$id" -- env "${envs[@]}" bash "$dir/install-target.sh" "${args[@]}"
@@ -980,8 +1000,9 @@ describe_item() {  # what run_item does, for the plan
                 *) echo 'nothing to do' ;;
             esac ;;
         guest)
-            if [[ $t == open-terminal ]]; then echo "push files to /root/${GUEST_DIR[$t]}; rerun install-target.sh with its port"
-            else echo "push files to /root/${GUEST_DIR[$t]}; install-target.sh --upgrade"; fi ;;
+            if [[ $t == open-terminal ]]; then echo -n "push files to /root/${GUEST_DIR[$t]}; rerun install-target.sh with its port"
+            else echo -n "push files to /root/${GUEST_DIR[$t]}; install-target.sh --upgrade"; fi
+            if [[ -n ${I_ENV[$i]:-} ]]; then echo " with ${I_ENV[$i]} (latest upstream)"; else echo; fi ;;
         reconfigure)
             if unpinned_service "$t"; then
                 echo "targets/$t/provision-lxc.sh --reconfigure (re-applies its setup; this repository does not pin the $t release, so it stays as it is)"
@@ -1037,11 +1058,267 @@ version_newer() {
     [[ $(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n 1) == "$a" ]]
 }
 
-# decide_pin ITEM KEY RECORDED DEFAULT: a release the user pinned moves to the
-# repository's pin when they agree; a moving channel (latest, main) and a
-# release newer than the pin are kept.
+# --- Upstream releases ---------------------------------------------------------------
+
+# Components installed from a public repository at a release this repository
+# pins (the one tested here). The run shows each pin beside the newest upstream
+# release and asks which to install; --pinned and --latest answer instead.
+# Kinds: pypi NAME; gh-release OWNER/REPO (the highest vX.Y.Z release that is
+# not a pre-release, else the newest release); gh-tag-commit OWNER/REPO (that,
+# and the commit its tag names, which the installer checks); gh-branch
+# OWNER/REPO BRANCH (the branch's tip commit); npm PACKAGE (its latest tag).
+declare -A UPSTREAM=(
+    [open-webui]='pypi open-webui'
+    [ollama]='gh-release ollama/ollama'
+    [llamacpp]='gh-release ggml-org/llama.cpp'
+    [comfyui]='gh-tag-commit Comfy-Org/ComfyUI'
+    [open-terminal]='gh-tag-commit open-webui/open-terminal'
+    [strata]='gh-branch Niko1221/Strata main'
+    [xolotl]='gh-branch Indras-Mirror/Xolotl main'
+    [avalon]='gh-branch freriadoc/Avalon main'
+    [kindi]='gh-branch ahtx/kindi main'
+    [honcho]='gh-release plastic-labs/honcho'
+    [deepseek-harness]='npm @deepseek-ai/dsh'
+    [opencode]='npm @opencode/cli'
+)
+# Components that pull from a public repository with no pin here: shown, not asked.
+declare -A UPSTREAM_UNPINNED=(
+    [basalt]='follows the tip of main (github.com/jesdga95/basalt)'
+    [maya]='follows its newest vX.Y.Z tag (github.com/mw00/project-maya)'
+    [openclaw]='follows npm latest (openclaw)'
+    [gitea]="the community script's newest at install; kept on upgrade"
+    [mattermost]="the community script's newest at install; kept on upgrade"
+)
+GITHUB_API=https://api.github.com
+UPSTREAM_OFFLINE=false
+UPSTREAM_BODY=''
+declare -A REL_PINNED=() REL_LATEST=() REL_COMMIT=() REL_CHOICE=()
+
+# pinned_release TARGET: the release (or commit) this repository installs.
+pinned_release() {
+    local f=$REPO_ROOT/targets/$1/install-target.sh
+    case $1 in
+        open-webui) sed -n 's/^open-webui==//p' "$REPO_ROOT/services/open-webui/requirements.txt" ;;
+        ollama) sed -n 's/^readonly OLLAMA_DEFAULT_VERSION=//p' "$f" ;;
+        llamacpp) sed -n 's/^readonly LLAMA_CPP_DEFAULT_REF=//p' "$f" ;;
+        comfyui) sed -n 's/^readonly COMFYUI_DEFAULT_VERSION=//p' "$f" ;;
+        open-terminal) sed -n 's/^DEFAULT_VERSION=//p' "$f" ;;
+        strata) sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$f" ;;
+        xolotl|avalon|kindi) cat -- "$REPO_ROOT/targets/$1/upstream-commit.txt" ;;
+        honcho|opencode) repo_default "$1" ;;
+        deepseek-harness) repo_default dsh ;;
+    esac 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+# upstream_get URL [ACCEPT]: the body in UPSTREAM_BODY, over HTTPS only. GitHub
+# API calls carry GITHUB_TOKEN when it is set, from a header file (never the
+# command line). An unreachable upstream (DNS, route, timeout, TLS) sets
+# UPSTREAM_OFFLINE, and later lookups are skipped.
+upstream_get() {
+    local url=$1 accept=${2:-application/json} rc=0
+    UPSTREAM_BODY=''
+    $UPSTREAM_OFFLINE && return 1
+    if [[ $url == "$GITHUB_API"/* && -n ${GITHUB_TOKEN:-} ]]; then
+        UPSTREAM_BODY=$(curl -fsSL --proto '=https' --connect-timeout 5 --max-time 20 -H "Accept: $accept" \
+            -H @<(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN") "$url" 2>/dev/null) || rc=$?
+    else
+        UPSTREAM_BODY=$(curl -fsSL --proto '=https' --connect-timeout 5 --max-time 20 -H "Accept: $accept" "$url" 2>/dev/null) || rc=$?
+    fi
+    case $rc in
+        0) return 0 ;;
+        6|7|28|35) UPSTREAM_OFFLINE=true ;;
+    esac
+    UPSTREAM_BODY=''
+    return 1
+}
+
+# latest_release TARGET: the newest upstream release (REL_LATEST) and, for
+# commit-checked kinds, its commit (REL_COMMIT). Fails when it cannot tell.
+latest_release() {
+    local t=$1 kind repo ref v='' c=''
+    read -r kind repo ref <<< "${UPSTREAM[$t]}"
+    case $kind in
+        pypi)
+            upstream_get "https://pypi.org/pypi/$repo/json" &&
+                v=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' <<< "$UPSTREAM_BODY" 2>/dev/null) ;;
+        npm)
+            upstream_get "https://registry.npmjs.org/-/package/${repo/\//%2F}/dist-tags" &&
+                v=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("latest", ""))' <<< "$UPSTREAM_BODY" 2>/dev/null) ;;
+        gh-release|gh-tag-commit)
+            upstream_get "$GITHUB_API/repos/$repo/releases?per_page=50" &&
+                v=$(python3 -c '
+import json, re, sys
+rel = [r for r in json.load(sys.stdin) if not r.get("draft") and not r.get("prerelease")]
+sem = [r["tag_name"] for r in rel if re.fullmatch(r"v?\d+\.\d+\.\d+", r["tag_name"])]
+key = lambda tag: tuple(int(x) for x in tag.lstrip("v").split("."))
+print(max(sem, key=key) if sem else (rel[0]["tag_name"] if rel else ""))' <<< "$UPSTREAM_BODY" 2>/dev/null) ;;
+        gh-branch) v=$ref ;;
+    esac
+    [[ $v =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || return 1
+    case $kind in
+        gh-tag-commit|gh-branch)
+            upstream_get "$GITHUB_API/repos/$repo/commits/$v" application/vnd.github.sha || return 1
+            c=$(tr -d '[:space:]' <<< "$UPSTREAM_BODY")
+            [[ $c =~ ^[0-9a-f]{40}$ ]] || return 1 ;;
+    esac
+    REL_LATEST[$t]=$v
+    REL_COMMIT[$t]=$c
+}
+
+pinned_label() {
+    local p=${REL_PINNED[$1]:-}
+    if [[ $p =~ ^[0-9a-f]{40}$ ]]; then echo "${p:0:12}"; else echo "${p:-?}"; fi
+}
+latest_label() {
+    case ${UPSTREAM[$1]%% *} in
+        gh-branch) echo "${REL_LATEST[$1]} @ ${REL_COMMIT[$1]:0:12}" ;;
+        gh-tag-commit) echo "${REL_LATEST[$1]} (${REL_COMMIT[$1]:0:12})" ;;
+        *) echo "${REL_LATEST[$1]}" ;;
+    esac
+}
+
+# release_offered TARGET: is the upstream release one to offer instead of the
+# pin (a different commit; a newer version, or one that cannot be compared)?
+release_offered() {
+    local t=$1 pinned=${REL_PINNED[$1]:-} latest=${REL_LATEST[$1]:-}
+    [[ -n $pinned && -n $latest ]] || return 1
+    if [[ ${UPSTREAM[$t]%% *} == gh-branch ]]; then
+        [[ ${REL_COMMIT[$t]} != "$pinned" ]]
+        return
+    fi
+    [[ ${latest#v} != "${pinned#v}" ]] || return 1
+    version_newer "$latest" "$pinned" && return 0
+    version_newer "$pinned" "$latest" && return 1
+    return 0
+}
+
+# in_release_list TARGET LIST: does --latest name TARGET (or all)?
+in_release_list() {
+    local word
+    for word in ${2//,/ }; do [[ $word == all || $word == "$1" ]] && return 0; done
+    return 1
+}
+
+ask_release() {  # ask_release TEXT: 0 for the latest, 1 for the pin (the default)
+    while true; do
+        ask "$1 [P/l] " p
+        case ${REPLY,,} in
+            p|pin|pinned) return 1 ;;
+            l|latest) return 0 ;;
+        esac
+    done
+}
+
+# choose_release TARGET: REL_CHOICE pinned or latest (for Hermes: whether to
+# run hermes update). Asked only on a terminal, and only when there is a newer
+# upstream release; --latest and --pinned answer instead.
+choose_release() {
+    local t=$1
+    if [[ $t == hermes ]]; then
+        $UPDATE_HERMES && return 0
+        if in_release_list hermes "$LATEST"; then UPDATE_HERMES=true; return 0; fi
+        if $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then return 0; fi
+        if ask_release 'hermes: keep Hermes itself at its installed commit (p) or update it with hermes update (l)?'; then
+            UPDATE_HERMES=true
+        fi
+        return 0
+    fi
+    REL_CHOICE[$t]=pinned
+    [[ -n ${UPSTREAM[$t]:-} ]] && release_offered "$t" || return 0
+    if in_release_list "$t" "$LATEST"; then
+        REL_CHOICE[$t]=latest
+    elif $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then
+        return 0
+    elif ask_release "$t: install the pinned $(pinned_label "$t") (p) or the latest upstream $(latest_label "$t") (l)?"; then
+        REL_CHOICE[$t]=latest
+    fi
+    [[ ${REL_CHOICE[$t]} == pinned ]] ||
+        note "$t: installing the latest upstream release $(latest_label "$t"), which this repository has not tested."
+}
+
+# release_pick TARGET: the upstream release chosen instead of the pin, or nothing.
+release_pick() { [[ ${REL_CHOICE[$1]:-} == latest ]] && printf '%s\n' "${REL_LATEST[$1]}"; }
+
+# decide_releases: show the pinned and the latest upstream release of every
+# component to upgrade that comes from a public repository, ask which to
+# install, and give the installers of the ones moving to the latest its version.
+decide_releases() {
+    local i t latest offered=false
+    local -a targets=()
+    local -A seen=()
+    for i in "${!I_TARGET[@]}"; do
+        [[ -z ${I_RESULT[$i]} ]] || continue
+        t=${I_TARGET[$i]}
+        [[ -n ${UPSTREAM[$t]:-} || -n ${UPSTREAM_UNPINNED[$t]:-} || $t == hermes ]] || continue
+        $INCLUDE_STOPPED || ct_running "${I_CT[$i]}" || continue
+        [[ -z ${seen[$t]:-} ]] || continue
+        seen[$t]=1
+        targets+=("$t")
+    done
+    (( ${#targets[@]} )) || return 0
+    section 'Upstream releases'
+    note 'Pinned: tested with this repository. Latest: the newest upstream release, not tested here.'
+    printf '%-18s %-24s %s\n' COMPONENT PINNED 'LATEST UPSTREAM' >&2
+    for t in "${targets[@]}"; do
+        if [[ -n ${UPSTREAM[$t]:-} ]]; then
+            REL_PINNED[$t]=$(pinned_release "$t")
+            if latest_release "$t"; then
+                latest=$(latest_label "$t")
+                if release_offered "$t"; then offered=true; else latest+=' (the pin is current)'; fi
+            elif $UPSTREAM_OFFLINE; then
+                latest='unknown: upstream not reachable'
+            else
+                latest='unknown: the lookup failed'
+            fi
+            printf '%-18s %-24s %s\n' "$t" "$(pinned_label "$t")" "$latest" >&2
+        elif [[ $t == hermes ]]; then
+            offered=true
+            printf '%-18s %-24s %s\n' hermes 'none: installed commit' 'hermes update (never past a HERMES_COMMIT pin)' >&2
+        else
+            printf '%-18s %-24s %s\n' "$t" '-' "${UPSTREAM_UNPINNED[$t]}" >&2
+        fi
+    done
+    if $offered && $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY; then
+        note 'Without --dry-run, a run asks for each component with a newer upstream release (pinned is the default); this plan uses the pins.'
+    fi
+    for t in "${targets[@]}"; do choose_release "$t"; done
+    for i in "${!I_TARGET[@]}"; do
+        t=${I_TARGET[$i]}
+        [[ -z ${I_RESULT[$i]} && ${REL_CHOICE[$t]:-} == latest ]] || continue
+        case $t in
+            ollama) I_ENV[i]="OLLAMA_VERSION=${REL_LATEST[$t]}" ;;
+            llamacpp) I_ENV[i]="LLAMA_CPP_REF=${REL_LATEST[$t]}" ;;
+            comfyui) I_ENV[i]="COMFYUI_VERSION=${REL_LATEST[$t]} COMFYUI_COMMIT=${REL_COMMIT[$t]}" ;;
+            open-terminal) I_ENV[i]="OPEN_TERMINAL_VERSION=${REL_LATEST[$t]} OPEN_TERMINAL_COMMIT=${REL_COMMIT[$t]}" ;;
+            strata) I_ENV[i]="STRATA_COMMIT=${REL_COMMIT[$t]}" ;;
+            xolotl) I_ENV[i]="XOLOTL_COMMIT=${REL_COMMIT[$t]}" ;;
+            avalon) I_ENV[i]="AVALON_COMMIT=${REL_COMMIT[$t]}" ;;
+            kindi) I_ENV[i]="KINDI_COMMIT=${REL_COMMIT[$t]}" ;;
+        esac
+    done
+}
+
+# decide_pin ITEM KEY RECORDED DEFAULT [LATEST]: a release the user pinned moves
+# to the repository's pin when they agree; a moving channel (latest, main) and
+# a release newer than the pin are kept. LATEST, the upstream release chosen
+# for this run, replaces the pin and needs no second question.
 decide_pin() {
-    local i=$1 key=$2 recorded=$3 default=$4
+    local i=$1 key=$2 recorded=$3 default=$4 latest=${5:-}
+    if [[ -n $latest ]]; then
+        if [[ $recorded == "$latest" ]]; then
+            return 0
+        elif [[ $recorded == latest || $recorded == main ]]; then
+            I_NOTE[i]="keeps $key=$recorded"
+        elif [[ -n $recorded ]] && version_newer "$recorded" "$latest"; then
+            I_NOTE[i]="keeps $key=$recorded (newer than the latest upstream $latest)"
+        elif $KEEP_PINS && [[ -n $recorded && $recorded != "$default" ]]; then
+            I_NOTE[i]="keeps $key=$recorded (--keep-pins)"
+        else
+            I_INFO[i]+=" $key=$latest"
+            I_NOTE[i]="${recorded:-?} -> $latest (latest upstream)"
+        fi
+        return 0
+    fi
     [[ -n $recorded && -n $default && $recorded != "$default" ]] || return 0
     if [[ $recorded == latest || $recorded == main ]] || $KEEP_PINS; then
         I_NOTE[i]="keeps $key=$recorded"
@@ -1051,11 +1328,11 @@ decide_pin() {
         I_NOTE[i]="keeps $key=$recorded (newer than the pin $default)"
         return 0
     fi
-    if $DRY_RUN; then
+    if $DRY_RUN && ! $PINNED_ONLY; then
         I_NOTE[i]="asks whether to move $key=$recorded to $default"
         return 0
     fi
-    if $INTERACTIVE && ! ask_yes "$(item_label "$i") records $key=$recorded; this repository pins $default. Move it to $default?" y; then
+    if $INTERACTIVE && ! $PINNED_ONLY && ! ask_yes "$(item_label "$i") records $key=$recorded; this repository pins $default. Move it to $default?" y; then
         I_NOTE[i]="keeps $key=$recorded"
         return 0
     fi
@@ -1065,7 +1342,8 @@ decide_pin() {
 
 decide_webui() {
     local i=$1 id=${I_CT[$1]} pin installed ct_pin
-    pin=$(sed -n 's/^open-webui==//p' "$REPO_ROOT/services/open-webui/requirements.txt" | head -n 1)
+    pin=$(release_pick open-webui)
+    [[ -n $pin ]] || pin=$(sed -n 's/^open-webui==//p' "$REPO_ROOT/services/open-webui/requirements.txt" | head -n 1)
     installed=$(pct exec "$id" -- /app/openwebui/venv/bin/python -c \
         'import importlib.metadata as m; print(m.version("open-webui"))' 2>/dev/null | tr -d '\r')
     ct_pin=$(pct exec "$id" -- sed -n 's/^open-webui==//p' /app/config-repo/services/open-webui/requirements.txt 2>/dev/null | head -n 1)
@@ -1110,13 +1388,13 @@ prepare() {
             open-webui) decide_webui "$i" ;;
             deepseek-harness)
                 recorded=$(pct exec "$id" -- sed -n 's/^DSH_VERSION=//p' /etc/deepseek-harness/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
-                decide_pin "$i" DSH_VERSION "$recorded" "$(repo_default dsh)" ;;
+                decide_pin "$i" DSH_VERSION "$recorded" "$(repo_default dsh)" "$(release_pick deepseek-harness)" ;;
             opencode)
                 recorded=$(pct exec "$id" -- sed -n 's/^OPENCODE_VERSION=//p' /etc/opencode-target/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
-                decide_pin "$i" OPENCODE_VERSION "$recorded" "$(repo_default opencode)" ;;
+                decide_pin "$i" OPENCODE_VERSION "$recorded" "$(repo_default opencode)" "$(release_pick opencode)" ;;
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
-                decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" ;;
+                decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" "$(release_pick honcho)" ;;
             hermes)
                 # Its reconfigure keeps the pin; --update-hermes must not move past it.
                 recorded=$(hermes_recorded_pin "$id")
@@ -1147,8 +1425,8 @@ prepare() {
 
 # --- The Open WebUI admin token --------------------------------------------------------
 
-# Honcho, and Hermes and OpenClaw with an Open WebUI connection, register with
-# Open WebUI again when they are reconfigured, which needs an admin token.
+# Honcho, and agents with an Open WebUI connection, register with Open WebUI
+# again when they are reconfigured, which needs an admin token.
 # It is asked once and kept in OPENWEBUI_ADMIN_TOKEN for the whole run, as an
 # unexported variable: it is never written to disk or put on a command line,
 # and only those provisioners get it (run_reconfigure exports it in their own
@@ -1170,7 +1448,7 @@ check_webui_token() {
 token_needed() {
     local i
     for i in "${!I_TARGET[@]}"; do
-        case ${I_TARGET[$i]} in honcho|hermes|openclaw|opencode) ;; *) continue ;; esac
+        case ${I_TARGET[$i]} in honcho|hermes|openclaw|deepseek-harness|opencode) ;; *) continue ;; esac
         [[ -z ${I_RESULT[$i]} ]] && ct_running "${I_CT[$i]}" && needs_webui_token "$i" && return 0
     done
     return 1
@@ -1191,8 +1469,8 @@ token_tty() {
 read_token() {
     local fd=$1 enter=$2 token tries=0
     note ''
-    note 'Honcho, and Hermes and OpenClaw with an Open WebUI connection, register with'
-    note 'Open WebUI again when they are reconfigured, which needs an admin token.'
+    note 'Honcho, and agents with an Open WebUI connection, register with Open WebUI'
+    note 'again when they are reconfigured, which needs an admin token.'
     while (( tries < 3 )); do
         printf 'Open WebUI admin API key or session JWT (not shown; Enter: %s): ' "$enter" >&2
         IFS= read -rs -u "$fd" token || token=''
@@ -1524,6 +1802,7 @@ cleanup() {
 
 main() {
     DRY_RUN=false LIST_ONLY=false ASSUME_YES=false ON_FAILURE='' KEEP_PINS=false INCLUDE_STOPPED=false UPDATE_HERMES=false
+    PINNED_ONLY=false LATEST=''
     SNAPSHOTS=true REQUIRE_SNAPSHOT=false KEEP_SNAPSHOTS=false NOTIFY=true ONLY='' SKIP='' NODES='' WEBUI_TOKEN=''
     HCOM_MQTT_CT='' HCOM_MATTERMOST_CT=''
     while (( $# )); do
@@ -1541,6 +1820,9 @@ main() {
             --on-failure=*) ON_FAILURE=${1#*=} ;;
             --keep-pins) KEEP_PINS=true ;;
             --update-hermes) UPDATE_HERMES=true ;;
+            --pinned) PINNED_ONLY=true ;;
+            --latest) [[ -n ${2:-} ]] || die '--latest needs components (or all).'; LATEST=$2; shift ;;
+            --latest=*) LATEST=${1#*=}; [[ -n $LATEST ]] || die '--latest needs components (or all).' ;;
             --include-stopped) INCLUDE_STOPPED=true ;;
             --no-snapshot) SNAPSHOTS=false ;;
             --require-snapshot) REQUIRE_SNAPSHOT=true ;;
@@ -1560,6 +1842,12 @@ main() {
     [[ $HEALTH_TIMEOUT =~ ^[0-9]+$ ]] || die '--health-timeout takes a number of seconds.'
     case $ON_FAILURE in ''|ask|rollback|skip|abort) ;; *) die '--on-failure must be ask, rollback, skip or abort.' ;; esac
     if $REQUIRE_SNAPSHOT && ! $SNAPSHOTS; then die 'Use only one of --no-snapshot and --require-snapshot.'; fi
+    if $PINNED_ONLY && [[ -n $LATEST ]]; then die 'Use only one of --pinned and --latest.'; fi
+    local word
+    for word in ${LATEST//,/ }; do
+        [[ $word == all || $word == hermes || -n ${UPSTREAM[$word]:-} ]] ||
+            die "--latest: $word has no pinned upstream release here (choose from: all hermes $(printf '%s\n' "${!UPSTREAM[@]}" | csort | tr '\n' ' '))."
+    done
 
     [[ $(id -u) -eq 0 ]] || die 'Run as root on a Proxmox node.'
     local command_name i
@@ -1612,6 +1900,7 @@ main() {
     (( ${#I_TARGET[@]} )) || die 'Nothing to upgrade: no router or target CTs found in the cluster.'
     check_nodes
     ask_token_unattended
+    decide_releases
     prepare
     section 'Plan'
     print_plan
