@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fixture variables are consumed by dynamically extracted helpers.
 # shellcheck disable=SC2034
-# Unit tests for the functions in ollama-smart-router-install.sh
+# Unit tests for the functions in open-smart-router-install.sh
 #
 # Functions are extracted (heredoc-aware) and sourced in isolation, so no
 # container is created and no Proxmox host is required.
@@ -11,7 +11,7 @@
 exec </dev/null
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="${1:-${HERE}/../ollama-smart-router-install.sh}"
+SCRIPT="${1:-${HERE}/../open-smart-router-install.sh}"
 # shellcheck source=lib/assert.sh
 source "${HERE}/lib/assert.sh"
 # shellcheck source=lib/mocks.sh
@@ -37,7 +37,7 @@ GITEA_VERIFY_TLS=false
 GITEA_SERVER_URL="https://git.example.net"
 GITEA_ADMIN_USER="tester"
 GITEA_OWNER="tester"
-GITEA_REPO_NAME="ollama-smart-router"
+GITEA_REPO_NAME="open-smart-router"
 GITEA_REPO_OWNER=""
 GITEA_REPO_PRIVATE=true
 MODEL_SERVERS=()
@@ -2564,7 +2564,7 @@ ROOTFS_GB=32; STORAGE="local"
 describe prompt_gitea_credentials
 _pg_out="$(mktemp)"
 GITEA_SERVER_URL="https://git.example.net"; GITEA_ADMIN_USER="tester"
-GITEA_REPO_NAME="ollama-smart-router"; GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
+GITEA_REPO_NAME="open-smart-router"; GITEA_DEPLOY_TOKEN=""; CONFIG_SOURCE="gitea"
 mock_command curl 0 '{"login":"tester"}'
 prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
 assert_eq "accepts a verified token"  "TOKEN123" "$GITEA_DEPLOY_TOKEN"
@@ -2615,7 +2615,7 @@ GITEA_ADMIN_USER="tester"; GITEA_OWNER="tester"; GITEA_DEPLOY_TOKEN=""
 # ── gitea access test ─────────────────────────────────────────────────────────
 describe test_gitea_access
 GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
-GITEA_REPO_NAME="ollama-smart-router"; GITEA_REPO_OWNER=""; GITEA_REPO_PRIVATE=true
+GITEA_REPO_NAME="open-smart-router"; GITEA_REPO_OWNER=""; GITEA_REPO_PRIVATE=true
 assert_ok "no token is a skip, not a failure" test_gitea_access ""
 
 # NOTE on these curl stubs: gitea_probe_user calls curl WITHOUT -X and parses
@@ -2672,7 +2672,7 @@ case "$*" in
   *)    echo '{"login":"tester"}'; exit 0;;
 esac
 case "$*" in
-  *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
+  *"user/repos"*) echo '{"full_name":"tester/open-smart-router"}'; echo 201; exit 0;;
   *search*)       echo '{"data":[]}'; echo 200; exit 0;;
   *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
   *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
@@ -2690,7 +2690,7 @@ case "$*" in
   *)    echo '{"login":"tester"}'; exit 0;;
 esac
 case "$*" in
-  *"user/repos"*) echo '{"full_name":"tester/ollama-smart-router"}'; echo 201; exit 0;;
+  *"user/repos"*) echo '{"full_name":"tester/open-smart-router"}'; echo 201; exit 0;;
   *contents*)     echo '{"commit":{"html_url":"u"}}'; echo 201; exit 0;;
   *)              echo '{"message":"Not Found"}'; echo 404; exit 0;;
 esac
@@ -2706,7 +2706,7 @@ assert_eq       "or writing a test commit" "0" "$(mock_call_count 'contents')"
 GITEA_REPO_OWNER="Tester"
 mock_reset_log
 out="$(test_gitea_access TOKEN 2>&1)" || true
-assert_contains "the token owner in another case is still created" "Creating repository tester/ollama-smart-router" "$out"
+assert_contains "the token owner in another case is still created" "Creating repository tester/open-smart-router" "$out"
 assert_contains "and committed to"                     "test commit succeeded" "$out"
 GITEA_REPO_OWNER=""
 
@@ -2949,13 +2949,13 @@ rm -rf "$_vtree" "$_vclone"; unset _vtree _vclone _saved_repo_dir _rc
 describe clone_config_repo
 CT_ID=910; CONFIG_REPO_DIR="/app/config-repo"
 GITEA_SERVER_URL="https://git.example.net"; GITEA_OWNER="tester"
-GITEA_REPO_NAME="ollama-smart-router"; GITEA_VERIFY_TLS=false
+GITEA_REPO_NAME="open-smart-router"; GITEA_VERIFY_TLS=false
 mock_reset_log; mock_command pct 0
 clone_config_repo "SECRETTOKEN" >/dev/null 2>&1
 calls="$(mock_calls)"
 assert_contains "pushes a credential file into the container" "push 910" "$calls"
 assert_contains "with 0600 permissions"                       "--perms 0600" "$calls"
-assert_contains "clones the configured repo"  "ollama-smart-router.git" "$calls"
+assert_contains "clones the configured repo"  "open-smart-router.git" "$calls"
 assert_contains "honours GITEA_VERIFY_TLS"    "http.sslVerify=false"    "$calls"
 assert_contains "removes the credential file afterwards" "rm -f /root/.git-credentials" "$calls"
 assert_contains "tightens permissions on the clone" "chmod -R go-rwx" "$calls"

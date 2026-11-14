@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generate a DeepSeek Harness overlay for an existing Ollama Smart Router, and
+// Generate a DeepSeek Harness overlay for an existing Open Smart Router, and
 // optionally connect Honcho memory and this agent's Open Terminal workspace
 // through their MCP servers.
 // Keys are read only for discovery and checks. The overlay names their
@@ -8,8 +8,13 @@ import { writeFile, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const BLOCK_BEGIN = '<!-- osr-honcho:begin (managed by Ollama Smart Router; edits inside are replaced) -->';
+const BLOCK_BEGIN = '<!-- osr-honcho:begin (managed by Open Smart Router; edits inside are replaced) -->';
 const BLOCK_END = '<!-- osr-honcho:end -->';
+// The block's first line before the project was renamed from Ollama Smart
+// Router. A block written then is found and replaced like a current one.
+const LEGACY_BLOCK_BEGINS = [
+  '<!-- osr-honcho:begin (managed by Ollama Smart Router; edits inside are replaced) -->',
+];
 
 function usage() {
   return `Usage: node configure.mjs --router-url URL --model ID --output FILE [options]
@@ -282,7 +287,7 @@ export function overlay(options) {
   config:
     providers:
       osr:
-        displayName: Ollama Smart Router
+        displayName: Open Smart Router
         apiKeyEnv: ${options.apiKeyEnv}
         api: openai-completions
         baseURL: ${q(`${options.routerUrl}/v1`)}
@@ -359,10 +364,15 @@ ${BLOCK_END}
 }
 
 // withBlock TEXT BLOCK: TEXT with the managed block replaced by BLOCK (or
-// removed when BLOCK is empty); everything outside the markers is kept.
+// removed when BLOCK is empty); everything outside the markers is kept. A
+// block that opens with a pre-rename first line counts as the managed block.
 export function withBlock(text, block) {
-  const start = text.indexOf(BLOCK_BEGIN);
-  const end = text.indexOf(BLOCK_END);
+  let start = -1;
+  for (const begin of [BLOCK_BEGIN, ...LEGACY_BLOCK_BEGINS]) {
+    start = text.indexOf(begin);
+    if (start !== -1) break;
+  }
+  const end = start === -1 ? -1 : text.indexOf(BLOCK_END, start);
   let rest = text;
   if (start !== -1 && end > start) {
     rest = text.slice(0, start) + text.slice(end + BLOCK_END.length).replace(/^\r?\n/, '');

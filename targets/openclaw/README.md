@@ -183,8 +183,9 @@ update`, web tools), dropping everything else including private ranges;
 `EGRESS=open` allows all. Unreachable-server handling is the dispatcher's
 ([Hermes's Network section](../hermes/README.md#network)).
 
-Owned rules carry the comments `ollama-smart-router openclaw-api`,
-`-dashboard`, `-router` and `-model`. `--reconfigure` replaces only those,
+Owned rules carry the comments `open-smart-router openclaw-api`,
+`-dashboard`, `-router` and `-model` (or, from before the rename,
+`ollama-smart-router openclaw-…`, rewritten with the new name). `--reconfigure` replaces only those,
 first in `[RULES]`, adding the new rules before the guest step and removing
 the old ones after success; `policy_out` is never changed, a missing file is
 not created, and every write goes through `targets/pve-firewall-swap.pl` under

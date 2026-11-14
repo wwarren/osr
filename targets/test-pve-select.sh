@@ -187,8 +187,8 @@ if ( pve_ask_network X ) 2>/dev/null; then die 'an unattended run took the sugge
 # CT descriptions as Proxmox keeps them: URL-encoded on one line, with the
 # trailing newline the GUI's Notes field adds, or notes below the first line.
 pct() { [[ $1 == config ]] && printf 'hostname: x\ndescription: %s\ntags: t\n' "$FAKE_DESCRIPTION"; }
-want='DeepSeek Harness for Ollama Smart Router'
-for d in "$want" "$want%0A" "$want%0A%0A" "$want %0A" "$want%0Akept for the team%3A do not delete%0A" 'DeepSeek%20Harness for Ollama Smart Router'; do
+want='DeepSeek Harness for Open Smart Router'
+for d in "$want" "$want%0A" "$want%0A%0A" "$want %0A" "$want%0Akept for the team%3A do not delete%0A" 'DeepSeek%20Harness for Open Smart Router'; do
     FAKE_DESCRIPTION=$d pve_ct_described 159 "$want" || die "description not recognised: $d"
 done
 for d in "$want 2" "Not $want" 'DeepSeek Harness' "x%0A$want" ''; do

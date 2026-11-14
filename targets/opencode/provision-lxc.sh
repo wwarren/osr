@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on a Proxmox VE host. Creates an unprivileged CT for OpenCode, points it
-# at an existing ollama-smart-router with the router's API key, serves
+# at an existing open-smart-router with the router's API key, serves
 # OpenCode's web UI to the access range, and adds OpenCode to Open WebUI
 # through an OpenAI-compatible chat endpoint in the CT. The router can be a CT
 # on this host (reached with pct) or any LXC or VM that root can log in to over
@@ -161,8 +161,19 @@ url_port() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest##*:}"
 
 # The rules this target owns carry a rule comment, which Proxmox keeps when
 # the firewall is edited in its GUI or API (comment-only lines are dropped).
-FW_TAG='ollama-smart-router opencode'
-OPENCODE_CT_DESCRIPTION='OpenCode for Ollama Smart Router'
+FW_TAG='open-smart-router opencode'
+OPENCODE_CT_DESCRIPTION='OpenCode for Open Smart Router'
+# The project's name before it became Open Smart Router. CTs made before the
+# rename carry these: they are recognised as this target's, and their rules
+# are rewritten with FW_TAG.
+FW_TAG_LEGACY='ollama-smart-router opencode'
+OPENCODE_CT_DESCRIPTION_LEGACY='OpenCode for Ollama Smart Router'
+
+# opencode_ct_described ID: does the CT carry this target's description (or the
+# one it had before the rename)?
+opencode_ct_described() {
+  pve_ct_described "$1" "$OPENCODE_CT_DESCRIPTION" || pve_ct_described "$1" "$OPENCODE_CT_DESCRIPTION_LEGACY"
+}
 
 # opencode_fw_rules ACCESS_CIDR WEB_PORT ROUTER_DEST ROUTER_PORT RESTRICTED
 # [API_SOURCE API_PORT]: the owned rules. Inbound: the access range to the web
@@ -204,19 +215,20 @@ firewall_config() {
 
 # fw_access FILE: the web UI's access range in an OpenCode firewall file.
 fw_access() {
-  sed -nE "s/^IN ACCEPT -source ([0-9.]+\/[0-9]+) -p tcp -dport [0-9]+ -log nolog # ${FW_TAG}-web\$/\1/p" "$1" 2>/dev/null | head -n 1
+  sed -nE "s/^IN ACCEPT -source ([0-9.]+\/[0-9]+) -p tcp -dport [0-9]+ -log nolog # (${FW_TAG}|${FW_TAG_LEGACY})-web\$/\1/p" "$1" 2>/dev/null | head -n 1
 }
 
 # opencode_fw_update FILE KEEP ACCESS_CIDR WEB_PORT ROUTER_DEST ROUTER_PORT
 # [API_SOURCE API_PORT]:
-# FILE with this target's rules (found by their comment, wherever they are)
+# FILE with this target's rules (found by their comment, or its pre-rename
+# form, wherever they are)
 # replaced by the current ones, at the top of [RULES] so they match first;
 # every other line is kept as it is. KEEP=keep also keeps the old owned rules,
 # so a reconfigure that fails half-way leaves the CT reachable as before. The
 # egress mode is read from the file's policy_out.
 opencode_fw_update() {
   local file=$1 keep=$2 access=$3 web_port=$4 router_dest=$5 router_port=$6 api_source=${7:-} api_port=${8:-}
-  local mark_re=" # ${FW_TAG}-(web|api|router|model)\$"
+  local mark_re=" # (${FW_TAG}|${FW_TAG_LEGACY})-(web|api|router|model)\$"
   local -a lines=() old=() rules=()
   local -A owned=()
   local i line section='' sections=0 restricted=false idx have seen_rules=0
@@ -231,7 +243,7 @@ opencode_fw_update() {
     fi
     if [[ $section == OPTIONS && $line =~ ^policy_out:[[:space:]]*DROP[[:space:]]*$ ]]; then restricted=true; fi
     [[ $section == RULES ]] || continue
-    if [[ $line =~ $mark_re ]]; then owned[$i]=1; old+=("$line"); fi
+    if [[ $line =~ $mark_re ]]; then owned[$i]=1; old+=("${line/ # ${FW_TAG_LEGACY}-/ # ${FW_TAG}-}"); fi
   done
   if (( sections > 1 )); then
     printf 'Multiple [RULES] sections in %s; inspect the file before reconfiguring.\n' "$file" >&2
@@ -785,7 +797,7 @@ if (( ! dry_run )); then
     router_exec true || die "Cannot log in to ${router_label} on port ${ROUTER_SSH_PORT}."
   fi
   router_exec test -f /app/router/router.py ||
-    die "No ollama-smart-router at /app/router on ${router_label}."
+    die "No open-smart-router at /app/router on ${router_label}."
   kindi_timeout=$(router_exec python3 -c 'import configparser, math, sys; c=configparser.ConfigParser(); c.read(sys.argv[1]); print(math.ceil(max(c.getfloat("http", "read_timeout_seconds", fallback=300), c.getfloat("http", "kindi_read_timeout_seconds", fallback=3600))))' /app/router/router.ini) ||
     die "Cannot read the router timeout on ${router_label}."
   kindi_timeout=${kindi_timeout//[$'\r\n ']/}
@@ -839,7 +851,7 @@ else
   pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "OpenCode CT $CT_ID is not running on this host."
   if pct exec "$CT_ID" -- test -f /etc/opencode-target/settings; then
     :
-  elif [[ $mode == reconfigure && -f $firewall_file ]] && pve_ct_described "$CT_ID" "$OPENCODE_CT_DESCRIPTION"; then
+  elif [[ $mode == reconfigure && -f $firewall_file ]] && opencode_ct_described "$CT_ID"; then
     note "CT $CT_ID has no completed OpenCode settings; resuming its partial installation."
   else
     die "CT $CT_ID has no completed OpenCode installation. A partial install can be resumed only when this target's CT description and firewall file remain."

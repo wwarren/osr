@@ -1,8 +1,8 @@
-# Ollama Smart Router — Service Architecture
+# Open Smart Router — Service Architecture
 
-**System:** `ollama-smart-router`
+**System:** `open-smart-router`
 **Platform:** Proxmox VE; an unprivileged Debian 13 router LXC and separate target LXCs
-**Built by:** `ollama-smart-router-install.sh` and `targets/*/provision-lxc.sh`
+**Built by:** `open-smart-router-install.sh` and `targets/*/provision-lxc.sh`
 **Last reviewed:** 2026-11-07
 
 ---
@@ -30,7 +30,7 @@ flowchart LR
         api["API clients"]
         browser["Browsers"]
     end
-    subgraph ct["ollama-smart-router LXC"]
+    subgraph ct["open-smart-router LXC"]
         router["Smart Router<br/>:8000"]
         webui["Open WebUI<br/>:8080"]
         litellm["LiteLLM<br/>127.0.0.1:4000"]
@@ -425,7 +425,7 @@ their CTs are not run. On a terminal the run first offers
 lock in `/etc/pve/priv` allows one run per cluster.
 
 **Config lock.** Writers take an `flock` on
-`/run/lock/ollama-smart-router-config.lock`. `update-router.sh` passes its held
+`/run/lock/open-smart-router-config.lock`. `update-router.sh` passes its held
 descriptor to the `apply`/`commit` it runs (`CONFIG_LOCK_INHERITED_FD`), which
 verifies it really holds the lock. The lock ends with its process;
 `clear-lock [--force]` reports, or stops, a hung holder.
@@ -499,6 +499,7 @@ service account before its venv is built.
 | 8000 / 20000-29999 | Open Terminal gateway / per-user workspaces | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI and connected agents → gateway → each user's workspace |
 | 8642 / 8765 | Hermes API / local dispatcher | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI → Hermes; dispatcher → router metadata and model servers |
 | 9119 | Hermes dashboard | `0.0.0.0` in its CT, when enabled | Authenticated browser UI |
+| 8082 | llama.cpp Monitor Dashboard | `0.0.0.0` in the llama.cpp CT (`DASHBOARD_HOST`/`DASHBOARD_PORT`) | Read-only browser page, no authentication; reads llama-server's `/metrics` and filtered `/slots` on loopback |
 | 18789 / 8765 | OpenClaw Gateway (API, Control UI) / dispatcher | `0.0.0.0` (loopback without Open WebUI and Control UI) / `127.0.0.1` | Open WebUI and browsers → OpenClaw; dispatcher as for Hermes |
 | 3080 / 3081 | DeepSeek Harness Web UI / chat endpoint | CT IPv4 address / CT IPv4 address when Open WebUI is on | Browser UI, inbound limited by `DSH_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → Harness's ACP server on a local socket, inbound from the router only |
 | 4096 / 4097 / 8765 | OpenCode server (web UI, API) / chat endpoint / dispatcher | `0.0.0.0` (loopback with `OPENCODE_WEB=false`) / `0.0.0.0` when Open WebUI is on / `127.0.0.1` | Browsers (Basic auth) → OpenCode, inbound limited by `OPENCODE_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → OpenCode on loopback, inbound from the router only; dispatcher as for Hermes |
@@ -1116,8 +1117,8 @@ Router CT:
 | `/app/config-repo/` | Root-only clone of the configuration repository |
 | `/usr/local/bin/manage-model-servers` | Link to the management script in the config repo |
 | `/var/lib/ollama-monitor/` | Monitor state and notice timestamp |
-| `/var/backups/ollama-smart-router/` | Root-only `apply` snapshots |
-| `/run/lock/ollama-smart-router-config.lock` | Configuration write lock |
+| `/var/backups/open-smart-router/` | Root-only `apply` snapshots |
+| `/run/lock/open-smart-router-config.lock` | Configuration write lock |
 
 Target paths vary by engine; Strata-style CTs use `/opt/<target>/` for code,
 `/var/lib/<target>/` for models, `/etc/<target>-target/` for private settings

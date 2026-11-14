@@ -66,6 +66,8 @@ Hermes Agent itself is not pinned either: its integration (units, dispatcher,
 settings) is upgraded and Hermes stays at its installed version unless
 --update-hermes is given (never past a HERMES_COMMIT pin).
 Stopped CTs are left alone unless --include-stopped.
+A llama.cpp target installed before the monitor dashboard existed gets it
+(llama-dashboard, TCP 8082); the plan and summary say so.
 
 Before the plan it lists, for every component it will upgrade that comes from
 a public repository, the release pinned here (tested with this repository)
@@ -141,7 +143,7 @@ MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
 declare -A UNITS=(
     [router]='ollama-router litellm-proxy ollama-monitor open-webui'
     [open-webui]='open-webui ollama-router'
-    [llamacpp]='llama-server llama-ollama-bridge'
+    [llamacpp]='llama-server llama-ollama-bridge llama-dashboard'
     [airllm]='airllm-ollama-api'
     [ollama]='ollama'
     [strata]='strata' [basalt]='basalt' [maya]='maya' [xolotl]='xolotl' [avalon]='avalon' [kindi]='kindi'
@@ -179,7 +181,7 @@ declare -A GUEST_FILES=(
     [avalon]='install-target.sh rocm-toolkit.sh cuda-toolkit.sh avalon.service avalon-weights.txt upstream-commit.txt'
     [kindi]='install-target.sh cuda-toolkit.sh kindi.service kindi-weights.txt upstream-commit.txt requirements-cpu.lock requirements-cuda.lock uv.lock'
     [airllm]='install-target.sh server.py requirements.txt requirements.lock airllm.env.example airllm-ollama-api.service README.md'
-    [llamacpp]='install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example'
+    [llamacpp]='install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example dashboard.py monitor.html llama-dashboard.service'
     [ollama]='install-target.sh ollama.env.example ollama-target.conf README.md'
     [comfyui]='install-target.sh comfyui-target.conf comfyui.env.example README.md klein-weights.txt'
     [open-terminal]='install-target.sh open-terminal-gateway.service open-terminal-spawner.service open-terminal-ws@.service gateway.py spawner.py open-terminal-clients requirements.in requirements.lock'
@@ -458,6 +460,51 @@ if [ -n "$d" ] && ! grep -qsF "<!-- osr-hcom:start -->" "$d"; then
   if [ -n "$f" ] && [ "$(printf "%s\n" "$f" | wc -l)" -eq 1 ]; then echo "instructions=${f#"$r"}"; fi
 fi
 '
+
+# Run in a llama.cpp CT: dashboard=missing when the monitor dashboard is not
+# installed (its install-target.sh --upgrade then adds it); otherwise its port,
+# unit state and dashboard_http=ok when its /healthz answers.
+LLAMA_DASHBOARD_PROBE='
+[ -e /etc/systemd/system/llama-dashboard.service ] || { echo dashboard=missing; exit 0; }
+p=$(sed -n "s/^DASHBOARD_PORT=//p" /etc/llama-target/dashboard.env 2>/dev/null | tail -n 1)
+case $p in ""|*[!0-9]*) p=8082 ;; esac
+echo dashboard=present
+echo "dashboard_port=$p"
+echo "dashboard_state=$(systemctl is-active llama-dashboard.service 2>/dev/null)"
+if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$p/healthz" 2>/dev/null; then echo dashboard_http=ok; fi
+'
+llamacpp_dashboard() {  # llamacpp_dashboard ID: the probe's lines
+    pct exec "$1" -- sh -c "$LLAMA_DASHBOARD_PROBE" </dev/null 2>/dev/null
+}
+# Note an item whose upgrade will add the dashboard (dashboard=missing in its info).
+note_llamacpp_dashboard() {  # note_llamacpp_dashboard ITEM
+    if [[ $(llamacpp_dashboard "${I_CT[$1]}") == *dashboard=missing* ]]; then
+        I_INFO[$1]+=' dashboard=missing'
+        return 0
+    fi
+    I_INFO[$1]+=' dashboard=present'
+    return 1
+}
+# The summary note after an upgrade that was to add the dashboard.
+llamacpp_dashboard_outcome() {  # llamacpp_dashboard_outcome ID
+    local id=$1 out port state address
+    out=$(llamacpp_dashboard "$id")
+    if [[ $out != *dashboard=present* ]]; then
+        echo 'the monitor dashboard was not installed; see the log'
+        return
+    fi
+    port=$(sed -n 's/^dashboard_port=//p' <<< "$out")
+    state=$(sed -n 's/^dashboard_state=//p' <<< "$out")
+    address=$(ct_config_value "$id" net0 | grep -oE 'ip=[0-9.]+' | cut -d= -f2)
+    [[ -n $address ]] || address=$(pct exec "$id" -- hostname -I 2>/dev/null </dev/null | awk '{ print $1 }')
+    if [[ $out == *dashboard_http=ok* ]]; then
+        echo "monitor dashboard added: http://${address:-<CT address>}:${port:-8082}/"
+    elif [[ $state == inactive ]]; then
+        echo "monitor dashboard added (TCP ${port:-8082}); it starts with the target's services"
+    else
+        echo "monitor dashboard added but not answering on TCP ${port:-8082} (${state:-unknown}); see journalctl -u llama-dashboard in the CT"
+    fi
+}
 
 on_listed_node() {  # on_listed_node ID LIST: is CT ID on a node in LIST (or is LIST empty)?
     local node word
@@ -1395,6 +1442,8 @@ prepare() {
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" "$(release_pick honcho)" ;;
+            llamacpp)
+                if note_llamacpp_dashboard "$i"; then I_NOTE[i]='adds the llama.cpp monitor dashboard (TCP 8082)'; fi ;;
             hermes)
                 # Its reconfigure keeps the pin; --update-hermes must not move past it.
                 recorded=$(hermes_recorded_pin "$id")
@@ -1599,6 +1648,8 @@ process_item() {
     collect_state "$i" | csort -u > "$pre"
     for unit in ${UNITS[$t]:-}; do grep -qx "unit:$unit" "$pre" || inactive+=("$unit"); done
     (( ${#inactive[@]} == 0 )) || note "Not active before the upgrade, so not checked afterwards: ${inactive[*]}"
+    # A CT started here (--include-stopped) could not be looked at before.
+    if [[ $t == llamacpp && -z $(info_value "$i" dashboard) ]]; then note_llamacpp_dashboard "$i"; fi
     if ! take_snapshot "$i" "$log"; then
         I_RESULT[i]=skipped; I_NOTE[i]='not upgraded: no snapshot'
         if $started; then pct stop "$id" >> "$log" 2>&1; fi
@@ -1631,6 +1682,9 @@ process_item() {
                     I_NOTE[i]=$(hermes_outcome "$i" "$log" "$attempt_start")
                     [[ ${I_RESULT[$i]} != upgraded ]] || tail -n "+$((attempt_start + 1))" "$log" | grep -q '^OSR-HERMES: moved ' ||
                         I_NOTE[i]="integration upgraded; ${I_NOTE[$i]}"
+                fi
+                if [[ $t == llamacpp && $(info_value "$i" dashboard) == missing ]]; then
+                    I_NOTE[i]=$(llamacpp_dashboard_outcome "$id")
                 fi
                 note "$label: OK"
                 $KEEP_SNAPSHOTS || drop_snapshot "$id" "$SNAP" "$log"
@@ -1763,10 +1817,10 @@ print_summary() {
 
 check_repo() {
     local crlf
-    [[ -f $REPO_ROOT/ollama-smart-router-install.sh && -f $REPO_ROOT/tools/update-router-services.sh ]] ||
+    [[ -f $REPO_ROOT/open-smart-router-install.sh && -f $REPO_ROOT/tools/update-router-services.sh ]] ||
         die "Cannot locate the router repository beside this script: $REPO_ROOT"
     crlf=$(cd "$REPO_ROOT" && grep -rlI --exclude-dir=.git --exclude-dir=__pycache__ --exclude='*.md' "$(printf '\r')" \
-        install services targets tools ollama-smart-router-install.sh 2>/dev/null)
+        install services targets tools open-smart-router-install.sh 2>/dev/null)
     if [[ -n $crlf ]]; then
         note 'These files have Windows (CRLF) line endings, which bash and systemd cannot use:'
         head -n 20 <<< "$crlf" | sed 's/^/  /' >&2

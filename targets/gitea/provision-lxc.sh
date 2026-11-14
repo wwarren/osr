@@ -314,7 +314,7 @@ Next steps (web UI at http://$address:3000):
      access to that repository only). Keep the token for the router installer.
   4. In the router installer, supply GITEA_SERVER_URL as that base URL, the
      dedicated router account's name (GITEA_ADMIN_USER, despite the variable's name), and its
-     token (GITEA_DEPLOY_TOKEN). GITEA_REPO_NAME defaults to ollama-smart-router; the router
+     token (GITEA_DEPLOY_TOKEN). GITEA_REPO_NAME defaults to open-smart-router; the router
      installer can create it under the token owner's account. Over http:// the
      token travels unencrypted; put a TLS reverse proxy in front of Gitea if that
      network is not trusted, and use its https:// URL instead.

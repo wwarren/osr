@@ -32,7 +32,7 @@ if classify_router 99 >/dev/null; then fail 'classify_router accepted 99'; fi
 [[ $(cidr_network 192.0.2.84/24) == 192.0.2.0/24 && $(cidr_network 10.1.2.3/8) == 10.0.0.0/8 ]] || fail cidr_network
 fw=$(firewall_config restricted 192.0.2.0/24 192.0.2.80 8000 4096)
 [[ $fw == *$'policy_in: DROP\npolicy_out: DROP'* ]] || fail "restricted policies: $fw"
-grep -qx 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web' <<< "$fw" || fail 'inbound web rule'
+grep -qx 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web' <<< "$fw" || fail 'inbound web rule'
 [[ $(grep -c '^IN ' <<< "$fw") == 1 ]] || fail 'one inbound rule'
 # Order matters (first match wins): router, DNS, private drops, then the web.
 order=$(grep -n -E 'dport 8000|udp -dport 53|-dest 192.168.0.0/16|dport 443' <<< "$fw" | cut -d: -f1 | paste -sd' ')
@@ -46,7 +46,7 @@ fw=$(firewall_config open '' 192.0.2.80 8000 '')
 printf '%s\n' "$(firewall_config restricted 10.9.0.0/16 192.0.2.80 8000 4096)" > "$tmp_root/access.fw"
 [[ $(fw_access "$tmp_root/access.fw") == 10.9.0.0/16 ]] || fail fw_access
 fw=$(firewall_config restricted 192.0.2.0/24 192.0.2.80 8000 4096 192.0.2.80 4097)
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api' <<< "$fw" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api' <<< "$fw" ||
   fail "the chat endpoint rule (the router only): $fw"
 [[ $(grep -c '^IN ' <<< "$fw") == 2 ]] || fail 'web and chat endpoint rules'
 printf '%s\n' "$fw" > "$tmp_root/access.fw"
@@ -75,8 +75,8 @@ pass "inventory: endpoints default to 80/443, bad URLs are refused, target names
 # keeps every other line.
 fwfile=$tmp_root/owned.fw
 upd() { opencode_fw_update "$fwfile" "$@" > "$fwfile.new" && mv -- "$fwfile.new" "$fwfile"; }
-web81='IN ACCEPT -source 10.0.0.0/8 -p tcp -dport 4100 -log nolog # ollama-smart-router opencode-web'
-out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-router'
+web81='IN ACCEPT -source 10.0.0.0/8 -p tcp -dport 4100 -log nolog # open-smart-router opencode-web'
+out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-router'
 cat > "$fwfile" <<'FW'
 [OPTIONS]
 enable: 1
@@ -85,20 +85,20 @@ policy_out: DROP
 
 [RULES]
 IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog
-IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web
-OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-router
-OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model
+IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web
+OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-router
+OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model
 OUT ACCEPT -dest 203.0.113.10/32 -p tcp -dport 5432 -log nolog
 OUT ACCEPT -p udp -dport 53 -log nolog
 # an operator's note
 IN DROP -source 198.51.100.0/24 -log nolog
 FW
 # shellcheck disable=SC2034  # read by opencode_fw_rules
-model_rules=('OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model')
+model_rules=('OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model')
 upd replace 10.0.0.0/8 4100 192.0.2.81 8000 || fail 'firewall update'
 [[ $(awk '/^\[RULES\]$/ {getline; print; exit}' "$fwfile") == "$web81" ]] || fail "web rule not first: $(cat "$fwfile")"
 grep -qxF "$out81" "$fwfile" || fail 'router rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model' "$fwfile" || fail 'model rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model' "$fwfile" || fail 'model rule'
 grep -q -e '192.0.2.80' -e '192.0.2.71' -e 'dport 4096' "$fwfile" && fail "old owned rules remain: $(cat "$fwfile")"
 for keep in 'IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' 'OUT ACCEPT -dest 203.0.113.10/32 -p tcp -dport 5432 -log nolog' \
             'OUT ACCEPT -p udp -dport 53 -log nolog' '# an operator'"'"'s note' 'IN DROP -source 198.51.100.0/24 -log nolog' 'policy_out: DROP'; do
@@ -110,7 +110,7 @@ cmp -s "$fwfile" "$fwfile.expected" || fail "an unchanged reconfigure doubled th
 upd keep 10.0.0.0/8 4100 192.0.2.82 8000 || fail 'keeping the old rules'
 grep -qxF "$out81" "$fwfile" && grep -q '192.0.2.82/32 -p tcp -dport 8000' "$fwfile" || fail 'new rules missing next to the old ones'
 upd replace 10.0.0.0/8 4100 192.0.2.82 8000 192.0.2.82 4097 || fail 'opening the chat endpoint'
-grep -qx 'IN ACCEPT -source 192.0.2.82/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api' "$fwfile" || fail 'chat endpoint rule'
+grep -qx 'IN ACCEPT -source 192.0.2.82/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api' "$fwfile" || fail 'chat endpoint rule'
 upd replace 10.0.0.0/8 4100 192.0.2.82 8000 192.0.2.90 4200 || fail 'moving the chat endpoint'
 grep -q 'dport 4097' "$fwfile" && fail 'the old chat endpoint rule remains'
 grep -q -- '-source 192.0.2.90/32 -p tcp -dport 4200 .*opencode-api$' "$fwfile" || fail 'moved chat endpoint rule'
@@ -121,6 +121,60 @@ printf '[RULES]\n[RULES]\n' > "$fwfile"; cp "$fwfile" "$fwfile.expected"
 if opencode_fw_update "$fwfile" replace 10.0.0.0/8 4096 192.0.2.82 8000 > /dev/null 2> "$fwfile.err"; then fail 'two [RULES] sections accepted'; fi
 grep -q 'inspect' "$fwfile.err" && cmp -s "$fwfile" "$fwfile.expected" || fail 'two [RULES] sections: no reason, or the file changed'
 pass 'reconfigure replaces only the commented OpenCode rules (web, chat endpoint, egress), wherever they are; keeps other lines; is idempotent; closes disabled ports'
+
+# A CT provisioned before the rename from Ollama Smart Router: its rules carry
+# the old tag. Its web range is still read, the rules are replaced like
+# current ones, and kept ones come back with the new tag.
+renamed_fw() {
+  cat > "$fwfile" <<'FW'
+[OPTIONS]
+enable: 1
+policy_out: DROP
+
+[RULES]
+IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog
+IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web
+IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api
+OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-router
+OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model
+OUT ACCEPT -p udp -dport 53 -log nolog
+FW
+}
+model_rules=()
+renamed_fw
+[[ $(fw_access "$fwfile") == 192.0.2.0/24 ]] || fail 'fw_access did not read a pre-rename web rule'
+upd replace 10.0.0.0/8 4100 192.0.2.81 8000 || fail 'updating a pre-rename firewall'
+grep -qxF "$web81" "$fwfile" && grep -qxF "$out81" "$fwfile" || fail "pre-rename firewall not updated: $(cat "$fwfile")"
+grep -q -e 'ollama-smart-router' -e '192.0.2.80' -e '192.0.2.71' -e 'dport 4096' -e 'dport 4097' "$fwfile" &&
+  fail "pre-rename rules left behind: $(cat "$fwfile")"
+grep -qx 'IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' "$fwfile" &&
+  grep -qx 'OUT ACCEPT -p udp -dport 53 -log nolog' "$fwfile" || fail 'updating a pre-rename firewall lost an unrelated rule'
+renamed_fw
+upd keep 10.0.0.0/8 4100 192.0.2.81 8000 || fail 'keeping pre-rename rules'
+for rule in 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web' \
+            'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api' \
+            'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-router' \
+            'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model'; do
+  grep -qxF "$rule" "$fwfile" || fail "kept pre-rename rule not retagged: $rule"
+done
+grep -q 'ollama-smart-router' "$fwfile" && fail 'a kept rule still carries the pre-rename tag'
+upd replace 10.0.0.0/8 4100 192.0.2.81 8000 || fail 'dropping the kept pre-rename rules'
+grep -q -e '192.0.2.80' -e '192.0.2.71' "$fwfile" && fail 'kept pre-rename rules survived the final update'
+pass 'rules from before the rename are owned and replaced (their web range read), and kept ones come back with the new tag'
+
+# The CT description from before the rename identifies an OpenCode CT too.
+(
+  # shellcheck disable=SC1091
+  source "$here/pve-select.sh"
+  pct() { [[ $1 == config ]] && printf 'hostname: x\ndescription: %s\n' "$FAKE_DESCRIPTION"; }
+  for d in 'OpenCode for Open Smart Router' 'OpenCode for Ollama Smart Router' 'OpenCode%20for Ollama Smart Router%0Anotes'; do
+    FAKE_DESCRIPTION=$d opencode_ct_described 284 || fail "description not recognised: $d"
+  done
+  for d in 'OpenCode' 'OpenClaw for Ollama Smart Router' 'OpenCode for Smart Router'; do
+    if FAKE_DESCRIPTION=$d opencode_ct_described 284; then fail "wrong description accepted: $d"; fi
+  done
+) || exit 1
+pass 'a CT described before the rename (Ollama Smart Router) is recognised as an OpenCode CT'
 
 # --- dry-run plans and validation ------------------------------------------------
 has() { [[ $output == *"$1"* ]] || fail "missing: $1"$'\n'"$output"; }
@@ -153,7 +207,7 @@ has '--tags ai\;ai-tools\;osr-target\;opencode'
 has '--features nesting=1'
 has '--hostname opencode'
 has 'read ROUTER_API_KEY from /app/router/secrets.env on router CT 280 into a 0600 file'
-has 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web'
+has 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web'
 has 'policy_out: DROP'
 has '/root/opencode-deploy/router-api-key --perms 0600'
 has '/hermes/direct-dispatch.py /root/opencode-deploy/direct-dispatch.py'
@@ -162,7 +216,7 @@ has 'OPENCODE_VERSION=2.2.7'
 has 'OPENCODE_FREE_MODELS=false'
 has 'HONCHO_PLUGIN_VERSION=0.2.1'
 has 'ROUTER_URL=http://\<router-source-ip\>:8000'
-has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api'
+has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api'
 has 'OPENCODE_API=true'; has 'OPENCODE_API_PORT=4097'; has 'OPENCODE_API_PERMISSIONS=allow'
 has '/root/opencode-deploy/openai-proxy.py --perms 0644'; has '/root/opencode-deploy/opencode-api.service --perms 0644'
 has '+ pct pull 284 /etc/opencode-target/api-key'
@@ -174,7 +228,7 @@ pass 'the default plan reads the router key, admits the CT network to the web UI
 plan OPENCODE_WEB=false OPENWEBUI=false
 has 'OPENCODE_WEB=false'; lacks 'IN ACCEPT'; has 'OPENCODE_API=false'; lacks 'integrate-webui'; lacks 'opencode-api-key'
 plan OPENCODE_API_PORT=4300 OPENCODE_API_PERMISSIONS=reject TASK_MODEL= OPENWEBUI_PORT=3000
-has '-dport 4300 -log nolog # ollama-smart-router opencode-api'; has 'OPENCODE_API_PERMISSIONS=reject'
+has '-dport 4300 -log nolog # open-smart-router opencode-api'; has 'OPENCODE_API_PERMISSIONS=reject'
 has 'http://127.0.0.1:3000 --opencode-url http://192.0.2.84:4300/v1'; has "--task-model ''"
 plan EGRESS=open ROUTER_URL=http://10.1.2.3:8001 OPENCODE_PORT=4100 OPENCODE_ACCESS_CIDR=10.9.8.7/16 OPENCODE_VERSION=latest
 has 'policy_out: ACCEPT'; lacks 'OUT DROP'; has 'ROUTER_URL=http://10.1.2.3:8001'
@@ -238,7 +292,7 @@ cmd=$1 id=$2; shift 2
 case $cmd in
   status) [[ -e $FAKE_DIR/ct$id || $id == 280 ]] && echo 'status: running' ;;
   create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id"
-    printf 'description: OpenCode for Ollama Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
+    printf 'description: OpenCode for Open Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
   config) cat "$FAKE_DIR/ct$id/description" ;;
   set) : ;;
   start) : ;;
@@ -413,9 +467,9 @@ for want in ROUTER_URL=http://192.0.2.80:8000 OPENCODE_WEB=true OPENCODE_PORT=40
             OPENCODE_MODEL=auto OPENCODE_CONTEXT_LENGTH=65536 OPENCODE_VERSION=2.2.7 HONCHO_URL= OPEN_TERMINAL_URL=; do
   [[ " $guest_env " == *" $want "* ]] || fail "guest installer not given $want: $guest_env"
 done
-grep -qx 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web' "$fwfile" || fail "firewall: $(cat "$fwfile")"
-grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-router' "$fwfile" || fail 'router egress rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model' "$fwfile" || fail 'model egress rule'
+grep -qx 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web' "$fwfile" || fail "firewall: $(cat "$fwfile")"
+grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-router' "$fwfile" || fail 'router egress rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model' "$fwfile" || fail 'model egress rule'
 grep -q 'pct create 284' "$log" || fail 'no CT created'
 grep -qx 'pct-create-umask 0022' "$log" || fail 'pct create inherited a restrictive umask'
 grep -q 'pct create 284.*--features nesting=1' "$log" || fail 'the OpenCode CT was created without nesting'
@@ -430,9 +484,9 @@ pass 'a full run pushes the keys as files, the shared dispatcher and units; admi
 for want in OPENCODE_API=true OPENCODE_API_PORT=4097 OPENCODE_API_PERMISSIONS=allow; do
   [[ " $guest_env " == *" $want "* ]] || fail "guest installer not given $want: $guest_env"
 done
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api' "$fwfile" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api' "$fwfile" ||
   fail "chat endpoint rule: $(cat "$fwfile")"
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # ollama-smart-router opencode-api' "$fake/fw-at-guest" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 4097 -log nolog # open-smart-router opencode-api' "$fake/fw-at-guest" ||
   fail 'the router was not admitted to the chat endpoint before the guest step'
 args=$(< "$fake/integrate-args")
 [[ $args == *'--webui-url http://127.0.0.1:8080 --opencode-url http://192.0.2.84:4097/v1 --model-name opencode --task-model fast'* &&
@@ -454,7 +508,7 @@ out=$(real --reconfigure OPENCODE_WEB=false) || fail "web off: $out"
 grep -q 'opencode-web' "$fwfile" && fail 'the web rule remained after disabling the web UI'
 [[ $(< "$fake/guest-env") == *OPENCODE_WEB=false* ]] || fail 'guest did not receive the web setting'
 out=$(real --reconfigure OPENCODE_WEB=true OPENCODE_ACCESS_CIDR=10.20.30.40/16) || fail "web on again: $out"
-grep -qx 'IN ACCEPT -source 10.20.0.0/16 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web' "$fwfile" || fail 'the new access range'
+grep -qx 'IN ACCEPT -source 10.20.0.0/16 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web' "$fwfile" || fail 'the new access range'
 out=$(real --reconfigure OPENCODE_MAX_TOKENS=4096) || fail "plain reconfigure: $out"
 [[ $(grep -c 'opencode-web$' "$fwfile") == 1 ]] && grep -q -- '-source 10.20.0.0/16 ' "$fwfile" || fail 'a reconfigure did not keep the access range from the firewall'
 [[ $(< "$fake/guest-env") == *OPENCODE_MAX_TOKENS=4096* && $(< "$fake/guest-env") == *OPENCODE_WEB=true* ]] ||
@@ -485,8 +539,8 @@ out=$(real --integrate-only) && fail '--integrate-only on a CT with the chat end
 out=$(real --reconfigure OPENWEBUI=true OPENCODE_API_PORT=4300 TASK_MODEL=) || fail "turning Open WebUI on: $out"
 [[ $(< "$fake/integrate-args") == *'--opencode-url http://192.0.2.84:4300/v1 --model-name opencode --task-model  --admin-token-file'* ]] ||
   fail "registration after turning it on: $(< "$fake/integrate-args")"
-grep -q -- '-dport 4300 -log nolog # ollama-smart-router opencode-api' "$fwfile" || fail 'the chat endpoint port was not opened'
-grep -q -- '-dport 4300 -log nolog # ollama-smart-router opencode-api' "$fake/fw-at-guest" ||
+grep -q -- '-dport 4300 -log nolog # open-smart-router opencode-api' "$fwfile" || fail 'the chat endpoint port was not opened'
+grep -q -- '-dport 4300 -log nolog # open-smart-router opencode-api' "$fake/fw-at-guest" ||
   fail 'a reconfigure did not admit the router to the new chat endpoint port before the guest step'
 rm -f "$fake/integrate-args"; : > "$log"
 out=$(real --reconfigure NO_TOKEN=1) && fail 'a reconfigure that registers again ran without a token'
@@ -527,12 +581,12 @@ pass 'a failed guest install leaves an incomplete CT; --reconfigure resumes it'
 
 : > "$log"
 out=$(real --reconfigure FAKE_MODEL_SERVER=192.0.2.72) || fail "changed model server: $out"
-grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router opencode-model' "$fwfile" || fail 'new model server not admitted'
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router opencode-model' "$fwfile" || fail 'new model server not admitted'
 grep -q '192.0.2.71/32.*opencode-model' "$fwfile" && fail 'old model server still admitted'
 pass '--reconfigure follows the inventory'
 
 # Honcho: given once, kept by a plain --reconfigure, turned off with HONCHO_URL=.
-honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-model'
+honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-model'
 : > "$log"; rm -f "$fake"/pushed-*
 out=$(real --reconfigure HONCHO_URL=http://192.0.2.85:8000 FAKE_HONCHO_KEY=$honcho_key) || fail "Honcho on: $out"
 grep -q 'pct exec 285 -- /usr/local/sbin/honcho-clients issue opencode-284 --workspace opencode-284' "$log" ||
@@ -562,7 +616,7 @@ pass 'Honcho: its own gateway key and workspace, as a file, and an egress rule; 
 # firewall, an egress rule here; kept by a plain --reconfigure; OPEN_TERMINAL_URL= revokes it.
 printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
 ot_rule='IN ACCEPT -source 192.0.2.84/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client opencode-284'
-ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # ollama-smart-router opencode-model'
+ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # open-smart-router opencode-model'
 : > "$log"; rm -f "$fake"/pushed-*
 out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000) || fail "Open Terminal on: $out"
 grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients issue opencode-284 --default-user default' "$log" ||
@@ -588,7 +642,7 @@ grep -q 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000' "$fake/fw-at-guest" 
   grep -q 'OUT ACCEPT -dest 192.0.2.90/32 -p tcp -dport 8000' "$fake/fw-at-guest" ||
   fail "the guest step did not reach the old and the new router: $(cat "$fake/fw-at-guest")"
 grep -q '192.0.2.80' "$fwfile" && fail "the old router address is still admitted: $(cat "$fwfile")"
-grep -q -- '-dport 4100 -log nolog # ollama-smart-router opencode-web' "$fwfile" || fail 'new web rule'
+grep -q -- '-dport 4100 -log nolog # open-smart-router opencode-web' "$fwfile" || fail 'new web rule'
 grep -q 'dport 4096' "$fwfile" && fail 'the old port is still open'
 grep -qx 'OUT ACCEPT -p tcp -dport 443 -log nolog' "$fwfile" || fail 'the other egress rules were lost'
 : > "$log"
@@ -620,7 +674,7 @@ servers=strata+http://models.lan:8080,http://plain.lan,maya+https://secure.lan,h
 dns='FAKE_CT_DNS=models.lan=192.0.2.73,192.0.2.74;plain.lan=192.0.2.76;secure.lan=192.0.2.77'
 out=$(real FAKE_INVENTORY_SERVERS=$servers "$dns") || fail "model servers by name: $out"
 for want in 192.0.2.73/32:8080 192.0.2.74/32:8080 192.0.2.76/32:80 192.0.2.77/32:443 192.0.2.75/32:80; do
-  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # ollama-smart-router opencode-model"
+  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # open-smart-router opencode-model"
   grep -qxF "$rule" "$fwfile" || fail "missing $rule: $(cat "$fwfile")"
   grep -qxF "$rule" "$fake/fw-at-guest" || fail "not admitted before the guest step: $rule"
 done
@@ -631,7 +685,7 @@ pass 'model server names are resolved inside the CT (every address) and ports de
 reset_fake
 mkdir -p "$fake/ct284"
 printf 'description: unrelated CT\n' > "$fake/ct284/description"
-printf '[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # ollama-smart-router opencode-web\n' > "$fwfile"
+printf '[RULES]\nIN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web\n' > "$fwfile"
 out=$(real --reconfigure) && fail 'an unrelated CT without OpenCode settings was accepted'
 [[ $out == *'no completed OpenCode installation'* ]] || fail "unrelated CT message: $out"
 grep -q 'pct push' "$log" && fail 'an unrelated CT was modified'

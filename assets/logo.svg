@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 320" role="img" aria-labelledby="title desc">
-  <title id="title">Ollama Smart Router</title>
-  <desc id="desc">A luminous routing hub beside the Ollama Smart Router wordmark.</desc>
+  <title id="title">Open Smart Router</title>
+  <desc id="desc">A luminous routing hub beside the Open Smart Router wordmark.</desc>
   <defs>
     <radialGradient id="panel" cx="23%" cy="50%" r="92%">
       <stop stop-color="#172B49"/>
@@ -41,7 +41,7 @@
     <path d="M249 237L268 256L249 275L230 256Z" fill="#0D2540"/>
     <circle cx="249" cy="256" r="6" fill="#A4FFF0"/>
   </g>
-  <text x="310" y="138" fill="#F2F8FF" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="71" font-weight="800" letter-spacing="8">OLLAMA</text>
+  <text x="310" y="138" fill="#F2F8FF" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="86" font-weight="800" letter-spacing="10">OPEN</text>
   <text x="313" y="203" fill="#8DEDF1" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="48" font-weight="700" letter-spacing="2.5">SMART ROUTER</text>
   <text x="315" y="247" fill="#91A7BD" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="17" font-weight="600" letter-spacing="3.6">ONE ENDPOINT / EVERY MODEL</text>
   <path d="M313 271H835" stroke="url(#underline)" stroke-width="4" stroke-linecap="round"/>

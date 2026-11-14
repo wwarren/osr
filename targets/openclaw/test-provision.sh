@@ -31,7 +31,7 @@ if classify_router 99 >/dev/null; then fail 'classify_router accepted 99'; fi
 [[ $(url_host http://router.lan:8000) == router.lan && $(url_port http://10.0.0.5:8001/) == 8001 ]] || fail 'url_host/url_port'
 fw=$(firewall_config restricted 192.0.2.80 192.0.2.80 8000 18789)
 [[ $fw == *$'policy_in: DROP\npolicy_out: DROP'* ]] || fail "restricted policies: $fw"
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api' <<< "$fw" || fail 'inbound API rule'
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api' <<< "$fw" || fail 'inbound API rule'
 [[ $(grep -c '^IN ' <<< "$fw") == 1 ]] || fail 'only one inbound rule without the Control UI'
 # Order matters (first match wins): router, DNS, private drops, then the web.
 order=$(grep -n -E 'dport 8000|udp -dport 53|-dest 192.168.0.0/16|dport 443' <<< "$fw" | cut -d: -f1 | paste -sd' ')
@@ -43,7 +43,7 @@ done
 fw=$(firewall_config open 192.0.2.80 192.0.2.80 8000 '')
 [[ $fw == *'policy_out: ACCEPT'* && $fw != *'IN ACCEPT'* && $fw != *'OUT '* ]] || fail "open egress, no API: $fw"
 fw=$(firewall_config restricted 192.0.2.80 192.0.2.80 8000 18789 18789)
-grep -qx 'IN ACCEPT -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-dashboard' <<< "$fw" || fail 'Control UI inbound rule'
+grep -qx 'IN ACCEPT -p tcp -dport 18789 -log nolog # open-smart-router openclaw-dashboard' <<< "$fw" || fail 'Control UI inbound rule'
 pass 'helpers: router kind, route source, URL parts, and firewall rules in first-match order'
 
 inv=$tmp_root/inventory.json
@@ -75,8 +75,8 @@ pass "inventory: endpoints default to 80/443, bad URLs are refused, target names
 # keeps every other line.
 fwfile=$tmp_root/owned.fw
 upd() { openclaw_fw_update "$fwfile" "$@" > "$fwfile.new" && mv -- "$fwfile.new" "$fwfile"; }
-api81='IN ACCEPT -source 192.0.2.81/32 -p tcp -dport 18790 -log nolog # ollama-smart-router openclaw-api'
-out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-router'
+api81='IN ACCEPT -source 192.0.2.81/32 -p tcp -dport 18790 -log nolog # open-smart-router openclaw-api'
+out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-router'
 cat > "$fwfile" <<'FW'
 [OPTIONS]
 enable: 1
@@ -85,22 +85,22 @@ policy_out: DROP
 
 [RULES]
 IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog
-IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api
-IN ACCEPT -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-dashboard
-OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-router
-OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model
+IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api
+IN ACCEPT -p tcp -dport 18789 -log nolog # open-smart-router openclaw-dashboard
+OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-router
+OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model
 OUT ACCEPT -dest 203.0.113.10/32 -p tcp -dport 5432 -log nolog
 OUT ACCEPT -p udp -dport 53 -log nolog
 # an operator's note
 IN DROP -source 198.51.100.0/24 -log nolog
 FW
 # shellcheck disable=SC2034  # read by openclaw_fw_rules
-model_rules=('OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model')
+model_rules=('OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model')
 upd replace 192.0.2.81 18790 192.0.2.81 8000 18790 || fail 'firewall update'
 [[ $(awk '/^\[RULES\]$/ {getline; print; exit}' "$fwfile") == "$api81" ]] || fail "API rule not first: $(cat "$fwfile")"
 grep -qxF "$out81" "$fwfile" || fail 'router rule'
-grep -qx 'IN ACCEPT -p tcp -dport 18790 -log nolog # ollama-smart-router openclaw-dashboard' "$fwfile" || fail 'Control UI rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model' "$fwfile" || fail 'model rule'
+grep -qx 'IN ACCEPT -p tcp -dport 18790 -log nolog # open-smart-router openclaw-dashboard' "$fwfile" || fail 'Control UI rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model' "$fwfile" || fail 'model rule'
 grep -q -e '192.0.2.80' -e '192.0.2.71' -e 'dport 18789' "$fwfile" && fail "old owned rules remain: $(cat "$fwfile")"
 for keep in 'IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' 'OUT ACCEPT -dest 203.0.113.10/32 -p tcp -dport 5432 -log nolog' \
             'OUT ACCEPT -p udp -dport 53 -log nolog' '# an operator'"'"'s note' 'IN DROP -source 198.51.100.0/24 -log nolog' 'policy_out: DROP'; do
@@ -122,6 +122,58 @@ printf '[RULES]\n[RULES]\n' > "$fwfile"; cp "$fwfile" "$fwfile.expected"
 if openclaw_fw_update "$fwfile" replace 192.0.2.82 18789 192.0.2.82 8000 '' > /dev/null 2> "$fwfile.err"; then fail 'two [RULES] sections accepted'; fi
 grep -q 'inspect' "$fwfile.err" && cmp -s "$fwfile" "$fwfile.expected" || fail 'two [RULES] sections: no reason, or the file changed'
 pass 'reconfigure replaces only the commented OpenClaw rules, wherever they are; keeps other lines; is idempotent; closes disabled ports'
+
+# A CT provisioned before the rename from Ollama Smart Router: its rules carry
+# the old tag. They are replaced like current ones, and kept ones come back
+# with the new tag, so no rule for an old address is left behind.
+renamed_fw() {
+  cat > "$fwfile" <<'FW'
+[OPTIONS]
+enable: 1
+policy_out: DROP
+
+[RULES]
+IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog
+IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api
+IN ACCEPT -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-dashboard
+OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-router
+OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model
+OUT ACCEPT -p udp -dport 53 -log nolog
+FW
+}
+model_rules=()
+renamed_fw
+upd replace 192.0.2.81 18790 192.0.2.81 8000 18790 || fail 'updating a pre-rename firewall'
+grep -qxF "$api81" "$fwfile" && grep -qxF "$out81" "$fwfile" || fail "pre-rename firewall not updated: $(cat "$fwfile")"
+grep -q -e 'ollama-smart-router' -e '192.0.2.80' -e '192.0.2.71' -e 'dport 18789' "$fwfile" && fail "pre-rename rules left behind: $(cat "$fwfile")"
+grep -qx 'IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' "$fwfile" &&
+  grep -qx 'OUT ACCEPT -p udp -dport 53 -log nolog' "$fwfile" || fail 'updating a pre-rename firewall lost an unrelated rule'
+renamed_fw
+upd keep 192.0.2.81 18790 192.0.2.81 8000 18790 || fail 'keeping pre-rename rules'
+for rule in 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api' \
+            'IN ACCEPT -p tcp -dport 18789 -log nolog # open-smart-router openclaw-dashboard' \
+            'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-router' \
+            'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model'; do
+  grep -qxF "$rule" "$fwfile" || fail "kept pre-rename rule not retagged: $rule"
+done
+grep -q 'ollama-smart-router' "$fwfile" && fail 'a kept rule still carries the pre-rename tag'
+upd replace 192.0.2.81 18790 192.0.2.81 8000 18790 || fail 'dropping the kept pre-rename rules'
+grep -q -e '192.0.2.80' -e '192.0.2.71' "$fwfile" && fail 'kept pre-rename rules survived the final update'
+pass 'rules from before the rename are owned and replaced, and kept ones come back with the new tag'
+
+# The CT description from before the rename identifies an OpenClaw CT too.
+(
+  # shellcheck disable=SC1091
+  source "$here/pve-select.sh"
+  pct() { [[ $1 == config ]] && printf 'hostname: x\ndescription: %s\n' "$FAKE_DESCRIPTION"; }
+  for d in 'OpenClaw for Open Smart Router' 'OpenClaw for Ollama Smart Router' 'OpenClaw%20for Ollama Smart Router%0Anotes'; do
+    FAKE_DESCRIPTION=$d openclaw_ct_described 283 || fail "description not recognised: $d"
+  done
+  for d in 'OpenClaw' 'Hermes Agent for Ollama Smart Router' 'OpenClaw for Smart Router'; do
+    if FAKE_DESCRIPTION=$d openclaw_ct_described 283; then fail "wrong description accepted: $d"; fi
+  done
+) || exit 1
+pass 'a CT described before the rename (Ollama Smart Router) is recognised as an OpenClaw CT'
 
 # --- dry-run plans and validation ------------------------------------------------
 has() { [[ $output == *"$1"* ]] || fail "missing: $1"$'\n'"$output"; }
@@ -155,8 +207,8 @@ has '--tags ai\;ai-tools\;osr-target\;openclaw'
 has '--features nesting=1'
 has '--hostname openclaw'
 has 'read ROUTER_API_KEY from /app/router/secrets.env on router CT 280 into a 0600 file'
-has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api'
-has 'IN ACCEPT -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-dashboard'
+has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api'
+has 'IN ACCEPT -p tcp -dport 18789 -log nolog # open-smart-router openclaw-dashboard'
 has 'policy_out: DROP'
 has '/root/openclaw-deploy/router-api-key --perms 0600'
 has '/hermes/direct-dispatch.py /root/openclaw-deploy/direct-dispatch.py'
@@ -233,7 +285,7 @@ cmd=$1 id=$2; shift 2
 case $cmd in
   status) [[ -e $FAKE_DIR/ct$id || $id == 280 ]] && echo 'status: running' ;;
   create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id"
-    printf 'description: OpenClaw for Ollama Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
+    printf 'description: OpenClaw for Open Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
   config) cat "$FAKE_DIR/ct$id/description" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")"
@@ -398,12 +450,12 @@ for want in ROUTER_URL=http://192.0.2.80:8000 OPENCLAW_API=true OPENCLAW_DASHBOA
   [[ " $guest_env " == *" $want "* ]] || fail "guest installer not given $want: $guest_env"
 done
 [[ $guest_env != *NVM_INSTALLER_SHA256* ]] || fail 'an unset nvm pin must leave the guest default in force'
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
-grep -qx 'IN ACCEPT -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-dashboard' "$fwfile" || fail 'Control UI firewall rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-router' "$fwfile" || fail 'router egress rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model' "$fwfile" || fail 'model egress rule'
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
+grep -qx 'IN ACCEPT -p tcp -dport 18789 -log nolog # open-smart-router openclaw-dashboard' "$fwfile" || fail 'Control UI firewall rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-router' "$fwfile" || fail 'router egress rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model' "$fwfile" || fail 'model egress rule'
 grep -q -- '--openclaw-url http://192.0.2.83:18789/v1' "$log" || fail 'integration URL'
-grep -qxF "IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api" "$fake/fw-at-integrate" ||
+grep -qxF "IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api" "$fake/fw-at-integrate" ||
   fail 'the router was not admitted before Open WebUI checked OpenClaw'
 grep -q 'rm -rf -- /root/openclaw-integration.AbC123' "$log" || fail 'the router staging directory was not removed'
 [[ $out == *'Open WebUI connection 1 added'* && $out == *'choose "openclaw"'* ]] || fail "summary: $out"
@@ -460,10 +512,10 @@ grep -q 'pct create' "$log" && fail '--reconfigure created a CT'
 grep -q 'integrate-webui.py' "$log" || fail '--reconfigure did not register again'
 : > "$log"
 out=$(real --reconfigure FAKE_MODEL_SERVER=192.0.2.72) || fail "changed model server: $out"
-grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router openclaw-model' "$fwfile" || fail 'new model server not admitted'
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router openclaw-model' "$fwfile" || fail 'new model server not admitted'
 grep -q '192.0.2.71/32.*openclaw-model' "$fwfile" && fail 'old model server still admitted'
 # Honcho: given once, kept by a plain --reconfigure, turned off with HONCHO_URL=.
-honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-model'
+honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-model'
 : > "$log"; rm -f "$fake"/pushed-*
 honcho_lxc=$fake/honcho-lxc; mkdir -p "$honcho_lxc"
 printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.85/24,gw=192.0.2.1\n' > "$honcho_lxc/285.conf"
@@ -501,7 +553,7 @@ ot_lxc=$fake/lxc; mkdir -p "$ot_lxc"
 printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.70/24,gw=192.0.2.1\n' > "$ot_lxc/270.conf"
 printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
 ot_rule='IN ACCEPT -source 192.0.2.83/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client openclaw-283'
-ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # ollama-smart-router openclaw-model'
+ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # open-smart-router openclaw-model'
 : > "$log"; rm -f "$fake"/pushed-*
 out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000 PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal on: $out"
 grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients issue openclaw-283 --default-user default' "$log" ||
@@ -540,8 +592,8 @@ grep -q 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000' "$fake/fw-at-guest" 
   grep -q 'OUT ACCEPT -dest 192.0.2.90/32 -p tcp -dport 8000' "$fake/fw-at-guest" ||
   fail "the guest step did not reach the old and the new router: $(cat "$fake/fw-at-guest")"
 grep -q '192.0.2.80' "$fwfile" && fail "the old router address is still admitted: $(cat "$fwfile")"
-grep -qx 'IN ACCEPT -source 192.0.2.90/32 -p tcp -dport 18790 -log nolog # ollama-smart-router openclaw-api' "$fwfile" || fail 'new API rule'
-grep -qx 'IN ACCEPT -p tcp -dport 18790 -log nolog # ollama-smart-router openclaw-dashboard' "$fwfile" || fail 'new Control UI rule'
+grep -qx 'IN ACCEPT -source 192.0.2.90/32 -p tcp -dport 18790 -log nolog # open-smart-router openclaw-api' "$fwfile" || fail 'new API rule'
+grep -qx 'IN ACCEPT -p tcp -dport 18790 -log nolog # open-smart-router openclaw-dashboard' "$fwfile" || fail 'new Control UI rule'
 grep -q 'dport 18789' "$fwfile" && fail 'the old port is still open'
 grep -qx 'OUT ACCEPT -p tcp -dport 443 -log nolog' "$fwfile" || fail 'the other egress rules were lost'
 : > "$log"
@@ -584,7 +636,7 @@ servers=strata+http://models.lan:8080,http://plain.lan,maya+https://secure.lan,h
 dns='FAKE_CT_DNS=models.lan=192.0.2.73,192.0.2.74;plain.lan=192.0.2.76;secure.lan=192.0.2.77'
 out=$(real FAKE_INVENTORY_SERVERS=$servers "$dns") || fail "model servers by name: $out"
 for want in 192.0.2.73/32:8080 192.0.2.74/32:8080 192.0.2.76/32:80 192.0.2.77/32:443 192.0.2.75/32:80; do
-  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # ollama-smart-router openclaw-model"
+  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # open-smart-router openclaw-model"
   grep -qxF "$rule" "$fwfile" || fail "missing $rule: $(cat "$fwfile")"
   grep -qxF "$rule" "$fake/fw-at-guest" || fail "not admitted before the guest step: $rule"
 done
@@ -598,7 +650,7 @@ pass 'model server names are resolved inside the CT (every address) and ports de
 reset_fake
 mkdir -p "$fake/ct283"
 printf 'description: unrelated CT\n' > "$fake/ct283/description"
-printf '[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # ollama-smart-router openclaw-api\n' > "$fwfile"
+printf '[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 18789 -log nolog # open-smart-router openclaw-api\n' > "$fwfile"
 out=$(real --reconfigure) && fail 'an unrelated CT without OpenClaw settings was accepted'
 [[ $out == *'no completed OpenClaw installation'* ]] || fail "unrelated CT message: $out"
 grep -q 'pct push' "$log" && fail 'an unrelated CT was modified'

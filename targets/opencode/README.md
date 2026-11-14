@@ -271,8 +271,9 @@ gateway when set, DNS and internet HTTP(S) (the npm registry for releases and
 plugins, models.dev, OpenCode's web tools), dropping everything else including
 private ranges; `EGRESS=open` allows all.
 
-Owned rules carry the comments `ollama-smart-router opencode-web`, `-api`,
-`-router` and `-model`. `--reconfigure` replaces only those, first in `[RULES]`, adding
+Owned rules carry the comments `open-smart-router opencode-web`, `-api`,
+`-router` and `-model` (or, from before the rename,
+`ollama-smart-router opencode-…`, rewritten with the new name). `--reconfigure` replaces only those, first in `[RULES]`, adding
 the new rules before the guest step and removing the old ones after success;
 `policy_out` is never changed, a missing file is not created, and every write
 goes through `targets/pve-firewall-swap.pl` under the firewall lock, stopping

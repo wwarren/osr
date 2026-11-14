@@ -1,0 +1,35 @@
+[Unit]
+Description=llama.cpp Monitor Dashboard on the llama.cpp target
+Wants=llama-server.service
+After=network.target llama-server.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=llama-target
+Group=llama-target
+WorkingDirectory=/opt/llama-target/dashboard
+# Port and address can be changed in /etc/llama-target/dashboard.env
+# (DASHBOARD_PORT, DASHBOARD_HOST); llama-server stays on loopback either way.
+Environment=DASHBOARD_HOST=0.0.0.0 DASHBOARD_PORT=8082 LLAMA_BASE_URL=http://127.0.0.1:8081
+EnvironmentFile=-/etc/llama-target/dashboard.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/llama-target/venv/bin/uvicorn dashboard:app --host ${DASHBOARD_HOST} --port ${DASHBOARD_PORT} --workers 1 --no-proxy-headers --no-server-header
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# nvidia-smi needs the passed-through GPU nodes for the hardware panel.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -546,7 +546,7 @@ if (( reconfigure )); then
         [[ ! -v $name ]] || die "$name changes CT hardware; --reconfigure accepts guest model settings only. Use pct set or pct resize for CT changes."
     done
     source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-    files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example)
+    files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example dashboard.py monitor.html llama-dashboard.service)
     for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
     if (( ! dry_run )); then
         [[ $EUID -eq 0 ]] || die 'Run as root on the intended PVE host.'
@@ -646,13 +646,13 @@ nvidia_installer=''
 if [[ -r $source_dir/../../tools/install-nvidia-driver.sh ]]; then
     nvidia_installer=$(cd -- "$source_dir/../../tools" && pwd)/install-nvidia-driver.sh
 fi
-files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example)
+files=(install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example dashboard.py monitor.html llama-dashboard.service)
 for file in "${files[@]}"; do [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"; done
 [[ -n $nvidia_installer ]] || die 'Missing tools/install-nvidia-driver.sh from the repository.'
 net="name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,firewall=1"
 [[ -z $GATEWAY ]] || net+=",gw=$GATEWAY"
 [[ -z $VLAN_TAG ]] || net+=",tag=$VLAN_TAG"
-create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype debian --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB" --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT" --tags 'ai;ai-model;osr-target;llamacpp' --description 'Standalone llama.cpp inference target; OpenAI/Ollama compatibility on TCP 11434')
+create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype debian --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB" --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT" --tags 'ai;ai-model;osr-target;llamacpp' --description 'Standalone llama.cpp inference target; OpenAI/Ollama compatibility on TCP 11434, monitor dashboard on TCP 8082')
 [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
 [[ -z $SSH_PUBLIC_KEY ]] || create+=(--ssh-public-keys "$SSH_PUBLIC_KEY")
 devices=()

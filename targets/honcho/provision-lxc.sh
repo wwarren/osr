@@ -673,7 +673,7 @@ if [[ $mode == create ]]; then
     --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB"
     --swap "$SWAP_MB" --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net"
     --onboot "$ONBOOT" --tags 'ai;ai-tools;osr-target;honcho'
-    --description 'Honcho AI for Ollama Smart Router')
+    --description 'Honcho AI for Open Smart Router')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
   (umask 022; "${create[@]}")
   pct start "$CT_ID"

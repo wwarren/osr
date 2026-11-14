@@ -137,6 +137,12 @@ case $cmd in
                 if [[ $3 == *http:hermes-gateway* ]]; then
                     [[ ! -e $MOCK/$id.http ]] || cat "$MOCK/$id.http"; exit 0
                 fi
+                # The llama.cpp dashboard probe: <id>.dashboard, else installed and answering.
+                if [[ $3 == *llama-dashboard.service* ]]; then
+                    if [[ -e $MOCK/$id.dashboard ]]; then cat "$MOCK/$id.dashboard"
+                    else printf 'dashboard=present\ndashboard_port=8082\ndashboard_state=active\ndashboard_http=ok\n'; fi
+                    exit 0
+                fi
                 if [[ $3 == *systemctl* ]]; then grep -v '^ct:' "$MOCK/$id.state"; fi ;;
             hostname) echo "10.0.0.$((id % 250))" ;;
             sed)
@@ -164,7 +170,9 @@ case $cmd in
             env)
                 printf 'INSTALL %s %s\n' "$id" "$*" >> "$MOCK/installs.log"
                 case $(cat "$MOCK/$id.upgrade" 2>/dev/null || echo ok) in
-                    ok) echo 'upgraded' ;;
+                    # <id>.dashboard-after: what the dashboard probe finds after it.
+                    ok) [[ ! -e $MOCK/$id.dashboard-after ]] || cp "$MOCK/$id.dashboard-after" "$MOCK/$id.dashboard"
+                        echo 'upgraded' ;;
                     nothing) echo 'same commit: nothing to do' ;;
                     break) sed -i '/^unit:/d' "$MOCK/$id.state"; echo 'upgraded (but broke)' ;;
                     fail) echo 'failed; rolled back'; exit 1 ;;
@@ -262,6 +270,49 @@ assert_file_contains 'pushes the unit' 'strata.service --perms 0644' "$tmp/mock/
 assert_file_contains 'runs --upgrade' 'install-target.sh --upgrade' "$tmp/mock/installs.log"
 assert_file_contains 'takes a snapshot' 'snapshot 251 osr-upg-' "$tmp/mock/pct.log"
 assert_file_contains 'drops it afterwards' 'delsnapshot 251 osr-upg-' "$tmp/mock/pct.log"
+
+describe 'a llama.cpp target without the monitor dashboard gets it'
+llama_dashboard() {  # llama_dashboard STATE [http]: what the probe finds after the upgrade
+    printf 'dashboard=present\ndashboard_port=8082\ndashboard_state=%s\n%s' "$1" "${2:+dashboard_http=ok$'\n'}" > "$tmp/mock/253.dashboard-after"
+}
+llama_note() { grep '^llamacpp' "$tmp"/logs/*/summary.txt; }
+reset_mock
+conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
+echo dashboard=missing > "$tmp/mock/253.dashboard"
+run_tool '' --dry-run --only llamacpp
+assert_contains 'the plan says it adds the dashboard' 'adds the llama.cpp monitor dashboard (TCP 8082)' "$out"
+llama_dashboard active http
+run_tool 'y\n' --only llamacpp
+assert_eq 'upgraded' upgraded "$(summary_line llamacpp 253)"
+assert_file_contains 'pushes the dashboard service' "push 253 $ROOT/targets/llamacpp/dashboard.py /root/llama-target-deploy/dashboard.py --perms 0755" "$tmp/mock/pct.log"
+assert_file_contains 'its page' "push 253 $ROOT/targets/llamacpp/monitor.html /root/llama-target-deploy/monitor.html --perms 0644" "$tmp/mock/pct.log"
+assert_file_contains 'and its unit' "push 253 $ROOT/targets/llamacpp/llama-dashboard.service /root/llama-target-deploy/llama-dashboard.service --perms 0644" "$tmp/mock/pct.log"
+assert_file_contains 'through install-target.sh --upgrade' 'INSTALL 253 env bash /root/llama-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
+assert_contains 'the summary gives its address' 'monitor dashboard added: http://10.0.0.3:8082/' "$(llama_note)"
+reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
+echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard inactive
+run_tool 'y\n' --only llamacpp
+assert_contains 'stopped services: it starts with them' "monitor dashboard added (TCP 8082); it starts with the target's services" "$(llama_note)"
+reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
+echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard failed
+run_tool 'y\n' --only llamacpp
+assert_eq 'a failing dashboard does not fail the upgrade' upgraded "$(summary_line llamacpp 253)"
+assert_contains 'but the summary says so' 'monitor dashboard added but not answering on TCP 8082 (failed); see journalctl -u llama-dashboard' "$(llama_note)"
+reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
+echo dashboard=missing > "$tmp/mock/253.dashboard"
+run_tool 'y\n' --only llamacpp
+assert_contains 'still missing afterwards is reported' 'the monitor dashboard was not installed; see the log' "$(llama_note)"
+reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge llama-dashboard
+run_tool '' --dry-run --only llamacpp
+assert_not_contains 'one that has it is not announced' 'monitor dashboard' "$out"
+run_tool 'y\n' --only llamacpp
+assert_not_contains 'nor noted in the summary' 'dashboard' "$(llama_note)"
+reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
+echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard active http
+touch "$tmp/mock/253.stopped"
+run_tool 'y\n' --only llamacpp --include-stopped
+assert_contains 'a CT started for the run is looked at too' 'monitor dashboard added: http://10.0.0.3:8082/' "$(llama_note)"
+unset -f llama_dashboard llama_note
 
 describe 'unchanged target'
 reset_mock

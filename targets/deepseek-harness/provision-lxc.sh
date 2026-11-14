@@ -264,7 +264,9 @@ else
   if (( ! dry_run )); then
     # What the CT records: the defaults for every question below.
     pct status "$CT_ID" 2>/dev/null | grep -q 'status: running' || die "DeepSeek CT $CT_ID is not running."
-    pve_ct_described "$CT_ID" 'DeepSeek Harness for Ollama Smart Router' ||
+    # Before the rename the project was Ollama Smart Router; its CTs still say so.
+    pve_ct_described "$CT_ID" 'DeepSeek Harness for Open Smart Router' ||
+      pve_ct_described "$CT_ID" 'DeepSeek Harness for Ollama Smart Router' ||
       die 'The selected CT is not this target; refusing to reconfigure it.'
     IP_CIDR=$(pct exec "$CT_ID" -- ip -4 -o addr show dev eth0 | awk 'NR==1 {print $4}')
     valid_cidr "$IP_CIDR" || die 'Cannot determine the DeepSeek CT IPv4 address.'
@@ -701,7 +703,7 @@ if [[ $mode == create ]]; then
     --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT"
     --tags 'ai;ai-tools;osr-target;deepseek-harness'
-    --description 'DeepSeek Harness for Ollama Smart Router')
+    --description 'DeepSeek Harness for Open Smart Router')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
   # Proxmox extracts an unprivileged template as the mapped root user, with
   # this process's umask: under 077 the rootfs path is 0700 and tar cannot

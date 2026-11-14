@@ -47,7 +47,8 @@ fails instead of blocking.
 | `<target>-install`, `<target>-provision`, other `<target>-*` | Each target's install, settings, upgrade, rollback and integration behavior; registered automatically from `targets/*/test-*.sh` |
 | `runner-skips`, `skip-report` | Skip detection and strict-mode behavior |
 
-The runner also registers target Python tests for the llama.cpp bridge,
+The runner also registers target Python tests for the llama.cpp bridge and
+monitor dashboard,
 AirLLM, Open Terminal, Hermes, OpenClaw, OpenCode, DeepSeek Harness, ComfyUI,
 Honcho and hcom. The complete
 suite list is the `add_suite` registry in `tests/run-tests.sh`; use `--list`
@@ -63,7 +64,7 @@ heredocs, including the installer's embedded copies, and uses the last
 definition of a repeated function name, like Bash. Inspect extraction with:
 
 ```bash
-python3 tests/lib/extract-functions.py ollama-smart-router-install.sh --list
+python3 tests/lib/extract-functions.py open-smart-router-install.sh --list
 python3 tests/lib/extract-functions.py install/manage-model-servers.sh --only cmd_add
 ```
 

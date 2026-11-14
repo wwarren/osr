@@ -87,7 +87,7 @@ check contains 'exec 280 -- find /app/router -maxdepth 1' "$MOCK_LOG"
 check contains 'exec 280 -- env CONFIG_REPO_DIR=/app/config-repo ROUTER_DIR=/app/router bash /root/osr-update.ABCDEFGH/install/update-router.sh --dry-run --diff' "$MOCK_LOG"
 check contains 'exec 280 -- rm -rf -- /root/osr-update.ABCDEFGH' "$MOCK_LOG"
 tar -tzf "$MOCK_ARCHIVE" > "$tmp/manifest"
-check contains 'ollama-smart-router-install.sh' "$tmp/manifest"
+check contains 'open-smart-router-install.sh' "$tmp/manifest"
 check contains 'install/update-router.sh' "$tmp/manifest"
 check contains 'services/ollama-router/router.py' "$tmp/manifest"
 check lacks 'env/router.env' "$tmp/manifest"
@@ -244,7 +244,7 @@ chmod +x "$tmp/bin/id"
 # A clone with a CRLF file is refused before any CT is touched.
 clone=$tmp/clone
 mkdir -p "$clone"
-(cd "$root" && tar -cf - tools install services ollama-smart-router-install.sh) | tar -xf - -C "$clone"
+(cd "$root" && tar -cf - tools install services open-smart-router-install.sh) | tar -xf - -C "$clone"
 printf 'x = 1\r\n' >> "$clone/services/ollama-router/router.py"
 : > "$MOCK_LOG"
 if CT_ID=280 "$real_bash" "$clone/tools/update-router-services.sh" --host --dry-run > "$tmp/output" 2>&1; then

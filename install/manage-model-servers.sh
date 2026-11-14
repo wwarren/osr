@@ -2,7 +2,7 @@
 set -euo pipefail
 # ==============================================================================
 # manage-model-servers.sh — add / remove / re-tier the Ollama model servers of
-# a running ollama-smart-router container, without re-running the installer.
+# a running open-smart-router container, without re-running the installer.
 #
 # Run it from either place, as root:
 #   * inside the container:   ./manage-model-servers.sh list
@@ -47,13 +47,13 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
 SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # Snapshots of the runtime files taken before each apply (root-only).
-APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/ollama-smart-router}"
+APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/open-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
 # One config change at a time (this tool and install/update-router.sh share it).
 # The lock is an flock on this file: it lasts only as long as the process that
 # holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
 # seconds to wait for it (0 = fail at once); `clear-lock` deals with a hung holder.
-CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/ollama-smart-router-config.lock}"
+CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/open-smart-router-config.lock}"
 CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
 # Seconds clear-lock --force gives a holder to exit after SIGTERM before SIGKILL.
 LOCK_KILL_WAIT="${LOCK_KILL_WAIT:-10}"
@@ -2580,7 +2580,7 @@ cmd_commit() {
   if git -C "$REPO_DIR" diff --cached --quiet; then
     note "Nothing to commit."
   else
-    git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-ollama-smart-router}" \
+    git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-open-smart-router}" \
         -c user.email="${GIT_AUTHOR_EMAIL:-router@localhost}" \
         commit -q -m "$message"
     echo "Committed: ${message}"

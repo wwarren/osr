@@ -114,6 +114,18 @@ test('the managed AGENTS.md block is replaced or removed, the rest kept', () => 
   assert.equal(withBlock(block, ''), '');
 });
 
+test('a block written before the rename from Ollama Smart Router is replaced, not doubled', () => {
+  const options = parseArgs(['--router-url', 'http://r:1', '--model', 'm', '--output', 'x']);
+  const block = instructionsBlock(options);
+  const mine = '# Mine\n\nKeep it short.\n';
+  const old = `${mine}\n<!-- osr-honcho:begin (managed by Ollama Smart Router; edits inside are replaced) -->\nold text\n<!-- osr-honcho:end -->\n`;
+  const updated = withBlock(old, block);
+  assert.equal(updated, withBlock(mine, block));
+  assert.ok(!updated.includes('Ollama Smart Router'));
+  assert.equal(updated.split('osr-honcho:begin').length, 2, 'exactly one block');
+  assert.equal(withBlock(old, ''), mine);
+});
+
 test('Honcho initialize requires a JSON-RPC success, including over SSE', async () => {
   let payload = { jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'workspace unavailable' } };
   let eventStream = false;

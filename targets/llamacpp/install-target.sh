@@ -61,6 +61,8 @@ MODEL_DOWNLOAD_URL optionally fetches one public GGUF from a Hugging Face
 to /resolve/ before download.
 NONINTERACTIVE=true disables prompts and requires MODEL_ALIAS plus a GGUF file
 setting or a valid MODEL_DOWNLOAD_URL.
+The llama.cpp Monitor Dashboard is installed too (llama-dashboard.service,
+TCP 8082): a read-only page of tokens per second, slots and hardware use.
 Optional: LLAMA_CPP_REF=<release-tag-or-full-commit> ($LLAMA_CPP_DEFAULT_REF),
           BACKEND=cuda|vulkan|cpu (cuda), BUILD_JOBS=4, CONTEXT_SIZE=65536,
           PARALLEL_SLOTS=1, THREADS=4, GPU_LAYERS=auto (0 for cpu),
@@ -91,9 +93,12 @@ the previous llama-server is restored.
 Upgrade an installed target in place (same model and settings):
        LLAMA_CPP_REF=<tag-or-commit> bash install-target.sh --upgrade
 Rebuilds llama.cpp only when the ref resolves to a different commit
-(FORCE_REBUILD=true to force), always refreshes bridge.py, its venv and the
-units, restarts services that were running and waits for them to be healthy.
-Everything replaced is kept as *.prev and restored if the upgrade fails.
+(FORCE_REBUILD=true to force), always refreshes bridge.py, its venv, the
+monitor dashboard and the units, restarts services that were running and waits
+for them to be healthy. A target without the dashboard gets it (enabled, and
+started when the target was running); a dashboard you disabled stays disabled.
+Everything replaced is kept as *.prev and restored if the upgrade fails; a
+dashboard this run added is removed again.
 
 Reconfigure an installed target's model and runtime settings:
        CONTEXT_SIZE=32768 MODEL_CAPABILITIES=completion,tools bash install-target.sh --reconfigure
@@ -458,6 +463,10 @@ TARGET_ROOT=${TARGET_ROOT:-/opt/llama-target}
 TARGET_ETC=${TARGET_ETC:-/etc/llama-target}
 TARGET_UNITS=${TARGET_UNITS:-/etc/systemd/system}
 TARGET_HEALTH_URL=${TARGET_HEALTH_URL:-http://127.0.0.1:11434/healthz}
+# The monitor dashboard (llama-dashboard.service): dashboard.py and the pinned
+# upstream monitor.html, served from $TARGET_ROOT/dashboard on the bridge venv.
+DASHBOARD_FILES=(dashboard.py monitor.html)
+TARGET_UNIT_FILES=(llama-server.service llama-ollama-bridge.service llama-dashboard.service)
 # Extra llama-server flags (llama-server.env): e.g. "--flash-attn on
 # --cache-type-k q8_0 --cache-type-v q8_0". Word-split by systemd.
 valid_extra_args() {
@@ -677,6 +686,32 @@ install_bridge() {
       "$TARGET_ROOT/venv/bin/python" -m py_compile "$TARGET_ROOT/bridge.py"
       "$TARGET_ROOT/venv/bin/python" -m pip freeze > "$TARGET_ROOT/python-packages.txt" )
 }
+# Install the dashboard from $1 (needs the venv that install_bridge creates).
+install_dashboard() {
+    local src=$1
+    ( umask 022
+      install -d -o root -g root -m 0755 "$TARGET_ROOT/dashboard"
+      install -o root -g root -m 0644 "$src/dashboard.py" "$src/monitor.html" "$TARGET_ROOT/dashboard/"
+      "$TARGET_ROOT/venv/bin/python" -m py_compile "$TARGET_ROOT/dashboard/dashboard.py" )
+}
+# The dashboard's port: DASHBOARD_PORT in dashboard.env, else 8082.
+dashboard_port() {
+    local port=''
+    [[ ! -f $TARGET_ETC/dashboard.env ]] || port=$(env_key_value "$TARGET_ETC/dashboard.env" DASHBOARD_PORT)
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || port=8082
+    printf '%s\n' "$port"
+}
+# Wait up to $1 seconds (default 30) for the dashboard's /healthz.
+dashboard_healthy() {
+    local limit=${1:-30} waited=0 url
+    url=${TARGET_DASHBOARD_URL:-http://127.0.0.1:$(dashboard_port)/healthz}
+    while (( waited < limit )); do
+        curl -fsS -o /dev/null --max-time 5 "$url" 2>/dev/null && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
 write_build_info() {
     ( umask 022
       cat > "$TARGET_ROOT/build-info.txt" <<BUILDINFO
@@ -695,10 +730,10 @@ BUILDINFO
 }
 # upgrade_unchanged COMMIT SOURCE_DIR: would --upgrade change nothing? The
 # same llama.cpp commit, requested ref, backend and CPU build, the same bridge,
-# requirements and unit files, a venv, and every setting the upgrade adds
-# already present. FORCE_REBUILD=true always counts as a change.
+# requirements, dashboard and unit files, a venv, and every setting the upgrade
+# adds already present. FORCE_REBUILD=true always counts as a change.
 upgrade_unchanged() {
-    local commit=$1 src=$2 unit
+    local commit=$1 src=$2 unit file
     [[ ${FORCE_REBUILD:-false} != true ]] || return 1
     [[ $commit == "$(build_info resolved_commit)" && $LLAMA_CPP_REF == "$(build_info requested_ref)" &&
        $BACKEND == "$(build_info backend)" && ${CPU_BUILD:-native} == "$(installed_cpu_build)" ]] || return 1
@@ -706,7 +741,10 @@ upgrade_unchanged() {
     cmp -s "$src/bridge.py" "$TARGET_ROOT/bridge.py" || return 1
     cmp -s "$src/requirements.txt" "$TARGET_ROOT/requirements.txt" || return 1
     [[ -x $TARGET_ROOT/venv/bin/python ]] || return 1
-    for unit in llama-server.service llama-ollama-bridge.service; do
+    for file in "${DASHBOARD_FILES[@]}"; do
+        cmp -s "$src/$file" "$TARGET_ROOT/dashboard/$file" || return 1
+    done
+    for unit in "${TARGET_UNIT_FILES[@]}"; do
         cmp -s "$src/$unit" "$TARGET_UNITS/$unit" || return 1
     done
     grep -q '^LLAMA_EXTRA_ARGS=' "$TARGET_ETC/llama-server.env" || return 1
@@ -794,6 +832,10 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # A rebuild uses only what is installed, so it also runs from a lone copy of this script.
 for file in bridge.py requirements.txt llama-server.service llama-ollama-bridge.service; do
     [[ $MODE == rebuild || -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
+done
+# A reconfigure leaves the dashboard alone, so an older copy still runs it.
+for file in "${DASHBOARD_FILES[@]}" llama-dashboard.service; do
+    [[ $MODE == rebuild || $MODE == reconfigure || -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
 
 if [[ $MODE == reconfigure ]]; then
@@ -1005,18 +1047,27 @@ if [[ $MODE == upgrade ]]; then
 
     was_active=false
     [[ $(systemctl show llama-server.service -p ActiveState --value) != inactive ]] && was_active=true
+    # A target installed before the dashboard existed gets it now. One that
+    # is there keeps its state: running ones are restarted, disabled ones stay.
+    dashboard_new=false dashboard_was_active=false
+    [[ -e $TARGET_UNITS/llama-dashboard.service ]] || dashboard_new=true
+    if ! $dashboard_new && systemctl is-active --quiet llama-dashboard.service; then dashboard_was_active=true; fi
     # Only what THIS run set aside is restored: a *.prev left by an earlier
-    # upgrade must never be mistaken for the version to go back to.
-    aside=()
+    # upgrade must never be mistaken for the version to go back to. What it
+    # adds (a first dashboard) is removed again.
+    aside=() added=()
     stash() { set_aside "$1"; aside+=("$1"); }
     stash_copy() { copy_aside "$1"; aside+=("$1"); }
+    stash_or_add() { if [[ -e $1 || -L $1 ]]; then stash "$1"; else added+=("$1"); fi; }
     # Put back everything this run replaced, code and settings alike, then
     # check that the previous installation really serves again.
     rollback() {
         local path
         printf 'Upgrade failed; restoring the previous installation...\n' >&2
-        systemctl stop llama-ollama-bridge.service llama-server.service 2>/dev/null || true
+        systemctl stop llama-dashboard.service llama-ollama-bridge.service llama-server.service 2>/dev/null || true
         rm -f -- "$TARGET_ROOT/bin/llama-server.new"
+        if $dashboard_new; then systemctl disable llama-dashboard.service 2>/dev/null || true; fi
+        for path in "${added[@]}"; do rm -rf -- "$path"; done
         for path in "${aside[@]}"; do restore_aside "$path"; done
         systemctl daemon-reload
         if ! $was_active; then
@@ -1027,6 +1078,7 @@ if [[ $MODE == upgrade ]]; then
         else
             printf 'Upgrade failed, and the previous installation did not become healthy either; see journalctl -u llama-server -u llama-ollama-bridge.\n' >&2
         fi
+        if $dashboard_was_active; then systemctl start llama-dashboard.service 2>/dev/null || true; fi
     }
     # With set -E a failure inside a ( ... ) subshell fires this trap in the
     # subshell and again in the parent; only the main shell rolls back.
@@ -1047,10 +1099,12 @@ if [[ $MODE == upgrade ]]; then
     stash "$TARGET_ROOT/requirements.txt"
     stash "$TARGET_ROOT/venv"
     install_bridge "$source_dir"
+    stash_or_add "$TARGET_ROOT/dashboard"
+    install_dashboard "$source_dir"
     stash "$TARGET_ROOT/build-info.txt"
     write_build_info "$new_commit"
-    for unit in llama-server.service llama-ollama-bridge.service; do
-        stash "$TARGET_UNITS/$unit"
+    for unit in "${TARGET_UNIT_FILES[@]}"; do
+        stash_or_add "$TARGET_UNITS/$unit"
         install -o root -g root -m 0644 "$source_dir/$unit" "$TARGET_UNITS/$unit"
     done
     # New settings get their defaults; existing values are never rewritten.
@@ -1066,6 +1120,10 @@ if [[ $MODE == upgrade ]]; then
         set_env_key "$TARGET_ETC/llama-server.env" GPU_LAYERS "$gpu_layers_new"
     fi
     systemctl daemon-reload
+    if $dashboard_new; then
+        systemctl enable llama-dashboard.service
+        printf 'Installed the llama.cpp Monitor Dashboard (llama-dashboard.service, TCP %s).\n' "$(dashboard_port)"
+    fi
 
     if $was_active; then
         systemctl restart llama-server.service llama-ollama-bridge.service
@@ -1076,6 +1134,20 @@ if [[ $MODE == upgrade ]]; then
         printf 'Services were stopped before the upgrade and are left stopped.\n'
     fi
     trap - ERR
+    # The dashboard only reads from the target, so it never rolls back an
+    # upgrade that serves: a problem with it is reported and left to fix.
+    if $dashboard_was_active || { $dashboard_new && $was_active; }; then
+        systemctl reset-failed llama-dashboard.service 2>/dev/null || true
+        if systemctl restart llama-dashboard.service && dashboard_healthy "${DASHBOARD_HEALTH_TIMEOUT:-30}"; then
+            printf 'Monitor dashboard: http://<this CT>:%s/\n' "$(dashboard_port)"
+        else
+            printf 'Warning: the monitor dashboard does not answer on TCP %s; inference is unaffected. See journalctl -u llama-dashboard.\n' "$(dashboard_port)" >&2
+        fi
+    elif $dashboard_new; then
+        printf 'The dashboard starts with the other services: systemctl start llama-dashboard\n'
+    elif ! systemctl is-enabled --quiet llama-dashboard.service 2>/dev/null; then
+        printf 'The monitor dashboard is disabled and stays disabled (systemctl enable --now llama-dashboard to use it).\n'
+    fi
     printf 'Upgrade complete: llama.cpp %s (%s). Previous files are kept as *.prev.\n' "$LLAMA_CPP_REF" "$new_commit"
     exit 0
 fi
@@ -1248,14 +1320,14 @@ valid_extra_args "$LLAMA_EXTRA_ARGS" || die 'LLAMA_EXTRA_ARGS may contain only l
 valid_cpu_target "$CPU_TARGET" || die 'CPU_TARGET must be auto, native or portable.'
 CPU_BUILD=$(cpu_build "$CPU_TARGET") || die 'Cannot choose the CPU build; see the message above.'
 
-for path in /opt/llama-target /etc/llama-target /etc/systemd/system/llama-server.service /etc/systemd/system/llama-ollama-bridge.service; do
+for path in /opt/llama-target /etc/llama-target /etc/systemd/system/llama-server.service /etc/systemd/system/llama-ollama-bridge.service /etc/systemd/system/llama-dashboard.service; do
     [[ ! -e $path && ! -L $path ]] || die "Refusing to overwrite $path. Inspect the existing installation before a manual update."
 done
 getent passwd llama-target >/dev/null && die 'The llama-target user already exists; inspect before installing.'
 getent group llama-target >/dev/null && die 'The llama-target group already exists; inspect before installing.'
 getent group 993 >/dev/null && die 'GID 993 is already in use. Resolve the dedicated target group and device mapping before installing.'
 if command -v ss >/dev/null; then
-    [[ -z $(ss -H -ltn '( sport = :8081 or sport = :11434 )') ]] || die 'Port 8081 or 11434 is already in use. Do not install over a live Ollama target.'
+    [[ -z $(ss -H -ltn '( sport = :8081 or sport = :8082 or sport = :11434 )') ]] || die 'Port 8081, 8082 or 11434 is already in use. Do not install over a live Ollama target.'
 fi
 
 trap '[[ $BASHPID == "$$" ]] || exit 1; printf "Installation stopped at line %s. Services were not started. Inspect partial files before retrying; no existing installation is overwritten.\n" "$LINENO" >&2' ERR
@@ -1300,6 +1372,7 @@ printf 'Building llama.cpp from pinned ref: %s (CPU build: %s)\n' "$LLAMA_CPP_RE
 resolved_commit=$(fetch_llama_source "$TARGET_ROOT/src/llama.cpp")
 build_llama_server "$TARGET_ROOT/src/llama.cpp" "$TARGET_ROOT/bin/llama-server"
 install_bridge "$source_dir"
+install_dashboard "$source_dir"
 write_build_info "$resolved_commit"
 
 umask 027
@@ -1326,9 +1399,10 @@ REQUEST_TIMEOUT_SECONDS=600
 BRIDGEENV
 chown root:llama-target /etc/llama-target/*.env
 chmod 0640 /etc/llama-target/*.env
-install -o root -g root -m 0644 "$source_dir/llama-server.service" "$source_dir/llama-ollama-bridge.service" /etc/systemd/system/
+install -o root -g root -m 0644 "$source_dir/llama-server.service" "$source_dir/llama-ollama-bridge.service" \
+    "$source_dir/llama-dashboard.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable llama-server.service llama-ollama-bridge.service
+systemctl enable llama-server.service llama-ollama-bridge.service llama-dashboard.service
 
 printf '\nInstalled target build %s (%s). Services are enabled and currently stopped.\n' "$resolved_commit" "$BACKEND"
 if [[ -n $MODEL_DOWNLOAD_URL ]]; then
@@ -1336,6 +1410,7 @@ if [[ -n $MODEL_DOWNLOAD_URL ]]; then
 else
     printf 'Stage the local GGUF at %s, readable by llama-target.\n' "$MODEL_PATH"
 fi
-printf 'Review /etc/llama-target/*.env and restrict TCP 11434 to trusted clients.\n'
-printf 'Then run: systemctl start llama-server llama-ollama-bridge\n'
+printf 'Review /etc/llama-target/*.env and restrict TCP 11434 (API) and 8082 (dashboard) to trusted clients.\n'
+printf 'Then run: systemctl start llama-server llama-ollama-bridge llama-dashboard\n'
 printf 'Check readiness: curl --fail http://127.0.0.1:11434/healthz\n'
+printf 'Monitor dashboard: http://<this CT>:8082/\n'

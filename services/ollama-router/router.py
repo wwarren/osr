@@ -947,7 +947,7 @@ async def lifespan(_app):
             _HTTP["client"] = None
 
 
-app = FastAPI(title="Ollama Smart Router", lifespan=lifespan)
+app = FastAPI(title="Open Smart Router", lifespan=lifespan)
 
 
 @app.middleware("http")

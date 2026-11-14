@@ -261,7 +261,7 @@ if token_ok; then
   note "The router token in $GITEA_TARGET_ETC/router-token still works; kept."
 else
   token=$(as_gitea admin user generate-access-token --username "$GITEA_ROUTER_USER" \
-    --token-name "ollama-smart-router-$(date +%Y%m%d%H%M%S)" --scopes write:repository,write:user --raw |
+    --token-name "open-smart-router-$(date +%Y%m%d%H%M%S)" --scopes write:repository,write:user --raw |
     token_from_output) || die 'Gitea did not return an access token.'
   write_secret "$GITEA_TARGET_ETC/router-token" "$token"
   unset token

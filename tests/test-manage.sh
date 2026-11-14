@@ -1822,9 +1822,9 @@ mock_command pct 0 'VMID       Status     Lock         Name
 assert_eq "lists only running ids" "101 105" "$(running_ct_ids | tr '\n' ' ' | sed 's/ $//')"
 
 describe ct_name_of
-mock_command pct 0 'hostname: ollama-smart-router
+mock_command pct 0 'hostname: open-smart-router
 cores: 2'
-assert_eq "reads the hostname" "ollama-smart-router" "$(ct_name_of 105)"
+assert_eq "reads the hostname" "open-smart-router" "$(ct_name_of 105)"
 
 describe find_router_ct
 mock_script pct <<'EOF'

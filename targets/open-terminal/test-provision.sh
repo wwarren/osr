@@ -21,7 +21,7 @@ check() { "$@" || { printf 'FAIL %s\n' "$*" >&2; exit 1; }; }
 check [ "$(classify_router 280)" = 'ct 280' ]
 check [ "$(classify_router 192.0.2.80)" = 'ssh 192.0.2.80' ]
 check [ "$(classify_router router.lan)" = 'ssh router.lan' ]
-check [ "$(classify_router ollama-smart-router)" = 'ssh ollama-smart-router' ]
+check [ "$(classify_router open-smart-router)" = 'ssh open-smart-router' ]
 for bad in 99 0280 192.0.2.999 1.2.3 'host name' 'a;b' '' -router; do
     if classify_router "$bad" >/dev/null; then printf 'FAIL classify_router accepted %q\n' "$bad" >&2; exit 1; fi
 done

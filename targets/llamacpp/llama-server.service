@@ -12,7 +12,8 @@ WorkingDirectory=/var/lib/llama-target
 EnvironmentFile=/etc/llama-target/llama-server.env
 ExecStartPre=/usr/bin/test -r ${MODEL_PATH}
 # $LLAMA_EXTRA_ARGS (unbraced) is split into separate arguments; empty adds none.
-ExecStart=/opt/llama-target/bin/llama-server --host 127.0.0.1 --port 8081 --model ${MODEL_PATH} --alias ${MODEL_ALIAS} --ctx-size ${CONTEXT_SIZE} --parallel ${PARALLEL_SLOTS} --threads ${THREADS} --n-gpu-layers ${GPU_LAYERS} --jinja $LLAMA_EXTRA_ARGS
+# --metrics and --slots feed the monitor dashboard; both stay on loopback.
+ExecStart=/opt/llama-target/bin/llama-server --host 127.0.0.1 --port 8081 --model ${MODEL_PATH} --alias ${MODEL_ALIAS} --ctx-size ${CONTEXT_SIZE} --parallel ${PARALLEL_SLOTS} --threads ${THREADS} --n-gpu-layers ${GPU_LAYERS} --jinja --metrics --slots $LLAMA_EXTRA_ARGS
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120

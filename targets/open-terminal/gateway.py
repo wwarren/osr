@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open Terminal workspace gateway for Ollama Smart Router.
+"""Open Terminal workspace gateway for Open Smart Router.
 
 Listens on the terminal CT's public port, in front of one open-terminal
 process per workspace:

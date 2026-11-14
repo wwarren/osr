@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek Harness agent for Ollama Smart Router
+Description=DeepSeek Harness agent for Open Smart Router
 Wants=network-online.target
 After=network-online.target
 

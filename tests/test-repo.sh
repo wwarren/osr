@@ -13,7 +13,7 @@ exec </dev/null
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/.." && pwd)"
-INSTALLER="${1:-${ROOT}/ollama-smart-router-install.sh}"
+INSTALLER="${1:-${ROOT}/open-smart-router-install.sh}"
 # shellcheck source=lib/assert.sh
 source "${HERE}/lib/assert.sh"
 

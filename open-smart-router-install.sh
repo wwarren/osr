@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ==============================================================================
-# Ollama Smart Router LXC installer for Proxmox
+# Open Smart Router LXC installer for Proxmox
 #
 # Changes vs. the original:
 #   * App/config files are staged on the host and pushed with `pct push`, so
@@ -30,7 +30,7 @@ set -euo pipefail
 #     monitor polling into monitor.ini, so behaviour is configurable per commit.
 # ==============================================================================
 CT_ID="${CT_ID:-}"                    # default: the cluster's next free ID
-CT_NAME="${CT_NAME:-ollama-smart-router}"
+CT_NAME="${CT_NAME:-open-smart-router}"
 BRIDGE="${BRIDGE:-vmbr0}"
 IP_CIDR="${IP_CIDR:-}"
 GATEWAY="${GATEWAY:-}"
@@ -158,7 +158,7 @@ TIER_XLARGE_IDX=""
 GITEA_SERVER_URL="${GITEA_SERVER_URL:-}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
-GITEA_REPO_NAME="${GITEA_REPO_NAME:-ollama-smart-router}"
+GITEA_REPO_NAME="${GITEA_REPO_NAME:-open-smart-router}"
 # Owner of that repository. Leave empty to resolve automatically: the token
 # owner first, then a search across everything the token can see. Set this
 # explicitly when the repo belongs to an organisation, or when several accounts
@@ -2417,7 +2417,7 @@ provision_selected_targets() {
 # occupied ID is refused and re-asked (or stops unattended runs).
 prompt_router_ct_id() {
   echo
-  echo "--- Ollama Smart Router container ---"
+  echo "--- Open Smart Router container ---"
   prompt_until_valid "OSR CT ID" CT_ID "${CT_ID:-$(next_free_ct_id)}" valid_router_ct_id
 }
 # Proxmox accepts guest IDs 100-999999999.
@@ -3258,7 +3258,7 @@ test_gitea_access() {
       fi
       owner="$GITEA_OWNER"
       echo "Creating repository ${owner}/${repo_name}."
-      payload="$(printf '{"name":"%s","private":%s,"auto_init":true,"default_branch":"main","description":"Provisioned by the ollama-smart-router installer"}' \
+      payload="$(printf '{"name":"%s","private":%s,"auto_init":true,"default_branch":"main","description":"Provisioned by the open-smart-router installer"}' \
         "$repo_name" "$GITEA_REPO_PRIVATE")"
       resp="$(gitea_api POST "${api}/user/repos" "$payload")"
       http="${resp##*$'\n'}"; body="${resp%$'\n'*}"
@@ -3284,7 +3284,7 @@ test_gitea_access() {
   [[ -z "$branch" ]] && branch="main"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   filepath="provisioning-tests/${ts}.md"
-  content_b64="$(printf 'Provisioning test commit\nCreated (UTC): %s\nProxmox host: %s\nService: ollama-smart-router\n' \
+  content_b64="$(printf 'Provisioning test commit\nCreated (UTC): %s\nProxmox host: %s\nService: open-smart-router\n' \
     "$ts" "$(hostname)" | base64 -w0)"
   payload="$(printf '{"message":"Provisioning test commit %s","content":"%s","branch":"%s"}' \
     "$ts" "$content_b64" "$branch")"
@@ -4429,7 +4429,7 @@ async def lifespan(_app):
             _HTTP["client"] = None
 
 
-app = FastAPI(title="Ollama Smart Router", lifespan=lifespan)
+app = FastAPI(title="Open Smart Router", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -6198,7 +6198,7 @@ cat > "${REPO_DIR}/install/manage-model-servers.sh" <<'MANAGEEOF'
 set -euo pipefail
 # ==============================================================================
 # manage-model-servers.sh — add / remove / re-tier the Ollama model servers of
-# a running ollama-smart-router container, without re-running the installer.
+# a running open-smart-router container, without re-running the installer.
 #
 # Run it from either place, as root:
 #   * inside the container:   ./manage-model-servers.sh list
@@ -6243,13 +6243,13 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
 SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # Snapshots of the runtime files taken before each apply (root-only).
-APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/ollama-smart-router}"
+APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/open-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
 # One config change at a time (this tool and install/update-router.sh share it).
 # The lock is an flock on this file: it lasts only as long as the process that
 # holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
 # seconds to wait for it (0 = fail at once); `clear-lock` deals with a hung holder.
-CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/ollama-smart-router-config.lock}"
+CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/open-smart-router-config.lock}"
 CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
 # Seconds clear-lock --force gives a holder to exit after SIGTERM before SIGKILL.
 LOCK_KILL_WAIT="${LOCK_KILL_WAIT:-10}"
@@ -8776,7 +8776,7 @@ cmd_commit() {
   if git -C "$REPO_DIR" diff --cached --quiet; then
     note "Nothing to commit."
   else
-    git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-ollama-smart-router}" \
+    git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-open-smart-router}" \
         -c user.email="${GIT_AUTHOR_EMAIL:-router@localhost}" \
         commit -q -m "$message"
     echo "Committed: ${message}"
@@ -9105,9 +9105,9 @@ chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
 
 # --- repo README so the tree is self-documenting in Gitea ---
 cat > "${REPO_DIR}/README.md" <<'RDEOF'
-# ollama-smart-router — service configuration
+# open-smart-router — service configuration
 
-Version-controlled configuration for the Ollama Smart Router LXC. The installer
+Version-controlled configuration for the Open Smart Router LXC. The installer
 clones this repo into the container during provisioning and runs
 `install/apply-config.sh` to copy each file into place.
 
@@ -9141,7 +9141,7 @@ RDEOF
 # --- systemd units (one per service directory) ---
 cat > "${REPO_DIR}/services/ollama-router/ollama-router.service" <<'UNITEOF'
 [Unit]
-Description=Ollama Smart Router Middleware
+Description=Open Smart Router Middleware
 # LiteLLM is the *fallback* dispatch path, not a hard requirement: the router
 # serves traffic from its own live discovery inventory and only forwards to
 # LiteLLM when discovery is off or the inventory is empty. Wants= keeps the
@@ -9423,7 +9423,7 @@ motd_tmp="$(mktemp)"
 cat > "$motd_tmp" <<EOF
 
 ==============================================================================
-  Ollama Smart Router        ${CT_NAME}  (CT ${CT_ID})
+  Open Smart Router        ${CT_NAME}  (CT ${CT_ID})
 ==============================================================================
   Container IP : ${ROUTER_IP}
 

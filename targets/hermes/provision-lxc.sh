@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on a Proxmox VE host. Creates an unprivileged CT for Hermes Agent, points
-# it at an existing ollama-smart-router with the router's API key, and (by
+# it at an existing open-smart-router with the router's API key, and (by
 # default) registers Hermes's API server in that router's Open WebUI. The
 # router can be a CT on this host (reached with pct) or any LXC or VM that root
 # can log in to over SSH.
@@ -129,8 +129,19 @@ url_port() { local rest=${1#*://}; rest=${rest%%/*}; printf '%s\n' "${rest##*:}"
 
 # The rules this target owns carry a rule comment, which Proxmox keeps when
 # the firewall is edited in its GUI or API (comment-only lines are dropped).
-FW_TAG='ollama-smart-router hermes'
-HERMES_CT_DESCRIPTION='Hermes Agent for Ollama Smart Router'
+FW_TAG='open-smart-router hermes'
+HERMES_CT_DESCRIPTION='Hermes Agent for Open Smart Router'
+# The project's name before it became Open Smart Router. CTs made before the
+# rename carry these: they are recognised as this target's, and their rules
+# are rewritten with FW_TAG.
+FW_TAG_LEGACY='ollama-smart-router hermes'
+HERMES_CT_DESCRIPTION_LEGACY='Hermes Agent for Ollama Smart Router'
+
+# hermes_ct_described ID: does the CT carry this target's description (or the
+# one it had before the rename)?
+hermes_ct_described() {
+  pve_ct_described "$1" "$HERMES_CT_DESCRIPTION" || pve_ct_described "$1" "$HERMES_CT_DESCRIPTION_LEGACY"
+}
 
 # hermes_fw_rules ROUTER_IP API_PORT ROUTER_DEST ROUTER_PORT RESTRICTED DASHBOARD_PORT: the
 # owned rules. Inbound: only the router, to the API server (an empty API_PORT
@@ -177,16 +188,19 @@ firewall_config() {
 # Owned rules are found by their comment. Files written before the comment have
 # none: there the generated layout is recognised (the API rule first in [RULES]
 # with the port recorded in the guest's prior settings, then the router rule;
-# or the API rule between "# BEGIN/END ollama-smart-router Hermes API" lines).
-# An unmarked inbound rule in a previously CLI-only CT is never adopted.
+# or the API rule between "# BEGIN/END open-smart-router Hermes API" lines).
+# Rules and BEGIN/END lines that still carry the pre-rename name
+# (ollama-smart-router) are owned too, and the rules are written back with
+# FW_TAG. An unmarked inbound rule in a previously CLI-only CT is never adopted.
 hermes_fw_update() {
   local file=$1 keep=$2 router_ip=$3 api_port=$4 router_dest=$5 router_port=$6
   local old_api_server=${7:-unknown} old_api_port=${8:-}
   local dashboard_port=${9:-}
-  local begin='# BEGIN ollama-smart-router Hermes API' end='# END ollama-smart-router Hermes API'
+  local begin='# BEGIN open-smart-router Hermes API' end='# END open-smart-router Hermes API'
+  local legacy_begin='# BEGIN ollama-smart-router Hermes API' legacy_end='# END ollama-smart-router Hermes API'
   local in_re='^IN ACCEPT -source [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
   local out_re='^OUT ACCEPT -dest [0-9.]+/32 -p tcp -dport [0-9]+ -log nolog$'
-  local mark_re=" # ${FW_TAG}-(api|router|model|dashboard)\$"
+  local mark_re=" # (${FW_TAG}|${FW_TAG_LEGACY})-(api|router|model|dashboard)\$"
   local -a lines=() rest=() old=() rules=()
   local -A owned=()
   local rule_re='^(IN|OUT) '
@@ -203,11 +217,11 @@ hermes_fw_update() {
     fi
     if [[ $section == OPTIONS && $line =~ ^policy_out:[[:space:]]*DROP[[:space:]]*$ ]]; then restricted=true; fi
     [[ $section == RULES ]] || continue
-    if [[ $line == "$begin" ]]; then
+    if [[ $line == "$begin" || $line == "$legacy_begin" ]]; then
       (( ! in_block )) || bad_block=1
       begins=$((begins + 1)); in_block=1; owned[$i]=1; continue
     fi
-    if [[ $line == "$end" ]]; then
+    if [[ $line == "$end" || $line == "$legacy_end" ]]; then
       (( in_block )) || bad_block=1
       in_block=0; owned[$i]=1; continue
     fi
@@ -215,6 +229,7 @@ hermes_fw_update() {
       owned[$i]=1; [[ ! $line =~ $rule_re ]] || old+=("$line"); continue
     fi
     if [[ $line =~ $mark_re ]]; then
+      line=${line/ # ${FW_TAG_LEGACY}-/ # ${FW_TAG}-}
       owned[$i]=1; old+=("$line")
       [[ $line == *" # ${FW_TAG}-model" || $line == *" # ${FW_TAG}-dashboard" ]] || marked=$((marked + 1))
       continue
@@ -226,7 +241,7 @@ hermes_fw_update() {
     return 1
   fi
   if (( begins > 1 || bad_block || in_block )); then
-    printf 'Malformed "# BEGIN/END ollama-smart-router Hermes API" lines in %s; inspect the file.\n' "$file" >&2
+    printf 'Malformed "# BEGIN/END open-smart-router Hermes API" lines in %s; inspect the file.\n' "$file" >&2
     return 1
   fi
   if (( marked == 0 )); then
@@ -772,7 +787,7 @@ if (( ! dry_run )); then
     router_exec true || die "Cannot log in to ${router_label} on port ${ROUTER_SSH_PORT}."
   fi
   router_exec test -f /app/router/router.py ||
-    die "No ollama-smart-router at /app/router on ${router_label}."
+    die "No open-smart-router at /app/router on ${router_label}."
   kindi_timeout=$(router_exec python3 -c 'import configparser, math, sys; c=configparser.ConfigParser(); c.read(sys.argv[1]); print(math.ceil(max(c.getfloat("http", "read_timeout_seconds", fallback=300), c.getfloat("http", "kindi_read_timeout_seconds", fallback=3600))))' /app/router/router.ini) ||
     die "Cannot read the router timeout on ${router_label}."
   kindi_timeout=${kindi_timeout//[$'\r\n ']/}
@@ -828,7 +843,7 @@ else
   if pct exec "$CT_ID" -- test -f /etc/hermes-target/settings; then
     existing_install=true
   elif [[ $mode == reconfigure && -f $firewall_file ]] &&
-       pve_ct_described "$CT_ID" "$HERMES_CT_DESCRIPTION"; then
+       hermes_ct_described "$CT_ID"; then
     note "CT $CT_ID has no completed Hermes settings; resuming its partial installation."
   else
     die "CT $CT_ID has no completed Hermes installation. A partial install can be resumed only when this target's CT description and firewall file remain."

@@ -99,7 +99,7 @@ print(value if isinstance(value, str) else json.dumps(value))
 
 # dropin: the systemd drop-in that turns local mode on.
 dropin() {
-  printf '%s\n' '# Written by the ollama-smart-router mattermost target: lets mmctl --local' \
+  printf '%s\n' '# Written by the open-smart-router mattermost target: lets mmctl --local' \
     '# manage this server over a socket only root and the mattermost account can open.' \
     '[Service]' 'Environment=MM_SERVICESETTINGS_ENABLELOCALMODE=true'
 }
@@ -210,7 +210,7 @@ write_secret "$MM_TARGET_ETC/admin-user" "$MATTERMOST_ADMIN_USER"
 if mm_json team list | json_find name "$MATTERMOST_TEAM" >/dev/null; then
   note "Team $MATTERMOST_TEAM exists."
 else
-  mm team create --name "$MATTERMOST_TEAM" --display-name "Ollama Smart Router" >/dev/null
+  mm team create --name "$MATTERMOST_TEAM" --display-name "Open Smart Router" >/dev/null
   note "Created the team $MATTERMOST_TEAM."
 fi
 # Already a member is fine; anything else only costs the admin the UI view.
@@ -245,7 +245,7 @@ if [[ -s $MM_TARGET_ETC/webhook-url ]]; then
 fi
 if [[ -z $hook_id ]]; then
   hook_id=$(mm_json webhook create-incoming --channel "$channel_id" --user "$admin_id" \
-    --display-name "Ollama Smart Router monitor" --description "Health alerts from ollama-monitor" |
+    --display-name "Open Smart Router monitor" --description "Health alerts from ollama-monitor" |
     json_find channel_id "$channel_id" id) || die 'Mattermost did not return the new webhook.'
   [[ $hook_id =~ ^[a-z0-9]{26}$ ]] || die "Unexpected webhook id: $hook_id"
   write_secret "$MM_TARGET_ETC/webhook-url" "$site_url/hooks/$hook_id"

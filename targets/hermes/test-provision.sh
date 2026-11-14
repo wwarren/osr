@@ -42,7 +42,7 @@ done
 fw=$(firewall_config open 192.0.2.80 192.0.2.80 8000 '')
 [[ $fw == *'policy_out: ACCEPT'* && $fw != *'IN ACCEPT'* && $fw != *'OUT '* ]] || fail "open egress, no API: $fw"
 fw=$(firewall_config restricted 192.0.2.80 192.0.2.80 8000 8642 9119)
-grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard' <<< "$fw" || fail 'dashboard inbound rule'
+grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # open-smart-router hermes-dashboard' <<< "$fw" || fail 'dashboard inbound rule'
 pass 'helpers: router kind, route source, URL parts, and firewall rules in first-match order'
 
 inv=$tmp_root/inventory.json
@@ -87,8 +87,8 @@ pass 'direct targets: stable names per endpoint, including URLs with =, with bad
 # in the layout earlier versions wrote) and keeps every other line.
 fwfile=$tmp_root/legacy.fw
 upd() { hermes_fw_update "$fwfile" "$@" true 8642 > "$fwfile.new" && mv -- "$fwfile.new" "$fwfile"; }
-api81='IN ACCEPT -source 192.0.2.81/32 -p tcp -dport 8643 -log nolog # ollama-smart-router hermes-api'
-out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router'
+api81='IN ACCEPT -source 192.0.2.81/32 -p tcp -dport 8643 -log nolog # open-smart-router hermes-api'
+out81='OUT ACCEPT -dest 192.0.2.81/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router'
 second_rule() { awk '/^\[RULES\]$/ {getline; getline; print; exit}' "$fwfile"; }
 legacy_fw() {
   cat > "$fwfile" <<'FW'
@@ -134,12 +134,70 @@ pass 'a legacy CLI-only firewall gains its first API rule and updates its router
 legacy_fw
 upd keep 192.0.2.81 8643 192.0.2.81 8000 || fail 'keeping the old rules'
 grep -qxF "$api81" "$fwfile" && grep -qxF "$out81" "$fwfile" || fail 'new rules missing next to the old ones'
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api' "$fwfile" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api' "$fwfile" ||
   fail "old API rule not kept and marked: $(cat "$fwfile")"
-grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" || fail 'old router rule not kept'
+grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router' "$fwfile" || fail 'old router rule not kept'
 upd replace 192.0.2.81 8643 192.0.2.81 8000 || fail 'dropping the kept rules'
 grep -q '192.0.2.80' "$fwfile" && fail 'kept rules survived the final update'
 pass 'before the guest step the new rules are added next to the old ones; afterwards only the new ones stay'
+
+# A CT provisioned before the rename from Ollama Smart Router: its rules carry
+# the old tag. They are this target's rules all the same, and come back with
+# the new tag (kept ones too), so no rule for an old address is left behind.
+renamed_fw() {
+  cat > "$fwfile" <<'FW'
+[OPTIONS]
+enable: 1
+policy_out: DROP
+
+[RULES]
+IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog
+IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api
+IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard
+OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router
+OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model
+OUT ACCEPT -p udp -dport 53 -log nolog
+FW
+}
+renamed_fw
+upd replace 192.0.2.81 8643 192.0.2.81 8000 || fail 'updating a pre-rename firewall'
+grep -qxF "$api81" "$fwfile" && grep -qxF "$out81" "$fwfile" || fail "pre-rename firewall not updated: $(cat "$fwfile")"
+grep -q 'ollama-smart-router' "$fwfile" && fail "pre-rename rules left behind: $(cat "$fwfile")"
+grep -q '192.0.2.80' "$fwfile" && fail 'a pre-rename rule for the old router address survived'
+grep -qx 'IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' "$fwfile" &&
+  grep -qx 'OUT ACCEPT -p udp -dport 53 -log nolog' "$fwfile" || fail 'updating a pre-rename firewall lost an unrelated rule'
+renamed_fw
+upd keep 192.0.2.81 8643 192.0.2.81 8000 || fail 'keeping pre-rename rules'
+for rule in 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api' \
+            'IN ACCEPT -p tcp -dport 9119 -log nolog # open-smart-router hermes-dashboard' \
+            'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router' \
+            'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router hermes-model'; do
+  grep -qxF "$rule" "$fwfile" || fail "kept pre-rename rule not retagged: $rule"
+done
+grep -q 'ollama-smart-router' "$fwfile" && fail 'a kept rule still carries the pre-rename tag'
+upd replace 192.0.2.81 8643 192.0.2.81 8000 || fail 'dropping the kept pre-rename rules'
+grep -q '192.0.2.80' "$fwfile" && fail 'kept pre-rename rules survived the final update'
+# The BEGIN/END lines an earlier version wrote, with the pre-rename name.
+printf '[OPTIONS]\nenable: 1\n\n[RULES]\n# BEGIN ollama-smart-router Hermes API\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog\n# END ollama-smart-router Hermes API\nOUT ACCEPT -p udp -dport 53 -log nolog\n' > "$fwfile"
+upd replace 192.0.2.81 8643 192.0.2.81 8000 || fail 'updating a pre-rename BEGIN/END block'
+grep -qxF "$api81" "$fwfile" || fail "pre-rename block not replaced: $(cat "$fwfile")"
+grep -qE '192\.0\.2\.80|smart-router Hermes API' "$fwfile" && fail "pre-rename block left behind: $(cat "$fwfile")"
+grep -qx 'OUT ACCEPT -p udp -dport 53 -log nolog' "$fwfile" || fail 'pre-rename block update lost a rule'
+pass 'rules and BEGIN/END lines from before the rename are owned, replaced, and kept ones come back with the new tag'
+
+# The CT description from before the rename identifies a Hermes CT too.
+(
+  # shellcheck disable=SC1091
+  source "$here/pve-select.sh"
+  pct() { [[ $1 == config ]] && printf 'hostname: x\ndescription: %s\n' "$FAKE_DESCRIPTION"; }
+  for d in 'Hermes Agent for Open Smart Router' 'Hermes Agent for Ollama Smart Router' 'Hermes%20Agent for Ollama Smart Router%0Anotes'; do
+    FAKE_DESCRIPTION=$d hermes_ct_described 282 || fail "description not recognised: $d"
+  done
+  for d in 'Hermes Agent' 'OpenClaw for Ollama Smart Router' 'Hermes Agent for Smart Router'; do
+    if FAKE_DESCRIPTION=$d hermes_ct_described 282; then fail "wrong description accepted: $d"; fi
+  done
+) || exit 1
+pass 'a CT described before the rename (Ollama Smart Router) is recognised as a Hermes CT'
 
 # Proxmox's GUI keeps rule comments but may move rules and drops comment lines.
 cat > "$fwfile" <<FW
@@ -163,9 +221,9 @@ cat > "$fwfile" <<'FW'
 policy_out: DROP
 
 [RULES]
-# BEGIN ollama-smart-router Hermes API
+# BEGIN open-smart-router Hermes API
 IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog
-# END ollama-smart-router Hermes API
+# END open-smart-router Hermes API
 OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog
 OUT ACCEPT -p udp -dport 53 -log nolog
 FW
@@ -192,7 +250,7 @@ printf '[RULES]\nIN DROP -source 198.51.100.0/24 -log nolog\nIN ACCEPT -source 1
 refused 'an unmarked API-like rule that is not first'
 printf '[OPTIONS]\npolicy_out: DROP\n\n[RULES]\nOUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog\nOUT ACCEPT -dest 10.9.9.9/32 -p tcp -dport 5432 -log nolog\n' > "$fwfile"
 refused 'two unmarked router-like rules'
-printf '[RULES]\n# BEGIN ollama-smart-router Hermes API\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog\n' > "$fwfile"
+printf '[RULES]\n# BEGIN open-smart-router Hermes API\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog\n' > "$fwfile"
 refused 'a BEGIN line without END'
 printf '[RULES]\n[RULES]\n' > "$fwfile"
 refused 'two [RULES] sections'
@@ -241,7 +299,7 @@ has 'policy_out: DROP'
 has '/root/hermes-deploy/router-api-key --perms 0600'
 has 'HERMES_API_SERVER=true'
 has 'HERMES_DASHBOARD=true'
-has 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard'
+has 'IN ACCEPT -p tcp -dport 9119 -log nolog # open-smart-router hermes-dashboard'
 has 'ROUTER_URL=http://\<router-source-ip\>:8000'
 has 'integrate-webui.py --webui-url http://127.0.0.1:8080 --hermes-url http://192.0.2.82:8642/v1'
 has '--task-model fast'
@@ -305,7 +363,7 @@ cmd=$1 id=$2; shift 2
 case $cmd in
   status) [[ -e $FAKE_DIR/ct$id || $id == 280 ]] && echo 'status: running' ;;
   create) printf 'pct-create-umask %s\n' "$(umask)" >> "$FAKE_LOG"; mkdir -p "$FAKE_DIR/ct$id"
-    printf 'description: Hermes Agent for Ollama Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
+    printf 'description: Hermes Agent for Open Smart Router\n' > "$FAKE_DIR/ct$id/description" ;;
   config) cat "$FAKE_DIR/ct$id/description" ;;
   start) : ;;
   push) cp "$1" "$FAKE_DIR/pushed-$id-$(basename "$2")"
@@ -479,12 +537,12 @@ grep -q 'install-target.sh' "$log" && grep -q 'HERMES_API_SERVER=true' "$log" ||
 grep -q 'ROUTER_URL=http://192.0.2.80:8000' "$log" || fail 'ROUTER_URL not derived from the router address'
 grep -q 'KINDI_READ_TIMEOUT_SECONDS=5400' "$log" || fail 'Kindi timeout not read from router.ini'
 fwfile=$fake/pve/firewall/282.fw
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
-grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # ollama-smart-router hermes-dashboard' "$fwfile" || fail 'dashboard firewall rule'
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"
+grep -qx 'IN ACCEPT -p tcp -dport 9119 -log nolog # open-smart-router hermes-dashboard' "$fwfile" || fail 'dashboard firewall rule'
 grep -q 'HERMES_DASHBOARD=true' "$log" || fail 'guest installer did not receive dashboard setting'
 grep -q 'hermes-dashboard.service' "$log" || fail 'dashboard service not pushed'
-grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" || fail 'router egress rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fwfile" || fail 'model egress rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router' "$fwfile" || fail 'router egress rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # open-smart-router hermes-model' "$fwfile" || fail 'model egress rule'
 grep -q -- '--hermes-url http://192.0.2.82:8642/v1' "$log" || fail 'integration URL'
 grep -q 'rm -rf -- /root/hermes-integration.AbC123' "$log" || fail 'the router staging directory was not removed'
 [[ $out == *'Open WebUI connection 1 added'* && $out == *'hermes-agent'* ]] || fail "summary: $out"
@@ -533,12 +591,12 @@ grep -q 'pct create' "$log" && fail '--reconfigure created a CT'
 grep -q 'integrate-webui.py' "$log" || fail '--reconfigure did not register again'
 : > "$log"
 out=$(real --reconfigure FAKE_MODEL_SERVER=192.0.2.72) || fail "changed model server: $out"
-grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fake/pve/firewall/282.fw" || fail 'new model server not admitted'
+grep -qx 'OUT ACCEPT -dest 192.0.2.72/32 -p tcp -dport 8080 -log nolog # open-smart-router hermes-model' "$fake/pve/firewall/282.fw" || fail 'new model server not admitted'
 grep -q '192.0.2.71/32.*hermes-model' "$fake/pve/firewall/282.fw" && fail 'old model server still admitted'
 : > "$log"
 out=$(real --reconfigure) || fail "restore model server: $out"
 # Honcho: given once, kept by a plain --reconfigure, turned off with HONCHO_URL=.
-honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-model'
+honcho_rule='OUT ACCEPT -dest 192.0.2.85/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-model'
 : > "$log"; rm -f "$fake"/pushed-*
 honcho_lxc=$fake/honcho-lxc; mkdir -p "$honcho_lxc"
 printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.85/24,gw=192.0.2.1\n' > "$honcho_lxc/285.conf"
@@ -576,7 +634,7 @@ ot_lxc=$fake/lxc; mkdir -p "$ot_lxc"
 printf 'net0: name=eth0,bridge=vmbr0,ip=192.0.2.70/24,gw=192.0.2.1\n' > "$ot_lxc/270.conf"
 printf '[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8000 -log nolog\n' > "$fake/pve/firewall/270.fw"
 ot_rule='IN ACCEPT -source 192.0.2.82/32 -p tcp -dport 8000 -log nolog # osr-open-terminal-client hermes-282'
-ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-model'
+ot_egress='OUT ACCEPT -dest 192.0.2.70/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-model'
 : > "$log"; rm -f "$fake"/pushed-*
 out=$(real --reconfigure OPEN_TERMINAL_URL=http://192.0.2.70:8000 PVE_LXC_DIR="$ot_lxc") || fail "Open Terminal on: $out"
 grep -q 'pct exec 270 -- /usr/local/sbin/open-terminal-clients issue hermes-282 --default-user default' "$log" ||
@@ -628,7 +686,7 @@ grep -q 'HERMES_API_PORT=8643 ' "$log" || fail 'a plain reconfigure moved the AP
 grep -q 'HERMES_API_MODEL_NAME=hermes-lab ' "$log" || fail 'a plain reconfigure renamed the Open WebUI model'
 grep -q -- '--hermes-url http://192.0.2.82:8643/v1 --model-name hermes-lab' "$log" ||
   fail "registered with another port or name: $(grep integrate-webui "$log")"
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # ollama-smart-router hermes-api' "$fwfile" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # open-smart-router hermes-api' "$fwfile" ||
   fail "the API rule moved: $(cat "$fwfile")"
 [[ $out == *"Keeping the recorded HERMES_COMMIT=$pin"* ]] || fail "the kept pin is not reported: $out"
 : > "$log"
@@ -659,7 +717,7 @@ pass '--reconfigure pushes the current router key and re-registers; --integrate-
 # --reconfigure and the CT's firewall. The fake CT records the firewall file
 # when the guest installer and Open WebUI's check run.
 fwfile=$fake/pve/firewall/282.fw
-api80='IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api'
+api80='IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api'
 reset_fake
 out=$(real OPENWEBUI=false OPENWEBUI_ADMIN_TOKEN=) || fail "CLI-only run: $out"
 : > "$log"
@@ -677,8 +735,8 @@ grep -q 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000' "$fake/fw-at-guest" 
   grep -q 'OUT ACCEPT -dest 192.0.2.90/32 -p tcp -dport 8000' "$fake/fw-at-guest" ||
   fail "the guest step did not reach the old and the new router: $(cat "$fake/fw-at-guest")"
 grep -q '192.0.2.80' "$fwfile" && fail "the old router address is still admitted: $(cat "$fwfile")"
-grep -qx 'IN ACCEPT -source 192.0.2.90/32 -p tcp -dport 8643 -log nolog # ollama-smart-router hermes-api' "$fwfile" || fail 'new API rule'
-grep -qx 'OUT ACCEPT -dest 192.0.2.90/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" || fail 'new router rule'
+grep -qx 'IN ACCEPT -source 192.0.2.90/32 -p tcp -dport 8643 -log nolog # open-smart-router hermes-api' "$fwfile" || fail 'new API rule'
+grep -qx 'OUT ACCEPT -dest 192.0.2.90/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router' "$fwfile" || fail 'new router rule'
 grep -qx 'OUT ACCEPT -p tcp -dport 443 -log nolog' "$fwfile" || fail 'the other egress rules were lost'
 : > "$log"
 out=$(real --reconfigure ROUTER_IP=192.0.2.90 HERMES_API_PORT=8650 FAKE_GUEST_RC=1) && fail 'a failed guest step was accepted'
@@ -711,7 +769,7 @@ pass 'firewall updates go through the locked swap: a racing edit stops the run a
 pass '--reconfigure follows a router move and port change in both directions; a failed guest step keeps the old rules'
 
 printf 'IN ACCEPT -source 198.51.100.7/32 -p tcp -dport 8642 -log nolog\n' >> "$fwfile"
-sed -i 's/ # ollama-smart-router hermes-[a-z]*$//' "$fwfile"
+sed -i 's/ # open-smart-router hermes-[a-z]*$//' "$fwfile"
 cp "$fwfile" "$fwfile.before"
 : > "$log"
 out=$(real --reconfigure ROUTER_IP=192.0.2.90 HERMES_API_PORT=8650) && fail 'an unreadable firewall was accepted'
@@ -728,7 +786,7 @@ pass '--reconfigure stops before changing the CT when its firewall is ambiguous,
 reset_fake
 out=$(real OPENWEBUI=false OPENWEBUI_ADMIN_TOKEN=) || fail "legacy CLI-only run: $out"
 fwfile=$fake/pve/firewall/282.fw
-sed -i 's/ # ollama-smart-router hermes-router$//' "$fwfile"
+sed -i 's/ # open-smart-router hermes-router$//' "$fwfile"
 sed -i '/^\[RULES\]$/a IN ACCEPT -source 203.0.113.9/32 -p tcp -dport 22 -log nolog' "$fwfile"
 cp "$fwfile" "$fwfile.before"
 : > "$log"
@@ -745,13 +803,13 @@ reset_fake
 out=$(real HERMES_API_PORT=8643) || fail "API server on 8643: $out"
 sed -i '/hermes-model/d' "$fwfile"
 sed -i '/hermes-dashboard/d' "$fwfile"
-sed -i 's/ # ollama-smart-router hermes-[a-z]*$//' "$fwfile"
-grep -q 'ollama-smart-router' "$fwfile" && fail 'test setup: the legacy layout still has comments'
+sed -i 's/ # open-smart-router hermes-[a-z]*$//' "$fwfile"
+grep -q 'open-smart-router' "$fwfile" && fail 'test setup: the legacy layout still has comments'
 : > "$log"
 out=$(real --reconfigure HERMES_API_PORT=8643) || fail "legacy upgrade with the API server: $out"
-grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # ollama-smart-router hermes-api' "$fwfile" ||
+grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8643 -log nolog # open-smart-router hermes-api' "$fwfile" ||
   fail "legacy API rule not adopted: $(cat "$fwfile")"
-grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router' "$fwfile" ||
+grep -qx 'OUT ACCEPT -dest 192.0.2.80/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router' "$fwfile" ||
   fail 'legacy router rule not adopted'
 [[ $(grep -c 'hermes-api$' "$fwfile") == 1 && $(grep -c 'hermes-dashboard$' "$fwfile") == 1 && $(grep -c 'dport 8000 ' "$fwfile") == 1 ]] || fail "legacy rules duplicated: $(cat "$fwfile")"
 grep -q 'integrate-webui.py' "$log" || fail 'the upgraded CT was not registered again'
@@ -764,7 +822,7 @@ dns='FAKE_CT_DNS=models.lan=192.0.2.73,192.0.2.74;plain.lan=192.0.2.76;secure.la
 out=$(real FAKE_INVENTORY_SERVERS=$servers "$dns") || fail "model servers by name: $out"
 fwfile=$fake/pve/firewall/282.fw
 for want in 192.0.2.73/32:8080 192.0.2.74/32:8080 192.0.2.76/32:80 192.0.2.77/32:443 192.0.2.75/32:80; do
-  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # ollama-smart-router hermes-model"
+  rule="OUT ACCEPT -dest ${want%:*} -p tcp -dport ${want##*:} -log nolog # open-smart-router hermes-model"
   grep -qxF "$rule" "$fwfile" || fail "missing $rule: $(cat "$fwfile")"
   grep -qxF "$rule" "$fake/fw-at-guest" || fail "not admitted before the guest step: $rule"
 done
@@ -777,21 +835,21 @@ start=$(grep -n 'pct start 282' "$log" | cut -d: -f1); lookup=$(grep -n 'getent 
 : > "$log"
 out=$(real --reconfigure FAKE_INVENTORY_SERVERS=$servers 'FAKE_CT_DNS=models.lan=192.0.2.79;plain.lan=192.0.2.76;secure.lan=192.0.2.77') ||
   fail "reconfigure after a DNS change: $out"
-grep -qxF 'OUT ACCEPT -dest 192.0.2.79/32 -p tcp -dport 8080 -log nolog # ollama-smart-router hermes-model' "$fwfile" ||
+grep -qxF 'OUT ACCEPT -dest 192.0.2.79/32 -p tcp -dport 8080 -log nolog # open-smart-router hermes-model' "$fwfile" ||
   fail "new address not admitted: $(cat "$fwfile")"
 grep -q -e '192.0.2.73/32' -e '192.0.2.74/32' "$fwfile" && fail "old addresses still admitted: $(cat "$fwfile")"
-grep -qxF 'OUT ACCEPT -dest 192.0.2.76/32 -p tcp -dport 80 -log nolog # ollama-smart-router hermes-model' "$fwfile" ||
+grep -qxF 'OUT ACCEPT -dest 192.0.2.76/32 -p tcp -dport 80 -log nolog # open-smart-router hermes-model' "$fwfile" ||
   fail 'an unchanged name lost its rule'
 pass 'model server names are resolved inside the CT (every address), ports default to 80/443, and --reconfigure follows DNS changes'
 
 reset_fake
 mkdir -p "$fake/ct282"
 printf 'description: unrelated CT\n' > "$fake/ct282/description"
-printf '[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api\n' > "$fake/pve/firewall/282.fw"
+printf '[RULES]\nIN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api\n' > "$fake/pve/firewall/282.fw"
 out=$(real --reconfigure) && fail 'an unrelated CT without Hermes settings was accepted'
 [[ $out == *'no completed Hermes installation'* ]] || fail "unrelated CT message: $out"
 grep -q 'pct push' "$log" && fail 'an unrelated CT was modified'
-printf 'description: Hermes Agent for Ollama Smart Router\n' > "$fake/ct282/description"
+printf 'description: Hermes Agent for Open Smart Router\n' > "$fake/ct282/description"
 rm -f "$fake/pve/firewall/282.fw"
 : > "$log"
 out=$(real --reconfigure) && fail 'an incomplete CT without a firewall was accepted'

@@ -42,8 +42,8 @@ policy_in: DROP
 policy_out: DROP
 
 [RULES]
-IN ACCEPT -source 192.0.2.10/32 -p tcp -dport 8642 -log nolog # ollama-smart-router hermes-api
-OUT ACCEPT -dest 192.0.2.10/32 -p tcp -dport 8000 -log nolog # ollama-smart-router hermes-router
+IN ACCEPT -source 192.0.2.10/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api
+OUT ACCEPT -dest 192.0.2.10/32 -p tcp -dport 8000 -log nolog # open-smart-router hermes-router
 OUT ACCEPT -p udp -dport 53 -log nolog
 OUT ACCEPT -p tcp -dport 53 -log nolog
 OUT DROP -dest 10.0.0.0/8 -log nolog

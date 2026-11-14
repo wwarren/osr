@@ -80,7 +80,8 @@ fi
 [[ $EUID == 0 ]] || die 'Run on the Proxmox host as root.'
 command -v pct >/dev/null || die 'pct is required.'
 if (( reconfigure )); then
-  pct config "$CT_ID" | grep -q '^description: MQTT relay for Ollama Smart Router' || die 'Selected CT is not the OSR MQTT target.'
+  # Before the rename the project was Ollama Smart Router; its CTs still say so.
+  pct config "$CT_ID" | grep -qE '^description: MQTT relay for (Open|Ollama) Smart Router' || die 'Selected CT is not the OSR MQTT target.'
   pct status "$CT_ID" | grep -q running || die 'Broker CT must be running.'
   # A broker made by an older version gets the tags tools/upgrade-all.sh finds it by.
   pve_ensure_tags "$CT_ID" ai ai-tools osr-target mqtt
@@ -89,7 +90,7 @@ else
   ( umask 022; pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --unprivileged 1 \
     --cores "$CORES" --memory "$MEMORY_MB" --swap 256 --rootfs "$STORAGE:$ROOTFS_GB" \
     --net0 "name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,gw=$GATEWAY,firewall=1" \
-    --onboot 1 --description 'MQTT relay for Ollama Smart Router' --tags 'ai;ai-tools;osr-target;mqtt' )
+    --onboot 1 --description 'MQTT relay for Open Smart Router' --tags 'ai;ai-tools;osr-target;mqtt' )
   pct start "$CT_ID"
 fi
 # Preserve user firewall rules on reconfigure. Replace only our managed rule.

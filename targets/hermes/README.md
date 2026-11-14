@@ -187,9 +187,10 @@ chunked response; for close-delimited backends the dispatcher requires
 complete JSON or an SSE `[DONE]` first.
 
 **What `--reconfigure` changes.** The rules carrying the comments
-`ollama-smart-router hermes-api`, `hermes-dashboard`, `hermes-router` and
-`hermes-model` (Proxmox's GUI keeps comments) belong to this target. Only those
-are replaced, placed first in `[RULES]`; every other line stays. Each write
+`open-smart-router hermes-api`, `hermes-dashboard`, `hermes-router` and
+`hermes-model` (Proxmox's GUI keeps comments) belong to this target, as do the
+same comments, and `# BEGIN/END` lines, with the pre-rename name
+`ollama-smart-router` (rewritten with the new one). Only those are replaced, placed first in `[RULES]`; every other line stays. Each write
 goes through `targets/pve-firewall-swap.pl` under the CT's firewall lock and
 only if the file is unchanged since read, so a concurrent edit stops the run
 and is kept.

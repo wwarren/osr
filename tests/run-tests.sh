@@ -23,7 +23,7 @@ SKIP_PARSER="${HERE}/lib/parse-skips.py"
 
 # suite-name : script-under-test : test-file
 SUITES=(
-  "installer:${ROOT}/ollama-smart-router-install.sh:${HERE}/test-installer.sh"
+  "installer:${ROOT}/open-smart-router-install.sh:${HERE}/test-installer.sh"
   "manage:${ROOT}/install/manage-model-servers.sh:${HERE}/test-manage.sh"
 )
 # Suites without per-function coverage: repo consistency, the inference-target
@@ -76,6 +76,8 @@ BRIDGE_PYTHON="${BRIDGE_PYTHON:-python3}"
 # retry test. Without it that suite prints a SKIP line, which --strict fails.
 LITELLM_PYTHON="${LITELLM_PYTHON:-python3}"
 add_suite bridge  pytest "${ROOT}/targets/llamacpp/test_bridge.py" "$BRIDGE_PYTHON"
+# The llama.cpp monitor dashboard runs on the bridge's venv.
+add_suite llamacpp-dashboard pytest "${ROOT}/targets/llamacpp/test_dashboard.py" "$BRIDGE_PYTHON"
 add_suite airllm  pytest "${ROOT}/targets/airllm/test_server.py"   "$BRIDGE_PYTHON"
 add_suite router  pytest "${HERE}/test_router.py"                  "$ROUTER_PYTHON"
 add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTHON"

@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "ollama-smart-router-install.sh"
+INSTALLER = ROOT / "open-smart-router-install.sh"
 LOCK = ROOT / "services/litellm-proxy/requirements.lock"
 
 try:

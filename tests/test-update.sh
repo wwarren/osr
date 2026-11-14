@@ -20,7 +20,7 @@ describe owned_code_list
 printf 'x=1\nINSTALLER_OWNED_CODE=(\n  services/a/a.py   # comment\n  install/b.sh\n  $(rm -rf /)\n)\n' > "$TMP/inst.sh"
 assert_eq "entries parsed as text, junk dropped" $'services/a/a.py\ninstall/b.sh' "$(owned_code_list "$TMP/inst.sh")"
 assert_eq "the real installer lists the router code" "yes" \
-  "$(owned_code_list "${ROOT}/ollama-smart-router-install.sh" | grep -qx services/ollama-router/router.py && echo yes)"
+  "$(owned_code_list "${ROOT}/open-smart-router-install.sh" | grep -qx services/ollama-router/router.py && echo yes)"
 
 describe safe_rel_path
 assert_ok   "plain path"           safe_rel_path services/ollama-router/router.py
@@ -82,6 +82,7 @@ EOF
 run_update() {
   CONFIG_REPO_DIR="$TMP/w/repo" ROUTER_DIR="$TMP/w/router" \
     MANAGE_CMD="${MANAGE_CMD_OVERRIDE:-$TMP/w/manage}" CONFIG_LOCK_FILE="${LOCK_FILE_OVERRIDE:-$TMP/w/update.lock}" \
+    CONFIG_LOCK_FILE_LEGACY="${LEGACY_LOCK_OVERRIDE:-$TMP/w/legacy.lock}" \
     PYTHON=python3 bash "$UPDATE" "$@" "$TMP/w/src" 2>&1
 }
 head_of() { git -C "$TMP/w/repo" rev-parse HEAD; }
@@ -235,6 +236,20 @@ assert_eq "held lock refuses update" "1" "$rc"
 assert_contains "lock refusal is explained" "another config update" "$out"
 assert_contains "and points at clear-lock" "clear-lock" "$out"
 exec 9>&-
+
+describe pre_rename_lock_is_honoured
+# A manage-model-servers.sh from before the rename locks the old path.
+make_world
+echo '# locked' >> "$TMP/w/src/$router"
+exec 9>"$TMP/w/legacy-held.lock"
+flock -n 9
+out="$(LEGACY_LOCK_OVERRIDE="$TMP/w/legacy-held.lock" run_update)"; rc=$?
+assert_eq "a held pre-rename lock refuses the update" "1" "$rc"
+assert_contains "the refusal names the old lock" "legacy-held.lock" "$out"
+assert_eq "manage not called under a held pre-rename lock" "" "$(cat "$TMP/w/calls")"
+exec 9>&-
+out="$(LEGACY_LOCK_OVERRIDE="$TMP/w/legacy-held.lock" run_update)"; rc=$?
+assert_eq "a free pre-rename lock file does not stop the update" "0" "$rc"
 
 make_world
 out="$(CONFIG_REPO_DIR="$TMP/w/repo" ROUTER_DIR="$TMP/w/router" MANAGE_CMD="$TMP/w/manage" bash "$UPDATE" "$TMP/w/repo" 2>&1)"; rc=$?

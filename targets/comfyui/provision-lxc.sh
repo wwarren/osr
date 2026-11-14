@@ -665,7 +665,7 @@ if (( webui )); then
             router_exec true || die "Cannot log in to ${router_label} on port ${ROUTER_SSH_PORT}."
         fi
         router_exec test -x /app/openwebui/venv/bin/open-webui ||
-            die "Open WebUI is not installed at /app/openwebui on ${router_label}. Is this an ollama-smart-router install?"
+            die "Open WebUI is not installed at /app/openwebui on ${router_label}. Is this an open-smart-router install?"
         router_exec systemctl is-active --quiet open-webui.service ||
             die "Open WebUI (open-webui.service) is not active on ${router_label}."
         router_exec sh -c 'command -v python3 >/dev/null' || die "python3 is missing on ${router_label}."

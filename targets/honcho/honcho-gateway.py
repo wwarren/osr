@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Honcho client gateway for Ollama Smart Router.
+"""Honcho client gateway for Open Smart Router.
 
 Listens on the Honcho CT's public ports, in front of the Honcho API (8000)
 and Honcho's MCP server (3000), which run on loopback only:

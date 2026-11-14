@@ -56,16 +56,16 @@ done
 [[ $(id -u) -eq 0 ]] || die 'Run as root (pct and the in-container updater need it).'
 script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -P -- "$script_dir/.." && pwd)
-[[ -f $repo_root/ollama-smart-router-install.sh && -f $repo_root/install/update-router.sh ]] ||
+[[ -f $repo_root/open-smart-router-install.sh && -f $repo_root/install/update-router.sh ]] ||
     die "Cannot locate the router repository beside this script: $repo_root"
 
 # The in-container updater uses this text list too. Do not source the installer
 # on the host: sourcing it would run its provisioning code.
-mapfile -t owned < <(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$repo_root/ollama-smart-router-install.sh" |
+mapfile -t owned < <(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$repo_root/open-smart-router-install.sh" |
     sed -e '1d' -e '$d' -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
     sed '/^$/d')
 (( ${#owned[@]} )) || die 'The source installer has no INSTALLER_OWNED_CODE list.'
-files=(ollama-smart-router-install.sh install/update-router.sh "${owned[@]}")
+files=(open-smart-router-install.sh install/update-router.sh "${owned[@]}")
 for arg in "${update_args[@]}"; do
     if [[ $arg == --with-tunables ]]; then
         files+=(services/ollama-router/router.ini services/ollama-monitor/monitor.ini)

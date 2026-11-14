@@ -46,7 +46,7 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 pct() {
   case $1 in
     status) [[ ${FAKE_CT_DOWN:-false} != true ]] && printf 'status: running\n' ;;
-    config) printf 'description: Honcho AI for Ollama Smart Router%%0A\ntags: %s\n' "${FAKE_CT_TAGS:-osr-target;honcho}" ;;
+    config) printf 'description: Honcho AI for Open Smart Router%%0A\ntags: %s\n' "${FAKE_CT_TAGS:-osr-target;honcho}" ;;
     exec)
       case $4 in
         sed) printf '%s\n' "${FAKE_PREVIOUS_EMBEDDING:-qwen3-embedding-0.6b}" ;;

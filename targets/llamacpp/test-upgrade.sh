@@ -24,6 +24,7 @@ source <(awk '
 ' "$script_dir/install-target.sh")
 for helper in valid_extra_args build_info fetch_llama_source build_llama_server install_bridge \
     write_build_info set_aside copy_aside restore_aside ensure_env_key target_healthy upgrade_unchanged \
+    install_dashboard dashboard_port dashboard_healthy \
     valid_cpu_target cpu_build cpu_cmake_args installed_cpu_build valid_cuda_architectures \
     detected_cuda_architectures resolve_cuda_architectures cuda_build_covers installed_cuda_architectures; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
@@ -103,6 +104,17 @@ ensure_env_key "$TARGET_ROOT/env" A 2; ensure_env_key "$TARGET_ROOT/env" B ''
 [[ $(cat "$TARGET_ROOT/env") == $'A=1\nB=' ]] || die 'ensure_env_key'
 pass 'ensure_env_key adds, never rewrites'
 
+TARGET_ETC=$tmp_root/dash-etc; mkdir -p "$TARGET_ETC"
+[[ $(dashboard_port) == 8082 ]] || die 'dashboard port default'
+printf 'DASHBOARD_PORT=9090\n' > "$TARGET_ETC/dashboard.env"
+[[ $(dashboard_port) == 9090 ]] || die 'dashboard port from dashboard.env'
+printf 'DASHBOARD_PORT=80; reboot\n' > "$TARGET_ETC/dashboard.env"
+[[ $(dashboard_port) == 8082 ]] || die 'a malformed dashboard port was used'
+[[ " ${TARGET_UNIT_FILES[*]} " == *' llama-dashboard.service '* && " ${DASHBOARD_FILES[*]} " == ' dashboard.py monitor.html ' ]] ||
+    die 'the dashboard is not among the upgraded files'
+unset TARGET_ETC
+pass 'the dashboard port comes from dashboard.env (8082 otherwise); its files are upgraded with the rest'
+
 # --- the full --upgrade run -------------------------------------------------
 # install-target.sh insists on root and installs files owned by root.
 if (( EUID != 0 )); then
@@ -132,11 +144,15 @@ stub systemctl 'case "$1" in
               if [[ -n ${FAKE_ACTIVE_STATE:-} ]]; then echo "$FAKE_ACTIVE_STATE"
               elif [[ ${FAKE_ACTIVE_RC:-0} == 0 ]]; then echo active; else echo inactive; fi
           else echo not-found; fi ;;
-    is-active) [[ ${FAKE_ACTIVE_STATE:-} == failed ]] && exit 3; exit "${FAKE_ACTIVE_RC:-0}" ;;
+    is-active) [[ $* == *llama-dashboard* && -n ${FAKE_DASH_ACTIVE:-} ]] && exit "$FAKE_DASH_ACTIVE"
+               [[ ${FAKE_ACTIVE_STATE:-} == failed ]] && exit 3; exit "${FAKE_ACTIVE_RC:-0}" ;;
+    is-enabled) exit "${FAKE_DASH_ENABLED:-0}" ;;
 esac; exit 0'
 # FAKE_HEALTH: ok, down, or old-only (only the previous build answers).
 # FAKE_HEALTH=ctx:N: healthy unless llama-server.env sets CONTEXT_SIZE=N.
-stub curl 'case ${FAKE_HEALTH:-ok} in ok) exit 0;; old-only) "$TARGET_ROOT/bin/llama-server" | grep -q "version old";;
+# FAKE_DASH=down: the monitor dashboard (TCP 8082) does not answer.
+stub curl '[[ $* == *:8082/* && ${FAKE_DASH:-ok} != ok ]] && exit 7
+case ${FAKE_HEALTH:-ok} in ok) exit 0;; old-only) "$TARGET_ROOT/bin/llama-server" | grep -q "version old";;
     ctx:*) ! grep -qx "CONTEXT_SIZE=${FAKE_HEALTH#ctx:}" "$TARGET_ETC/llama-server.env";; *) exit 1;; esac'
 stub git 'case "$*" in *"init -q "*) mkdir -p "${@: -1}";; *rev-parse*) echo "$FAKE_COMMIT";; esac; exit 0'
 stub cmake 'if [[ $1 == --build ]]; then mkdir -p "$2/bin"; printf "#!/bin/sh\necho version $FAKE_COMMIT\n" > "$2/bin/llama-server"; chmod +x "$2/bin/llama-server"; fi; [[ ${FAKE_BUILD:-ok} == ok ]]'
@@ -164,6 +180,8 @@ upgrade() {
         FAKE_BUILD="${FAKE_BUILD:-ok}" FAKE_PIP="${FAKE_PIP:-ok}" FAKE_ACTIVE_RC="${FAKE_ACTIVE_RC:-0}" \
         BACKEND="${BACKEND:-}" FAKE_ACTIVE_STATE="${FAKE_ACTIVE_STATE:-}" \
         FORCE_REBUILD="${FORCE_REBUILD:-false}" UPGRADE_HEALTH_TIMEOUT=10 \
+        FAKE_DASH="${FAKE_DASH:-ok}" FAKE_DASH_ACTIVE="${FAKE_DASH_ACTIVE:-}" FAKE_DASH_ENABLED="${FAKE_DASH_ENABLED:-0}" \
+        DASHBOARD_HEALTH_TIMEOUT=4 \
         GPU_LAYERS="${GPU_LAYERS:-}" CUDA_COMPILER="${CUDA_COMPILER:-}" \
         DRI_DIR="$tmp_root/dri" FAKE_VK="${FAKE_VK:-discrete}" \
         CPUINFO_FILE="$tmp_root/cpuinfo" CPU_TARGET="${CPU_TARGET:-}" \
@@ -288,6 +306,19 @@ cmp -s "$script_dir/bridge.py" "$tmp_root/opt/bridge.py" || die 'bridge.py not r
 cmp -s "$script_dir/llama-server.service" "$tmp_root/units/llama-server.service" || die 'unit not refreshed'
 grep -q 'systemctl restart llama-server.service llama-ollama-bridge.service' "$log" || die 'services not restarted'
 pass 'healthy upgrade: rebuilds, refreshes bridge and units, keeps settings, restarts'
+
+# make_install is a target from before the dashboard: the upgrade added it.
+for file in dashboard.py monitor.html; do
+    cmp -s "$script_dir/$file" "$tmp_root/opt/dashboard/$file" || die "dashboard $file not installed"
+done
+cmp -s "$script_dir/llama-dashboard.service" "$tmp_root/units/llama-dashboard.service" || die 'dashboard unit not installed'
+grep -q -- '--metrics --slots' "$tmp_root/units/llama-server.service" || die 'llama-server does not serve the metrics and slots'
+grep -q 'venv-python -m py_compile .*/opt/dashboard/dashboard.py' "$log" || die 'dashboard.py not compiled'
+grep -q 'systemctl enable llama-dashboard.service' "$log" || die 'a new dashboard was not enabled'
+grep -q 'systemctl restart llama-dashboard.service' "$log" || die 'a new dashboard was not started on a running target'
+[[ $out == *'Installed the llama.cpp Monitor Dashboard (llama-dashboard.service, TCP 8082)'*'Monitor dashboard: http://<this CT>:8082/'* ]] ||
+    die "new dashboard report: $out"
+pass 'a target without the dashboard gets it: installed, enabled and started with the running target'
 
 # A second upgrade to the same ref, bridge, units and settings changes nothing.
 : > "$log"
@@ -447,6 +478,58 @@ pass 'stopped services stay stopped, on success and on rollback'
 rm -rf "$tmp_root/opt/bin/llama-server"
 upgrade >/dev/null 2>&1 && die 'upgrade without an installation succeeded'
 pass 'upgrade refuses a target that is not installed'
+
+# --- the monitor dashboard ----------------------------------------------------
+with_dashboard() {  # an installed target that already has the dashboard (from an older copy)
+    make_install
+    upgrade >/dev/null 2>&1 || die 'setting up a target with the dashboard failed'
+    echo '# from an older copy' >> "$tmp_root/opt/dashboard/dashboard.py"
+    cp "$tmp_root/opt/dashboard/dashboard.py" "$tmp_root/dashboard-before"
+    : > "$log"
+}
+with_dashboard
+out=$(upgrade 2>&1) || die "dashboard refresh failed: $out"
+cmp -s "$script_dir/dashboard.py" "$tmp_root/opt/dashboard/dashboard.py" || die 'dashboard.py not refreshed'
+cmp -s "$tmp_root/opt/dashboard.prev/dashboard.py" "$tmp_root/dashboard-before" || die 'the previous dashboard was not kept as .prev'
+grep -q 'systemctl enable llama-dashboard' "$log" && die 'an existing dashboard was enabled again'
+grep -q 'systemctl restart llama-dashboard.service' "$log" || die 'a running dashboard was not restarted'
+[[ $out != *'Installed the llama.cpp Monitor Dashboard'* ]] || die 'an existing dashboard was reported as new'
+pass 'an existing dashboard is refreshed, kept as .prev and restarted, not enabled again'
+
+with_dashboard
+out=$(FAKE_DASH_ACTIVE=3 FAKE_DASH_ENABLED=1 upgrade 2>&1) || die "upgrade with a disabled dashboard failed: $out"
+grep -qE 'systemctl (enable|start|restart|reset-failed) llama-dashboard' "$log" && die "a disabled dashboard was enabled or started: $(cat "$log")"
+[[ $out == *'is disabled and stays disabled'* ]] || die "disabled dashboard: $out"
+pass 'a dashboard you disabled stays disabled'
+
+make_install
+out=$(FAKE_DASH=down upgrade 2>&1) || die "a dashboard that does not answer failed the upgrade: $out"
+[[ $out == *'Warning: the monitor dashboard does not answer on TCP 8082; inference is unaffected.'* && $out == *'Upgrade complete'* ]] ||
+    die "silent dashboard: $out"
+[[ $out != *'Upgrade failed'* && -e $tmp_root/units/llama-dashboard.service ]] || die 'a silent dashboard rolled the upgrade back'
+pass 'a dashboard that does not answer is reported and does not roll back a serving upgrade'
+
+make_install
+out=$(FAKE_HEALTH=down upgrade 2>&1) && die 'an unhealthy upgrade reported success'
+[[ ! -e $tmp_root/units/llama-dashboard.service && ! -e $tmp_root/opt/dashboard && ! -e $tmp_root/opt/dashboard.prev ]] ||
+    die 'a dashboard added by a failed upgrade was left behind'
+grep -q 'systemctl disable llama-dashboard.service' "$log" || die 'the added dashboard was not disabled again'
+grep -q 'systemctl start llama-dashboard' "$log" && die 'a dashboard that was not there before was started'
+pass 'a failed upgrade removes the dashboard it added'
+
+with_dashboard
+out=$(FAKE_HEALTH=down upgrade 2>&1) && die 'an unhealthy upgrade reported success'
+cmp -s "$tmp_root/opt/dashboard/dashboard.py" "$tmp_root/dashboard-before" || die 'the previous dashboard was not restored'
+grep -q 'systemctl disable llama-dashboard' "$log" && die 'a dashboard from before was disabled'
+grep -q 'systemctl start llama-dashboard.service' "$log" || die 'the dashboard that ran before was not started again'
+pass 'a failed upgrade restores the previous dashboard and starts it again'
+
+make_install
+out=$(FAKE_ACTIVE_RC=3 upgrade 2>&1) || die "stopped upgrade failed: $out"
+grep -q 'systemctl enable llama-dashboard.service' "$log" || die 'the new dashboard was not enabled on a stopped target'
+grep -qE 'systemctl (start|restart) llama-dashboard' "$log" && die 'the dashboard was started on a stopped target'
+[[ $out == *'The dashboard starts with the other services: systemctl start llama-dashboard'* ]] || die "stopped dashboard: $out"
+pass 'on a stopped target the new dashboard is enabled and left stopped'
 
 # Vulkan (AMD Radeon, Intel Arc) needs Debian 13; CUDA stays on Debian 12.
 mkdir -p "$tmp_root/dri"; : > "$tmp_root/dri/renderD128"

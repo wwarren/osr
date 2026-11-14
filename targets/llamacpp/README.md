@@ -1,16 +1,20 @@
 # llama.cpp inference target
 
 A dedicated LXC running `llama-server` with one resident GGUF behind an
-Ollama-compatible bridge on port 11434. Nothing is installed in the router CT;
-the router uses the target as an Ollama host. Builds use CUDA (NVIDIA), Vulkan
-(AMD Radeon, Intel Arc) or the CPU (`BACKEND=cuda|vulkan|cpu`).
+Ollama-compatible bridge on port 11434, and the
+[llama.cpp Monitor Dashboard](#monitor-dashboard) on port 8082. Nothing is
+installed in the router CT; the router uses the target as an Ollama host.
+Builds use CUDA (NVIDIA), Vulkan (AMD Radeon, Intel Arc) or the CPU
+(`BACKEND=cuda|vulkan|cpu`).
 
 ```mermaid
 flowchart LR
     R[Router] -->|LAN HTTP :11434| B
     C[Ollama / OpenAI clients] -->|LAN HTTP :11434| B
+    W[Browser] -->|LAN HTTP :8082| D
     subgraph T[llama.cpp target LXC]
       B[llama-ollama-bridge] -->|127.0.0.1:8081| L[llama-server]
+      D[llama-dashboard] -->|/metrics, /slots| L
       L --> G[GPU or CPU]
     end
 ```
@@ -106,8 +110,9 @@ either `MODEL_PATH` or a public `MODEL_DOWNLOAD_URL` (URL alone uses the
 default store; `/blob/` links become `/resolve/`). `--create-only` forces the
 CT-only behaviour.
 
-The bridge has no authentication or TLS. Restrict TCP 11434 to the router and
-trusted clients; 8081 stays on guest loopback.
+The bridge and the dashboard have no authentication or TLS. Restrict TCP 11434
+to the router and trusted clients, and 8082 to whoever may see the dashboard;
+8081 stays on guest loopback.
 
 ## 2. NVIDIA user-space and CUDA (CUDA only)
 
@@ -188,13 +193,13 @@ lower it, quantize the cache (`--cache-type-k q8_0 --cache-type-v q8_0` in
 
 The installer creates the `llama-target` account (gid 993), builds the server,
 installs the bridge and units and enables them, but leaves them stopped. It
-refuses an existing installation or occupied ports 8081/11434. Then:
+refuses an existing installation or occupied ports 8081/8082/11434. Then:
 
 ```bash
 chown root:llama-target /var/lib/llama-target/models/*.gguf   # hand-staged files
 chmod 0640 /var/lib/llama-target/models/*.gguf
 runuser -u llama-target -- /opt/llama-target/bin/llama-server --list-devices
-systemctl start llama-server llama-ollama-bridge
+systemctl start llama-server llama-ollama-bridge llama-dashboard
 journalctl -u llama-server -u llama-ollama-bridge -n 80 --no-pager
 curl --fail http://127.0.0.1:11434/healthz
 ```
@@ -229,6 +234,37 @@ manage-model-servers discover
 
 Check `/routing/inventory` and a chat through the router before removing a
 replaced backend; reusing its IP and tag avoids any router change.
+
+## Monitor dashboard
+
+`http://<target-ip>:8082/` opens the
+[llama.cpp Monitor Dashboard](https://github.com/abhiFSD/llama.cpp-Monitor-Dashboard)
+(by abhiFSD, MIT): generation and prompt tokens per second, each slot's
+progress and context, completed requests, totals, and CPU, RAM, disk and GPU
+use. It is read-only. `llama-dashboard.service` serves it from
+`/opt/llama-target/dashboard` on the bridge's venv, and llama-server stays on
+loopback:
+
+| Path | What it serves |
+|---|---|
+| `/` | Redirects to `/monitor.html?hw=.` (the page with its hardware panel) |
+| `/metrics` | llama-server's Prometheus counters, unchanged (llama-server runs with `--metrics`) |
+| `/slots` | llama-server's slot list (`--slots`) reduced to slot ID, context, busy flag and decoded/remaining tokens. Sampling settings, and the prompt and generated text llama-server adds when slot debugging is on, are not passed on |
+| `/hw` | CPU, RAM and root-disk use from `/proc`, plus GPU 0 from `nvidia-smi` on CUDA targets (on Vulkan and CPU targets the GPU and VRAM cards stay at `--`). It replaces upstream's `hw-metrics.py` sidecar, so there is no Flask, psutil or second port |
+| `/healthz` | `{"status": "ok"}` while the dashboard runs, even if llama-server is down (the page then shows "Offline") |
+
+The page is the upstream `monitor.html`, unmodified, from commit
+`d5254ed42c801f5aa60984b0ceb8df5a804057b1`; `test_dashboard.py` checks its
+SHA-256. Its responses carry a Content-Security-Policy that allows no other
+origin, so the page's `?server=` parameter cannot point it at another host.
+Totals come from llama-server; the peaks, graphs and completed-requests list
+are kept by the page and start again when it is reloaded.
+
+Set `DASHBOARD_PORT` (default 8082) or `DASHBOARD_HOST` (default `0.0.0.0`;
+`127.0.0.1` keeps it to SSH tunnels) in `/etc/llama-target/dashboard.env`, then
+`systemctl restart llama-dashboard`. To turn it off:
+`systemctl disable --now llama-dashboard`; `--upgrade` leaves a disabled
+dashboard disabled.
 
 ## Compatibility
 
@@ -305,13 +341,20 @@ prints "nothing to do". Otherwise it:
    `build-info.txt` unless `BACKEND` is set and must suit the Debian release
    (CUDA 12, Vulkan 13, CPU either); a backend change resets `GPU_LAYERS`
    (`auto` for GPU, `0` for CPU) unless given.
-2. Refreshes `bridge.py`, its venv and both units (a bridge-only update needs
-   no rebuild).
+2. Refreshes `bridge.py`, its venv, the [monitor dashboard](#monitor-dashboard)
+   and the units (a bridge-only update needs no rebuild). A target installed
+   before the dashboard existed gets it, enabled, and started if the target
+   was running.
 3. Restarts services that were running and waits `UPGRADE_HEALTH_TIMEOUT`
    (300 s) for `/healthz`.
 4. Keeps every replaced file as `*.prev`; on any failure restores exactly
-   those, restarts the previous build if it was running and reports whether
-   it is healthy.
+   those (and removes a dashboard this run added), restarts the previous build
+   if it was running and reports whether it is healthy.
+
+The dashboard only reads from the target, so a dashboard that does not answer
+afterwards is reported as a warning and does not roll back an upgrade that
+serves. `tools/upgrade-all.sh` runs this same `--upgrade`; its plan says when a
+llama.cpp target will get the dashboard, and its summary gives the address.
 
 An explicitly stopped service stays stopped; a failed unit is restarted.
 Snapshot the CT for a fallback that includes the GGUF.
@@ -344,8 +387,9 @@ letters, digits, spaces and `. _ , : = / + -` only. Restart `llama-server`.
 
 `bash tests/run-tests.sh bridge` and the `llamacpp-*` suites
 (`llamacpp-provision`, `-model-settings`, `-model-storage`, `-gguf-download`,
-`-cuda-compiler`, `-container-settings`, `-gpu-selector`, `-upgrade`) cover API
-translation, provisioning, model settings and storage, downloads, compiler
-discovery, GPU selection and upgrade rollback with mocks. They do not prove GPU
+`-cuda-compiler`, `-container-settings`, `-gpu-selector`, `-upgrade`,
+`-dashboard`) cover API translation, provisioning, model settings and storage,
+downloads, compiler discovery, GPU selection, the dashboard service and
+upgrade rollback with mocks. They do not prove GPU
 performance, GGUF/chat-template compatibility or real PVE provisioning, so run
 the live checks above on each GPU class before replacing an Ollama host.

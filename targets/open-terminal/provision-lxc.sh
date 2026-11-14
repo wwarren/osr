@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on the Proxmox host. Creates a separate unprivileged CT for Open Terminal
-# and registers it with an existing ollama-smart-router Open WebUI. The router
+# and registers it with an existing open-smart-router Open WebUI. The router
 # can be a CT on this host (reached with pct) or any LXC or VM that root can
 # log in to over SSH, so the terminal can be added after the fact.
 set -Eeuo pipefail
@@ -16,7 +16,7 @@ Creates a dedicated unprivileged Debian 12/13 LXC, installs Open Terminal from
 the open-webui/open-terminal v0.14.0 GitHub tag behind a workspace gateway
 (every Open WebUI user, and every agent CT connected later, gets an isolated
 workspace), and registers an admin-only system terminal in an existing
-ollama-smart-router Open WebUI. It asks for an
+open-smart-router Open WebUI. It asks for an
 Open WebUI admin API key or session JWT unless OPENWEBUI_ADMIN_TOKEN is set.
 
 The router (the LXC or VM running that Open WebUI) is given as ROUTER:
@@ -472,9 +472,9 @@ if (( ! dry_run )); then
     router_exec true || die "Cannot log in to ${router_label} on port ${ROUTER_SSH_PORT}. Check that ${ROUTER_SSH_USER} may log in over SSH (key, or password at the prompt) and that the host key is known."
   fi
   router_exec test -x /app/openwebui/venv/bin/open-webui ||
-    die "Open WebUI is not installed at /app/openwebui on ${router_label}. Is this an ollama-smart-router install?"
+    die "Open WebUI is not installed at /app/openwebui on ${router_label}. Is this an open-smart-router install?"
   router_exec systemctl is-active --quiet open-webui.service ||
-    die "Open WebUI (open-webui.service) is not active on ${router_label}. Is this an ollama-smart-router install?"
+    die "Open WebUI (open-webui.service) is not active on ${router_label}. Is this an open-smart-router install?"
   router_exec sh -c 'command -v python3 >/dev/null' || die "python3 is missing on ${router_label}."
   if [[ -z $OPENWEBUI_PORT ]]; then
     OPENWEBUI_PORT=$(router_exec sh -c "sed -n 's/^PORT=//p' /app/openwebui/.env 2>/dev/null | head -n1" || true)
@@ -566,7 +566,7 @@ else
   create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype debian
     --unprivileged 1 --features nesting=1 --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB"
     --rootfs "$STORAGE:$ROOTFS_GB" --net0 "$net" --onboot "$ONBOOT" --tags 'ai;ai-tools;osr-target;open-terminal'
-    --description 'Open Terminal workspace for Ollama Smart Router Open WebUI')
+    --description 'Open Terminal workspace for Open Smart Router Open WebUI')
   [[ -z $NAMESERVER ]] || create+=(--nameserver "$NAMESERVER")
   create_attempted=1
   run_pct_create "${create[@]}"

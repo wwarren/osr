@@ -1,6 +1,6 @@
-![Ollama Smart Router logo](assets/logo.svg)
+![Open Smart Router logo](assets/logo.svg)
 
-# Ollama Smart Router — Setup & Operations
+# Open Smart Router — Setup & Operations
 
 A Proxmox LXC that puts one OpenAI-compatible endpoint in front of a pool of
 self-hosted model servers. It routes each request by complexity, spreads load,
@@ -33,7 +33,7 @@ From a full repository checkout, as root on the Proxmox host that should hold
 the new CTs:
 
 ```bash
-bash ollama-smart-router-install.sh
+bash open-smart-router-install.sh
 ```
 
 The installer's menu offers, grouped by purpose: Gitea and Mattermost
@@ -215,7 +215,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 | Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` (1/20) |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
-| Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`ollama-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
+| Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
 | Cluster | `CLUSTER_SSH` (`fix`, the default: check and repair root SSH between nodes; `check`: report only; `skip`) |
 | Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
@@ -271,7 +271,7 @@ settings and recovery steps.
 | Target | Register as | Port | Key requirement |
 |---|---|---|---|
 | [Ollama](targets/ollama/README.md) | Plain address | 11434 | NVIDIA, AMD, Intel or CPU |
-| [llama.cpp](targets/llamacpp/README.md) | Plain address | 11434 | One GGUF; CUDA, Vulkan or CPU |
+| [llama.cpp](targets/llamacpp/README.md) | Plain address | 11434 (monitor dashboard on 8082) | One GGUF; CUDA, Vulkan or CPU |
 | [AirLLM](targets/airllm/README.md) | Plain address | 11434 | Large disk; slow, give it its own tier |
 | [Strata](targets/strata/README.md) | `strata://` | 8080 | NVIDIA |
 | [Basalt](targets/basalt/README.md) | `basalt://` | 8080 | Blackwell (sm_120), CUDA 13 |
@@ -557,7 +557,7 @@ bash /path/to/clone/install/manage-model-servers.sh list         # from a clone 
 ```
 
 `<CT_ID>` is printed at the end of the install and shown by `pct list`
-(`ollama-smart-router` unless `CT_NAME` was set). Writing commands take the
+(`open-smart-router` unless `CT_NAME` was set). Writing commands take the
 config lock; `--apply` validates, applies and health-checks
 ([Applying changes](#applying-configuration-changes)).
 
@@ -672,7 +672,7 @@ manage-model-servers apply          # or --all to restart every service
 1. **Validates** the LiteLLM YAML (models, `api_base`, fallbacks), the ini files
    and keyword JSON, the env files, and that `router.py`/`monitor.py` compile;
    on any error nothing changes.
-2. **Snapshots** the installed files to `/var/backups/ollama-smart-router/`
+2. **Snapshots** the installed files to `/var/backups/open-smart-router/`
    (root-only; `APPLY_BACKUP_KEEP`, default 5).
 3. **Applies** the files, brings the LiteLLM and Open WebUI venvs in line with
    their pins (backing up `webui.db` first) and restarts only affected services.
@@ -694,7 +694,7 @@ live only in `/app/router/secrets.env` (`0640 root:ollama-router`); `apply` and
 contain the old deploy token: rotate it in Gitea.
 
 **Config lock.** `update-router.sh` and every writing command take
-`/run/lock/ollama-smart-router-config.lock`. A second change fails at once
+`/run/lock/open-smart-router-config.lock`. A second change fails at once
 (`CONFIG_LOCK_WAIT=<seconds>` waits). The lock dies with its process. For a
 hung holder, `clear-lock --force` confirms, then sends SIGTERM and SIGKILL
 after `LOCK_KILL_WAIT` (10) s (`--yes` skips the prompt; without a terminal it
@@ -725,7 +725,7 @@ settings or rollback changes:
 |---|---|---|
 | Router | `update-router-services.sh --host --no-push`, pushed once checks pass | Updater never touches `env/*.env`, tiers, `litellm_config.yaml`, ini files or secrets |
 | Open WebUI | `set-webui-version <pin> --apply` (never a downgrade) | `apply`'s snapshot and `webui.db` backup |
-| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin) | Each target's settings record or env files |
+| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say) | Each target's settings record or env files |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request) | Its recorded port, passed back; workspace limits kept by the installer |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true` | Recorded answers; an Open WebUI admin key is requested once when needed |
@@ -885,7 +885,7 @@ against PyPI and the venv's Python first, and a failed health check restores
 the previous version and `webui.db`. New installs get 0.12.4; upgrade older
 routers with `set-webui-version 0.12.4 --apply`. Open WebUI 0.11.1, 0.12.0 and
 0.12.1 migrate the database irreversibly; `apply` keeps a copy in
-`/var/backups/ollama-smart-router/<timestamp>/openwebui-data/`, but only the
+`/var/backups/open-smart-router/<timestamp>/openwebui-data/`, but only the
 last `APPLY_BACKUP_KEEP` (5) snapshots are kept, so copy it elsewhere if you
 may roll back later.
 
@@ -988,7 +988,7 @@ there. The router shows their inventory and `/routing/explain` requests but no
 | No Mattermost alerts | `journalctl -u ollama-monitor` shows rejected webhooks; `set-webhook`, `test-alert`. Alerts fire after 3 failed checks, recover after 2; the startup notice is at most hourly |
 | hcom cannot connect across CTs | `osr-bus status` as the agent, broker `MQTT_CLIENT_CIDR`, agent egress rules, credentials, TLS trust; `journalctl -u osr-hcom-relay` (agent) and `-u mosquitto` (broker) |
 | No Mattermost handoff posts | `journalctl -u osr-hcom-mattermost` in the observer CT; check its webhook and outbound HTTP(S); one observer per group |
-| `apply` failed | The snapshot was restored and services restarted on the old files; read the reported check and `journalctl -u <unit>`. Snapshots: `/var/backups/ollama-smart-router/` |
+| `apply` failed | The snapshot was restored and services restarted on the old files; read the reported check and `journalctl -u <unit>`. Snapshots: `/var/backups/open-smart-router/` |
 | "config is locked" | Another change is running. For a hung one, `clear-lock` shows and `--force` stops it; then `git -C /app/config-repo status` and rerun `apply` |
 | Target upgrade failed | The installer says whether the previous version is "running again"; else `journalctl -u <unit>` in the target CT. llama.cpp, AirLLM and Ollama keep replaced files as `*.prev`; the Strata-style targets keep their snapshot in `/var/lib/<target>-target/` when rollback fails. Basalt, Maya and Xolotl need a CUDA release the distro's NVIDIA repository carries (Debian 13 starts at 13.1: no V100 for Maya; `CUDA_VERSION=13.1` for Basalt) or an installed toolkit |
 

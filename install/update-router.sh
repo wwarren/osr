@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# update-router.sh — update the ollama-smart-router components of a running
+# update-router.sh — update the open-smart-router components of a running
 # router container from a local directory of updated sources (a checkout or
 # copy of this repository), without re-running the installer.
 #
@@ -19,7 +19,7 @@
 # put back, so the repo, the venv and the running files stay consistent.
 #
 # Updated: the installer-owned code (INSTALLER_OWNED_CODE in the source's
-# ollama-smart-router-install.sh: service code, units, requirements, the
+# open-smart-router-install.sh: service code, units, requirements, the
 # management tools) plus this script. Never touched: env/*.env and
 # litellm_config.yaml (your servers, tiers and settings) and secrets. The
 # tunables router.ini / monitor.ini are updated only with --with-tunables.
@@ -33,7 +33,10 @@ ROUTER_VENV="${ROUTER_VENV:-${ROUTER_DIR}/venv}"
 MANAGE_CMD="${MANAGE_CMD:-}"
 MANAGE_SCRIPT="${MANAGE_SCRIPT:-${REPO_DIR}/install/manage-model-servers.sh}"
 # Shared with manage-model-servers.sh; CONFIG_LOCK_WAIT seconds to wait for it.
-CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/ollama-smart-router-config.lock}"
+CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/open-smart-router-config.lock}"
+# The lock's path before the rename from Ollama Smart Router. A management
+# tool installed before this update still takes it, so it is held as well.
+CONFIG_LOCK_FILE_LEGACY="${CONFIG_LOCK_FILE_LEGACY:-/run/lock/ollama-smart-router-config.lock}"
 CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
 TUNABLES=(services/ollama-router/router.ini services/ollama-monitor/monitor.ini)
 SELF=install/update-router.sh
@@ -156,14 +159,14 @@ main() {
   [[ -d $REPO_DIR/.git ]] || die "no config repo at ${REPO_DIR} — run this inside the router container (or set CONFIG_REPO_DIR)."
   [[ -d $ROUTER_DIR ]] || die "no router installation at ${ROUTER_DIR}."
   [[ $source != "$(cd -- "$REPO_DIR" && pwd -P)" ]] || die 'the source must be a separate copy, not the config repo itself.'
-  source_file_is_regular "$source" ollama-smart-router-install.sh && \
+  source_file_is_regular "$source" open-smart-router-install.sh && \
     source_file_is_regular "$source" install/manage-model-servers.sh || \
-    die "${source} does not look like the ollama-smart-router repository."
+    die "${source} does not look like the open-smart-router repository."
 
   # --- what to update --------------------------------------------------------
   local -a files=() changed=() bad=()
   local rel
-  mapfile -t files < <(owned_code_list "$source/ollama-smart-router-install.sh")
+  mapfile -t files < <(owned_code_list "$source/open-smart-router-install.sh")
   (( ${#files[@]} )) || die 'the source installer has no INSTALLER_OWNED_CODE list.'
   files+=("$SELF")
   $with_tunables && files+=("${TUNABLES[@]}")
@@ -197,6 +200,15 @@ main() {
     exec {lock_fd}>>"$CONFIG_LOCK_FILE" || die "cannot open config lock: ${CONFIG_LOCK_FILE}"
     flock "${wait[@]}" "$lock_fd" || \
       die "another config update is already running (lock: ${CONFIG_LOCK_FILE}). If it is hung: manage-model-servers clear-lock"
+    # The file exists only if a pre-rename tool has run since boot (/run is
+    # cleared then); holding it keeps a change that tool is making from
+    # overlapping this update.
+    local legacy_fd=''
+    if [[ $CONFIG_LOCK_FILE_LEGACY != "$CONFIG_LOCK_FILE" && -e $CONFIG_LOCK_FILE_LEGACY ]]; then
+      exec {legacy_fd}>>"$CONFIG_LOCK_FILE_LEGACY" || die "cannot open config lock: ${CONFIG_LOCK_FILE_LEGACY}"
+      flock "${wait[@]}" "$legacy_fd" || \
+        die "a config change by the management tool from before the rename is still running (lock: ${CONFIG_LOCK_FILE_LEGACY}); wait for it, then run this again."
+    fi
   fi
 
   mapfile -t changed < <(changed_files "$source" "$REPO_DIR" "${files[@]}")
@@ -294,7 +306,7 @@ PY
     install -D -m "$mode" "$source/$rel" "$REPO_DIR/$rel"
   done
   git -C "$REPO_DIR" add -- "${changed[@]}"
-  git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-ollama-smart-router}" \
+  git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-open-smart-router}" \
       -c user.email="${GIT_AUTHOR_EMAIL:-router@localhost}" \
       commit -q -m "Update router components from $(source_label "$source")" \
       -m "$(printf '%s\n' "${changed[@]}")"

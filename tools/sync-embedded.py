@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep the installer's embedded copies identical to the files in this repo.
 
-ollama-smart-router-install.sh is a single file that is copied to a Proxmox
+open-smart-router-install.sh is a single file that is copied to a Proxmox
 host on its own, so it carries every installer-owned service file as a quoted
 heredoc:
 
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "ollama-smart-router-install.sh"
+INSTALLER = ROOT / "open-smart-router-install.sh"
 # Seeded only when the repo lacks them; intentionally not a copy of the repo file.
 NOT_SYNCED = {"README.md"}
 # (copy, source) pairs that must be byte-identical. (None today: the management

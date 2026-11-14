@@ -351,7 +351,7 @@ whether the secret actually changed:
 
 ## Install with the router
 
-Select `honcho` in `ollama-smart-router-install.sh` with the agents (Honcho is
+Select `honcho` in `open-smart-router-install.sh` with the agents (Honcho is
 always created first). The installer gives it the router's URL and key and
 registers `http://<honcho-ip>:3000/mcp` as an authenticated Streamable HTTP
 tool server in Open WebUI (admin-only until granted; it does not make every

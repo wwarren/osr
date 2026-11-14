@@ -235,7 +235,7 @@ cat > "$fake/bin/pct" <<'EOF'
 #!/usr/bin/env bash
 case $1 in
   status) echo 'status: running' ;;
-  config) echo "description: DeepSeek Harness for Ollama Smart Router$(cat "$FAKE/description-suffix" 2>/dev/null)" ;;
+  config) echo "description: $(cat "$FAKE/description-name" 2>/dev/null || echo 'DeepSeek Harness for Open Smart Router')$(cat "$FAKE/description-suffix" 2>/dev/null)" ;;
   push) cp -- "$3" "$FAKE/pushed-$(basename "$4")" ;;
   pull) printf 'dsh-api-key-0123\n' > "$4" ;;
   exec)
@@ -308,6 +308,16 @@ status=0; out=$("${reconf[@]}" 2>&1) || status=$?
 rm -f -- "$fake/description-suffix"
 assert_eq "another description is refused" 1 "$status"
 assert_contains "naming why" 'not this target' "$out"
+
+reset_fake
+# A CT made before the rename from Ollama Smart Router keeps that description.
+printf 'DeepSeek Harness for Ollama Smart Router' > "$fake/description-name"
+status=0; out=$("${reconf[@]}" 2>&1) || status=$?
+assert_eq "a CT described before the rename is still this target's" 0 "$status"
+printf 'Hermes Agent for Ollama Smart Router' > "$fake/description-name"
+status=0; out=$("${reconf[@]}" 2>&1) || status=$?
+rm -f -- "$fake/description-name"
+assert_eq "another target's pre-rename description is refused" 1 "$status"
 
 reset_fake
 echo 1 > "$fake/guest-status"
