@@ -771,7 +771,7 @@ header file, never on a command line):
 |---|---|---|---|
 | Open WebUI | `services/open-webui/requirements.txt` | PyPI `open-webui` | `set-webui-version` |
 | Ollama, llama.cpp, Honcho | the installer's (provisioner's) default | highest `vX.Y.Z` GitHub release, no pre-releases | `OLLAMA_VERSION`, `LLAMA_CPP_REF`, `HONCHO_REF` |
-| ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT` |
+| ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT`; Open Terminal resolves a newer release's Python dependencies with pip when they differ from its lock |
 | Strata, Xolotl, Avalon, Kindi | the tested commit | the tip of `main` | `*_COMMIT` |
 | DeepSeek Harness, OpenCode | the provisioner's default | npm `latest` tag | `DSH_VERSION`, `OPENCODE_VERSION` |
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
@@ -781,7 +781,9 @@ terminal asks `[P/l]` for each; the pin is the default and the answer for
 `--yes`. `--latest ollama,comfyui` (or `all`) takes the latest without asking,
 and `--pinned` takes every pin. The latest is untested here, and a commit the
 installer checks is the one upstream names at that moment, not a reviewed one;
-the snapshot and checks still cover it. An unreachable upstream is reported
+the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
+newer release on later runs that take the pin; Ollama, llama.cpp, Strata,
+Xolotl, Avalon and Kindi go back to the pin then. An unreachable upstream is reported
 and the pins are used. Basalt, Maya, OpenClaw, Gitea and Mattermost follow
 upstream with no pin here; they are listed, not asked about.
 

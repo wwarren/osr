@@ -14,9 +14,11 @@
 #
 # The upstream tag is checked against a pinned commit (tags can be moved), the
 # Python dependencies come from the hash-locked requirements.lock, and the
-# package itself is built offline from the verified checkout. Each commit and
-# lock hash gets its own venv; /opt/open-terminal/venv points at the active
-# one. Every file this run replaces is set aside first, so a failed upgrade
+# package itself is built offline from the verified checkout. A tag other than
+# the default whose dependencies differ from requirements.in has them resolved
+# by pip instead (OPEN_TERMINAL_DEPS). Each commit and lock hash (or resolved
+# dependency set) gets its own venv; /opt/open-terminal/venv points at the
+# active one. Every file this run replaces is set aside first, so a failed upgrade
 # (including the move from the earlier single shared workspace) is undone.
 set -Eeuo pipefail
 # Signal rollback helper
@@ -81,7 +83,8 @@ with an isolated workspace per user: open-terminal-gateway.service on the
 public port, one open-terminal-ws@<id>.service per workspace.
 
 Environment (unset: the value recorded by the last run, else the default):
-  OPEN_TERMINAL_VERSION=v0.14.0   upstream tag
+  OPEN_TERMINAL_VERSION=v0.14.0   upstream tag (unset, a newer tag the last run
+                                  installed is kept: no downgrade unless asked)
   OPEN_TERMINAL_COMMIT=<sha>      the commit that tag must resolve to (required
                                   for any tag other than the default)
   OPEN_TERMINAL_PORT=8000         the gateway's port
@@ -91,7 +94,14 @@ Environment (unset: the value recorded by the last run, else the default):
   OPEN_TERMINAL_WS_MEMORY=1G      per-workspace MemoryMax
   OPEN_TERMINAL_WS_TASKS=512      per-workspace TasksMax
   OPEN_TERMINAL_WS_CPU=100%       per-workspace CPUQuota
-The tag's Python dependencies must match requirements.in; a release that
+  OPEN_TERMINAL_DEPS=auto         Python dependencies: lock (the hash-checked
+                                  requirements.lock; the tag's dependencies must
+                                  match requirements.in), resolve (pip installs
+                                  the tag with its own dependencies from PyPI,
+                                  saved as requirements.resolved.txt in the venv),
+                                  or auto: lock when they match, else resolve
+                                  for a tag other than the default
+The default tag's dependencies must match requirements.in; a new default that
 changes them needs a regenerated requirements.lock (see README.md).
 Client keys: open-terminal-clients (list, issue, revoke, workspaces).
 USAGE
@@ -129,6 +139,26 @@ for spec in sorted(locked - wanted):
 PY
 }
 
+# checkout_deps PYPROJECT: the checkout's runtime dependencies, one per line,
+# normalized and sorted (Windows-only ones left out), for the resolved venv's name.
+checkout_deps() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    project = tomllib.load(f)["project"]
+for spec in sorted({re.sub(r"\s+", "", d.split(";")[0]).lower()
+                    for d in project.get("dependencies", []) if "win32" not in d}):
+    print(spec)
+PY
+}
+
+# What gateway.py and spawner.py import from the venv; a resolved install
+# asks for them too and checks they import.
+GATEWAY_DEPS=(starlette httpx websockets uvicorn)
+
 # service_env: the gateway's EnvironmentFile. It also records the workspace
 # limits for the next run. No key: clients.json holds hashes only.
 service_env() {
@@ -165,6 +195,23 @@ limits_conf() {
 env_get() {
     [[ -f $1 ]] || return 0
     sed -n "s/^$2=//p" "$1" | tail -n 1
+}
+
+# version_newer A B: is tag A (v0.17.8) newer than tag B?
+version_newer() {
+    [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && $1 != "$2" ]] || return 1
+    [[ $(printf '%s\n%s\n' "${1#v}" "${2#v}" | sort -V | tail -n 1) == "${1#v}" ]]
+}
+
+# release_record: the tag and commit a successful run installed ($OT_ETC/release),
+# so a later run without OPEN_TERMINAL_VERSION keeps a release newer than the pin.
+release_record() {
+    printf '# Written by install-target.sh after a healthy install.\n'
+    printf 'OPEN_TERMINAL_VERSION=%s\nOPEN_TERMINAL_COMMIT=%s\n' "$VERSION" "$COMMIT"
+}
+write_release_record() {
+    cmp -s <(release_record) "$OT_ETC/release" 2>/dev/null && return 0
+    release_record > "$OT_ETC/release.new" && chmod 0644 "$OT_ETC/release.new" && mv -f -- "$OT_ETC/release.new" "$OT_ETC/release"
 }
 
 # key_hash KEYFILE: the SHA-256 the gateway compares (whitespace removed).
@@ -219,6 +266,17 @@ done
 # the port), then the defaults.
 VERSION=${OPEN_TERMINAL_VERSION:-$DEFAULT_VERSION}
 COMMIT=${OPEN_TERMINAL_COMMIT:-}
+# Never a downgrade unless asked: a newer tag the last run installed (the latest
+# upstream, chosen in tools/upgrade-all.sh) is kept when none is given.
+if [[ -z ${OPEN_TERMINAL_VERSION:-} && -z $COMMIT ]]; then
+    recorded_version=$(env_get "$OT_ETC/release" OPEN_TERMINAL_VERSION)
+    recorded_commit=$(env_get "$OT_ETC/release" OPEN_TERMINAL_COMMIT)
+    if [[ $recorded_commit =~ ^[0-9a-f]{40}$ ]] && version_newer "$recorded_version" "$DEFAULT_VERSION"; then
+        VERSION=$recorded_version
+        COMMIT=$recorded_commit
+        printf 'Keeping Open Terminal %s, newer than the pinned %s (set OPEN_TERMINAL_VERSION to move to another release).\n' "$VERSION" "$DEFAULT_VERSION"
+    fi
+fi
 PORT=${OPEN_TERMINAL_PORT:-$(env_get "$OT_ETC/service.env" OPEN_TERMINAL_PORT)}
 PORT=${PORT:-8000}
 IDLE_MINUTES=${OPEN_TERMINAL_IDLE_MINUTES:-$(env_get "$OT_ETC/service.env" OPEN_TERMINAL_IDLE_MINUTES)}
@@ -238,6 +296,8 @@ if [[ -z $COMMIT ]]; then
     COMMIT=$DEFAULT_COMMIT
 fi
 [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || die 'OPEN_TERMINAL_COMMIT must be a full 40-digit lowercase SHA-1.'
+DEPS=${OPEN_TERMINAL_DEPS:-auto}
+[[ $DEPS =~ ^(auto|lock|resolve)$ ]] || die 'OPEN_TERMINAL_DEPS must be auto, lock or resolve.'
 [[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || die 'Invalid OPEN_TERMINAL_PORT.'
 (( PORT < 20000 || PORT > 29999 )) || die 'OPEN_TERMINAL_PORT must be outside 20000-29999 (the workspaces use those).'
 [[ $IDLE_MINUTES =~ ^[0-9]{1,5}$ ]] || die 'OPEN_TERMINAL_IDLE_MINUTES must be minutes (0 = never stop).'
@@ -262,8 +322,14 @@ if (( dry_run )); then
     run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-venv passwd
     printf '+ create the %s account; workspaces under %s/ws (one ot-<id> account each)\n' "$GATEWAY_USER" "$OT_SRV"
     printf '+ git fetch --depth 1 %s refs/tags/%s; require commit %s\n' "$OPEN_TERMINAL_URL" "$VERSION" "$COMMIT"
-    printf '+ check the checkout'\''s dependencies against requirements.in\n'
-    printf '+ python3 -m venv %s; pip install --require-hashes -r requirements.lock; pip install --no-deps --no-build-isolation %s\n' "$venv" "$src"
+    printf '+ check the checkout'\''s dependencies against requirements.in (OPEN_TERMINAL_DEPS=%s)\n' "$DEPS"
+    if [[ $DEPS == resolve ]]; then
+        printf '+ python3 -m venv %s/venv-%s-resolved-<deps>; pip install %s %s (resolved from PyPI); save pip freeze\n' "$OT_OPT" "$COMMIT" "$src" "${GATEWAY_DEPS[*]}"
+    else
+        printf '+ python3 -m venv %s; pip install --require-hashes -r requirements.lock; pip install --no-deps --no-build-isolation %s\n' "$venv" "$src"
+        [[ $DEPS == lock || $VERSION == "$DEFAULT_VERSION" ]] ||
+            printf '+ if %s needs other dependencies than requirements.in: resolve them with pip instead (not hash-checked)\n' "$VERSION"
+    fi
     printf '+ set aside the files this run replaces (%s/rollback)\n' "$OT_ETC"
     printf '+ point %s/venv at %s; install %s/lib/{gateway,spawner}.py and %s/open-terminal-clients\n' "$OT_OPT" "$venv" "$OT_OPT" "$SBIN_DIR"
     printf '+ write %s/service.env (port %s, idle %s min, at most %s active), workspace.env and the %s limits (%s, %s tasks, %s CPU)\n' \
@@ -313,8 +379,24 @@ actual=$(git -C "$src" rev-parse HEAD)
 [[ $actual == "$COMMIT" ]] ||
     die "Tag ${VERSION} is commit ${actual}, not the reviewed ${COMMIT}. Review the change and set OPEN_TERMINAL_COMMIT if it is intended."
 mismatch=$(deps_mismatch "$src/pyproject.toml" "$source_dir/requirements.in")
-[[ -z $mismatch ]] ||
-    die "Open Terminal ${VERSION} needs different Python dependencies than requirements.lock was built for:"$'\n'"$mismatch"$'\n'"Update requirements.in and regenerate requirements.lock (README.md, \"Updating the pin\")."
+deps_mode=lock
+if [[ $DEPS == resolve ]]; then
+    deps_mode=resolve
+elif [[ -n $mismatch ]]; then
+    if [[ $DEPS == lock || $VERSION == "$DEFAULT_VERSION" ]]; then
+        die "Open Terminal ${VERSION} needs different Python dependencies than requirements.lock was built for:"$'\n'"$mismatch"$'\n'"Update requirements.in and regenerate requirements.lock (README.md, \"Updating the pin\"), or set OPEN_TERMINAL_DEPS=resolve to have pip resolve them."
+    fi
+    deps_mode=resolve
+    printf 'Open Terminal %s needs different Python dependencies than requirements.lock was built for:\n%s\n' "$VERSION" "$mismatch"
+    printf 'Resolving them with pip from PyPI for this release (not hash-checked); the resolved set is saved in the venv.\n'
+fi
+if [[ $deps_mode == resolve ]]; then
+    # Named by the commit, the dependency list and the Python it is built for,
+    # so an unchanged rerun finds it complete and changes nothing.
+    deps_sha256=$( { python3 -c 'import sys; print(sys.version_info[:2])'; checkout_deps "$src/pyproject.toml"; printf '%s\n' "${GATEWAY_DEPS[@]}"; } |
+        sha256sum | cut -d' ' -f1)
+    venv=$OT_OPT/venv-$COMMIT-resolved-${deps_sha256:0:16}
+fi
 
 # The files this target owns: destination|content source|mode. A content
 # source is a repo file or a rendering helper. clients.json is handled
@@ -353,6 +435,7 @@ if [[ -f $venv/.install-complete && -x $venv/bin/open-terminal && $(readlink "$O
         [[ ! -e $UNIT_DIR/$LEGACY_UNIT ]] &&
         systemctl is-active --quiet "$SPAWNER_UNIT" && systemctl is-active --quiet "$GATEWAY_UNIT" &&
         healthy "$PORT"; then
+    write_release_record
     printf 'Open Terminal %s (%s) is already installed with these settings and is healthy; nothing to do.\n' "$VERSION" "$COMMIT"
     exit 0
 fi
@@ -365,8 +448,15 @@ if [[ ! -f $venv/.install-complete || ! -x $venv/bin/open-terminal ]]; then
     rm -rf -- "${venv:?}"
     (umask 022
      python3 -m venv "$venv"
-     "$venv/bin/python" -m pip install --no-cache-dir --require-hashes -r "$source_dir/requirements.lock"
-     "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src"
+     if [[ $deps_mode == lock ]]; then
+         "$venv/bin/python" -m pip install --no-cache-dir --require-hashes -r "$source_dir/requirements.lock"
+         "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src"
+     else
+         # The checkout and the gateway's own imports, resolved together.
+         "$venv/bin/python" -m pip install --no-cache-dir "$src" "${GATEWAY_DEPS[@]}"
+         "$venv/bin/python" -c 'import starlette, httpx, websockets, uvicorn'
+         "$venv/bin/python" -m pip freeze --all > "$venv/requirements.resolved.txt"
+     fi
      touch "$venv/.install-complete")
 fi
 previous=''
@@ -481,4 +571,7 @@ if [[ $previous != "$venv" ]]; then
         [[ -d $old && $old != "$venv" && $old != "$previous" ]] && rm -rf -- "${old:?}"
     done
 fi
+write_release_record
 printf 'Open Terminal %s (%s) is healthy on port %s, with a separate workspace per user.\n' "$VERSION" "$COMMIT" "$PORT"
+[[ $deps_mode == lock ]] ||
+    printf 'Its Python dependencies were resolved by pip, not hash-checked: %s/requirements.resolved.txt. To make them the pin, update requirements.in and regenerate requirements.lock (README.md, "Updating the pin").\n' "$venv"

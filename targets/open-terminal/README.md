@@ -253,9 +253,17 @@ keep it as secret as the admin token.
 ## Upgrade and roll back
 
 Each install checks that the tag still resolves to the reviewed commit and
-that the tag's Python dependencies match `requirements.in`, refusing before pip
-otherwise. Every commit and lock hash gets its own venv,
-`/opt/open-terminal/venv-<commit>-<lock-sha256>`, with
+that the tag's Python dependencies match `requirements.in`. The default tag
+must match (otherwise the run stops before pip). A newer tag whose
+dependencies differ, such as the latest upstream release picked in
+`tools/upgrade-all.sh`, has them resolved instead (`OPEN_TERMINAL_DEPS=auto`):
+pip installs the checkout with its own dependencies and the gateway's
+(starlette, httpx, websockets, uvicorn) from PyPI, checks that they import,
+and saves the result as `requirements.resolved.txt` in that venv. These are
+not hash-checked; `OPEN_TERMINAL_DEPS=lock` refuses instead, and
+`OPEN_TERMINAL_DEPS=resolve` always resolves. Every commit and lock hash gets
+its own venv, `/opt/open-terminal/venv-<commit>-<lock-sha256>` (a resolved set:
+`venv-<commit>-resolved-<hash>`), with
 `/opt/open-terminal/venv` pointing at the active one; a failed build leaves the
 active venv in place, and partial venvs are rebuilt on retry. Only once the new
 venv is ready are the files changed, and every file the run replaces or
@@ -267,6 +275,12 @@ services are restored and checked on the previous port; a rollback that does
 not come back keeps its copies there. Running workspaces are stopped on every
 applied change and start again with the new release on their next request.
 An unchanged rerun on a healthy terminal prints "nothing to do".
+
+A healthy run records its tag and commit in `/etc/open-terminal/release`. A
+later run without `OPEN_TERMINAL_VERSION` (as `tools/upgrade-all.sh` does for
+the pinned choice) keeps a recorded tag newer than the pin instead of
+downgrading it; set `OPEN_TERMINAL_VERSION` (and the commit, for a tag other
+than the default) to move to another release.
 
 **From the single shared workspace.** A CT installed before per-user
 workspaces is converted the same way: `open-terminal.service` is stopped and

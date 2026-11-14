@@ -141,6 +141,12 @@ echo "venv-python \$venv \$*" >> "$log"
 if [[ " \$* " == *" --no-deps "* ]]; then
     printf '#!/bin/sh\nexit 0\n' > "\$venv/bin/open-terminal"; chmod +x "\$venv/bin/open-terminal"
     [[ \${FAKE_PIP_FAIL:-0} != 1 ]] || exit 1
+elif [[ " \$* " == *" pip install "* && " \$* " != *" --require-hashes "* ]]; then
+    # A resolved install: the checkout with its own dependencies.
+    [[ \${FAKE_RESOLVE_FAIL:-0} != 1 ]] || exit 1
+    printf '#!/bin/sh\nexit 0\n' > "\$venv/bin/open-terminal"; chmod +x "\$venv/bin/open-terminal"
+elif [[ " \$* " == *" pip freeze "* ]]; then
+    printf 'fastapi==0.200.0\nopen-terminal @ file:///opt/open-terminal/source\n'
 fi
 PY
     chmod +x "\$3/bin/python"
@@ -380,7 +386,67 @@ reset_tree
 out=$(FAKE_EXTRA_DEP='rich>=13' run_target 2>&1) && fail 'dependency drift was installed'
 [[ $out == *'different Python dependencies'*'rich>=13'* ]] || fail "drift message: $out"
 grep -q 'python3 -m venv' "$log" && fail 'a venv was built despite the drift'
+[[ $out == *'OPEN_TERMINAL_DEPS=resolve'* ]] || fail "drift message gives no way on: $out"
 pass 'a release whose dependencies differ from the lock is refused before pip runs'
+
+# A newer release (what tools/upgrade-all.sh passes when the latest upstream is
+# chosen) whose dependencies differ: pip resolves them instead.
+new_commit=$(printf 'e%.0s' {1..40})
+newer() { OPEN_TERMINAL_VERSION=v0.17.8 OPEN_TERMINAL_COMMIT=$new_commit FAKE_TAG_COMMIT=$new_commit run_target; }
+reset_tree
+out=$(FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) || fail "a newer release with other dependencies failed: $out"
+[[ $out == *'not in requirements.in: pillow>=10.0.0'* && $out == *'Resolving them with pip'* ]] || fail "resolve message: $out"
+active=$(readlink "$OT_OPT/venv")
+[[ $active == "$OT_OPT/venv-$new_commit-resolved-"* ]] || fail "resolved venv name: $active"
+contains "-m pip install --no-cache-dir $OT_OPT/source starlette httpx websockets uvicorn" "$log"
+contains "venv-python $active -c import starlette, httpx, websockets, uvicorn" "$log"
+grep -q -- '--require-hashes' "$log" && fail 'the lock was used for a release it does not fit'
+[[ $(cat "$active/requirements.resolved.txt") == *'fastapi==0.200.0'* ]] || fail 'the resolved set was not saved'
+[[ $out == *"not hash-checked: $active/requirements.resolved.txt"* ]] || fail "resolved report: $out"
+: > "$log"
+out=$(FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) || fail "unchanged rerun failed: $out"
+[[ $out == *'nothing to do'* ]] && ! grep -q 'python3 -m venv' "$log" || fail "an unchanged rerun rebuilt the resolved venv: $out"
+pass 'a newer release with other dependencies has them resolved by pip, saved, and reused by a rerun'
+
+# The next run without OPEN_TERMINAL_VERSION (upgrade-all's pinned default)
+# keeps that newer release instead of downgrading it.
+[[ $(cat "$tree/etc/open-terminal/release") == *"OPEN_TERMINAL_VERSION=v0.17.8"*"OPEN_TERMINAL_COMMIT=$new_commit"* ]] ||
+    fail "the installed release was not recorded: $(cat "$tree/etc/open-terminal/release" 2>&1)"
+: > "$log"
+out=$(FAKE_TAG_COMMIT=$new_commit FAKE_EXTRA_DEP='pillow>=10.0.0' run_target 2>&1) || fail "a run without a version failed: $out"
+[[ $out == *'Keeping Open Terminal v0.17.8, newer than the pinned'* && $out == *'nothing to do'* ]] || fail "newer release not kept: $out"
+[[ $(readlink "$OT_OPT/venv") == "$active" ]] || fail 'a run without a version left the newer release'
+out=$(OPEN_TERMINAL_VERSION=$(sed -n 's/^DEFAULT_VERSION=//p' "$target") run_target 2>&1) || fail "an asked-for downgrade failed: $out"
+[[ $(readlink "$OT_OPT/venv") == "$default_venv" ]] || fail 'OPEN_TERMINAL_VERSION did not move back to the pin'
+grep -q "OPEN_TERMINAL_COMMIT=$default_commit" "$tree/etc/open-terminal/release" || fail 'the downgrade was not recorded'
+printf 'OPEN_TERMINAL_VERSION=v0.1.0\nOPEN_TERMINAL_COMMIT=%s\n' "$new_commit" > "$tree/etc/open-terminal/release"
+out=$(run_target 2>&1) || fail "a run with an older record failed: $out"
+[[ $out != *'Keeping Open Terminal'* && $(readlink "$OT_OPT/venv") == "$default_venv" ]] || fail "an older record was kept: $out"
+pass 'a newer release is kept by a run without OPEN_TERMINAL_VERSION; asking moves back; an older record is not kept'
+
+reset_tree
+out=$(newer 2>&1) || fail "a newer release that fits the lock failed: $out"
+contains "--require-hashes -r $deploy/requirements.lock" "$log"
+[[ $(readlink "$OT_OPT/venv") == "$(venv_for "$new_commit")" ]] || fail 'a newer release that fits the lock did not get the lock venv'
+pass 'a newer release whose dependencies match requirements.in still uses the hash-checked lock'
+
+reset_tree
+out=$(OPEN_TERMINAL_DEPS=lock FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) && fail 'OPEN_TERMINAL_DEPS=lock installed other dependencies'
+[[ $out == *'different Python dependencies'* ]] && ! grep -q 'python3 -m venv' "$log" || fail "lock-only refusal: $out"
+out=$(OPEN_TERMINAL_DEPS=maybe run_target 2>&1) && fail 'an unknown OPEN_TERMINAL_DEPS was accepted'
+[[ $out == *'OPEN_TERMINAL_DEPS must be auto, lock or resolve'* ]] || fail "OPEN_TERMINAL_DEPS check: $out"
+reset_tree
+out=$(OPEN_TERMINAL_DEPS=resolve run_target 2>&1) || fail "OPEN_TERMINAL_DEPS=resolve failed: $out"
+[[ $(readlink "$OT_OPT/venv") == "$OT_OPT/venv-$default_commit-resolved-"* ]] || fail 'OPEN_TERMINAL_DEPS=resolve used the lock'
+pass 'OPEN_TERMINAL_DEPS=lock refuses other dependencies, resolve always resolves, anything else is refused'
+
+reset_tree
+run_target >/dev/null 2>&1 || fail 'setup install failed'
+before=$(readlink "$OT_OPT/venv")
+out=$(FAKE_RESOLVE_FAIL=1 FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) && fail 'a failed resolve was installed'
+[[ $(readlink "$OT_OPT/venv") == "$before" ]] || fail 'a failed resolve switched the venv'
+for v in "$OT_OPT"/venv-"$new_commit"-resolved-*; do [[ ! -f $v/.install-complete ]] || fail "a failed resolve left a complete venv: $v"; done
+pass 'a failed resolve leaves the running release alone'
 
 reset_tree
 out=$(OPEN_TERMINAL_VERSION=v0.15.0 run_target 2>&1) && fail 'a new version without a commit pin was accepted'
