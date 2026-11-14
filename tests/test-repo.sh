@@ -392,4 +392,33 @@ for name in "${TARGET_ORDER[@]}"; do
 done
 assert_ok "the router CT is tagged osr-router" grep -qE -- '-tags "([^"]*;)?osr-router(;[^"]*)?"' "$INSTALLER"
 
+# Gitea reads .gitea/workflows, GitHub .github/workflows: one workflow, two
+# places, kept identical so neither forge runs a stale copy.
+describe ci_workflows
+assert_ok "the GitHub workflow is the Gitea workflow" \
+  cmp -s "${ROOT}/.gitea/workflows/tests.yml" "${ROOT}/.github/workflows/tests.yml"
+assert_file_contains "CI installs Node.js for configure.test.mjs" "actions/setup-node@" "${ROOT}/.gitea/workflows/tests.yml"
+assert_file_contains "CI runs the suites strictly" "tests/run-tests.sh --strict" "${ROOT}/.gitea/workflows/tests.yml"
+
+# Every companion in the installer's target table waits for the Open WebUI
+# admin key (provision_selected_targets), so README's Install section must
+# name each of them. A new companion needs a name here and in that sentence.
+describe readme_admin_key_companions
+sentence="$(tr '\n' ' ' < "${ROOT}/README.md" | grep -oE 'Companions that register with Open +WebUI +\([^)]*\) +need an Open WebUI +admin API key' | tr -s ' ')"
+assert_ok "README names the companions that need the admin key" test -n "$sentence"
+companions="$(sed -n "/^target_table() {/,/^}/p" "$INSTALLER" | grep -oE "'[a-z-]+\|companion\|" | sed -E "s/^'([a-z-]+)\|.*/\1/")"
+assert_ok "the installer's target table lists companions" test -n "$companions"
+listed="${sentence#*(}"; listed=", ${listed%%)*},"
+for name in $companions; do
+  case $name in
+    honcho) label='Honcho' ;; hermes) label='Hermes' ;; openclaw) label='OpenClaw' ;;
+    deepseek-harness) label='DeepSeek Harness' ;; opencode) label='OpenCode' ;;
+    open-terminal) label='Open Terminal' ;; comfyui) label='ComfyUI' ;;
+    *) label="(no README name for ${name})" ;;
+  esac
+  assert_contains "README lists ${name} among the admin-key companions" ", ${label}," "$listed"
+done
+count="$(grep -o ',' <<< "${listed#, }" | wc -l)"
+assert_eq "and no target that is not a companion" "$(wc -w <<< "$companions" | tr -d ' ')" "$count"
+
 summary

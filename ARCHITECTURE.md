@@ -3,7 +3,7 @@
 **System:** `open-smart-router`
 **Platform:** Proxmox VE; an unprivileged Debian 13 router LXC and separate target LXCs
 **Built by:** `open-smart-router-install.sh` and `targets/*/provision-lxc.sh`
-**Last reviewed:** 2026-11-07
+**Last reviewed:** 2026-11-14
 
 ---
 
@@ -482,7 +482,11 @@ failure (§17.7).
 
 Committed configuration wins over installer defaults; installer-owned code is
 updated when `CONFIG_UPDATE_CODE=true`, and `tools/sync-embedded.py` keeps the
-installer's embedded copies in sync with their sources. The router and monitor
+installer's embedded copies in sync with their sources. When the default
+repository `open-smart-router` does not exist but the pre-rename
+`ollama-smart-router` does, the installer uses that one
+(`GITEA_REPO_LEGACY_NAME`), so a rerun never seeds an empty repository beside
+committed configuration. The router and monitor
 use Debian 13's Python 3.13; LiteLLM has its own hash-locked venv; Open WebUI
 needs Python 3.11–3.12, so 3.12 is found or provisioned and tested as the
 service account before its venv is built.
@@ -569,7 +573,7 @@ unchanged. No agent coordination API is added to the router.
 
 | Accepted risk | Mitigation |
 |---|---|
-| `GITEA_VERIFY_TLS=false` (TurnKey self-signed cert) | Install the appliance CA and flip the flag in `prompt_gitea_credentials` |
+| `GITEA_VERIFY_TLS=false` by default (TurnKey self-signed cert) | Install the appliance CA and run the installer with `GITEA_VERIFY_TLS=true` |
 | Router API key optional | `set-api-key --generate`; firewall CIDR; TLS reverse proxy if exposed |
 | Backend traffic is plain HTTP | Keep targets on a trusted segment; restrict their ports |
 | A Strata-family key is also its admin key (Maya's dashboard) | Restrict the target port to the router CT |
@@ -660,6 +664,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | Cloud models only when named | Cloud models in the pool or fallbacks | Automatic routing must never incur API charges |
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
 | ComfyUI as Open WebUI's image engine | An image route in the router | The router is chat-only; Open WebUI already drives ComfyUI's workflow API |
+| Keep `ollama-router`, `ollama-monitor`, the `ollama-router` account and `services/ollama-*` after the rename to Open Smart Router | Rename units, account and repository paths too | Running installs, committed configuration, `apply` snapshots and health alerts refer to them; a rename would need a migration for no change in behaviour. Renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
 
 ---
 
@@ -1070,7 +1075,10 @@ OpenCode substitutes from its environment.
   Kindi), LiteLLM locks and the upgrade contract.
 * `.gitea/workflows/tests.yml` runs the suites with `--strict` (its job
   container must run as root), ShellCheck on every repository shell file and
-  ruff, with separate router, bridge and LiteLLM venvs. The `strata-upstream`,
+  ruff, with separate router, bridge, LiteLLM and Open Terminal venvs and
+  Node.js for DeepSeek Harness's `configure.mjs` tests.
+  `.github/workflows/tests.yml` is an identical copy for GitHub Actions, where
+  the suites run through `sudo`. The `strata-upstream`,
   `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream` and
   `honcho-upstream` jobs each fetch one pinned upstream, kept separate so a
   GitHub outage cannot hide the main results.
@@ -1117,7 +1125,7 @@ Router CT:
 | `/app/config-repo/` | Root-only clone of the configuration repository |
 | `/usr/local/bin/manage-model-servers` | Link to the management script in the config repo |
 | `/var/lib/ollama-monitor/` | Monitor state and notice timestamp |
-| `/var/backups/open-smart-router/` | Root-only `apply` snapshots |
+| `/var/backups/open-smart-router/` | Root-only `apply` snapshots (those in the pre-rename `/var/backups/ollama-smart-router/` are moved here by the next `apply`) |
 | `/run/lock/open-smart-router-config.lock` | Configuration write lock |
 
 Target paths vary by engine; Strata-style CTs use `/opt/<target>/` for code,

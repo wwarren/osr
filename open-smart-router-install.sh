@@ -3,31 +3,25 @@ set -euo pipefail
 # ==============================================================================
 # Open Smart Router LXC installer for Proxmox
 #
-# Changes vs. the original:
-#   * App/config files are staged on the host and pushed with `pct push`, so
-#     secrets can never break out of shell quoting or be mangled by an inner
-#     heredoc (fixes the GITEA/Mattermost token injection bug).
-#   * Root password is set over stdin via `chpasswd`, never passed on argv
-#     (no longer visible in the host process list).
-#   * Container readiness is polled (DNS + systemd) instead of `sleep 8`, and
-#     apt is retried, so a slow first boot no longer aborts the run.
-#   * An ERR trap destroys a half-provisioned container on failure.
-#   * The health monitor now probes each Ollama backend directly, instead of
-#     reading a `services` key that LiteLLM's /health endpoint never returns
-#     (the old monitor reported "healthy" forever and never alerted).
-#   * The download storage is validated to support vztmpl content.
-#   * Open WebUI is installed (own venv, own Python 3.12 — Debian 13's 3.13 is
-#     outside its supported range) and pointed at the smart router, so the
-#     container ships a chat UI in addition to the OpenAI-compatible API.
-#   * A login MOTD lists every service, IP, port and config path.
-#   * Container resources bumped to accommodate Open WebUI.
+# Run as root on a Proxmox host, from a full repository checkout. It creates
+# the router CT (smart router, LiteLLM, health monitor, Open WebUI) and the
+# selected targets/ CTs. README.md covers installation and operation,
+# ARCHITECTURE.md the design.
+#
+#   * Config files are staged on the host and pushed with `pct push`, so a
+#     secret can never break out of shell quoting; the root password is set
+#     over stdin, never on argv.
 #   * Configuration is version controlled: the installer builds a per-service
-#     config tree, seeds it into the Gitea repo (missing files only, so your
-#     commits win), then the container clones it and injects the files via
-#     install/apply-config.sh. Pull happens ONCE at provisioning time, so a
+#     config tree and seeds it into the Gitea repository (missing files only,
+#     so your commits win); the container clones it and applies it with
+#     install/apply-config.sh. The pull happens once, at provisioning, so a
 #     Gitea outage can never block a service start.
-#   * Routing thresholds/keywords moved out of router.py into router.ini, and
-#     monitor polling into monitor.ini, so behaviour is configurable per commit.
+#   * An ERR trap destroys a half-provisioned router container.
+#
+# The project was called Ollama Smart Router before November 2026. Names that
+# running installs depend on were kept (the ollama-router and ollama-monitor
+# units, the ollama-router account, services/ollama-*); see "Upgrading from
+# Ollama Smart Router" in README.md.
 # ==============================================================================
 CT_ID="${CT_ID:-}"                    # default: the cluster's next free ID
 CT_NAME="${CT_NAME:-open-smart-router}"
@@ -46,7 +40,7 @@ CORES="${CORES:-2}"
 MEMORY="${MEMORY:-4096}"
 SWAP="${SWAP:-1024}"
 ROOTFS_GB="${ROOTFS_GB:-32}"
-# This container never has a GPU — inference happens on the remote Ollama hosts —
+# This container never has a GPU — inference happens on the remote model hosts —
 # so the CUDA build of torch is pure dead weight (~4.5 GB of nvidia-* wheels).
 # Default true: CPU-only torch is installed from the PyTorch CPU index before
 # Open WebUI, so pip sees the requirement already satisfied and skips the CUDA
@@ -78,11 +72,11 @@ FIREWALL="${FIREWALL:-1}"
 #   manage-model-servers set-api-key [key|--generate|--off]
 ROUTER_API_KEY="${ROUTER_API_KEY:-}"
 API_ALLOW_CIDR="${API_ALLOW_CIDR:-}"  # if FIREWALL=1, allow 8000 from this CIDR
-# --- Ollama model servers ---------------------------------------------------
+# --- Model servers -----------------------------------------------------------
 # Everything here is only a DEFAULT offered at the prompts; set any of these in
 # the environment to pre-fill (or, with NONINTERACTIVE=true, to skip) a prompt.
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
-# How many Ollama hosts to configure. Asked at install; anything outside
+# How many model servers to configure. Asked at install; anything outside
 # MODEL_SERVER_MIN..MODEL_SERVER_MAX is rejected with an error and re-prompted.
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -99,9 +93,8 @@ MODEL_SERVER_3="${MODEL_SERVER_3:-}"
 # why the OpenAI-compatible endpoint needs the maintainer.
 OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-}"
 KEEP_ALIVE_REFRESH_SECONDS="${KEEP_ALIVE_REFRESH_SECONDS:-240}"
-# Model tag served by each tier. NOTE: qwen3.8:27b is the value carried over
-# from the original script and looks like a typo — the prompt lets you correct
-# it to whatever you actually `ollama pull`ed (e.g. qwen3:32b).
+# Model tag served by each tier: defaults only. The prompts take the tags the
+# servers really have (what you `ollama pull`ed, or a non-Ollama server's ID).
 MODEL_FAST="${MODEL_FAST:-qwen2.5-coder}"
 MODEL_MEDIUM="${MODEL_MEDIUM:-qwen3:14b}"
 MODEL_LARGE="${MODEL_LARGE:-qwen3.8:27b}"
@@ -158,18 +151,27 @@ TIER_XLARGE_IDX=""
 GITEA_SERVER_URL="${GITEA_SERVER_URL:-}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-gitea}"
 # The configuration repository. Every Gitea call below is built from this name.
-GITEA_REPO_NAME="${GITEA_REPO_NAME:-open-smart-router}"
+GITEA_REPO_DEFAULT_NAME="open-smart-router"
+GITEA_REPO_NAME="${GITEA_REPO_NAME:-$GITEA_REPO_DEFAULT_NAME}"
+# The default name before the rename from Ollama Smart Router. When the default
+# name above finds no repository but this one exists, it is used, so a rerun
+# keeps the configuration committed there instead of seeding an empty
+# repository. Set it empty to turn that off; a GITEA_REPO_NAME of your own is
+# never replaced.
+GITEA_REPO_LEGACY_NAME="${GITEA_REPO_LEGACY_NAME-ollama-smart-router}"
 # Owner of that repository. Leave empty to resolve automatically: the token
 # owner first, then a search across everything the token can see. Set this
 # explicitly when the repo belongs to an organisation, or when several accounts
 # have a repo by the same name.
 GITEA_REPO_OWNER="${GITEA_REPO_OWNER:-}"
 GITEA_REPO_PRIVATE="${GITEA_REPO_PRIVATE:-true}"
-# TurnKey appliances ship a self-signed certificate, so this defaults to false.
-# NOTE: prompt_gitea_credentials sets this to false unconditionally — change it
-# there (not here) if you have installed the appliance's CA or a real
-# certificate and want verification enforced.
+# TurnKey appliances ship a self-signed certificate, so this defaults to false:
+# the deploy token is then sent over a connection whose certificate is not
+# authenticated. Set GITEA_VERIFY_TLS=true once the appliance's CA (or a real
+# certificate) is trusted on this host. Every Gitea call, the container's clone
+# and GITEA_VERIFY_TLS in env/router.env follow it. Anything but "true" is false.
 GITEA_VERIFY_TLS="${GITEA_VERIFY_TLS:-false}"
+[[ "$GITEA_VERIFY_TLS" == "true" ]] || GITEA_VERIFY_TLS=false
 # Where the config repo is cloned inside the container. Config is pulled ONCE,
 # at provisioning time — services never depend on Gitea being up to start.
 CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-/app/config-repo}"
@@ -2568,12 +2570,12 @@ indices_to_urls() {
 prompt_model_servers() {
   local count raw default_addr i tier_sel
   echo
-  echo "--- Ollama model servers ---"
+  echo "--- Model servers ---"
   while true; do
     if [[ "$NONINTERACTIVE" == "true" ]]; then
       count="$MODEL_SERVER_COUNT"
     else
-      read -r -p "How many Ollama model servers? (${MODEL_SERVER_MIN}-${MODEL_SERVER_MAX}) [${MODEL_SERVER_COUNT}]: " count
+      read -r -p "How many model servers? (${MODEL_SERVER_MIN}-${MODEL_SERVER_MAX}) [${MODEL_SERVER_COUNT}]: " count
       [[ -z "$count" ]] && count="$MODEL_SERVER_COUNT"
     fi
     if [[ "$count" =~ ^[0-9]+$ ]] \
@@ -2699,14 +2701,11 @@ prompt_gitea_credentials() {
   prompt_value "Configuration repository name" GITEA_REPO_NAME "$GITEA_REPO_NAME"
   GITEA_OWNER="$GITEA_ADMIN_USER"
 
-  # The TurnKey Gitea appliance ships a self-signed certificate, so certificate
-  # verification is turned off for every Gitea call. Set here — before
-  # init_gitea_curl_opts — so the credential check, the repo resolution, the
-  # seeding API calls and the container's `git clone` all use the same setting.
-  # Trade-off: the deploy token is sent over a connection whose certificate is
-  # not authenticated. Install the appliance's CA (or a real certificate) and
-  # change this to "true" if that path isn't a network you trust.
-  GITEA_VERIFY_TLS=false
+  # GITEA_VERIFY_TLS (false unless preset to true, see the top of the script)
+  # is settled before init_gitea_curl_opts, so the credential check, the repo
+  # resolution, the seeding API calls and the container's `git clone` all use
+  # the same setting.
+  [[ "$GITEA_VERIFY_TLS" == "true" ]] || GITEA_VERIFY_TLS=false
 
   init_gitea_curl_opts
 
@@ -2886,7 +2885,8 @@ init_gitea_curl_opts() {
   GITEA_CURL_OPTS=(--location)
   if [[ "$GITEA_VERIFY_TLS" != "true" ]]; then
     GITEA_CURL_OPTS+=(--insecure)
-    echo "NOTE: TLS verification disabled for Gitea (GITEA_VERIFY_TLS=false)." >&2
+    echo "NOTE: TLS verification disabled for Gitea (GITEA_VERIFY_TLS=false); set" >&2
+    echo "      GITEA_VERIFY_TLS=true once its certificate is trusted on this host." >&2
   fi
 }
 
@@ -2911,7 +2911,7 @@ gitea_diagnose_rc() {
         if [[ "$GITEA_VERIFY_TLS" == "true" ]]; then
           echo "         TurnKey appliances ship a self-signed certificate. Either" >&2
           echo "         trust its CA on this host, install a real certificate, or" >&2
-          echo "         set GITEA_VERIFY_TLS=false in prompt_gitea_credentials." >&2
+          echo "         run again without GITEA_VERIFY_TLS=true (verification off)." >&2
         else
           echo "         Unexpected: verification is already disabled, so this is" >&2
           echo "         likely a TLS handshake or proxy problem rather than the" >&2
@@ -3136,11 +3136,46 @@ remove_marker_file() {
 }
 
 # Work out which repository to use, and set GITEA_OWNER to its real owner.
+# Returns as resolve_gitea_repo_named. When the default name is not found, the
+# name it had before the rename (GITEA_REPO_LEGACY_NAME) is looked up the same
+# way; a repository found there becomes GITEA_REPO_NAME, so its committed
+# configuration is used rather than a new, empty repository seeded with
+# defaults. An ambiguous or failed lookup of the old name returns 1: creating
+# a repository beside one that may hold the configuration would hide it.
+resolve_gitea_repo() {
+  local token="$1" rc=0 wanted="$GITEA_REPO_NAME" owner="$GITEA_OWNER"
+  resolve_gitea_repo_named "$token" || rc=$?
+  [[ "$rc" == "2" && -n "${GITEA_REPO_LEGACY_NAME:-}" \
+     && "$wanted" == "${GITEA_REPO_DEFAULT_NAME:-}" \
+     && "$wanted" != "$GITEA_REPO_LEGACY_NAME" ]] || return "$rc"
+  rc=0
+  GITEA_REPO_NAME="$GITEA_REPO_LEGACY_NAME"
+  resolve_gitea_repo_named "$token" >/dev/null || rc=$?
+  case "$rc" in
+    0)
+      echo "NOTE: no repository is named ${wanted}; using ${GITEA_OWNER}/${GITEA_REPO_NAME}," >&2
+      echo "      the configuration repository from before the rename. To move to the" >&2
+      echo "      new name, rename it in Gitea (and update the remote of /app/config-repo" >&2
+      echo "      in the router CT). GITEA_REPO_LEGACY_NAME= ignores the old repository." >&2
+      return 0 ;;
+    2)
+      GITEA_REPO_NAME="$wanted"; GITEA_OWNER="$owner"
+      return 2 ;;
+  esac
+  echo "WARNING: ${wanted} does not exist, and the pre-rename repository" >&2
+  echo "         ${GITEA_REPO_NAME} could not be resolved (see above). Set GITEA_REPO_NAME" >&2
+  echo "         (and GITEA_REPO_OWNER) to the repository to use, or" >&2
+  echo "         GITEA_REPO_LEGACY_NAME= to ignore the old one." >&2
+  GITEA_REPO_NAME="$wanted"; GITEA_OWNER="$owner"
+  return 1
+}
+
+# Look GITEA_REPO_NAME up, and set GITEA_OWNER to its real owner.
 # Without this, a repo that lives under an organisation (or another account)
 # would 404 against the token owner and a duplicate would be created silently.
 # Returns: 0 = found and GITEA_OWNER set, 2 = does not exist anywhere the token
 # can see (caller should create it), 1 = ambiguous or an explicit owner missed.
-resolve_gitea_repo() {
+resolve_gitea_repo_named() {
   local token="$1" base api auth resp http body matches count first
   base="${GITEA_SERVER_URL%/}"; api="${base}/api/v1"
   auth="Authorization: token ${token}"
@@ -3244,6 +3279,7 @@ test_gitea_access() {
   case "$rrc" in
     0)
       owner="$GITEA_OWNER"
+      repo_name="$GITEA_REPO_NAME"   # the pre-rename repository may have been chosen
       ;;
     2)
       # Not found anywhere the token can see — create it under the token owner.
@@ -5671,7 +5707,7 @@ def send_startup_notice(checks: list) -> None:
     host = socket.gethostname()
     watched = ", ".join(c.key for c in checks) or "nothing configured"
     message = (
-        f"Ollama monitor online on `{host}` — health alerting is active. "
+        f"Health monitor online on `{host}` — health alerting is active. "
         f"Watching: {watched}. "
         f"(This is a startup test message confirming webhook access to "
         f"#{MATTERMOST_CHANNEL}.)"
@@ -5787,7 +5823,7 @@ def keep_alive_loop(checks: list, stop: threading.Event) -> None:
 def run_health_checks() -> None:
     checks = build_checks()
     if not checks:
-        logging.error("No Ollama hosts or local services configured; nothing to monitor.")
+        logging.error("No model hosts or local services configured; nothing to monitor.")
         return
     logging.info("Monitoring %d endpoint(s): %s (alert after %d failures, "
                  "recover after %d passes)", len(checks),
@@ -6197,7 +6233,7 @@ cat > "${REPO_DIR}/install/manage-model-servers.sh" <<'MANAGEEOF'
 #!/usr/bin/env bash
 set -euo pipefail
 # ==============================================================================
-# manage-model-servers.sh — add / remove / re-tier the Ollama model servers of
+# manage-model-servers.sh — add / remove / re-tier the model servers of
 # a running open-smart-router container, without re-running the installer.
 #
 # Run it from either place, as root:
@@ -6245,6 +6281,10 @@ UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # Snapshots of the runtime files taken before each apply (root-only).
 APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/open-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
+# The snapshot directory before the rename from Ollama Smart Router. The next
+# apply moves its snapshots into APPLY_BACKUP_DIR, so they are found in one
+# place and pruned with the rest. Empty leaves that directory alone.
+APPLY_BACKUP_DIR_LEGACY="${APPLY_BACKUP_DIR_LEGACY-/var/backups/ollama-smart-router}"
 # One config change at a time (this tool and install/update-router.sh share it).
 # The lock is an flock on this file: it lasts only as long as the process that
 # holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
@@ -6386,7 +6426,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-model large qwen3:32b --apply --commit
     manage-model-servers.sh set-model fast llama3.2:3b --no-probe
     manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
-    manage-model-servers.sh set-server-model medium 192.168.11.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
+    manage-model-servers.sh set-server-model medium 192.0.2.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
     manage-model-servers.sh set-keepalive 2h --apply
     manage-model-servers.sh set-keepalive -1 --apply
     manage-model-servers.sh set-keepalive '' --apply
@@ -8181,11 +8221,35 @@ affected_services() {
   return 0
 }
 
+# Move the snapshots taken before the rename (APPLY_BACKUP_DIR_LEGACY) into
+# APPLY_BACKUP_DIR and remove the old directory once it is empty. Snapshot
+# names are timestamps, so the moved ones sort before new ones and are pruned
+# first. A name already present in APPLY_BACKUP_DIR is left where it is.
+# Never fails: an apply must not stop over an old snapshot.
+adopt_legacy_snapshots() {
+  local old name moved=0
+  [[ -n "${APPLY_BACKUP_DIR_LEGACY:-}" && "$APPLY_BACKUP_DIR_LEGACY" != "$APPLY_BACKUP_DIR" \
+     && -d "$APPLY_BACKUP_DIR_LEGACY" ]] || return 0
+  mkdir -p "$APPLY_BACKUP_DIR" 2>/dev/null && chmod 0700 "$APPLY_BACKUP_DIR" 2>/dev/null || return 0
+  for old in "$APPLY_BACKUP_DIR_LEGACY"/*/; do
+    [[ -d "$old" ]] || continue
+    old="${old%/}"; name="${old##*/}"
+    [[ ! -e "${APPLY_BACKUP_DIR}/${name}" ]] || continue
+    if mv -- "$old" "${APPLY_BACKUP_DIR}/${name}" 2>/dev/null; then moved=$((moved + 1)); fi
+  done
+  rmdir -- "$APPLY_BACKUP_DIR_LEGACY" 2>/dev/null || true
+  if (( moved > 0 )); then
+    note "  moved ${moved} snapshot(s) from ${APPLY_BACKUP_DIR_LEGACY} to ${APPLY_BACKUP_DIR}"
+  fi
+  return 0
+}
+
 # Copy every runtime file apply-config.sh may overwrite into a new timestamped
 # snapshot directory; print its path. Old snapshots beyond APPLY_BACKUP_KEEP
-# are pruned.
+# are pruned, those from before the rename included (adopt_legacy_snapshots).
 snapshot_runtime() {
   local dir src dest svcs
+  adopt_legacy_snapshots
   dir="${APPLY_BACKUP_DIR}/$(date +%Y%m%dT%H%M%S)-$$"
   mkdir -p "$dir" && chmod 0700 "$APPLY_BACKUP_DIR" "$dir"
   : > "${dir}/MANIFEST"
@@ -9219,7 +9283,7 @@ UNITEOF
 
 cat > "${REPO_DIR}/services/ollama-monitor/ollama-monitor.service" <<'UNITEOF'
 [Unit]
-Description=Ollama Cluster Resilience Health Monitor
+Description=Open Smart Router Health Monitor
 # The monitor probes model hosts and local services, including LiteLLM, and
 # posts transitions to Mattermost. LiteLLM is monitored, not a hard dependency:
 # its failure must not stop health checks for the other services and hosts.
@@ -9435,12 +9499,12 @@ cat > "$motd_tmp" <<EOF
    LiteLLM proxy              http://127.0.0.1:4000  (local)  [litellm-proxy.service]
    Health monitor             Mattermost alerts               [ollama-monitor.service]
 
-  MODEL TIERS  ->  OLLAMA BACKEND(S)
+  MODEL TIERS  ->  MODEL SERVER(S)
   ---------------------------------------------------------------------------
-   fast     ->  $(indices_to_urls "$TIER_FAST_IDX")   (ollama/${MODEL_FAST})
-   medium   ->  $(indices_to_urls "$TIER_MEDIUM_IDX")   (ollama/${MODEL_MEDIUM})
-   large    ->  $(indices_to_urls "$TIER_LARGE_IDX")   (ollama/${MODEL_LARGE})
-   xlarge   ->  $(indices_to_urls "$TIER_XLARGE_IDX")   (ollama/${MODEL_XLARGE})
+   fast     ->  $(indices_to_urls "$TIER_FAST_IDX")   (${MODEL_FAST})
+   medium   ->  $(indices_to_urls "$TIER_MEDIUM_IDX")   (${MODEL_MEDIUM})
+   large    ->  $(indices_to_urls "$TIER_LARGE_IDX")   (${MODEL_LARGE})
+   xlarge   ->  $(indices_to_urls "$TIER_XLARGE_IDX")   (${MODEL_XLARGE})
    ${MODEL_SERVER_COUNT} server(s) total
 
   PATHS & COMMANDS

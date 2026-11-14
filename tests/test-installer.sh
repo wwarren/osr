@@ -38,6 +38,8 @@ GITEA_SERVER_URL="https://git.example.net"
 GITEA_ADMIN_USER="tester"
 GITEA_OWNER="tester"
 GITEA_REPO_NAME="open-smart-router"
+GITEA_REPO_DEFAULT_NAME="open-smart-router"
+GITEA_REPO_LEGACY_NAME="ollama-smart-router"
 GITEA_REPO_OWNER=""
 GITEA_REPO_PRIVATE=true
 MODEL_SERVERS=()
@@ -2339,7 +2341,7 @@ assert_contains "with --data-binary @-" "--data-binary @-" "$(mock_calls)"
 assert_not_contains "and not on the command line" "AAAAAAAAAA" "$(mock_calls)"
 rm -f "$_body_seen"; unset _body_seen _big_body
 
-describe resolve_gitea_repo
+describe resolve_gitea_repo_named
 GITEA_REPO_OWNER=""; GITEA_OWNER="mike"
 mock_script curl <<'EOF'
 # GET /repos/mike/... -> 200 with the trailing status line gitea_api appends
@@ -2347,15 +2349,84 @@ echo '{"default_branch":"main"}'
 echo 200
 exit 0
 EOF
-assert_status "found under the token owner" 0 resolve_gitea_repo TOKEN
+assert_status "found under the token owner" 0 resolve_gitea_repo_named TOKEN
 GITEA_REPO_OWNER="org-team"
 mock_script curl <<'EOF'
 echo '{"message":"not found"}'
 echo 404
 exit 0
 EOF
-assert_status "explicit owner, repo missing -> 2" 2 resolve_gitea_repo TOKEN
+assert_status "explicit owner, repo missing -> 2" 2 resolve_gitea_repo_named TOKEN
 GITEA_REPO_OWNER=""
+
+describe resolve_gitea_repo
+# An install from before the rename: only ollama-smart-router exists. Every
+# lookup of the new name misses (direct 404, empty search); the old name is
+# found under the token owner.
+_legacy_curl() {
+  mock_script curl <<'EOF'
+case "$*" in
+  *repos/search*q=ollama-smart-router*) echo "${LEGACY_SEARCH:-{\"data\":[]\}}"; echo 200;;
+  *repos/search*)                       echo '{"data":[]}'; echo 200;;
+  *repos/mike/ollama-smart-router*)     echo "{}"; echo "${LEGACY_DIRECT:-200}";;
+  *)                                    echo '{"message":"not found"}'; echo 404;;
+esac
+exit 0
+EOF
+}
+_legacy_curl
+GITEA_REPO_OWNER=""; GITEA_OWNER="mike"; GITEA_REPO_NAME="open-smart-router"
+out="$(resolve_gitea_repo TOKEN 2>&1)"; rc=$?
+assert_eq "the pre-rename repository is found" "0" "$rc"
+assert_contains "and named" "mike/ollama-smart-router" "$out"
+assert_not_contains "without the lookup's own chatter" "Using existing repository" "$out"
+resolve_gitea_repo TOKEN >/dev/null 2>&1
+assert_eq "it becomes the repository name" "ollama-smart-router" "$GITEA_REPO_NAME"
+assert_eq "under its owner" "mike" "$GITEA_OWNER"
+
+# Found only by the search, under an organisation.
+GITEA_REPO_NAME="open-smart-router"; GITEA_OWNER="mike"
+export LEGACY_DIRECT=404 LEGACY_SEARCH='{"data":[{"name":"ollama-smart-router","full_name":"ops/ollama-smart-router"}]}'
+assert_status "a pre-rename repository under an organisation is found" 0 resolve_gitea_repo TOKEN
+resolve_gitea_repo TOKEN >/dev/null 2>&1
+assert_eq "with the organisation as owner" "ops/ollama-smart-router" "${GITEA_OWNER}/${GITEA_REPO_NAME}"
+
+# Several pre-rename repositories: refuse rather than create a new one.
+GITEA_REPO_NAME="open-smart-router"; GITEA_OWNER="mike"
+export LEGACY_SEARCH='{"data":[{"name":"ollama-smart-router","full_name":"ops/ollama-smart-router"},{"name":"ollama-smart-router","full_name":"lab/ollama-smart-router"}]}'
+out="$(resolve_gitea_repo TOKEN 2>&1)"; rc=$?
+assert_eq "an ambiguous pre-rename name is not guessed" "1" "$rc"
+assert_contains "the choices are listed" "lab/ollama-smart-router" "$out"
+assert_contains "and the way out is named" "GITEA_REPO_LEGACY_NAME=" "$out"
+resolve_gitea_repo TOKEN >/dev/null 2>&1 || true
+assert_eq "the wanted name is kept" "mike/open-smart-router" "${GITEA_OWNER}/${GITEA_REPO_NAME}"
+
+# Neither name exists: a new install creates the new name.
+export LEGACY_SEARCH='{"data":[]}'
+assert_status "neither name exists -> 2" 2 resolve_gitea_repo TOKEN
+resolve_gitea_repo TOKEN >/dev/null 2>&1 || true
+assert_eq "and the new name is the one to create" "mike/open-smart-router" "${GITEA_OWNER}/${GITEA_REPO_NAME}"
+
+# The fallback is for the default name only, and can be turned off.
+unset LEGACY_DIRECT LEGACY_SEARCH
+GITEA_REPO_NAME="my-config"
+assert_status "a chosen repository name never falls back" 2 resolve_gitea_repo TOKEN
+resolve_gitea_repo TOKEN >/dev/null 2>&1 || true
+assert_eq "and stays as chosen" "my-config" "$GITEA_REPO_NAME"
+GITEA_REPO_NAME="open-smart-router"; GITEA_REPO_LEGACY_NAME=""
+assert_status "GITEA_REPO_LEGACY_NAME= turns the fallback off" 2 resolve_gitea_repo TOKEN
+GITEA_REPO_LEGACY_NAME="ollama-smart-router"
+
+# The new name exists: the old one is not looked at.
+mock_script curl <<'EOF'
+echo "$*" >> "$MOCK_LOG"
+echo '{"default_branch":"main"}'; echo 200
+exit 0
+EOF
+mock_reset_log
+assert_status "the new name wins when it exists" 0 resolve_gitea_repo TOKEN
+assert_not_contains "without a lookup of the old name" "ollama-smart-router" "$(mock_calls)"
+GITEA_REPO_NAME="open-smart-router"; GITEA_OWNER="tester"
 
 # ── config generation ─────────────────────────────────────────────────────────
 describe push_local_config_tree
@@ -2570,8 +2641,17 @@ prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
 assert_eq "accepts a verified token"  "TOKEN123" "$GITEA_DEPLOY_TOKEN"
 assert_eq "owner comes from the token" "tester"  "$GITEA_OWNER"
 assert_eq "config stays version controlled" "gitea" "$CONFIG_SOURCE"
-# TLS verification is forced off for the TurnKey appliance's self-signed cert.
-assert_eq "forces GITEA_VERIFY_TLS=false" "false" "$GITEA_VERIFY_TLS"
+# TLS verification stays off by default (the TurnKey appliance's self-signed
+# cert), and a preset true is honoured.
+assert_eq "GITEA_VERIFY_TLS stays false by default" "false" "$GITEA_VERIFY_TLS"
+GITEA_DEPLOY_TOKEN=""; GITEA_VERIFY_TLS=true
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
+assert_eq "a preset GITEA_VERIFY_TLS=true is kept" "true" "$GITEA_VERIFY_TLS"
+assert_not_contains "and verification is not reported off" "TLS verification disabled" "$(cat "$_pg_out")"
+GITEA_DEPLOY_TOKEN=""; GITEA_VERIFY_TLS=yes
+prompt_gitea_credentials > "$_pg_out" 2>&1 <<< $'\n\n\nTOKEN123\n' || true
+assert_eq "anything but true is false" "false" "$GITEA_VERIFY_TLS"
+GITEA_VERIFY_TLS=false
 
 # A token owned by a different account: the real login wins as repo owner.
 GITEA_DEPLOY_TOKEN=""; GITEA_ADMIN_USER="tester"
@@ -2638,6 +2718,29 @@ out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
 assert_eq       "succeeds end to end"        "0" "$rc"
 assert_contains "reports the authenticated user" "tester" "$out"
 assert_contains "reports the test commit"        "test commit succeeded" "$out"
+
+# An install from before the rename: only ollama-smart-router exists, and the
+# test commit goes there instead of to a new, empty open-smart-router.
+mock_script curl <<'EOF'
+case "$*" in
+  *-X*) ;;
+  *)    echo '{"login":"tester"}'; exit 0;;
+esac
+case "$*" in
+  *repos/search*)                  echo '{"data":[]}'; echo 200;;
+  *open-smart-router*)             echo '{"message":"not found"}'; echo 404;;
+  *ollama-smart-router/contents*)  echo '{"commit":{"html_url":"https://git.example.net/c/2"}}'; echo 201;;
+  *ollama-smart-router*)           echo '{"default_branch":"main"}'; echo 200;;
+  *)                               echo '{}'; echo 500;;
+esac
+exit 0
+EOF
+mock_reset_log
+out="$(test_gitea_access TOKEN 2>&1)"; rc=$?
+assert_eq       "a pre-rename repository passes the access test" "0" "$rc"
+assert_contains "it is reported as the configuration repository" "Configuration repository: tester/ollama-smart-router" "$out"
+assert_contains "the test commit goes to it" "repos/tester/ollama-smart-router/contents/provisioning-tests/" "$(mock_calls)"
+assert_not_contains "no repository is created beside it" "/user/repos" "$(mock_calls)"
 
 # The marker file is deleted again after the successful write. Request bodies
 # reach curl on stdin (see gitea_api); log them so the sha can be checked.

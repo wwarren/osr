@@ -353,7 +353,7 @@ def send_startup_notice(checks: list) -> None:
     host = socket.gethostname()
     watched = ", ".join(c.key for c in checks) or "nothing configured"
     message = (
-        f"Ollama monitor online on `{host}` — health alerting is active. "
+        f"Health monitor online on `{host}` — health alerting is active. "
         f"Watching: {watched}. "
         f"(This is a startup test message confirming webhook access to "
         f"#{MATTERMOST_CHANNEL}.)"
@@ -469,7 +469,7 @@ def keep_alive_loop(checks: list, stop: threading.Event) -> None:
 def run_health_checks() -> None:
     checks = build_checks()
     if not checks:
-        logging.error("No Ollama hosts or local services configured; nothing to monitor.")
+        logging.error("No model hosts or local services configured; nothing to monitor.")
         return
     logging.info("Monitoring %d endpoint(s): %s (alert after %d failures, "
                  "recover after %d passes)", len(checks),

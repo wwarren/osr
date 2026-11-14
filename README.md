@@ -53,10 +53,12 @@ the selected service CTs (a failure stops the install before the router is
 built), verifies the Gitea token, creates the router, provisions model targets,
 then Honcho, the agents and tools. Choose **Default** in the Gitea, Mattermost,
 Ollama and ComfyUI community-script menus. Companions that register with Open
-WebUI (Honcho, Hermes, OpenClaw, Open Terminal, ComfyUI) need an Open WebUI
-admin API key: create the first admin account in the browser, enable API keys
-and create one when prompted. A failed model or companion target leaves the
-router running and is listed with retry instructions at the end.
+WebUI (Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode, Open Terminal,
+ComfyUI) need an Open WebUI admin API key: create the first admin account in
+the browser, enable API keys and create one when prompted (without a key,
+DeepSeek Harness is installed without its Open WebUI endpoint and the others
+are skipped). A failed model or companion target leaves the router running
+and is listed with retry instructions at the end.
 
 Ollama and AirLLM install their engines during provisioning; llama.cpp creates
 only a CT unless `MODEL_ALIAS` and `MODEL_DOWNLOAD_URL` or `MODEL_PATH` are set
@@ -215,7 +217,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 | Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` (1/20) |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
-| Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE` |
+| Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
 | Cluster | `CLUSTER_SSH` (`fix`, the default: check and repair root SSH between nodes; `check`: report only; `skip`) |
 | Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
@@ -241,9 +243,9 @@ dedicated non-admin account needs `read:user` and `write:repository` for an
 existing repo, or `write:user` and `write:repository` to create one. Set
 `GITEA_REPO_OWNER` if the lookup is ambiguous (a repo under another owner must
 exist). Without a usable token the install continues in local mode. For
-self-signed TLS verification defaults off; install the CA and change
-`GITEA_VERIFY_TLS` in `prompt_gitea_credentials`. Protect tokens on untrusted
-networks with a TLS reverse proxy. The installer tests write access by
+self-signed TLS verification defaults off; install the CA on the Proxmox
+host and run the installer with `GITEA_VERIFY_TLS=true`. Protect tokens on
+untrusted networks with a TLS reverse proxy. The installer tests write access by
 committing and then deleting `provisioning-tests/<timestamp>.md` (both commits
 stay in history); if cleanup fails, `git rm -r provisioning-tests` and commit.
 
@@ -557,7 +559,8 @@ bash /path/to/clone/install/manage-model-servers.sh list         # from a clone 
 ```
 
 `<CT_ID>` is printed at the end of the install and shown by `pct list`
-(`open-smart-router` unless `CT_NAME` was set). Writing commands take the
+(`open-smart-router` unless `CT_NAME` was set; `ollama-smart-router` on an
+install from before the rename). Writing commands take the
 config lock; `--apply` validates, applies and health-checks
 ([Applying changes](#applying-configuration-changes)).
 
@@ -673,7 +676,8 @@ manage-model-servers apply          # or --all to restart every service
    and keyword JSON, the env files, and that `router.py`/`monitor.py` compile;
    on any error nothing changes.
 2. **Snapshots** the installed files to `/var/backups/open-smart-router/`
-   (root-only; `APPLY_BACKUP_KEEP`, default 5).
+   (root-only; `APPLY_BACKUP_KEEP`, default 5). Snapshots from before the
+   rename, in `/var/backups/ollama-smart-router/`, are moved there first.
 3. **Applies** the files, brings the LiteLLM and Open WebUI venvs in line with
    their pins (backing up `webui.db` first) and restarts only affected services.
 4. **Health-checks** router `/healthz`, LiteLLM `/health/liveliness`, Open
@@ -955,6 +959,29 @@ build. It needs ~2 GB in `DOWNLOAD_DIR` (`/root`) and ~1 GB per NVIDIA
 container while installing. Exit 2 means reboot (kernel, firmware or a driver
 that could not load live), then rerun to confirm.
 
+### Upgrading from Ollama Smart Router
+
+The project was renamed to Open Smart Router in November 2026. An existing
+install needs no manual step: update it from a new clone as above
+(`tools/upgrade-all.sh`, or `tools/update-router-services.sh` for the router
+alone).
+
+| Renamed | On an existing install |
+|---|---|
+| Installer `ollama-smart-router-install.sh` → `open-smart-router-install.sh` | Use the new file from a new clone |
+| Default CT hostname and Gitea repository `ollama-smart-router` → `open-smart-router` | Both keep their old names. The tools find the router by its `osr-router` tag, and the installer uses an existing `ollama-smart-router` repository when `open-smart-router` does not exist (`GITEA_REPO_LEGACY_NAME=` turns that off; a `GITEA_REPO_NAME` of your own is never replaced). To move to the new name, rename the repository in Gitea and run `git -C /app/config-repo remote set-url origin <new URL>` in the router CT |
+| Snapshots `/var/backups/ollama-smart-router/` → `/var/backups/open-smart-router/` | The next `apply` moves the old snapshots and prunes them with the rest |
+| Config lock `/run/lock/ollama-smart-router-config.lock` → `…/open-smart-router-config.lock` | `update-router.sh` also takes the old lock, so a management tool from before the update cannot overlap it |
+| Firewall rule tags and CT descriptions (`… for Ollama Smart Router`) | Old ones are recognised; Hermes, OpenClaw and OpenCode rewrite theirs on the next `--reconfigure` |
+| DeepSeek Harness's managed `AGENTS.md` block | Replaced in place on the next run |
+
+Kept, because running installs, commits and webhooks depend on them: the
+`ollama-router.service` and `ollama-monitor.service` units, the `ollama-router`
+account, `/app/router`, the `services/ollama-*` paths in the configuration
+repository, `manage-model-servers`, the `OLLAMA_*` settings, the
+`osr-router`/`osr-target` tags and the Mattermost defaults (`OllamaMonitor` in
+`ollama-monitor`).
+
 ## Troubleshooting
 
 Inside the router CT (`pct enter <CT_ID>`):
@@ -1002,6 +1029,8 @@ See [tests/README.md](tests/README.md).
 
 To run CI (`.gitea/workflows/tests.yml`) in Gitea, enable Actions and register
 an `act_runner` with an ubuntu-latest style image whose job containers run as
-root (`--strict` fails on skipped root-only tests). The `strata-upstream`,
+root (`--strict` fails on skipped root-only tests). `.github/workflows/tests.yml`
+is the same file for GitHub Actions, where the suites run through `sudo`;
+`tests/test-repo.sh` keeps the two identical. The `strata-upstream`,
 `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream` and
 `honcho-upstream` jobs also need GitHub (and PyPI) access.

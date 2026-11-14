@@ -7,7 +7,9 @@ source "$here/pve-select.sh"
 for provisioner in "$here"/*/provision-lxc.sh; do
     [[ -f $provisioner ]] || continue
     target=$(basename "$(dirname "$provisioner")")
-    grep -q 'pve-select\.sh' "$provisioner" || continue
+    # A provisioner that only mentions the file in a comment (llama.cpp keeps
+    # its own prompts) has no copy to compare.
+    grep -qE '^[[:space:]]*(source|\.)[[:space:]].*pve-select\.sh' "$provisioner" || continue
     cmp -s "$here/pve-select.sh" "$here/$target/pve-select.sh" || die "$target has an outdated selector copy"
 done
 

@@ -141,6 +141,7 @@ OUT ACCEPT -dest 192.0.2.71/32 -p tcp -dport 8080 -log nolog # ollama-smart-rout
 OUT ACCEPT -p udp -dport 53 -log nolog
 FW
 }
+# shellcheck disable=SC2034  # read by the provisioner's firewall writer
 model_rules=()
 renamed_fw
 upd replace 192.0.2.81 18790 192.0.2.81 8000 18790 || fail 'updating a pre-rename firewall'

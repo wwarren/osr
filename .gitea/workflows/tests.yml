@@ -1,5 +1,7 @@
 # Runs every test suite, shellcheck and ruff on each push and pull request.
-# Needs a Gitea Actions runner (act_runner) with an ubuntu-latest style image.
+# In Gitea it needs an Actions runner (act_runner) with an ubuntu-latest style
+# image. .github/workflows/tests.yml is the same file, for GitHub Actions;
+# tests/test-repo.sh fails when the two differ, so edit both.
 # The "test" job talks to nothing beyond PyPI. The "strata-upstream",
 # "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
 # GitHub; they are separate jobs so a GitHub outage cannot hide the results of
@@ -20,6 +22,13 @@ jobs:
         with:
           # The router container runs Debian 13's Python 3.13.
           python-version: "3.13"
+
+      # DeepSeek Harness's configure.mjs tests (deepseek-harness-provision) run
+      # on the Node.js release its target installs; without Node.js they are
+      # skipped, which --strict fails.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Tooling (pytest, ruff, shellcheck, PyYAML)
         run: python -m pip install -r tests/requirements-dev.txt
@@ -60,9 +69,17 @@ jobs:
           LITELLM_PYTHON: ${{ github.workspace }}/.venv-litellm/bin/python
           OPEN_TERMINAL_PYTHON: ${{ github.workspace }}/.venv-open-terminal/bin/python
         # --strict: a suite that skips cases (most end-to-end cases need root)
-        # fails the job, so a green run means they all ran. The runner's
-        # job container must therefore run as root, as act_runner's do.
-        run: bash tests/run-tests.sh --strict </dev/null
+        # fails the job, so a green run means they all ran. They must
+        # therefore run as root: act_runner's job containers are; GitHub's
+        # hosted runners are not, so there the suites go through sudo, which
+        # keeps PATH (setup-python, setup-node) and the interpreter settings.
+        run: |
+          if [ "$(id -u)" = 0 ]; then
+            bash tests/run-tests.sh --strict </dev/null
+          else
+            sudo --preserve-env=ROUTER_PYTHON,BRIDGE_PYTHON,LITELLM_PYTHON,OPEN_TERMINAL_PYTHON,CI \
+              env "PATH=$PATH" bash tests/run-tests.sh --strict </dev/null
+          fi
 
       - name: shellcheck
         run: |

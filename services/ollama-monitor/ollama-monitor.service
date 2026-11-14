@@ -1,5 +1,5 @@
 [Unit]
-Description=Ollama Cluster Resilience Health Monitor
+Description=Open Smart Router Health Monitor
 # The monitor probes model hosts and local services, including LiteLLM, and
 # posts transitions to Mattermost. LiteLLM is monitored, not a hard dependency:
 # its failure must not stop health checks for the other services and hosts.

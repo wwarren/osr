@@ -21,7 +21,10 @@ Requirements: Linux, Bash 4.4+, Python 3, coreutils and the dependencies in
 `tests/requirements-dev.txt`. Set `ROUTER_PYTHON` and `BRIDGE_PYTHON` for the
 pytest suites; they need different FastAPI versions. Set `LITELLM_PYTHON` to
 the venv built from `services/litellm-proxy/requirements.lock` for
-`litellm-retries`. A missing test dependency skips its pytest suite.
+`litellm-retries`, and `OPEN_TERMINAL_PYTHON` to the venv built from
+`targets/open-terminal/requirements.lock` for `open-terminal-gateway`.
+`deepseek-harness-provision` runs `configure.test.mjs` with Node.js 20 or
+newer. A missing test dependency skips its suite or case.
 
 The runner fails on a failed assertion or on a function in the installer or
 manager without a matching `describe` block. Root-only target cases report a

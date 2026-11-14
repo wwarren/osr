@@ -40,6 +40,7 @@ export SECRETS_FILE="${WORK}/router/secrets.env"
 LITELLM_DIR="${WORK}/litellm"
 UNIT_DIR="${WORK}/units"
 APPLY_BACKUP_DIR="${WORK}/backups"
+APPLY_BACKUP_DIR_LEGACY="${WORK}/backups-pre-rename"
 APPLY_BACKUP_KEEP=2
 HEALTH_TIMEOUT=4
 OPENWEBUI_HEALTH_TIMEOUT=4
@@ -1422,6 +1423,41 @@ assert_file_contains "records what it saved" "${ROUTER_DIR}/router.ini" "${snap}
 assert_file_mode "snapshots are root-only" "700" "$snap"
 snapshot_runtime >/dev/null; sleep 1; snapshot_runtime >/dev/null
 assert_eq "old snapshots are pruned" "2" "$(ls -1d "$APPLY_BACKUP_DIR"/*/ | wc -l)"
+
+describe adopt_legacy_snapshots
+# Snapshots taken before the rename sit in the old directory.
+rm -rf "$APPLY_BACKUP_DIR" "$APPLY_BACKUP_DIR_LEGACY"
+assert_ok "no old directory is not an error" adopt_legacy_snapshots
+assert_ok "and nothing is created for it" bash -c "[[ ! -e '$APPLY_BACKUP_DIR' ]]"
+mkdir -p "$APPLY_BACKUP_DIR_LEGACY/20260101T000000-1/openwebui-data" "$APPLY_BACKUP_DIR_LEGACY/20260102T000000-2" \
+  "$APPLY_BACKUP_DIR/20260102T000000-2"
+echo db > "$APPLY_BACKUP_DIR_LEGACY/20260101T000000-1/openwebui-data/webui.db"
+echo old > "$APPLY_BACKUP_DIR_LEGACY/20260102T000000-2/MANIFEST"
+echo new > "$APPLY_BACKUP_DIR/20260102T000000-2/MANIFEST"
+out="$(adopt_legacy_snapshots 2>&1)"
+assert_contains "says what it moved" "moved 1 snapshot(s)" "$out"
+assert_file_contains "a snapshot moves with its contents" "db" "$APPLY_BACKUP_DIR/20260101T000000-1/openwebui-data/webui.db"
+assert_file_contains "a snapshot of the same name is not overwritten" "new" "$APPLY_BACKUP_DIR/20260102T000000-2/MANIFEST"
+assert_file_contains "and stays in the old directory" "old" "$APPLY_BACKUP_DIR_LEGACY/20260102T000000-2/MANIFEST"
+assert_file_mode "the snapshot directory is root-only" "700" "$APPLY_BACKUP_DIR"
+rm -rf "$APPLY_BACKUP_DIR_LEGACY/20260102T000000-2"
+assert_eq "a second run moves nothing and says nothing" "" "$(adopt_legacy_snapshots 2>&1)"
+assert_ok "the emptied old directory is removed" bash -c "[[ ! -e '$APPLY_BACKUP_DIR_LEGACY' ]]"
+_saved_legacy="$APPLY_BACKUP_DIR_LEGACY"
+mkdir -p "$_saved_legacy/20260103T000000-3"
+APPLY_BACKUP_DIR_LEGACY=""
+adopt_legacy_snapshots
+assert_ok "an empty APPLY_BACKUP_DIR_LEGACY leaves the old directory alone" bash -c "[[ -d '$_saved_legacy/20260103T000000-3' ]]"
+APPLY_BACKUP_DIR_LEGACY="$APPLY_BACKUP_DIR"
+assert_ok "the same directory for both is a no-op" adopt_legacy_snapshots
+APPLY_BACKUP_DIR_LEGACY="$_saved_legacy"
+# The next apply's snapshot adopts and prunes them with the rest (keep = 2).
+rm -rf "$APPLY_BACKUP_DIR"; mkdir -p "$APPLY_BACKUP_DIR_LEGACY/20260104T000000-4"
+snap="$(snapshot_runtime 2>/dev/null)"
+assert_ok "snapshot_runtime prints only its own path" bash -c "[[ -f '${snap}/MANIFEST' ]]"
+assert_eq "old snapshots count towards the limit" "2" "$(ls -1d "$APPLY_BACKUP_DIR"/*/ | wc -l)"
+assert_ok "the oldest pre-rename snapshot is the one pruned" bash -c "[[ ! -e '$APPLY_BACKUP_DIR/20260103T000000-3' && -d '$APPLY_BACKUP_DIR/20260104T000000-4' ]]"
+assert_ok "and the old directory is gone" bash -c "[[ ! -e '$APPLY_BACKUP_DIR_LEGACY' ]]"
 
 describe restore_runtime
 snap="$(snapshot_runtime)"

@@ -151,7 +151,8 @@ class DashboardTests(unittest.TestCase):
     def test_hardware_is_cached_between_viewers(self):
         runs = []
         with self.client(gpu=lambda: runs.append(1)) as c:
-            c.get("/hw"); c.get("/hw"); c.get("/hw")
+            for _ in range(3):
+                c.get("/hw")
         self.assertEqual(len(runs), 1)
 
     def test_no_nvidia_gpu_leaves_the_gpu_out(self):

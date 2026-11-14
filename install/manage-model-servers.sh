@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ==============================================================================
-# manage-model-servers.sh — add / remove / re-tier the Ollama model servers of
+# manage-model-servers.sh — add / remove / re-tier the model servers of
 # a running open-smart-router container, without re-running the installer.
 #
 # Run it from either place, as root:
@@ -49,6 +49,10 @@ UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # Snapshots of the runtime files taken before each apply (root-only).
 APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/open-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
+# The snapshot directory before the rename from Ollama Smart Router. The next
+# apply moves its snapshots into APPLY_BACKUP_DIR, so they are found in one
+# place and pruned with the rest. Empty leaves that directory alone.
+APPLY_BACKUP_DIR_LEGACY="${APPLY_BACKUP_DIR_LEGACY-/var/backups/ollama-smart-router}"
 # One config change at a time (this tool and install/update-router.sh share it).
 # The lock is an flock on this file: it lasts only as long as the process that
 # holds it, so a crash or reboot never leaves it in force. CONFIG_LOCK_WAIT
@@ -190,7 +194,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-model large qwen3:32b --apply --commit
     manage-model-servers.sh set-model fast llama3.2:3b --no-probe
     manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
-    manage-model-servers.sh set-server-model medium 192.168.11.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
+    manage-model-servers.sh set-server-model medium 192.0.2.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
     manage-model-servers.sh set-keepalive 2h --apply
     manage-model-servers.sh set-keepalive -1 --apply
     manage-model-servers.sh set-keepalive '' --apply
@@ -1985,11 +1989,35 @@ affected_services() {
   return 0
 }
 
+# Move the snapshots taken before the rename (APPLY_BACKUP_DIR_LEGACY) into
+# APPLY_BACKUP_DIR and remove the old directory once it is empty. Snapshot
+# names are timestamps, so the moved ones sort before new ones and are pruned
+# first. A name already present in APPLY_BACKUP_DIR is left where it is.
+# Never fails: an apply must not stop over an old snapshot.
+adopt_legacy_snapshots() {
+  local old name moved=0
+  [[ -n "${APPLY_BACKUP_DIR_LEGACY:-}" && "$APPLY_BACKUP_DIR_LEGACY" != "$APPLY_BACKUP_DIR" \
+     && -d "$APPLY_BACKUP_DIR_LEGACY" ]] || return 0
+  mkdir -p "$APPLY_BACKUP_DIR" 2>/dev/null && chmod 0700 "$APPLY_BACKUP_DIR" 2>/dev/null || return 0
+  for old in "$APPLY_BACKUP_DIR_LEGACY"/*/; do
+    [[ -d "$old" ]] || continue
+    old="${old%/}"; name="${old##*/}"
+    [[ ! -e "${APPLY_BACKUP_DIR}/${name}" ]] || continue
+    if mv -- "$old" "${APPLY_BACKUP_DIR}/${name}" 2>/dev/null; then moved=$((moved + 1)); fi
+  done
+  rmdir -- "$APPLY_BACKUP_DIR_LEGACY" 2>/dev/null || true
+  if (( moved > 0 )); then
+    note "  moved ${moved} snapshot(s) from ${APPLY_BACKUP_DIR_LEGACY} to ${APPLY_BACKUP_DIR}"
+  fi
+  return 0
+}
+
 # Copy every runtime file apply-config.sh may overwrite into a new timestamped
 # snapshot directory; print its path. Old snapshots beyond APPLY_BACKUP_KEEP
-# are pruned.
+# are pruned, those from before the rename included (adopt_legacy_snapshots).
 snapshot_runtime() {
   local dir src dest svcs
+  adopt_legacy_snapshots
   dir="${APPLY_BACKUP_DIR}/$(date +%Y%m%dT%H%M%S)-$$"
   mkdir -p "$dir" && chmod 0700 "$APPLY_BACKUP_DIR" "$dir"
   : > "${dir}/MANIFEST"

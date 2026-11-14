@@ -195,7 +195,7 @@ def gpu_info(run=subprocess.run):
     if len(values) != len(GPU_FIELDS):
         return None
     # "[N/A]" (no fan, no power reading) would draw NaN; the page shows 0.
-    return {k: (v if v.replace(".", "", 1).isdigit() else "0") for k, v in zip(GPU_FIELDS, values)}
+    return {k: (v if v.replace(".", "", 1).isdigit() else "0") for k, v in zip(GPU_FIELDS, values, strict=False)}
 
 
 def create_app(config=None, transport=None, gpu=gpu_info):
