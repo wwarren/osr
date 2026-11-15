@@ -1006,8 +1006,17 @@ update_hermes() {
         note 'Cannot read the installed Hermes commit; Hermes itself was not updated.'
         return 1
     fi
-    note "Updating Hermes itself (--update-hermes): hermes update as the hermes user."
-    if ! pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update </dev/null; then
+    # hermes update runs as the hermes user, which cannot restart the system
+    # units: left to restart them itself it drains the gateway, cannot restart
+    # the dashboard and reports the update as incomplete. A Hermes that has
+    # --no-gateway-restart only updates the code; root restarts both units below.
+    local -a update_args=()
+    if pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update --help </dev/null 2>/dev/null |
+            grep -q -- '--no-gateway-restart'; then
+        update_args=(--no-gateway-restart)
+    fi
+    note "Updating Hermes itself (--update-hermes): hermes update ${update_args[*]:+${update_args[*]} }as the hermes user; root then restarts its gateway and dashboard."
+    if ! pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update ${update_args[@]+"${update_args[@]}"} </dev/null; then
         note 'hermes update failed.'
         return 1
     fi

@@ -20,6 +20,10 @@ ExecStart=/home/hermes/.local/bin/hermes gateway run
 # systemd retries it like any other exit.
 Restart=always
 RestartSec=5
+# Exit 78 is upstream's permanent refusal (a configuration it will not start
+# with): leave the unit failed instead of restarting it every 5 s. `hermes
+# update` warns about a gateway unit without this line.
+RestartPreventExitStatus=78
 TimeoutStopSec=60
 # --- sandboxing (same model as the other target units) ---
 # The agent's terminal and file tools run inside this sandbox too: they can

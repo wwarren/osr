@@ -157,6 +157,12 @@ case $cmd in
             # and the restart after it.
             git) [[ ! -e $MOCK/$id.hermes-commit ]] || cat "$MOCK/$id.hermes-commit" ;;
             runuser)
+                if [[ $* == *' update --help' ]]; then
+                    # Only a newer Hermes knows --no-gateway-restart.
+                    echo 'usage: hermes update [--check] [--force]'
+                    [[ ! -e $MOCK/$id.hermes-no-restart-flag ]] || echo '  --no-gateway-restart  defer the restart'
+                    exit 0
+                fi
                 printf 'RUNUSER %s %s\n' "$id" "$*" >> "$MOCK/installs.log"
                 [[ ! -e $MOCK/$id.hermes-update-fails ]] || exit 1
                 [[ ! -e $MOCK/$id.hermes-next ]] || cp "$MOCK/$id.hermes-next" "$MOCK/$id.hermes-commit" ;;
@@ -897,6 +903,16 @@ assert_file_contains 'runs hermes update as the hermes user' \
     'RUNUSER 282 runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update' "$tmp/mock/installs.log"
 assert_file_contains 'restarts the gateway and dashboard' \
     'SYSTEMCTL 282 systemctl try-restart hermes-gateway.service hermes-dashboard.service' "$tmp/mock/installs.log"
+assert_eq 'an older Hermes gets no flag it does not know' '' "$(grep -- '--no-gateway-restart' "$tmp/mock/installs.log")"
+hermes_reset
+touch "$tmp/mock/282.hermes-no-restart-flag"
+printf '%040d\n' 0 | tr 0 b > "$tmp/mock/282.hermes-next"
+out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
+assert_file_contains 'a Hermes that can leaves the restarts to root' \
+    'RUNUSER 282 runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update --no-gateway-restart' "$tmp/mock/installs.log"
+assert_file_contains 'which restarts both units' \
+    'SYSTEMCTL 282 systemctl try-restart hermes-gateway.service hermes-dashboard.service' "$tmp/mock/installs.log"
+assert_contains 'and it is still an upgrade' 'upgraded|Hermes updated' "$out"
 hermes_reset
 assert_eq 'nothing newer: still current' 'current|hermes update found nothing newer (aaaaaaaaaaaa)' \
     "$(in_tool hermes_case true 'settings unchanged; nothing to do')"
