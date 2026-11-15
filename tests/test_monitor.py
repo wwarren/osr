@@ -193,6 +193,139 @@ def test_keep_alive_skips_down_hosts(monkeypatch):
     assert pinned == [(A, "qwen3:8b")]
 
 
+def test_keep_alive_pins_hosts_side_by_side(monkeypatch):
+    module = load_monitor(monkeypatch, BACKEND_FAST=f"{A},{B},{C}", MODEL_FAST="qwen3:8b",
+                          BACKEND_MEDIUM="", BACKEND_LARGE="", OLLAMA_KEEP_ALIVE="2h")
+    together = threading.Barrier(3)
+
+    def pin(url, model):
+        together.wait(timeout=5)   # raises unless all three hosts are being pinned at once
+        return True
+
+    monkeypatch.setattr(module, "pin_model", pin)
+    assert module.refresh_keep_alive(lambda url: True) == 3
+
+
+def test_keep_alive_pins_a_shared_model_once_per_host(monkeypatch):
+    module = load_monitor(monkeypatch, BACKEND_MEDIUM=B, BACKEND_LARGE=B,
+                          MODEL_MEDIUM="qwen3:14b", MODEL_LARGE="qwen3:14b", OLLAMA_KEEP_ALIVE="2h")
+    assert module.keep_alive_plan() == {B: ["qwen3:14b"]}
+    pinned = []
+    monkeypatch.setattr(module, "pin_model", lambda url, model: pinned.append((url, model)) or True)
+    monkeypatch.setattr(module, "resident_models", lambda url: pytest.fail("one model needs no /api/ps"))
+    assert module.refresh_keep_alive(lambda url: True) == 1
+    assert pinned == [(B, "qwen3:14b")]
+
+
+def shared_host(monkeypatch, capacity):
+    """B serves medium and large with different models and holds `capacity` of
+    them: loading one more unloads the oldest, as Ollama does."""
+    module = load_monitor(monkeypatch, BACKEND_FAST="", BACKEND_MEDIUM=B, BACKEND_LARGE=B,
+                          MODEL_MEDIUM="qwen3:14b", MODEL_LARGE="qwen3:32b", OLLAMA_KEEP_ALIVE="2h")
+    loaded, loads = [], []
+
+    def pin(url, model):
+        if model in loaded:
+            return True
+        loads.append(model)
+        loaded.append(model)
+        del loaded[:-capacity]
+        return True
+
+    monkeypatch.setattr(module, "pin_model", pin)
+    monkeypatch.setattr(module, "resident_models", lambda url: set(loaded))
+    return module, loaded, loads
+
+
+def test_keep_alive_keeps_every_model_on_a_host_that_holds_them(monkeypatch):
+    module, loaded, loads = shared_host(monkeypatch, capacity=2)
+    for _ in range(3):
+        assert module.refresh_keep_alive(lambda url: True) == 2
+    assert loads == ["qwen3:14b", "qwen3:32b"]   # each loaded once, then only refreshed
+    assert B not in module._CROWDED
+
+
+def test_keep_alive_stops_reloading_on_a_host_that_cannot_hold_its_tiers(monkeypatch, caplog):
+    module, loaded, loads = shared_host(monkeypatch, capacity=1)
+    with caplog.at_level("WARNING"):
+        module.refresh_keep_alive(lambda url: True)
+    assert loads == ["qwen3:14b", "qwen3:32b"]   # the first pass tries both
+    assert B in module._CROWDED
+    assert "cannot hold them together" in caplog.text
+    for _ in range(3):
+        assert module.refresh_keep_alive(lambda url: True) == 1
+    assert loads == ["qwen3:14b", "qwen3:32b"]   # no model is loaded again: only the resident one is refreshed
+    assert loaded == ["qwen3:32b"]
+    # A request loaded the other model meanwhile: that one is kept alive instead.
+    loaded[:] = ["qwen3:14b"]
+    module.refresh_keep_alive(lambda url: True)
+    assert loads == ["qwen3:14b", "qwen3:32b"] and loaded == ["qwen3:14b"]
+    # Nothing of its tiers is resident: the first tier's model is loaded.
+    loaded[:] = ["other:7b"]
+    module.refresh_keep_alive(lambda url: True)
+    assert loads[-1] == "qwen3:14b" and len(loads) == 3
+
+
+def test_keep_alive_treats_a_host_normally_again_once_it_holds_everything(monkeypatch):
+    module, loaded, loads = shared_host(monkeypatch, capacity=1)
+    module.refresh_keep_alive(lambda url: True)
+    assert B in module._CROWDED
+    loaded[:] = ["qwen3:14b", "qwen3:32b"]       # e.g. a bigger card, or smaller models
+    module.refresh_keep_alive(lambda url: True)
+    assert B not in module._CROWDED
+
+
+def test_keep_alive_without_api_ps_pins_everything_as_before(monkeypatch):
+    module, loaded, loads = shared_host(monkeypatch, capacity=1)
+    monkeypatch.setattr(module, "resident_models", lambda url: None)
+    for _ in range(2):
+        assert module.refresh_keep_alive(lambda url: True) == 2
+    assert B not in module._CROWDED
+    assert loads == ["qwen3:14b", "qwen3:32b"] * 2
+
+
+def test_keep_alive_zero_is_not_mistaken_for_a_crowded_host(monkeypatch):
+    module, loaded, loads = shared_host(monkeypatch, capacity=1)
+    monkeypatch.setattr(module, "KEEP_ALIVE", "0")
+    module.refresh_keep_alive(lambda url: True)
+    assert B not in module._CROWDED
+
+
+def test_resident_models_reads_api_ps(monkeypatch):
+    module = load_monitor(monkeypatch)
+
+    class Client:
+        def __init__(self, response):
+            self.response = response
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, timeout):
+            assert url == f"{A}/api/ps"
+            if isinstance(self.response, Exception):
+                raise self.response
+            return self.response
+
+    request = httpx.Request("GET", f"{A}/api/ps")
+    answers = {
+        "listed": httpx.Response(200, request=request, json={"models": [
+            {"name": "qwen3:14b", "model": "qwen3:14b"}, {"name": "llama3:latest"}, "junk"]}),
+        "missing": httpx.Response(404, request=request),
+        "odd": httpx.Response(200, request=request, json={"models": None}),
+        "down": httpx.ConnectError("refused"),
+    }
+    seen = {}
+    for name, answer in answers.items():
+        monkeypatch.setattr(module.httpx, "Client", lambda answer=answer: Client(answer))
+        seen[name] = module.resident_models(A)
+    assert seen == {"listed": {"qwen3:14b", "llama3:latest"}, "missing": None, "odd": None, "down": None}
+    assert module._is_resident("llama3", seen["listed"]) and not module._is_resident("qwen3", seen["listed"])
+
+
 def test_keep_alive_runs_off_the_health_loop(monkeypatch):
     module = load_monitor(monkeypatch, MODEL_FAST="qwen3:8b", OLLAMA_KEEP_ALIVE="2h")
     started = threading.Event()

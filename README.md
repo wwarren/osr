@@ -509,8 +509,12 @@ login](https://geminicli.com/docs/faq/); use a Gemini API key.
 
 The router polls configured hosts every 60 s, classifies the newest user
 message as `fast`, `medium`, `large` or `xlarge`, and scores each host/model
-pair by size, code or vision fit, tool support and residency; close scores
-rotate. A named model is used if available; `auto` and tier aliases let the
+pair by size, code or vision fit, tool support and residency. A server loses a
+little for each request the router already has in flight there, so an equally
+good idle server is used first. Among equal choices a conversation keeps the
+server and model that answered it last (its prompt cache is there); the rest
+rotate. `[balancing]` in `router.ini` sets both (`busy_penalty`,
+`sticky_seconds`; 0 turns either off). A named model is used if available; `auto` and tier aliases let the
 router choose; embedding models are never used for chat. Connect errors,
 timeouts, 404s, 5xx and tool-support rejections try the next candidate until
 streaming starts; other 400s go back to the client. With discovery off or an
@@ -519,13 +523,16 @@ empty inventory, LiteLLM serves static tiers (`X-Router-Mode: litellm`).
 explain each choice.
 
 ```text
-GET  /routing/inventory   host models, capabilities, context and errors
-POST /routing/refresh     poll now
+GET  /routing/inventory   host models, capabilities, context, errors and requests in flight
+POST /routing/refresh     poll now and ask every Ollama model for its capabilities again (?probe=false: poll only)
 POST /routing/explain     {"prompt": "..."} -> scored candidates
 GET  /healthz             unauthenticated liveness
 ```
 
-Tune thresholds, keywords, weights, timeouts and sizes in
+Capabilities and context come from Ollama's `/api/show`, asked once per model
+digest and again after `[discovery] show_cache_seconds` (an hour): a re-pulled
+or re-created model is asked at once, and `POST /routing/refresh` asks all of
+them. Tune thresholds, keywords, weights, timeouts and sizes in
 `services/ollama-router/router.ini`; the rules are in
 [ARCHITECTURE.md](ARCHITECTURE.md#5-request-routing).
 
@@ -659,6 +666,14 @@ the monitor calls each up Ollama host's `/api/chat` with an empty message every
 240 s (`monitor.ini [keep_alive] refresh_seconds` or
 `KEEP_ALIVE_REFRESH_SECONDS`), keeping each tier's model loaded. Blank (the
 default) sends nothing and leaves each server's own setting in charge.
+
+Hosts are refreshed side by side. A host that serves several tiers with
+different models gets all of them, as long as it can hold them together. If
+loading one unloads another, the monitor logs that the host "cannot hold them
+together" and from then on only refreshes the tier models that are loaded
+(loading the first when none is), so the models in use are not swapped out
+every 240 s. Give each tier its own host, or the same model, to keep them all
+loaded.
 
 ## Applying configuration changes
 
@@ -803,7 +818,7 @@ For Hermes (and hcom on a Hermes CT) it also records whether the API server's
 `/health` answers `"status": "ok"` on its port, the direct dispatcher's
 `/healthz` and the dashboard's `/api/status` answer.
 For a model target it also records whether the router lists that server as up
-with models (after `/routing/refresh`). It then takes a Proxmox snapshot
+with models (after `/routing/refresh?probe=false`). It then takes a Proxmox snapshot
 (`osr-upg-<time>-<n>`; when one cannot be taken, interactive runs ask whether
 to continue, unattended runs continue, and `--require-snapshot` skips that CT). After the
 upgrade, everything that worked before must work again within

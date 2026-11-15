@@ -428,10 +428,10 @@ def pin_model(url: str, model: str) -> bool:
         return False
 
 
-def refresh_keep_alive(is_up) -> int:
-    """Pin each tier's model on every host serving that tier that is up.
-    is_up(url) -> bool comes from the health checks."""
-    pinned = 0
+def keep_alive_plan() -> dict:
+    """Ollama host URL -> the tier models to keep loaded there, in tier order.
+    A model that two of a host's tiers share is listed once."""
+    plan = {}
     for tier, urls in BACKENDS.items():
         model = TIER_MODELS.get(tier, "")
         if not model:
@@ -441,10 +441,83 @@ def refresh_keep_alive(is_up) -> int:
                 # LM Studio has no keep_alive: it loads on demand and unloads
                 # on its own idle TTL (configure that in LM Studio itself).
                 continue
-            if not is_up(url):
-                continue          # don't wait on a host we already know is down
-            if pin_model(url, model):
-                pinned += 1
+            models = plan.setdefault(url, [])
+            if model not in models:
+                models.append(model)
+    return plan
+
+
+def resident_models(url: str):
+    """The model names Ollama's /api/ps reports loaded on url, or None when it
+    cannot say (a failed call, or a bridge without /api/ps)."""
+    try:
+        with httpx.Client() as client:
+            resp = client.get(f"{url.rstrip('/')}/api/ps", timeout=CHECK_TIMEOUT)
+            resp.raise_for_status()
+            models = resp.json().get("models")
+        if not isinstance(models, list):
+            return None
+        return {name for model in models if isinstance(model, dict)
+                for name in (model.get("name"), model.get("model")) if isinstance(name, str)}
+    except Exception:  # noqa: BLE001 - residency is then simply unknown
+        return None
+
+
+def _is_resident(model: str, resident: set) -> bool:
+    return model in resident or (":" not in model and f"{model}:latest" in resident)
+
+
+# Hosts seen unloading one of their tier models to load another: they cannot
+# hold all of them at once.
+_CROWDED = set()
+
+
+def pin_host(url: str, models: list) -> int:
+    """Pin one host's tier models, one after another (a host loads one model at
+    a time). Returns how many were pinned.
+
+    A host that serves several tiers gets all of its models on the first pass.
+    If loading one of them unloaded another, the host cannot hold them all, and
+    loading each in turn on every refresh would evict the model in use again
+    and again. Such a host then only has the timers of its resident tier models
+    refreshed (the first is loaded when none is resident); the others load when
+    a request needs them. It is treated normally again once /api/ps shows all
+    of its models loaded together."""
+    wanted = models
+    if len(models) > 1 and url in _CROWDED:
+        resident = resident_models(url)
+        if resident is not None:
+            if all(_is_resident(model, resident) for model in models):
+                _CROWDED.discard(url)
+            else:
+                wanted = [m for m in models if _is_resident(m, resident)] or models[:1]
+    done = [model for model in wanted if pin_model(url, model)]
+    # keep_alive 0 unloads at once, so nothing stays resident to compare.
+    if len(done) > 1 and url not in _CROWDED and _keep_alive_value() != 0:
+        resident = resident_models(url)
+        if resident is not None and not all(_is_resident(model, resident) for model in done):
+            _CROWDED.add(url)
+            logging.warning(
+                "keep-alive: %s unloaded one tier model to load another (%s): it cannot "
+                "hold them together. Only its loaded tier models are kept alive from now "
+                "on; give each tier its own host, or one model, to keep them all loaded.",
+                url, ", ".join(done))
+    return len(done)
+
+
+def refresh_keep_alive(is_up) -> int:
+    """Pin each tier's model on every host serving that tier that is up.
+    is_up(url) -> bool comes from the health checks. Hosts are pinned side by
+    side, so one host's cold load (up to timeout_seconds) does not hold back
+    the others until their models have already been unloaded."""
+    # Down hosts are left out: don't wait on a host we already know is down.
+    plan = [(url, models) for url, models in keep_alive_plan().items() if is_up(url)]
+    if len(plan) > 1:
+        with ThreadPoolExecutor(max_workers=min(16, len(plan)),
+                                thread_name_prefix="keep-alive") as pool:
+            pinned = sum(pool.map(lambda item: pin_host(*item), plan))
+    else:
+        pinned = sum(pin_host(url, models) for url, models in plan)
     if pinned:
         logging.info("keep-alive: refreshed %d model(s) with keep_alive=%s",
                      pinned, KEEP_ALIVE)

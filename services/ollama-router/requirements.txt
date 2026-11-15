@@ -2,3 +2,9 @@ fastapi==0.116.1
 uvicorn==0.35.0
 httpx==0.28.1
 python-dotenv==1.1.1
+# uvicorn picks these up by itself when they are installed (its loop and HTTP
+# parser are "auto"): libuv's event loop and a C request parser, which cut the
+# per-chunk cost of streamed completions. Without them (another platform) it
+# runs on asyncio and h11 as before.
+uvloop==0.21.0; sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")
+httptools==0.6.4; sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")

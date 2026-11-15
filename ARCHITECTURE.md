@@ -124,13 +124,16 @@ flowchart TB
         C["litellm-proxy.service<br/>127.0.0.1:4000"]
         D["ollama-monitor.service<br/>no listener"]
     end
-    A -->|Requires| B
+    A -.->|Wants| B
     B -.->|Wants| C
     D -.->|Wants| C
 ```
 
-* `open-webui` **Requires** the router, its only backend. The router and
-  monitor only **Want** LiteLLM: a fallback must not cascade its restarts.
+* `open-webui` **Wants** the router, its only backend, and starts after it. It
+  does not `Require` it: that would restart the UI, the slowest service to
+  start, with every router restart, and each routing change restarts the
+  router. The router and monitor only **Want** LiteLLM: a fallback must not
+  cascade its restarts.
 * All units are `Restart=always`; `open-webui` has `TimeoutStartSec=600`
   because its first start downloads an embedding model.
 * Every unit reads `/app/router/secrets.env` as an optional second
@@ -162,7 +165,7 @@ FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 |---|---|
 | `POST /v1/chat/completions` | Classify, select, dispatch; a configured cloud ID goes to LiteLLM (§4.2) |
 | `GET /v1/models` | `auto`, tier aliases, configured cloud IDs (`owned_by` = provider), discovered chat models (`owned_by` = kind) |
-| `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll |
+| `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state, the router's requests in flight per server (`in_flight`) and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll, which also asks every Ollama model for its capabilities again unless `?probe=false` |
 | `POST /routing/explain` | Decision and scored candidates, without executing |
 | `GET /healthz` | Liveness (never needs the key) |
 | `ANY /v1/{path}` | Passthrough to LiteLLM (embeddings, etc.) |
@@ -183,6 +186,15 @@ key on a non-loopback address the router logs a warning.
   least `tools_min_class` (`large`).
 * **Selector and dispatcher** score every `(host, model)` pair and fail forward
   through the ranking (§5).
+
+The router is a streaming proxy on one event loop, so per-chunk and per-body
+work is kept off the request path: upstream bytes are relayed undecoded; the
+API-key check is plain ASGI middleware (`RouterKeyMiddleware`), not Starlette's
+`BaseHTTPMiddleware`, which would relay every chunk through a second task; the
+request body is encoded once per model name across fail-forward attempts and
+sent as the client's own bytes when the client named the model; and `uvloop`
+and `httptools` (pinned in `requirements.txt`, x86_64 and aarch64) replace
+asyncio's loop and the h11 parser.
 
 ### 4.2 LiteLLM proxy (`litellm-proxy.service`)
 
@@ -239,7 +251,12 @@ webhook check without delaying host alerts.
 
 The **keep-alive maintainer** exists because Ollama's OpenAI endpoint ignores
 `keep_alive`. It runs in its own thread (a slow load never delays health
-checks) and touches only Ollama hosts; see
+checks) and touches only Ollama hosts, all of them side by side, so one
+host's cold load does not hold back the others. A host gets each of its tier
+models once, in tier order. If loading one unloads another (`/api/ps` no
+longer lists it), the host cannot hold its tiers together: from then on only
+its resident tier models are refreshed (the first is loaded when none is),
+instead of reloading each on every pass; see
 [Keeping models loaded](README.md#keeping-models-loaded).
 
 ---
@@ -287,8 +304,10 @@ true`); a tool request whose candidates all lack tools gets `no-tool-model`
 | **Unknown size** | `unknown_params` (0.3): usable, never preferred |
 | **Embeddings** | Structurally excluded; naming one is a 400 |
 | **Tools** | On a tool request, models known to lack tools are excluded (unless nothing else is left); `+tool_match` for reported support over unknown. Support comes from Ollama's `/api/show` capabilities (also the llama.cpp bridge's `MODEL_CAPABILITIES` and AirLLM), LM Studio's `trained_for_tool_use`, and `tool_kinds` in `router.ini` for the `/v1/models` kinds (all six Strata-style kinds by default; their text models count as capable, image generators not). Shown as `tools` in `/routing/inventory` |
-| **Context length** | Recorded in `/routing/inventory`, not scored: Ollama the smaller of model limit and configured `num_ctx`; the llama.cpp bridge its per-slot context; AirLLM its window; the `/v1/models` kinds `context_length`, `max_model_len`, `context_window` or `meta.n_ctx`. Ollama's `/api/show` is cached 60 s, keeping the last good answer. It can overstate served context; the agent and Honcho dispatchers use it (§17.1) |
-| **Tie rotation** | Candidates within `tie_epsilon` rotate. For a tool request only the same model on several hosts rotates, so an agent loop keeps one model (and its prompt cache) |
+| **Context length** | Recorded in `/routing/inventory`, not scored: Ollama the smaller of model limit and configured `num_ctx`; the llama.cpp bridge its per-slot context; AirLLM its window; the `/v1/models` kinds `context_length`, `max_model_len`, `context_window` or `meta.n_ctx`. Ollama's `/api/show` answer is cached per model digest for `show_cache_seconds` (3600; 60 s for a server that lists no digest, such as the llama.cpp bridge, whose settings can change unseen), keeping the last good answer. It can overstate served context; the agent and Honcho dispatchers use it (§17.1) |
+| **Load** | `−busy_penalty` (0.03) for each request this router has in flight on the server (counted from sending it until its body is relayed, it fails or the client leaves; what agents or other clients send a server directly is not seen). An equally good idle server therefore wins, and a busy server that leads only by `loaded_bonus` gives way once the lead is within `tie_epsilon` (from its second request with the defaults). `busy_penalty = 0` turns it off |
+| **Tie order** | Candidates within `tie_epsilon` are tried least busy first, then the one the conversation used last (affinity), otherwise in rotation. For a tool request only the same model on several hosts takes part, so an agent loop keeps one model: the one its task has been using, while that is among the tied |
+| **Affinity** | A conversation prefers the server and model that answered it last, for `sticky_seconds` (1800) after that answer, so its prompt cache is reused and its model does not change between equal choices. It only orders tied candidates: a better score or a less busy server still wins, and the conversation then stays with that one. Conversations are told apart by a hash of how they began (through the first assistant reply once there is one, so two that open alike differ from their second turn); at most 4096 are remembered. A named model's hosts are ordered the same way. `sticky_seconds = 0` turns it off |
 
 Sizes come from `details.parameter_size` (Ollama), `params_string` (LM Studio)
 or `parameter_size` (OpenAI-style), else the tag (`qwen3:14b` → 14B), else
@@ -616,7 +635,8 @@ post: delivery is at least once (§17.7).
 ## 11. Scaling and performance
 
 * **Horizontal:** 1–20 hosts; tiers may hold several. LiteLLM load-balances the
-  static path; the router rotates tied candidates.
+  static path; the router sends equally good candidates the idle one first,
+  keeps a conversation on its server and rotates otherwise (§5.2).
 * **Vertical:** the CT is I/O-bound glue; 2 vCPU / 4 GB is sized for Open
   WebUI's embedding model, not routing.
 * **Disk:** Open WebUI pulls CUDA torch by default (~7.5 GB venv). The CT has no
@@ -624,7 +644,9 @@ post: delivery is at least once (§17.7).
   orphaned `nvidia-*`/`triton` wheels (if the CPU index is unreachable, it
   falls back to CUDA and removes nothing).
 * **Discovery cost:** one model list per host per `refresh_seconds`, plus
-  Ollama `/api/show` when its one-minute cache expires or on `/routing/refresh`.
+  Ollama `/api/show` for a model whose digest is new, whose cached answer is
+  older than `show_cache_seconds`, or on `/routing/refresh` (not with
+  `?probe=false`).
 * **Single-sequence targets:** AirLLM, Kindi and Maya (by default) serve one
   sequence at a time, which the router cannot see (§14).
 
@@ -664,6 +686,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | Cloud models only when named | Cloud models in the pool or fallbacks | Automatic routing must never incur API charges |
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
 | ComfyUI as Open WebUI's image engine | An image route in the router | The router is chat-only; Open WebUI already drives ComfyUI's workflow API |
+| Affinity and load only reorder or nudge near-equal candidates | Pin a conversation to its server, or always pick the idle one | Fit and residency must still decide: a pinned conversation would stay on a model too small for a later turn, and "always idle" would load a model on every server |
 | Keep `ollama-router`, `ollama-monitor`, the `ollama-router` account and `services/ollama-*` after the rename to Open Smart Router | Rename units, account and repository paths too | Running installs, committed configuration, `apply` snapshots and health alerts refer to them; a rename would need a migration for no change in behaviour. Renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
 
 ---
@@ -674,16 +697,19 @@ posts include local event IDs and use a channel distinct from health alerts.
    `manage-model-servers` act.
 2. **Classification is lexical** (length and keywords), not semantic.
 3. **One shared router key**, not per user; Open WebUI provides user accounts.
-4. **No concurrency awareness.** A saturated host is just "up". Single-sequence
-   targets queue extra requests; one that times out before its first byte fails
-   forward, but the target keeps working on it.
+4. **Load is seen only through the router's own requests.** It counts what it
+   has in flight on each server (§5.2), not what agents' dispatchers or other
+   clients send there, nor how many requests a server can run at once.
+   Single-sequence targets queue extra requests; one that times out before its
+   first byte fails forward, but the target keeps working on it.
 5. **Context windows are not used for routing.** A long prompt may land on a
    small-context model, and the resulting 4xx does not fail forward.
 6. **The router CT is a single point of failure** for the API.
 
-Next steps: feed observed latency into scoring; track in-flight requests per
-host (e.g. Maya's `/slots`); use the inventory's `context_length` to exclude
-models too small for the prompt; add hosts through an endpoint.
+Next steps: feed observed latency into scoring; read each server's own load
+(e.g. Maya's `/slots`, Ollama's `/api/ps`) beside the router's count; use the
+inventory's `context_length` to exclude models too small for the prompt; add
+hosts through an endpoint.
 
 ---
 
@@ -1150,7 +1176,7 @@ Coordination paths (§17.7):
 
 | File | Owns |
 |---|---|
-| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict, tool_kinds), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe), `[weights]`, `[model_sizes]` |
+| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict, tool_kinds), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe and its cache), `[weights]`, `[balancing]` (busy_penalty, sticky_seconds), `[model_sizes]` |
 | `monitor.ini` | Interval, timeout, Ollama health path, alert thresholds, startup notice, local services, keep-alive |
 | `env/router.env` | Hosts, per-tier backends and tags, keep-alive, LiteLLM URLs, `CLOUD_*_MODELS`, `SUBSCRIPTION_GATEWAY_BASE_URL`, Gitea/Mattermost settings (no credentials) |
 | `secrets.env` (not in git) | Gitea token, webhook, router key, backend tokens, cloud keys |

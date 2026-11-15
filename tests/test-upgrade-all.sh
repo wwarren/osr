@@ -820,6 +820,12 @@ hermes_probe() {
     CURL_DIR=$tmp/curl OSR_PROBE_ROOT=$probe_root PATH="$tmp/probe-bin:$PATH" sh -c "$probe"
 }
 assert_eq 'nothing answers: nothing reported' '' "$(hermes_probe)"
+# The router's inventory is polled every POLL_INTERVAL while a target is
+# awaited: it must not make the router ask every Ollama model about itself.
+router_probe_text=$(tables write_probe /dev/stdout)
+assert_contains 'the inventory check refreshes without re-probing capabilities' \
+    "-X POST 'http://127.0.0.1:8000/routing/refresh?probe=false'" "$router_probe_text"
+assert_eq 'and that is the only refresh it makes' 1 "$(grep -c 'routing/refresh' <<< "$router_probe_text")"
 echo '{"status": "ok", "platform": "hermes-agent"}' > "$tmp/curl/8642_health"
 echo ok > "$tmp/curl/8765_healthz"
 echo '{}' > "$tmp/curl/9119_api_status"

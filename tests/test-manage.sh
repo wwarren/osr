@@ -1250,6 +1250,45 @@ make_fake_litellm_venv 1.75.5.post1; touch "${WORK}/IMPORTFAIL"
 assert_fail "proxy extra missing"                 litellm_venv_ok
 rm -f "${WORK}/IMPORTFAIL"; rm -rf "$LITELLM_DIR"
 assert_fail "no venv"                             litellm_venv_ok
+# The import takes seconds, so a passed test is remembered until the venv, the
+# lock or the interpreter changes. The fake python fails the import while
+# IMPORTFAIL exists, which shows whether it was run again.
+make_fake_litellm_venv 1.75.5.post1
+_stamp="${LITELLM_DIR}/venv/.osr-imports-ok"
+assert_ok   "a first check imports the proxy"     litellm_venv_ok
+assert_ok   "and records that it passed"          test -s "$_stamp"
+touch "${WORK}/IMPORTFAIL"
+assert_ok   "an unchanged venv is not imported again" litellm_venv_ok
+mkdir -p "${LITELLM_DIR}/venv/lib/python3.13/site-packages"
+assert_fail "a change in its packages is tested again" litellm_venv_ok
+assert_ok   "a failed test leaves no record"      bash -c "[[ ! -e '$_stamp' ]]"
+rm -f "${WORK}/IMPORTFAIL"
+assert_ok   "and passes again once the import works" litellm_venv_ok
+touch "${WORK}/IMPORTFAIL"
+echo 'backoff==2.2.1 --hash=sha256:11' >> "$LITELLM_LOCK"
+assert_fail "a changed lock is tested again"       litellm_venv_ok
+rm -f "${WORK}/IMPORTFAIL"; litellm_venv_ok
+touch "${WORK}/IMPORTFAIL"
+echo '# rebuilt' >> "${LITELLM_DIR}/venv/bin/python"
+assert_fail "a changed interpreter is tested again" litellm_venv_ok
+rm -f "${WORK}/IMPORTFAIL"; litellm_venv_ok
+touch "${WORK}/IMPORTFAIL"
+echo 1.70.0 > "${LITELLM_DIR}/version"
+assert_fail "a record never hides version drift"   litellm_venv_ok
+rm -f "${WORK}/IMPORTFAIL"
+
+describe litellm_venv_fingerprint
+make_fake_litellm_venv 1.75.5.post1
+_print="$(litellm_venv_fingerprint 1.75.5.post1 1.75.5.post1)"
+assert_eq "one line" "1" "$(printf '%s\n' "$_print" | wc -l | tr -d ' ')"
+assert_contains "names both versions" "1.75.5.post1|1.75.5.post1|" "$_print"
+assert_contains "and the lock's hash" "$(sha256sum < "$LITELLM_LOCK" | cut -d' ' -f1)" "$_print"
+assert_contains "and the interpreter" "${LITELLM_DIR}/venv/bin/python" "$_print"
+assert_eq "it is stable" "$_print" "$(litellm_venv_fingerprint 1.75.5.post1 1.75.5.post1)"
+rm -f "$LITELLM_LOCK"
+assert_contains "no lock is a value of its own" "|-|" "$(litellm_venv_fingerprint 1.75.5.post1 1.75.5.post1)"
+rm -rf "$LITELLM_DIR"
+assert_ok "a missing venv still prints a line" litellm_venv_fingerprint a b
 
 describe litellm_install
 make_fake_litellm_venv 1.70.0
@@ -1365,6 +1404,14 @@ printf '[keywords]\ncode = ["def ",\n' > "$ROUTER_INI"
 assert_fail "bad keyword JSON fails" validate_config
 printf '[keywords]\ncode = ["re:(unclosed"]\n' > "$ROUTER_INI"
 assert_contains "a bad keyword regex fails" "bad regex" "$(validate_config)"
+printf '[balancing]\nbusy_penalty = 0.05\nsticky_seconds = 0\n[discovery]\nshow_cache_seconds = 600\n' > "$ROUTER_INI"
+assert_ok "balancing and cache settings validate" validate_config
+printf '[balancing]\nbusy_penalty = lots\n' > "$ROUTER_INI"
+assert_contains "a busy_penalty that is not a number fails" "could not convert" "$(validate_config)"
+printf '[balancing]\nsticky_seconds = -5\n' > "$ROUTER_INI"
+assert_contains "a negative sticky_seconds fails" "[balancing] sticky_seconds must not be negative" "$(validate_config)"
+printf '[discovery]\nshow_cache_seconds = -1\n' > "$ROUTER_INI"
+assert_contains "a negative show_cache_seconds fails" "[discovery] show_cache_seconds must not be negative" "$(validate_config)"
 reset_repo
 printf 'def broken(:\n' > "${REPO_DIR}/services/ollama-router/router.py"
 assert_contains "a syntax error fails" "does not compile" "$(validate_config)"

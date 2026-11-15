@@ -3518,6 +3518,7 @@ unset GITEA_DEPLOY_TOKEN
 cat > "${REPO_DIR}/services/ollama-router/router.py" <<'PYEOF'
 import asyncio
 import configparser
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -3525,6 +3526,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -3533,6 +3535,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import Headers
 
 logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -3639,6 +3642,9 @@ _DEFAULTS = {
         # Ask each server's /api/show for a model's real capabilities (vision,
         # embedding). Name matching below is the fallback.
         "capability_probe": "true",
+        # How long an /api/show answer is kept for a model the server lists
+        # with a digest (see SHOW_CACHE_SECONDS below).
+        "show_cache_seconds": "3600",
         # LM Studio servers (MODEL_SERVERS entries written lmstudio+http://...)
         # load models on demand. true: only route to models already loaded
         # there (no multi-second JIT load on the request path).
@@ -3673,12 +3679,21 @@ _DEFAULTS = {
         # Candidates within this score of the best are treated as equivalent and
         # rotated through, so identical models on several hosts share load.
         "tie_epsilon": "0.05",
-        # Bonus for a model that is already resident in memory (LM Studio
-        # reports this per model; Ollama entries are neutral).
+        # Bonus for a model that is already resident in memory (LM Studio and
+        # the Strata-style servers report it per model, Ollama through /api/ps).
         "loaded_bonus": "0.1",
         # Bonus, on a tool request, for a model the server reports as
         # tool-capable over one whose tool support is unknown.
         "tool_match": "0.3",
+    },
+    # How load is spread once the scores have been compared.
+    "balancing": {
+        # Taken off a candidate's score for each request this router has in
+        # flight on its server. 0 turns load awareness off.
+        "busy_penalty": "0.03",
+        # How long a conversation prefers the server and model that answered
+        # it last, among equally good candidates. 0 turns it off.
+        "sticky_seconds": "1800",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
     # Basalt, Maya, Xolotl, Avalon) lists without a parameter count. Matching is by the whole
@@ -3858,6 +3873,8 @@ W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 W_TOOLS = _cfg.getfloat("weights", "tool_match")
+BUSY_PENALTY = max(0.0, _cfg.getfloat("balancing", "busy_penalty"))
+STICKY_SECONDS = max(0.0, _cfg.getfloat("balancing", "sticky_seconds"))
 
 # --- server kinds -----------------------------------------------------------------
 # A server entry is a base URL. Entries for servers that are not Ollama carry a
@@ -4015,6 +4032,113 @@ def tier_has_kindi(tier: str) -> bool:
 INVENTORY = {"models": [], "servers": {}, "updated_at": 0.0, "errors": {}}
 _rotation = {}
 
+# --- load and conversation affinity -------------------------------------------
+# server -> requests this router has sent there and not yet seen finish. Only
+# its own traffic: what the agents' dispatchers or other clients send a server
+# directly is not seen.
+_IN_FLIGHT = {}
+
+
+class InFlight:
+    """One request counted against a server from the moment it is sent until
+    release(): when its body has been relayed, it failed, or the client left.
+    release() may be called more than once, and a forgotten one is released
+    when it is collected, so a lost count cannot weigh on a server for good."""
+
+    __slots__ = ("server", "open", "streaming")
+
+    def __init__(self, server: str):
+        self.server, self.open, self.streaming = server, True, False
+        _IN_FLIGHT[server] = _IN_FLIGHT.get(server, 0) + 1
+
+    def release(self) -> None:
+        if not self.open:
+            return
+        self.open = False
+        left = _IN_FLIGHT.get(self.server, 0) - 1
+        if left > 0:
+            _IN_FLIGHT[self.server] = left
+        else:
+            _IN_FLIGHT.pop(self.server, None)
+
+    def __del__(self):
+        self.release()
+
+
+def in_flight(server: str) -> int:
+    """Requests in flight on a server, as far as load awareness is on."""
+    return _IN_FLIGHT.get(server, 0) if BUSY_PENALTY > 0 else 0
+
+
+# conversation key -> (server, model, time of its last answer), oldest first.
+_STICKY = OrderedDict()
+STICKY_MAX = 4096
+
+
+def conversation_keys(messages) -> list:
+    """Fingerprints of how a conversation began, most specific first.
+
+    Clients resend the whole history with every turn, so its beginning names a
+    conversation. Two keys: one through the first assistant reply after the
+    first user turn (there from the second turn on, and as good as unique), and
+    one through the first user turn alone (all a first request has; two
+    conversations that open with the same words share it). Only hashes of the
+    roles and text are kept. Empty when affinity is off or no user has spoken."""
+    if STICKY_SECONDS <= 0:
+        return []
+    digest, opening = hashlib.blake2b(digest_size=16), None
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        digest.update(role.encode("utf-8", "replace") + b"\0")
+        digest.update(_message_parts(message)[0].encode("utf-8", "replace") + b"\0")
+        if opening is None:
+            if role == "user":
+                opening = digest.hexdigest()
+        elif role == "assistant":
+            # A reply that only calls tools has no text; its calls tell it apart.
+            calls = message.get("tool_calls")
+            if calls:
+                digest.update(json.dumps(calls, sort_keys=True, default=str).encode("utf-8", "replace"))
+            return [digest.hexdigest(), opening]
+    return [opening] if opening else []
+
+
+def sticky_choice(keys: list):
+    """(server, model) that last answered this conversation, or None."""
+    now = time.monotonic()
+    for key in keys or ():
+        found = _STICKY.get(key)
+        if found is None:
+            continue
+        if now - found[2] > STICKY_SECONDS:
+            del _STICKY[key]
+            continue
+        return found[0], found[1]
+    return None
+
+
+def remember_choice(keys: list, entry: dict) -> None:
+    """Note which server and model answered this conversation."""
+    now = time.monotonic()
+    for key in keys or ():
+        _STICKY[key] = (entry["server"], entry["name"], now)
+        _STICKY.move_to_end(key)
+    while len(_STICKY) > STICKY_MAX:
+        _STICKY.popitem(last=False)
+
+
+def order_tied(tied: list, sticky=None) -> list:
+    """Order candidates that are equally good: the server with the fewest
+    requests in flight first, then the one this conversation used last. What is
+    still equal keeps the order it came in (the rotation's)."""
+    if len(tied) < 2:
+        return tied
+    return sorted(tied, key=lambda entry: (
+        in_flight(entry["server"]),
+        0 if sticky and (entry["server"], entry["name"]) == sticky else 1))
+
 
 def parse_params_billions(text) -> float:
     """'7.6B' -> 7.6, '134M' -> 0.134. A mixture-of-experts label such as
@@ -4106,10 +4230,31 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
 _CAPABILITIES = {}
 # The same key -> context length from the same /api/show answer, or None.
 _CONTEXTS = {}
-# Runtime settings can change without changing a model digest (for example a
-# llama.cpp context size). Cached probes expire after one minute.
-SHOW_CACHE_SECONDS = 60
+# A digest identifies what was probed: Ollama gives a re-pulled or re-created
+# model a new one, and AirLLM puts its served window into its digest. Such an
+# answer is kept for show_cache_seconds (an hour), so a poll does not ask every
+# host about every model again. A server that lists no digest (the llama.cpp
+# bridge) can change a runtime setting, such as its context size, with nothing
+# to show for it, so its answers expire after a minute, as all did before.
+# POST /routing/refresh re-probes everything at once.
+SHOW_CACHE_SECONDS = max(0.0, _cfg.getfloat("discovery", "show_cache_seconds"))
+SHOW_CACHE_SECONDS_NO_DIGEST = 60.0
 _SHOW_TIMES = {}
+
+
+def _show_ttl(raw: dict) -> float:
+    """Seconds a cached /api/show answer for this /api/tags entry stays valid."""
+    if raw.get("digest"):
+        return SHOW_CACHE_SECONDS
+    return min(SHOW_CACHE_SECONDS, SHOW_CACHE_SECONDS_NO_DIGEST)
+
+
+def _forget_show_answers(server: str, current: set) -> None:
+    """Drop the cached answers of models a server no longer lists (a removed
+    model, or the previous digest of a re-pulled one)."""
+    for key in [k for k in _CAPABILITIES if k[0] == server and k not in current]:
+        for cache in (_CAPABILITIES, _CONTEXTS, _SHOW_TIMES):
+            cache.pop(key, None)
 
 
 def positive_int(value):
@@ -4149,7 +4294,7 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
     name = raw.get("name") or raw.get("model") or ""
     key = _show_key(server, raw)
     if (not force and key in _CAPABILITIES and key in _SHOW_TIMES
-            and time.monotonic() - _SHOW_TIMES[key] < SHOW_CACHE_SECONDS):
+            and time.monotonic() - _SHOW_TIMES[key] < _show_ttl(raw)):
         return _CAPABILITIES[key]
     caps = context = None
     try:
@@ -4354,6 +4499,7 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str,
                                       for m in raws])
         for raw in raws:
             raw["context_length"] = _CONTEXTS.get(_show_key(server, raw))
+        _forget_show_answers(server, {_show_key(server, raw) for raw in raws})
     else:
         caps = [None] * len(raws)
     entries = [build_entry(server, m, c) for m, c in zip(raws, caps, strict=True)]
@@ -4468,18 +4614,18 @@ async def lifespan(_app):
 app = FastAPI(title="Open Smart Router", lifespan=lifespan)
 
 
-@app.middleware("http")
-async def require_api_key(request: Request, call_next):
-    if request.url.path != "/healthz" and request.headers.get("x-router-subscription") == "1" \
+def api_key_failure(path: str, headers) -> Response | None:
+    """The response that refuses a request, or None when it may proceed."""
+    if path != "/healthz" and headers.get("x-router-subscription") == "1" \
             and not ROUTER_API_KEY:
         return _error(503, "Subscription pass through requires ROUTER_API_KEY.",
                       "subscription_auth_not_configured")
-    if ROUTER_API_KEY and request.url.path != "/healthz":
-        if request.headers.get("x-router-subscription") == "1":
+    if ROUTER_API_KEY and path != "/healthz":
+        if headers.get("x-router-subscription") == "1":
             # Keep Authorization free for the signed-in Codex/Claude client.
-            token = request.headers.get("x-router-api-key", "")
+            token = headers.get("x-router-api-key", "")
         else:
-            supplied = request.headers.get("authorization", "")
+            supplied = headers.get("authorization", "")
             token = supplied[7:].strip() if supplied.lower().startswith("bearer ") else ""
         if not hmac.compare_digest(token.encode(), ROUTER_API_KEY.encode()):
             return JSONResponse(
@@ -4487,7 +4633,31 @@ async def require_api_key(request: Request, call_next):
                            "type": "invalid_request_error",
                            "code": "invalid_api_key"}},
                 status_code=401)
-    return await call_next(request)
+    return None
+
+
+class RouterKeyMiddleware:
+    """The API-key check as plain ASGI middleware.
+
+    @app.middleware("http") would build Starlette's BaseHTTPMiddleware, which
+    runs the application in a second task and relays every response chunk
+    through an in-memory stream: a cost paid for each token of a streamed
+    completion. Here an admitted request reaches the application with its own
+    receive and send, untouched."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            denied = api_key_failure(scope["path"], Headers(scope=scope))
+            if denied is not None:
+                await denied(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RouterKeyMiddleware)
 
 
 # --- request analysis ---------------------------------------------------------
@@ -4667,11 +4837,17 @@ def score_entry(entry: dict, need: dict) -> float:
         score += W_LOADED
     if need.get("tools") and entry.get("tools"):
         score += W_TOOLS
+    # Each request already in flight on the server counts against it, so a busy
+    # server gives way to an equally good idle one at once, and to a slightly
+    # worse one (the same model not yet loaded elsewhere, say) as it gets busier.
+    score -= BUSY_PENALTY * in_flight(entry["server"])
     return score
 
 
-def rank_candidates(need: dict, inventory: dict = None) -> list:
-    """All usable (server, model) pairs, best first."""
+def rank_candidates(need: dict, inventory: dict = None, affinity: list = None) -> list:
+    """All usable (server, model) pairs, best first. affinity: the request's
+    conversation_keys, so that equally good candidates start with the one the
+    conversation used last."""
     inv = inventory if inventory is not None else INVENTORY
     scored = []
     for entry in inv.get("models", []):
@@ -4714,6 +4890,7 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
     # spread load across models of visibly different size.
     best_score = scored[0][0]
     best_distance = _distance(scored[0][1])
+    sticky = sticky_choice(affinity)
     tied, rest = [], []
     for s_val, e in scored:
         if _distance(e) == best_distance and best_score - s_val <= TIE_EPSILON:
@@ -4725,7 +4902,10 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
         # DIFFERENT models would change the model mid-task and discard the
         # backend's prompt cache, so only the same model on several hosts
         # shares the load.
+        # The model the task has been using stays the one, while it is tied.
         best_name = tied[0]["name"]
+        if sticky and any(e["name"] == sticky[1] for e in tied):
+            best_name = sticky[1]
         rest = [e for e in tied if e["name"] != best_name] + rest
         tied = [e for e in tied if e["name"] == best_name]
     if len(tied) > 1:
@@ -4733,11 +4913,12 @@ def rank_candidates(need: dict, inventory: dict = None) -> list:
         index = _rotation.get(key, 0) % len(tied)
         _rotation[key] = index + 1
         tied = tied[index:] + tied[:index]
-    return tied + rest
+    return order_tied(tied, sticky) + rest
 
 
-def find_named_model(model_name: str) -> list:
-    """Servers hosting an explicitly requested model, best first."""
+def find_named_model(model_name: str, affinity: list = None) -> list:
+    """Servers hosting an explicitly requested model, best first: the least
+    busy, then the one the conversation used last, in rotation otherwise."""
     wanted = (model_name or "").strip().lower()
     if not wanted:
         return []
@@ -4755,7 +4936,7 @@ def find_named_model(model_name: str) -> list:
         index = _rotation.get(wanted, 0) % len(matches)
         _rotation[wanted] = index + 1
         matches = matches[index:] + matches[:index]
-    return matches
+    return order_tied(matches, sticky_choice(affinity))
 
 
 def embedding_only_match(model_name: str):
@@ -4827,8 +5008,20 @@ def _response_headers(upstream: httpx.Response, extra: dict = None) -> dict:
     return headers
 
 
-async def close_upstream(response: httpx.Response) -> None:
+async def close_upstream(response: httpx.Response, slot: InFlight = None) -> None:
     await response.aclose()
+    if slot is not None:
+        slot.release()
+
+
+async def _relay_counted(slot: InFlight, chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Relay a streamed body. The request stops counting against its server
+    when the stream ends, breaks, or the client stops reading."""
+    try:
+        async for chunk in chunks:
+            yield chunk
+    finally:
+        slot.release()
 
 
 async def _stream_upstream(method: str, url: str, headers: dict,
@@ -4976,8 +5169,32 @@ async def _relay_kindi_stream(server: str, response: httpx.Response, first_chunk
         await response.aclose()
 
 
+def _json_bytes(payload) -> bytes:
+    """A JSON body as httpx encodes json=: compact UTF-8, non-ASCII kept."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
+def body_for_model(body: dict, name: str, raw: bytes | None, encoded: dict) -> bytes:
+    """The request body with "model" set to name, as bytes.
+
+    A long conversation or an inline image makes the body megabytes of JSON,
+    and encoding it holds the event loop, and with it every other stream. So
+    it is encoded once per model name (encoded caches it across the fail-forward
+    attempts, where the same model on another host is the usual next candidate),
+    and not at all when the client already named this model: its own bytes
+    (raw, when they are UTF-8 JSON) are sent as they came."""
+    if name not in encoded:
+        if raw is not None and body.get("model") == name and json.detect_encoding(raw) == "utf-8":
+            encoded[name] = raw
+        else:
+            encoded[name] = _json_bytes(dict(body, model=name))
+    return encoded[name]
+
+
 async def _dispatch_direct(candidates: list, body: dict, headers: dict,
-                           need: dict, extra_headers: dict = None) -> Response:
+                           need: dict, extra_headers: dict = None,
+                           raw: bytes | None = None, affinity: list = None) -> Response:
     """Send to the best candidate, falling forward through the ranked list on
     connection errors, 404 or 5xx. Retrying is only safe before any body has
     been streamed, which is why the status is checked before returning. A host
@@ -4986,6 +5203,9 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
     client = http_client()
     last_error = None
     no_reply = kindi_was_busy = False
+    encoded: dict = {}
+    if not any(key.lower() == "content-type" for key in headers):
+        headers = dict(headers, **{"Content-Type": "application/json"})
     for position, entry in enumerate(candidates):
         if not INVENTORY.get("servers", {}).get(entry["server"], {}).get("up", True):
             last_error = f"{entry['server']}: marked down"
@@ -4995,108 +5215,118 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                           "nothing was sent to it")
             kindi_was_busy = True
             continue
-        attempt_body = dict(body)
-        attempt_body["model"] = entry["name"]
-        url = f"{server_base(entry['server'])}/v1/chat/completions"
+        slot = InFlight(entry["server"])
         try:
-            upstream_request = client.build_request(
-                "POST", url, headers=dict(headers, **backend_headers(entry["server"])),
-                json=attempt_body,
-                timeout=httpx.Timeout(
-                    KINDI_READ_TIMEOUT if entry["kind"] == "kindi" else READ_TIMEOUT,
-                    connect=CONNECT_TIMEOUT,
-                ),
-            )
-            upstream_response = await client.send(upstream_request, stream=True)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
-            mark_server_down(entry["server"], last_error)
-            continue
-        except httpx.RequestError as exc:
-            last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
-            if entry["kind"] == "kindi" and isinstance(exc, httpx.ReadTimeout):
-                # Sent, but no reply: Kindi may still be working on it.
-                no_reply = True
-                mark_kindi_draining(entry["server"])
-                log.warning("dispatch: Kindi %s sent no reply; not sending it again", entry["server"])
-                continue
-            log.warning("dispatch: %s", last_error)
-            continue
-        is_last = position == len(candidates) - 1
-        if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
-            await upstream_response.aclose()
-            last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
-            log.warning("dispatch: %s for %s; trying the next candidate",
-                        last_error, entry["name"])
-            continue
-        if no_reply and upstream_response.status_code in CLIENT_RETRYABLE_STATUS:
-            # A later error must not turn an unanswered Kindi POST into a
-            # response that makes clients replay the whole call.
-            last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
-            await upstream_response.aclose()
-            continue
-        buffered = None
-        if upstream_response.status_code == 400 and need.get("tools"):
-            # The raw body is inspected as sent. A compressed error body will
-            # not match, so it is passed through and nothing is demoted.
-            buffered = await _read_raw(upstream_response)
-            await upstream_response.aclose()
-            if TOOL_REJECTION_RE.search(buffered):
-                # Skip this model for tool requests until the next poll
-                # (which rebuilds the entry) instead of failing every turn.
-                # The last candidate is remembered too; its 400 is returned.
-                entry["tools"] = False
-                last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
-                if not is_last:
-                    log.warning("dispatch: %s; trying the next candidate", last_error)
-                    continue
-                log.warning("dispatch: %s; no candidates left", last_error)
-        kindi_stream = None
-        if entry["kind"] == "kindi" and upstream_response.status_code < 400:
+            url = f"{server_base(entry['server'])}/v1/chat/completions"
             try:
-                raw_stream = upstream_response.aiter_raw()
-                if body.get("stream") is True:
-                    first_chunk = await anext(raw_stream, b"")
-                    kindi_stream = _relay_kindi_stream(entry["server"], upstream_response,
-                                                        first_chunk, raw_stream)
-                else:
-                    # The client expects one complete JSON reply. Read every
-                    # raw byte before sending 200, so a late read timeout can
-                    # still become 424 and the original encoding is preserved.
-                    buffered = b"".join([chunk async for chunk in raw_stream])
-                    await upstream_response.aclose()
-            except httpx.ReadTimeout as exc:
+                upstream_request = client.build_request(
+                    "POST", url, headers=dict(headers, **backend_headers(entry["server"])),
+                    content=body_for_model(body, entry["name"], raw, encoded),
+                    timeout=httpx.Timeout(
+                        KINDI_READ_TIMEOUT if entry["kind"] == "kindi" else READ_TIMEOUT,
+                        connect=CONNECT_TIMEOUT,
+                    ),
+                )
+                upstream_response = await client.send(upstream_request, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
-                no_reply = True
-                mark_kindi_draining(entry["server"])
-                await upstream_response.aclose()
+                mark_server_down(entry["server"], last_error)
                 continue
             except httpx.RequestError as exc:
                 last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
-                mark_server_down(entry["server"], last_error)
+                if entry["kind"] == "kindi" and isinstance(exc, httpx.ReadTimeout):
+                    # Sent, but no reply: Kindi may still be working on it.
+                    no_reply = True
+                    mark_kindi_draining(entry["server"])
+                    log.warning("dispatch: Kindi %s sent no reply; not sending it again", entry["server"])
+                    continue
+                log.warning("dispatch: %s", last_error)
+                continue
+            is_last = position == len(candidates) - 1
+            if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
+                await upstream_response.aclose()
+                last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+                log.warning("dispatch: %s for %s; trying the next candidate",
+                            last_error, entry["name"])
+                continue
+            if no_reply and upstream_response.status_code in CLIENT_RETRYABLE_STATUS:
+                # A later error must not turn an unanswered Kindi POST into a
+                # response that makes clients replay the whole call.
+                last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
                 await upstream_response.aclose()
                 continue
-        log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)",
-                 need["class"], need["code"], need["vision"], need.get("tools", False),
-                 need.get("approx_tokens"), entry["name"], entry["server"],
-                 position + 1, len(candidates))
-        router_headers = {
-            "X-Router-Model": entry["name"],
-            "X-Router-Server": entry["server"],
-            "X-Router-Class": need["class"],
-            "X-Router-Mode": "discovery",
-            "X-Router-Candidates": str(len(candidates)),
-        }
-        router_headers.update(extra_headers or {})
-        if buffered is not None:
-            return Response(content=buffered, status_code=upstream_response.status_code,
-                            headers=_response_headers(upstream_response, router_headers))
-        return StreamingResponse(
-            kindi_stream if kindi_stream is not None else upstream_response.aiter_raw(),
-            status_code=upstream_response.status_code,
-            headers=_response_headers(upstream_response, router_headers),
-            background=BackgroundTask(close_upstream, upstream_response),
-        )
+            buffered = None
+            if upstream_response.status_code == 400 and need.get("tools"):
+                # The raw body is inspected as sent. A compressed error body will
+                # not match, so it is passed through and nothing is demoted.
+                buffered = await _read_raw(upstream_response)
+                await upstream_response.aclose()
+                if TOOL_REJECTION_RE.search(buffered):
+                    # Skip this model for tool requests until the next poll
+                    # (which rebuilds the entry) instead of failing every turn.
+                    # The last candidate is remembered too; its 400 is returned.
+                    entry["tools"] = False
+                    last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
+                    if not is_last:
+                        log.warning("dispatch: %s; trying the next candidate", last_error)
+                        continue
+                    log.warning("dispatch: %s; no candidates left", last_error)
+            kindi_stream = None
+            if entry["kind"] == "kindi" and upstream_response.status_code < 400:
+                try:
+                    raw_stream = upstream_response.aiter_raw()
+                    if body.get("stream") is True:
+                        first_chunk = await anext(raw_stream, b"")
+                        kindi_stream = _relay_kindi_stream(entry["server"], upstream_response,
+                                                            first_chunk, raw_stream)
+                    else:
+                        # The client expects one complete JSON reply. Read every
+                        # raw byte before sending 200, so a late read timeout can
+                        # still become 424 and the original encoding is preserved.
+                        buffered = b"".join([chunk async for chunk in raw_stream])
+                        await upstream_response.aclose()
+                except httpx.ReadTimeout as exc:
+                    last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                    no_reply = True
+                    mark_kindi_draining(entry["server"])
+                    await upstream_response.aclose()
+                    continue
+                except httpx.RequestError as exc:
+                    last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                    mark_server_down(entry["server"], last_error)
+                    await upstream_response.aclose()
+                    continue
+            kept = sticky_choice(affinity) == (entry["server"], entry["name"])
+            if upstream_response.status_code < 400:
+                remember_choice(affinity, entry)
+            log.info("route class=%s code=%s vision=%s tools=%s tokens~%s -> %s @ %s (%d/%d)%s",
+                     need["class"], need["code"], need["vision"], need.get("tools", False),
+                     need.get("approx_tokens"), entry["name"], entry["server"],
+                     position + 1, len(candidates), " same server as last turn" if kept else "")
+            router_headers = {
+                "X-Router-Model": entry["name"],
+                "X-Router-Server": entry["server"],
+                "X-Router-Class": need["class"],
+                "X-Router-Mode": "discovery",
+                "X-Router-Candidates": str(len(candidates)),
+            }
+            router_headers.update(extra_headers or {})
+            if buffered is not None:
+                return Response(content=buffered, status_code=upstream_response.status_code,
+                                headers=_response_headers(upstream_response, router_headers))
+            # The body is still to come: the request counts against the server
+            # until it has been relayed.
+            slot.streaming = True
+            return StreamingResponse(
+                _relay_counted(slot, kindi_stream if kindi_stream is not None
+                               else upstream_response.aiter_raw()),
+                status_code=upstream_response.status_code,
+                headers=_response_headers(upstream_response, router_headers),
+                background=BackgroundTask(close_upstream, upstream_response, slot),
+            )
+        finally:
+            if not slot.streaming:
+                slot.release()
     if no_reply:
         return kindi_no_reply("No usable model target.")
     if kindi_was_busy:
@@ -5121,6 +5351,8 @@ async def routing_inventory():
         "updated_at": INVENTORY.get("updated_at"),
         "age_seconds": round(time.time() - (INVENTORY.get("updated_at") or 0), 1),
         "server_status": INVENTORY.get("servers", {}),
+        # Requests this router has in flight per server (others are not seen).
+        "in_flight": dict(_IN_FLIGHT),
         "errors": INVENTORY.get("errors", {}),
         "models": INVENTORY.get("models", []),
         # The direct dispatchers of Hermes, OpenClaw and Honcho compare this
@@ -5130,8 +5362,12 @@ async def routing_inventory():
 
 
 @app.post("/routing/refresh")
-async def routing_refresh():
-    await refresh_inventory(force_probe=True)
+async def routing_refresh(probe: bool = True):
+    """Poll every server now. By default every Ollama model is also asked for
+    its capabilities again; ?probe=false keeps the cached /api/show answers,
+    for callers that only need to know which servers are up with which models
+    (tools/upgrade-all.sh polls this while it waits for a target)."""
+    await refresh_inventory(force_probe=probe)
     return await routing_inventory()
 
 
@@ -5157,7 +5393,8 @@ async def routing_explain(request: Request):
                    if candidates else None),
         "candidates": [
             {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
-             "tools": e.get("tools"), "score": round(score_entry(e, need), 4)}
+             "tools": e.get("tools"), "score": round(score_entry(e, need), 4),
+             "in_flight": _IN_FLIGHT.get(e["server"], 0)}
             for e in candidates[:10]
         ],
     })
@@ -5172,8 +5409,9 @@ def _error(status: int, message: str, code: str) -> JSONResponse:
 async def route_chat_completion(request: Request):
     if request.headers.get("x-router-subscription") == "1":
         return await _proxy_subscription(request)
+    raw = await request.body()
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if not isinstance(body, dict):
@@ -5181,6 +5419,7 @@ async def route_chat_completion(request: Request):
     messages = body.get("messages") or []
     requested = str(body.get("model") or "").strip()
     need = apply_tool_needs(classify_request(messages), body)
+    affinity = conversation_keys(messages)
 
     if requested in CLOUD_MODELS:
         log.info("route explicit cloud model=%s", requested)
@@ -5202,7 +5441,7 @@ async def route_chat_completion(request: Request):
         candidates, explicit = [], False
         if requested and requested.lower() not in ("auto", "") \
                 and requested not in TIER_NAMES:
-            candidates = find_named_model(requested)
+            candidates = find_named_model(requested, affinity)
             explicit = bool(candidates)
             embedding = None if candidates else embedding_only_match(requested)
             if embedding:
@@ -5223,7 +5462,7 @@ async def route_chat_completion(request: Request):
         if not candidates:
             if requested in TIER_NAMES:
                 need = dict(need, **{"class": TIER_NAMES[requested]})
-            candidates = rank_candidates(need)
+            candidates = rank_candidates(need, affinity=affinity)
         extra = {}
         if need["vision"] and not explicit and candidates \
                 and not any(e["is_vision"] for e in candidates):
@@ -5246,7 +5485,7 @@ async def route_chat_completion(request: Request):
         if candidates:
             return await _dispatch_direct(
                 candidates, body, _forward_headers(request, drop_auth=True),
-                need, extra)
+                need, extra, raw=raw, affinity=affinity)
 
     # Fallback: the original static path through LiteLLM, which keeps its own
     # latency routing and cross-tier fallbacks.
@@ -5782,10 +6021,10 @@ def pin_model(url: str, model: str) -> bool:
         return False
 
 
-def refresh_keep_alive(is_up) -> int:
-    """Pin each tier's model on every host serving that tier that is up.
-    is_up(url) -> bool comes from the health checks."""
-    pinned = 0
+def keep_alive_plan() -> dict:
+    """Ollama host URL -> the tier models to keep loaded there, in tier order.
+    A model that two of a host's tiers share is listed once."""
+    plan = {}
     for tier, urls in BACKENDS.items():
         model = TIER_MODELS.get(tier, "")
         if not model:
@@ -5795,10 +6034,83 @@ def refresh_keep_alive(is_up) -> int:
                 # LM Studio has no keep_alive: it loads on demand and unloads
                 # on its own idle TTL (configure that in LM Studio itself).
                 continue
-            if not is_up(url):
-                continue          # don't wait on a host we already know is down
-            if pin_model(url, model):
-                pinned += 1
+            models = plan.setdefault(url, [])
+            if model not in models:
+                models.append(model)
+    return plan
+
+
+def resident_models(url: str):
+    """The model names Ollama's /api/ps reports loaded on url, or None when it
+    cannot say (a failed call, or a bridge without /api/ps)."""
+    try:
+        with httpx.Client() as client:
+            resp = client.get(f"{url.rstrip('/')}/api/ps", timeout=CHECK_TIMEOUT)
+            resp.raise_for_status()
+            models = resp.json().get("models")
+        if not isinstance(models, list):
+            return None
+        return {name for model in models if isinstance(model, dict)
+                for name in (model.get("name"), model.get("model")) if isinstance(name, str)}
+    except Exception:  # noqa: BLE001 - residency is then simply unknown
+        return None
+
+
+def _is_resident(model: str, resident: set) -> bool:
+    return model in resident or (":" not in model and f"{model}:latest" in resident)
+
+
+# Hosts seen unloading one of their tier models to load another: they cannot
+# hold all of them at once.
+_CROWDED = set()
+
+
+def pin_host(url: str, models: list) -> int:
+    """Pin one host's tier models, one after another (a host loads one model at
+    a time). Returns how many were pinned.
+
+    A host that serves several tiers gets all of its models on the first pass.
+    If loading one of them unloaded another, the host cannot hold them all, and
+    loading each in turn on every refresh would evict the model in use again
+    and again. Such a host then only has the timers of its resident tier models
+    refreshed (the first is loaded when none is resident); the others load when
+    a request needs them. It is treated normally again once /api/ps shows all
+    of its models loaded together."""
+    wanted = models
+    if len(models) > 1 and url in _CROWDED:
+        resident = resident_models(url)
+        if resident is not None:
+            if all(_is_resident(model, resident) for model in models):
+                _CROWDED.discard(url)
+            else:
+                wanted = [m for m in models if _is_resident(m, resident)] or models[:1]
+    done = [model for model in wanted if pin_model(url, model)]
+    # keep_alive 0 unloads at once, so nothing stays resident to compare.
+    if len(done) > 1 and url not in _CROWDED and _keep_alive_value() != 0:
+        resident = resident_models(url)
+        if resident is not None and not all(_is_resident(model, resident) for model in done):
+            _CROWDED.add(url)
+            logging.warning(
+                "keep-alive: %s unloaded one tier model to load another (%s): it cannot "
+                "hold them together. Only its loaded tier models are kept alive from now "
+                "on; give each tier its own host, or one model, to keep them all loaded.",
+                url, ", ".join(done))
+    return len(done)
+
+
+def refresh_keep_alive(is_up) -> int:
+    """Pin each tier's model on every host serving that tier that is up.
+    is_up(url) -> bool comes from the health checks. Hosts are pinned side by
+    side, so one host's cold load (up to timeout_seconds) does not hold back
+    the others until their models have already been unloaded."""
+    # Down hosts are left out: don't wait on a host we already know is down.
+    plan = [(url, models) for url, models in keep_alive_plan().items() if is_up(url)]
+    if len(plan) > 1:
+        with ThreadPoolExecutor(max_workers=min(16, len(plan)),
+                                thread_name_prefix="keep-alive") as pool:
+            pinned = sum(pool.map(lambda item: pin_host(*item), plan))
+    else:
+        pinned = sum(pin_host(url, models) for url, models in plan)
     if pinned:
         logging.info("keep-alive: refreshed %d model(s) with keep_alive=%s",
                      pinned, KEEP_ALIVE)
@@ -5943,6 +6255,12 @@ fastapi==0.116.1
 uvicorn==0.35.0
 httpx==0.28.1
 python-dotenv==1.1.1
+# uvicorn picks these up by itself when they are installed (its loop and HTTP
+# parser are "auto"): libuv's event loop and a C request parser, which cut the
+# per-chunk cost of streamed completions. Without them (another platform) it
+# runs on asyncio and h11 as before.
+uvloop==0.21.0; sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")
+httptools==0.6.4; sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64")
 REQEOF
 
 cat > "${REPO_DIR}/services/litellm-proxy/requirements.txt" <<'REQEOF'
@@ -6060,6 +6378,12 @@ servers =
 # The *_models / *_families name lists below are the fallback for servers that
 # do not report capabilities.
 capability_probe = true
+# How long an /api/show answer is kept for a model the server lists with a
+# digest. A re-pulled or re-created Ollama model gets a new digest and is asked
+# again at once; AirLLM's digest includes its window. Servers that list no
+# digest (the llama.cpp bridge) are asked again after a minute whatever this
+# says. POST /routing/refresh asks every model again.
+show_cache_seconds = 3600
 # LM Studio servers (entries written lmstudio+http://host:1234) are polled via
 # LM Studio's own model API, which reports vision/embedding and whether each
 # model is loaded. true: never route to a model that is not loaded there, so a
@@ -6094,12 +6418,35 @@ offtask_penalty = 0.25
 # Candidates within this score of the best are rotated through, so the same
 # model on several hosts shares load.
 tie_epsilon = 0.05
-# Bonus for a model that is already resident (LM Studio reports this; Ollama
-# entries are neutral). Small: it breaks near-ties, it does not override fit.
+# Bonus for a model that is already resident (LM Studio and the Strata-style
+# servers report it per model, Ollama through /api/ps). Small: it breaks
+# near-ties, it does not override fit. It is larger than tie_epsilon, so a
+# server that has the model in memory is used before one that would load it.
 loaded_bonus = 0.1
 # On a tool request, bonus for a model reported tool-capable over one whose
 # tool support is unknown (LM Studio's untrained models, a kind left out of tool_kinds).
 tool_match = 0.3
+
+[balancing]
+# How load is spread once the scores above have been compared.
+#
+# busy_penalty is taken off a candidate's score for each request this router
+# already has in flight on its server, and equally good candidates (within
+# tie_epsilon) are tried idle-first. So the same model on two servers goes to
+# the idle one, and a busy server that leads only by loaded_bonus (the model
+# is in memory there, not yet on the other) gives way once
+# loaded_bonus - busy_penalty x requests is within tie_epsilon: with the
+# defaults, from its second request in flight. Only this router's own requests
+# are counted, not what agents or other clients send a server directly.
+# 0 turns load awareness off (ties then simply rotate).
+busy_penalty = 0.03
+# A conversation prefers the server and model that answered it last, among
+# equally good candidates, for this many seconds after its last answer: the
+# server still holds the conversation's prompt cache, and the model stays the
+# same. It yields to a less busy candidate and never overrides the scores.
+# Conversations are told apart by a hash of how they began. 0 turns it off
+# (every request then takes the next server in rotation).
+sticky_seconds = 1800
 
 [model_sizes]
 # Sizes for exact model ids that an OpenAI-compatible server (Strata, Basalt,
@@ -7921,16 +8268,42 @@ try: print(m.version("litellm"))
 except Exception: pass' 2>/dev/null
 }
 
+# litellm_venv_fingerprint WANT HAVE: everything the import test's result
+# depends on, on one line: the pinned and installed versions, the lock the venv
+# is built from, the interpreter behind the venv, and its site-packages
+# directories (pip changes a directory's modification time with every package
+# it adds, replaces or removes there).
+litellm_venv_fingerprint() {
+  local venv="${LITELLM_DIR}/venv" lock='-' python packages
+  [[ ! -f "$LITELLM_LOCK" ]] || lock="$(sha256sum < "$LITELLM_LOCK" | cut -d' ' -f1)"
+  python="$(readlink -f "${venv}/bin/python" 2>/dev/null || true)"
+  python+=" $(stat -c '%Y %s' "$python" 2>/dev/null || true)"
+  packages="$(stat -c '%n %Y' "$venv"/lib/python*/site-packages 2>/dev/null | tr '\n' ' ' || true)"
+  printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$lock" "$python" "$packages"
+}
+
 # True when the venv has the pinned litellm AND the proxy extra's imports work.
 # The import is the real test: a plain `litellm` install passes a version check
 # but `litellm --config` then dies with "Missing dependency ... backoff".
+# Importing the proxy takes several seconds, and every apply asks, so a passed
+# test is remembered in the venv with litellm_venv_fingerprint and repeated only
+# when that changes (a rebuilt venv has no record at all).
 litellm_venv_ok() {
-  local want have
+  local want have print stamp="${LITELLM_DIR}/venv/.osr-imports-ok"
   want="$(litellm_pinned_version)"
   have="$(litellm_installed_version)"
   [[ -n "$have" ]] || return 1
   [[ -z "$want" || "$want" == "$have" ]] || return 1
-  "${LITELLM_DIR}/venv/bin/python" -c 'import litellm.proxy.proxy_server' >/dev/null 2>&1
+  print="$(litellm_venv_fingerprint "$want" "$have")"
+  if [[ -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$print" ]]; then
+    return 0
+  fi
+  if ! "${LITELLM_DIR}/venv/bin/python" -c 'import litellm.proxy.proxy_server' >/dev/null 2>&1; then
+    rm -f "$stamp" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "$print" > "$stamp" 2>/dev/null || true
+  return 0
 }
 
 # Build (or bring up to date) LiteLLM's own venv, hash-checked when the repo
@@ -8077,6 +8450,11 @@ try:
             low, high = cp.get("discovery", option).split(":", 1)
             if float(low) > float(high):
                 err(rel, "[discovery] %s has low > high" % option)
+    # Numbers the router reads at start: a bad one would stop it from starting.
+    for section, option in (("discovery", "show_cache_seconds"), ("balancing", "busy_penalty"),
+                            ("balancing", "sticky_seconds")):
+        if cp.has_option(section, option) and float(cp.get(section, option)) < 0:
+            err(rel, "[%s] %s must not be negative" % (section, option))
 except (configparser.Error, ValueError) as exc:
     err(rel, str(exc))
 
@@ -9324,12 +9702,14 @@ UNITEOF
 cat > "${REPO_DIR}/services/open-webui/open-webui.service" <<'UNITEOF'
 [Unit]
 Description=Open WebUI (chat frontend for the smart router)
-# This Requires= is deliberate and stays: the router is the UI's only backend,
-# so Open WebUI has nothing to serve without it. Contrast the router and monitor
-# units, which only Want= litellm-proxy.
+# Wants=, not Requires=: the router is the UI's only backend, so it is started
+# with the UI and before it (After=), but Requires= would also restart the UI
+# with every router restart. A router restart takes about a second; the UI's
+# takes far longer and drops its users' sessions, and every routing change
+# (router.ini, router.py, a key) restarts the router. While the router is away
+# the UI shows a connection error and carries on afterwards.
 After=network-online.target ollama-router.service
-Wants=network-online.target
-Requires=ollama-router.service
+Wants=network-online.target ollama-router.service
 [Service]
 Type=simple
 User=ollama-router

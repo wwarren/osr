@@ -1965,17 +1965,24 @@ def test_tool_requests_stay_on_one_model_but_share_its_hosts(served):
     tool_pool(router, upstream, client, ("qwen3:14b", "14B", "qwen3"),
               ("llama9:14b", "14B", "llama"), caps)
     router._rotation.clear()
-    plain = {chat(client).json()["model"] for _ in range(4)}
-    assert plain == {"qwen3:14b", "llama9:14b"}      # unchanged: ties rotate
-    tooled = {chat(client, tools=TOOLS).json()["model"] for _ in range(4)}
-    assert len(tooled) == 1                         # one model for an agent loop
-    # The same model on two hosts still shares the load.
+    # Conversations that begin differently: ties rotate, as before.
+    plain = {chat(client, messages=[user(f"hi {n}")]).json()["model"] for n in range(4)}
+    assert plain == {"qwen3:14b", "llama9:14b"}
+    # Agent loops, whichever task: one model, never the other.
+    tooled = {chat(client, tools=TOOLS, messages=[user(f"task {n}")]).json()["model"] for n in range(4)}
+    assert len(tooled) == 1
+    # The same model on two hosts still shares the load between tasks...
     tool_pool(router, upstream, client, ("qwen3:14b", "14B", "qwen3"),
               ("qwen3:14b", "14B", "qwen3"), caps)
     upstream.calls.clear()
-    for _ in range(4):
-        chat(client, tools=TOOLS)
+    for n in range(4):
+        chat(client, tools=TOOLS, messages=[user(f"another task {n}")])
     assert set(served_hosts(upstream)) == {HOST_A, HOST_B}
+    # ...while one task's requests stay on the host that holds its prompt cache.
+    upstream.calls.clear()
+    for _ in range(4):
+        chat(client, tools=TOOLS, messages=[user("one long task")])
+    assert len(set(served_hosts(upstream))) == 1
 
 
 def test_explain_lists_tool_support(served):
@@ -1986,3 +1993,472 @@ def test_explain_lists_tool_support(served):
     body = client.post("/routing/explain", json={"messages": [user("hi")], "tools": TOOLS}).json()
     assert [c["model"] for c in body["candidates"]] == ["qwen3:14b"]
     assert body["candidates"][0]["tools"] is True
+
+
+# --- /api/show cache lifetime ----------------------------------------------------
+def _age_show_cache(router, seconds):
+    """Let `seconds` pass for every cached /api/show answer."""
+    for key in router._SHOW_TIMES:
+        router._SHOW_TIMES[key] -= seconds
+
+
+def _digest_inventory(upstream, digest="sha256:aaa"):
+    """HOST_A as Ollama lists a model (with its digest); HOST_B as the
+    llama.cpp bridge does (no digest)."""
+    upstream.inventory[HOST_A] = {"models": [{
+        "name": "qwen3:14b", "digest": digest,
+        "details": {"parameter_size": "14.8B", "family": "qwen3"}}]}
+    upstream.inventory[HOST_B] = tags(("bridge-model:7b", "7B", "llama"))
+    upstream.capabilities.update({"qwen3:14b": ["completion"], "bridge-model:7b": ["completion"]})
+
+
+def test_show_answers_outlive_a_poll_for_models_with_a_digest(served):
+    router, upstream, client = served
+    assert router.SHOW_CACHE_SECONDS == 3600
+    _digest_inventory(upstream)
+    client.post("/routing/refresh")
+    # Two minutes on, a poll asks only the server that lists no digest.
+    _age_show_cache(router, 120)
+    upstream.show_calls.clear()
+    client.post("/routing/refresh?probe=false")
+    assert upstream.show_calls == [(HOST_B, "bridge-model:7b")]
+    # After show_cache_seconds the digest's answer has expired too.
+    _age_show_cache(router, 3600)
+    upstream.show_calls.clear()
+    client.post("/routing/refresh?probe=false")
+    assert sorted(upstream.show_calls) == [(HOST_A, "qwen3:14b"), (HOST_B, "bridge-model:7b")]
+
+
+def test_a_new_digest_is_probed_at_once_and_the_old_answer_forgotten(served):
+    router, upstream, client = served
+    _digest_inventory(upstream)
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 8192"}
+    client.post("/routing/refresh")
+    assert (HOST_A, "qwen3:14b", "sha256:aaa") in router._CAPABILITIES
+    # The model is re-created with another window: a new digest.
+    _digest_inventory(upstream, "sha256:bbb")
+    upstream.show_extra["qwen3:14b"] = {"parameters": "num_ctx 32768"}
+    upstream.show_calls.clear()
+    client.post("/routing/refresh?probe=false")
+    assert (HOST_A, "qwen3:14b") in upstream.show_calls
+    entry = [e for e in router.INVENTORY["models"] if e["server"] == HOST_A][0]
+    assert entry["context_length"] == 32768
+    for cache in (router._CAPABILITIES, router._CONTEXTS, router._SHOW_TIMES):
+        assert [k for k in cache if k[0] == HOST_A] == [(HOST_A, "qwen3:14b", "sha256:bbb")]
+    # A model the server no longer lists is forgotten as well.
+    upstream.inventory[HOST_A] = {"models": []}
+    client.post("/routing/refresh?probe=false")
+    assert not [k for k in router._CAPABILITIES if k[0] == HOST_A]
+
+
+def test_refresh_probes_every_model_unless_told_not_to(served):
+    router, upstream, client = served
+    _digest_inventory(upstream)
+    client.post("/routing/refresh")
+    upstream.show_calls.clear()
+    assert client.post("/routing/refresh?probe=false").status_code == 200
+    assert upstream.show_calls == []          # both answers are fresh
+    client.post("/routing/refresh")
+    assert sorted(upstream.show_calls) == [(HOST_A, "qwen3:14b"), (HOST_B, "bridge-model:7b")]
+
+
+def test_show_cache_seconds_is_a_setting(monkeypatch, tmp_path):
+    ini = tmp_path / "router.ini"
+    ini.write_text("[discovery]\nshow_cache_seconds = 30\n")
+    router = load_router(monkeypatch, ROUTER_INI=str(ini))
+    assert router.SHOW_CACHE_SECONDS == 30
+    assert router._show_ttl({"digest": "sha256:aaa"}) == 30
+    assert router._show_ttl({"name": "no-digest"}) == 30     # never longer than the setting
+    assert load_router(monkeypatch)._show_ttl({"name": "no-digest"}) == 60
+
+
+# --- the request body is not re-encoded needlessly ---------------------------------
+def _chat_bodies(upstream):
+    return [call[3] for call in upstream.calls if call[1] == "/v1/chat/completions"]
+
+
+def test_a_named_models_body_is_forwarded_as_sent(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "_json_bytes", lambda payload: pytest.fail("the body was re-encoded"))
+    raw = b'{"model": "qwen3:14b",  "messages": [{"role": "user", "content": "h\xc3\xa9llo"}]}'
+    response = client.post("/v1/chat/completions", content=raw,
+                           headers={"content-type": "application/json"})
+    assert response.status_code == 200
+    assert _chat_bodies(upstream) == [raw]
+
+
+def test_a_routed_body_is_encoded_once_for_the_same_model_on_two_hosts(served, monkeypatch):
+    router, upstream, client = served
+    upstream.chat = {HOST_A: 500, HOST_B: 500}
+    encodings, real = [], router._json_bytes
+    monkeypatch.setattr(router, "_json_bytes", lambda payload: encodings.append(payload["model"]) or real(payload))
+    response = client.post("/v1/chat/completions",
+                           json={"model": "auto", "messages": [user("héllo")]})
+    assert response.status_code == 500        # the last candidate's answer is passed through
+    bodies = _chat_bodies(upstream)
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+    assert encodings == ["qwen3:14b"]
+    assert json.loads(bodies[0]) == {"model": "qwen3:14b", "messages": [user("héllo")]}
+    assert "héllo".encode() in bodies[0]  # compact UTF-8, as httpx's json= produced
+
+
+def test_a_body_in_another_encoding_is_sent_on_as_utf8(served):
+    router, upstream, client = served
+    payload = {"model": "qwen3:14b", "messages": [user("héllo")]}
+    # UTF-16, and UTF-8 behind a byte order mark: json.loads reads both, but a
+    # backend may not, so neither is passed through as it came.
+    for raw in (json.dumps(payload).encode("utf-16"), b"\xef\xbb\xbf" + json.dumps(payload).encode()):
+        upstream.calls.clear()
+        assert client.post("/v1/chat/completions", content=raw).status_code == 200
+        (sent,) = _chat_bodies(upstream)
+        assert sent != raw and json.detect_encoding(sent) == "utf-8" and json.loads(sent) == payload
+
+
+def test_a_body_without_a_content_type_is_still_sent_as_json(served):
+    router, upstream, client = served
+    raw = json.dumps({"model": "qwen3:14b", "messages": [user("hi")]}).encode()
+    assert client.post("/v1/chat/completions", content=raw).status_code == 200
+    headers = [call[2] for call in upstream.calls if call[1] == "/v1/chat/completions"][0]
+    assert headers["content-type"] == "application/json"
+    assert headers["content-length"] == str(len(raw))
+
+
+def test_body_for_model_caches_per_name(router):
+    body, cache = {"model": "auto", "messages": [user("hi")]}, {}
+    first = router.body_for_model(body, "qwen3:14b", b"ignored", cache)
+    assert json.loads(first)["model"] == "qwen3:14b" and body["model"] == "auto"
+    assert router.body_for_model(body, "qwen3:14b", b"ignored", cache) is first
+    assert json.loads(router.body_for_model(body, "llama3:8b", None, cache))["model"] == "llama3:8b"
+    assert sorted(cache) == ["llama3:8b", "qwen3:14b"]
+
+
+# --- the key check is plain ASGI middleware ---------------------------------------
+def test_the_key_check_does_not_wrap_responses(router):
+    from starlette.middleware.base import BaseHTTPMiddleware
+    classes = [middleware.cls for middleware in router.app.user_middleware]
+    assert classes == [router.RouterKeyMiddleware]
+    assert not issubclass(router.RouterKeyMiddleware, BaseHTTPMiddleware)
+
+
+def test_api_key_failure_decides_from_path_and_headers(router, monkeypatch):
+    assert router.api_key_failure("/v1/models", {}) is None          # no key configured
+    assert router.api_key_failure("/v1/models", {"x-router-subscription": "1"}).status_code == 503
+    monkeypatch.setattr(router, "ROUTER_API_KEY", "s3cret")
+    assert router.api_key_failure("/healthz", {}) is None
+    assert router.api_key_failure("/v1/models", {}).status_code == 401
+    assert router.api_key_failure("/v1/models", {"authorization": "Bearer wrong"}).status_code == 401
+    assert router.api_key_failure("/v1/models", {"authorization": "bearer s3cret"}) is None
+    subscriber = {"x-router-subscription": "1", "authorization": "Bearer client-login"}
+    assert router.api_key_failure("/v1/models", subscriber).status_code == 401
+    assert router.api_key_failure("/v1/models", dict(subscriber, **{"x-router-api-key": "s3cret"})) is None
+
+
+def test_a_streamed_reply_passes_the_key_check_chunk_by_chunk(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "ROUTER_API_KEY", "s3cret")
+    payload = {"model": "qwen3:14b", "messages": [user("hi")], "stream": True}
+    assert client.post("/v1/chat/completions", json=payload).status_code == 401
+    with client.stream("POST", "/v1/chat/completions", json=payload,
+                       headers={"authorization": "Bearer s3cret"}) as response:
+        assert response.status_code == 200
+        assert json.loads(b"".join(response.iter_raw()))["model"] == "qwen3:14b"
+
+
+# --- load awareness: requests in flight -------------------------------------------
+def _need(router, text="hi", **body):
+    return router.apply_tool_needs(router.classify_request([user(text)]), body)
+
+
+def _first_servers(router, need, times=4, **kwargs):
+    return [router.rank_candidates(need, **kwargs)[0]["server"] for _ in range(times)]
+
+
+def test_in_flight_counts_a_request_until_it_is_released(router):
+    first, second = router.InFlight(HOST_A), router.InFlight(HOST_A)
+    other = router.InFlight(HOST_B)
+    assert router._IN_FLIGHT == {HOST_A: 2, HOST_B: 1}
+    first.release()
+    first.release()                       # a second release counts nothing
+    assert router._IN_FLIGHT == {HOST_A: 1, HOST_B: 1}
+    del second                            # a forgotten one is released when collected
+    other.release()
+    assert router._IN_FLIGHT == {}
+
+
+def test_a_busy_server_gives_way_to_an_idle_twin(served):
+    router, upstream, client = served     # the same model on HOST_A and HOST_B
+    need = _need(router)
+    assert set(_first_servers(router, need)) == {HOST_A, HOST_B}      # idle: they rotate
+    held = router.InFlight(HOST_A)
+    assert set(_first_servers(router, need)) == {HOST_B}
+    also = router.InFlight(HOST_B)
+    assert set(_first_servers(router, need)) == {HOST_A, HOST_B}      # equally busy: rotate again
+    more = [router.InFlight(HOST_B), router.InFlight(HOST_B)]
+    ranked = router.rank_candidates(need)
+    assert [e["server"] for e in ranked] == [HOST_A, HOST_B]
+    assert router.score_entry(ranked[0], need) - router.score_entry(ranked[1], need) == pytest.approx(0.06)
+    for slot in (held, also, *more):
+        slot.release()
+
+
+def test_a_loaded_server_keeps_its_lead_for_one_request_in_flight(served):
+    router, upstream, client = served
+    upstream.running = {HOST_A: ["qwen3:14b"], HOST_B: []}            # in memory on A only
+    client.post("/routing/refresh")
+    need = _need(router)
+    assert set(_first_servers(router, need)) == {HOST_A}
+    slots = [router.InFlight(HOST_A)]
+    assert set(_first_servers(router, need)) == {HOST_A}              # one request is no reason to load it elsewhere
+    slots.append(router.InFlight(HOST_A))
+    assert set(_first_servers(router, need)) == {HOST_B}              # two are
+    for slot in slots:
+        slot.release()
+
+
+def test_busy_penalty_zero_turns_load_awareness_off(served, monkeypatch):
+    router, upstream, client = served
+    need = _need(router)
+    idle_score = router.score_entry(router.rank_candidates(need)[0], need)
+    monkeypatch.setattr(router, "BUSY_PENALTY", 0.0)
+    slots = [router.InFlight(HOST_A) for _ in range(5)]
+    assert set(_first_servers(router, need)) == {HOST_A, HOST_B}
+    assert all(router.score_entry(e, need) == idle_score for e in router.rank_candidates(need))
+    for slot in slots:
+        slot.release()
+
+
+def test_busy_penalty_is_a_setting(monkeypatch, tmp_path):
+    ini = tmp_path / "router.ini"
+    ini.write_text("[balancing]\nbusy_penalty = 0.2\nsticky_seconds = 60\n")
+    router = load_router(monkeypatch, ROUTER_INI=str(ini))
+    assert (router.BUSY_PENALTY, router.STICKY_SECONDS) == (0.2, 60)
+    defaults = load_router(monkeypatch)
+    assert (defaults.BUSY_PENALTY, defaults.STICKY_SECONDS) == (0.03, 1800)
+
+
+class _InFlightSpy(list):
+    """upstream.calls that also notes what was in flight when each call arrived."""
+
+    def __init__(self, router):
+        super().__init__()
+        self.router, self.seen = router, []
+
+    def append(self, call):
+        if call[1] == "/v1/chat/completions":
+            self.seen.append((call[0], dict(self.router._IN_FLIGHT)))
+        super().append(call)
+
+
+def test_requests_are_counted_while_they_run_and_released_after(served):
+    router, upstream, client = served
+    upstream.calls = spy = _InFlightSpy(router)
+    assert chat(client).status_code == 200
+    (host, counted), = spy.seen
+    assert counted == {host: 1}
+    assert router._IN_FLIGHT == {}
+    # Streamed: counted until the body has been relayed.
+    with client.stream("POST", "/v1/chat/completions",
+                       json={"model": "auto", "stream": True, "messages": [user("streamed")]}) as response:
+        response.read()
+    assert router._IN_FLIGHT == {}
+
+
+@pytest.mark.parametrize("failures", [
+    {HOST_A: 500, HOST_B: 500}, {HOST_A: "connect", HOST_B: "timeout"}, {HOST_A: 404, HOST_B: "connect"}])
+def test_a_failed_attempt_stops_counting_before_the_next_one(served, failures):
+    router, upstream, client = served
+    upstream.chat = dict(failures)
+    upstream.calls = spy = _InFlightSpy(router)
+    chat(client)
+    assert len(spy.seen) == 2
+    for host, counted in spy.seen:
+        assert counted == {host: 1}       # the attempt before it is no longer counted
+    assert router._IN_FLIGHT == {}
+
+
+def test_a_stream_stops_counting_when_it_ends_breaks_or_is_dropped(router):
+    import asyncio
+
+    async def chunks():
+        yield b"a"
+        yield b"b"
+
+    async def broken():
+        yield b"a"
+        raise httpx.ReadError("gone")
+
+    async def run():
+        slot = router.InFlight(HOST_A)
+        assert [c async for c in router._relay_counted(slot, chunks())] == [b"a", b"b"]
+        assert router._IN_FLIGHT == {}
+        slot = router.InFlight(HOST_A)
+        with pytest.raises(httpx.ReadError):
+            [c async for c in router._relay_counted(slot, broken())]
+        assert router._IN_FLIGHT == {}
+        slot = router.InFlight(HOST_A)
+        stream = router._relay_counted(slot, chunks())
+        assert await anext(stream) == b"a" and router._IN_FLIGHT == {HOST_A: 1}
+        await stream.aclose()             # the client stopped reading
+        assert router._IN_FLIGHT == {}
+
+    asyncio.run(run())
+
+
+def test_inventory_and_explain_show_requests_in_flight(served):
+    router, upstream, client = served
+    slot = router.InFlight(HOST_A)
+    assert client.get("/routing/inventory").json()["in_flight"] == {HOST_A: 1}
+    candidates = client.post("/routing/explain", json={"prompt": "hi"}).json()["candidates"]
+    assert {c["server"]: c["in_flight"] for c in candidates} == {HOST_A: 1, HOST_B: 0}
+    assert candidates[0]["server"] == HOST_B and candidates[0]["score"] > candidates[1]["score"]
+    slot.release()
+    assert client.get("/routing/inventory").json()["in_flight"] == {}
+
+
+# --- conversation affinity ---------------------------------------------------------
+def _turns(opening, replies=0):
+    """A conversation's messages at its first request, or after `replies` answers."""
+    messages = [{"role": "system", "content": "Be brief."}, user(opening)]
+    for n in range(replies):
+        messages += [{"role": "assistant", "content": f"answer {n} to {opening}"}, user(f"follow-up {n}")]
+    return messages
+
+
+def _served_by(client, messages, **body):
+    response = chat(client, messages=messages, **body)
+    assert response.status_code == 200
+    return response.json()["served_by"]
+
+
+def test_conversation_keys_name_how_a_conversation_began(router):
+    first = router.conversation_keys(_turns("how do magnets work"))
+    assert len(first) == 1                                    # nothing but the opening yet
+    second = router.conversation_keys(_turns("how do magnets work", replies=1))
+    third = router.conversation_keys(_turns("how do magnets work", replies=3))
+    assert second == third and len(second) == 2 and second[1] == first[0]
+    assert router.conversation_keys(_turns("something else"))[0] != first[0]
+    # The same opening, answered differently: told apart from the second turn on.
+    other = _turns("how do magnets work", replies=1)
+    other[2] = {"role": "assistant", "content": "a different answer"}
+    assert router.conversation_keys(other)[1] == first[0]
+    assert router.conversation_keys(other)[0] != second[0]
+    # A first reply that only calls tools is told apart by its calls.
+    def tooled(call_id):
+        return [user("do the task"), {"role": "assistant", "content": None, "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": "run", "arguments": "{}"}}]}]
+    assert router.conversation_keys(tooled("call_1"))[0] != router.conversation_keys(tooled("call_2"))[0]
+    assert router.conversation_keys(tooled("call_1")) == router.conversation_keys(tooled("call_1"))
+    # Text parts are hashed, images are not; and nothing readable is kept.
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    parts = [{"role": "user", "content": [{"type": "text", "text": "what is this"}, image]}]
+    assert router.conversation_keys(parts) == router.conversation_keys([user("what is this")])
+    assert all(len(key) == 32 and "magnets" not in key for key in second)
+    assert router.conversation_keys([]) == router.conversation_keys(None) == []
+    assert router.conversation_keys([{"role": "system", "content": "only a system prompt"}, "junk"]) == []
+
+
+def test_a_conversation_stays_on_the_server_that_answered_it(served):
+    router, upstream, client = served     # the same model on HOST_A and HOST_B
+    home = _served_by(client, _turns("how do magnets work"))
+    for replies in (1, 2, 3):
+        assert _served_by(client, _turns("how do magnets work", replies)) == home
+    # Other conversations are still spread over both servers.
+    assert {_served_by(client, _turns(f"question {n}")) for n in range(4)} == {HOST_A, HOST_B}
+    # And a named model keeps its conversation's server the same way.
+    named = _served_by(client, _turns("a named one"), model="qwen3:14b")
+    for replies in (1, 2):
+        assert _served_by(client, _turns("a named one", replies), model="qwen3:14b") == named
+    assert {_served_by(client, _turns(f"named {n}"), model="qwen3:14b") for n in range(4)} == {HOST_A, HOST_B}
+
+
+def test_a_conversation_moves_to_an_idle_server_and_then_stays_there(served):
+    router, upstream, client = served
+    home = _served_by(client, _turns("a long chat"))
+    away = HOST_B if home == HOST_A else HOST_A
+    busy = router.InFlight(home)          # another conversation is using its server
+    assert _served_by(client, _turns("a long chat", 1)) == away
+    busy.release()
+    assert _served_by(client, _turns("a long chat", 2)) == away      # its prompt cache is there now
+    # Both equally busy: it stays where it is.
+    slots = [router.InFlight(HOST_A), router.InFlight(HOST_B)]
+    assert _served_by(client, _turns("a long chat", 3)) == away
+    for slot in slots:
+        slot.release()
+
+
+def test_affinity_ends_after_sticky_seconds_or_when_turned_off(served, monkeypatch):
+    router, upstream, client = served
+    home = _served_by(client, _turns("soon forgotten"))
+    assert router.sticky_choice(router.conversation_keys(_turns("soon forgotten"))) == (home, "qwen3:14b")
+    for key, (server, model, when) in list(router._STICKY.items()):
+        router._STICKY[key] = (server, model, when - router.STICKY_SECONDS - 1)
+    assert router.sticky_choice(router.conversation_keys(_turns("soon forgotten"))) is None
+    assert not router._STICKY             # an expired entry is dropped when it is looked up
+    monkeypatch.setattr(router, "STICKY_SECONDS", 0.0)
+    assert router.conversation_keys(_turns("never kept")) == []
+    assert {_served_by(client, _turns("never kept")) for _ in range(4)} == {HOST_A, HOST_B}
+    assert not router._STICKY
+
+
+def test_the_affinity_store_is_bounded(router, monkeypatch):
+    monkeypatch.setattr(router, "STICKY_MAX", 3)
+    entry = {"server": HOST_A, "name": "qwen3:14b"}
+    for n in range(5):
+        router.remember_choice([f"key{n}"], entry)
+    assert list(router._STICKY) == ["key2", "key3", "key4"]
+    router.sticky_choice(["key2"])                             # looking one up does not renew it
+    router.remember_choice(["key2"], entry)                    # an answer does
+    router.remember_choice(["key5"], entry)
+    assert list(router._STICKY) == ["key4", "key2", "key5"]
+    router.remember_choice([], entry)
+    router.remember_choice(None, entry)
+    assert len(router._STICKY) == 3
+
+
+def test_an_error_answer_is_not_remembered(served):
+    router, upstream, client = served
+    upstream.chat = {HOST_A: 500, HOST_B: 500}
+    assert chat(client, messages=_turns("fails everywhere")).status_code == 500
+    assert not router._STICKY
+
+
+def test_affinity_never_overrides_the_scores(served):
+    router, upstream, client = served
+    keys = router.conversation_keys(_turns("was on A"))
+    router.remember_choice(keys, {"server": HOST_A, "name": "qwen3:14b"})
+    need = _need(router)
+    assert set(_first_servers(router, need, affinity=keys)) == {HOST_A}       # tied: its server
+    upstream.running = {HOST_A: [], HOST_B: ["qwen3:14b"]}                    # now loaded on B only
+    client.post("/routing/refresh")
+    assert set(_first_servers(router, need, affinity=keys)) == {HOST_B}       # B scores higher: B
+    # A server that is down is not a candidate, remembered or not.
+    upstream.running = {}
+    client.post("/routing/refresh")
+    router.mark_server_down(HOST_A, "test")
+    assert set(_first_servers(router, need, affinity=keys)) == {HOST_B}
+
+
+def test_a_task_keeps_its_model_among_tied_models(served):
+    router, upstream, client = served
+    caps = {"qwen3:14b": ["completion", "tools"], "llama9:14b": ["completion", "tools"]}
+    tool_pool(router, upstream, client, ("qwen3:14b", "14B", "qwen3"),
+              ("llama9:14b", "14B", "llama"), caps)
+    usual = chat(client, tools=TOOLS, messages=_turns("some task")).json()["model"]
+    other = "llama9:14b" if usual == "qwen3:14b" else "qwen3:14b"
+    # A task that has been running on the other model keeps it.
+    keys = router.conversation_keys(_turns("an older task"))
+    host = [e for e in router.INVENTORY["models"] if e["name"] == other][0]
+    router.remember_choice(keys, host)
+    for replies in (0, 1, 2):
+        answer = chat(client, tools=TOOLS, messages=_turns("an older task", replies)).json()
+        assert answer["model"] == other
+    assert chat(client, tools=TOOLS, messages=_turns("a new task")).json()["model"] == usual
+
+
+def test_the_route_log_says_when_a_conversation_kept_its_server(served, caplog):
+    router, upstream, client = served
+    with caplog.at_level("INFO", logger="router"):
+        _served_by(client, _turns("logged"))
+        assert "same server as last turn" not in caplog.text
+        _served_by(client, _turns("logged", 1))
+        assert "same server as last turn" in caplog.text

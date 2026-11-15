@@ -392,6 +392,20 @@ for name in "${TARGET_ORDER[@]}"; do
 done
 assert_ok "the router CT is tagged osr-router" grep -qE -- '-tags "([^"]*;)?osr-router(;[^"]*)?"' "$INSTALLER"
 
+describe router_requirements
+req="${ROOT}/services/ollama-router/requirements.txt"
+for package in fastapi uvicorn httpx uvloop httptools; do
+  assert_ok "the router pins ${package} exactly" grep -Eq "^${package}==[0-9][0-9A-Za-z.]*( *;.*)?$" "$req"
+done
+assert_fail "uvicorn's extras are not pulled in wholesale" grep -q 'uvicorn\[' "$req"
+for package in uvloop httptools; do
+  assert_ok "${package} is skipped where it has no wheel" grep -Eq "^${package}==.*; *sys_platform == \"linux\" and \(platform_machine" "$req"
+done
+unit="${ROOT}/services/open-webui/open-webui.service"
+assert_fail "a router restart does not restart Open WebUI" grep -Eq '^(Requires|BindsTo|PartOf)=.*ollama-router' "$unit"
+assert_ok "Open WebUI still starts the router, and after it" bash -c \
+  "grep -Eq '^Wants=.*ollama-router\.service' '$unit' && grep -Eq '^After=.*ollama-router\.service' '$unit'"
+
 # Gitea reads .gitea/workflows, GitHub .github/workflows: one workflow, two
 # places, kept identical so neither forge runs a stale copy.
 describe ci_workflows

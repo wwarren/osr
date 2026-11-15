@@ -1,11 +1,13 @@
 [Unit]
 Description=Open WebUI (chat frontend for the smart router)
-# This Requires= is deliberate and stays: the router is the UI's only backend,
-# so Open WebUI has nothing to serve without it. Contrast the router and monitor
-# units, which only Want= litellm-proxy.
+# Wants=, not Requires=: the router is the UI's only backend, so it is started
+# with the UI and before it (After=), but Requires= would also restart the UI
+# with every router restart. A router restart takes about a second; the UI's
+# takes far longer and drops its users' sessions, and every routing change
+# (router.ini, router.py, a key) restarts the router. While the router is away
+# the UI shows a connection error and carries on afterwards.
 After=network-online.target ollama-router.service
-Wants=network-online.target
-Requires=ollama-router.service
+Wants=network-online.target ollama-router.service
 [Service]
 Type=simple
 User=ollama-router

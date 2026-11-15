@@ -676,7 +676,10 @@ auth() { if [ -n "$key" ]; then printf 'Authorization: Bearer %s\n' "$key"; fi; 
 case $1 in
   healthz) curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:8000/healthz ;;
   models) auth | curl -s -o /dev/null -m 30 -w '%{http_code}' -H @- http://127.0.0.1:8000/v1/models ;;
-  inventory) auth | curl -fsS -m 120 -H @- -X POST http://127.0.0.1:8000/routing/refresh ;;
+  # probe=false: which servers are up with models is all that is asked, and
+  # this runs every POLL_INTERVAL while a target is awaited. Without it the
+  # router asks every Ollama model for its capabilities again each time.
+  inventory) auth | curl -fsS -m 120 -H @- -X POST 'http://127.0.0.1:8000/routing/refresh?probe=false' ;;
   webui) port=$(sed -n 's/^PORT=//p' /app/openwebui/.env 2>/dev/null | tail -n 1)
          curl -s -o /dev/null -m 10 -w '%{http_code}' "http://127.0.0.1:${port:-8080}/health" ;;
   # An Open WebUI token, as an Authorization header on stdin: /openai/config

@@ -1689,16 +1689,42 @@ try: print(m.version("litellm"))
 except Exception: pass' 2>/dev/null
 }
 
+# litellm_venv_fingerprint WANT HAVE: everything the import test's result
+# depends on, on one line: the pinned and installed versions, the lock the venv
+# is built from, the interpreter behind the venv, and its site-packages
+# directories (pip changes a directory's modification time with every package
+# it adds, replaces or removes there).
+litellm_venv_fingerprint() {
+  local venv="${LITELLM_DIR}/venv" lock='-' python packages
+  [[ ! -f "$LITELLM_LOCK" ]] || lock="$(sha256sum < "$LITELLM_LOCK" | cut -d' ' -f1)"
+  python="$(readlink -f "${venv}/bin/python" 2>/dev/null || true)"
+  python+=" $(stat -c '%Y %s' "$python" 2>/dev/null || true)"
+  packages="$(stat -c '%n %Y' "$venv"/lib/python*/site-packages 2>/dev/null | tr '\n' ' ' || true)"
+  printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$lock" "$python" "$packages"
+}
+
 # True when the venv has the pinned litellm AND the proxy extra's imports work.
 # The import is the real test: a plain `litellm` install passes a version check
 # but `litellm --config` then dies with "Missing dependency ... backoff".
+# Importing the proxy takes several seconds, and every apply asks, so a passed
+# test is remembered in the venv with litellm_venv_fingerprint and repeated only
+# when that changes (a rebuilt venv has no record at all).
 litellm_venv_ok() {
-  local want have
+  local want have print stamp="${LITELLM_DIR}/venv/.osr-imports-ok"
   want="$(litellm_pinned_version)"
   have="$(litellm_installed_version)"
   [[ -n "$have" ]] || return 1
   [[ -z "$want" || "$want" == "$have" ]] || return 1
-  "${LITELLM_DIR}/venv/bin/python" -c 'import litellm.proxy.proxy_server' >/dev/null 2>&1
+  print="$(litellm_venv_fingerprint "$want" "$have")"
+  if [[ -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$print" ]]; then
+    return 0
+  fi
+  if ! "${LITELLM_DIR}/venv/bin/python" -c 'import litellm.proxy.proxy_server' >/dev/null 2>&1; then
+    rm -f "$stamp" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "$print" > "$stamp" 2>/dev/null || true
+  return 0
 }
 
 # Build (or bring up to date) LiteLLM's own venv, hash-checked when the repo
@@ -1845,6 +1871,11 @@ try:
             low, high = cp.get("discovery", option).split(":", 1)
             if float(low) > float(high):
                 err(rel, "[discovery] %s has low > high" % option)
+    # Numbers the router reads at start: a bad one would stop it from starting.
+    for section, option in (("discovery", "show_cache_seconds"), ("balancing", "busy_penalty"),
+                            ("balancing", "sticky_seconds")):
+        if cp.has_option(section, option) and float(cp.get(section, option)) < 0:
+            err(rel, "[%s] %s must not be negative" % (section, option))
 except (configparser.Error, ValueError) as exc:
     err(rel, str(exc))
 
