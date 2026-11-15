@@ -1827,6 +1827,19 @@ print_summary() {
     return "$problems"
 }
 
+# Grafana's address and first login (setup-metrics.sh login in the router CT),
+# after the summary and on the terminal only: a password belongs in no log.
+# Nothing is shown for a router without the metrics stack, or one whose copy
+# of the script is older than this.
+show_grafana_login() {
+    local out
+    [[ -n $ROUTER_CT ]] && selected router && ct_running "$ROUTER_CT" || return 0
+    out=$(pct exec "$ROUTER_CT" -- bash /app/config-repo/install/setup-metrics.sh login </dev/null 2>/dev/null) || return 0
+    [[ $out == Grafana:* ]] || return 0
+    section 'Grafana (router metrics)'
+    printf '%s\n' "$out" >&2
+}
+
 check_repo() {
     local crlf
     [[ -f $REPO_ROOT/open-smart-router-install.sh && -f $REPO_ROOT/tools/update-router-services.sh ]] ||
@@ -1990,7 +2003,8 @@ main() {
         [[ -n ${I_RESULT[$i]} ]] || process_item "$i"
         [[ ${I_TARGET[$i]} != open-webui ]] || push_router_config
     done
-    if print_summary; then exit 0; fi
+    if print_summary; then show_grafana_login; exit 0; fi
+    show_grafana_login
     notify "OSR upgrade (run on $LOCAL_NODE) finished with problems: $(awk 'NR > 1 && $4 ~ /^(broken|failed|rolled-back|skipped)$/ { printf "%s@%s (%s) %s; ", $1, $2, $3, $4 }' "$RUN_DIR/summary.txt")see $RUN_DIR on $LOCAL_NODE"
     exit 1
 }

@@ -22,6 +22,7 @@ echo "systemctl $*" >> "$STUB_CALLS"
 unit="${*: -1}"
 case "$1" in
   is-active) [[ -e "$STUB_STATE/active-$unit" ]] ;;
+  is-failed) [[ -e "$STUB_STATE/failed-$unit" ]] ;;
   restart|start) touch "$STUB_STATE/active-$unit" ;;
   stop) rm -f "$STUB_STATE/active-$unit" ;;
   mask) [[ "$2" == --now ]] && rm -f "$STUB_STATE/active-$unit"; true ;;
@@ -48,7 +49,25 @@ cat > "${bin}/gpg" <<'STUB'
 echo "gpg $*" >> "$STUB_CALLS"
 printf 'pub:-:4096:1:963FA27710458545:1:::-:::scESC::::::23::0:\nfpr:::::::::%s:\nsub:-:4096:1:AAAA:1::::::e::::::23:\nfpr:::::::::FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:\n' "$(cat "$STUB_STATE/fingerprint")"
 STUB
-for name in chown promtool; do
+cat > "${bin}/curl" <<'STUB'
+#!/usr/bin/env bash
+echo "curl $*" >> "$STUB_CALLS"
+case "$*" in
+  # The sign-in check: the credentials arrive on stdin (-K -).
+  *:3000/api/user) cat > "$STUB_STATE/login-stdin"
+                   [[ ! -e "$STUB_STATE/grafana-down" ]] || exit 7
+                   cat "$STUB_STATE/login-code" 2>/dev/null || printf 200 ;;
+  *:3000/*) [[ ! -e "$STUB_STATE/grafana-silent" ]] ;;
+  *) true ;;
+esac
+STUB
+cat > "${bin}/journalctl" <<'STUB'
+#!/usr/bin/env bash
+echo "journalctl $*" >> "$STUB_CALLS"
+echo "logger=server error: the reason it stopped"
+STUB
+printf '#!/usr/bin/env bash\necho "10.1.2.3 fd00::5"\n' > "${bin}/hostname"
+for name in chown promtool sleep; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$STUB_CALLS"\n' "$name" > "${bin}/${name}"
 done
 chmod +x "${bin}"/*
@@ -105,7 +124,9 @@ assert_file_contains "the data source is the local Prometheus" "url: http://127.
   "${fs}/etc/grafana/provisioning/datasources/osr.yml"
 assert_contains "both services are started" "systemctl restart grafana-server.service" "$(cat "$calls")"
 assert_contains "Prometheus too" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
-assert_contains "and it says where things are" "ready: Grafana port 3000" "$out"
+assert_contains "and it says where things are" "ready: Grafana answers on port 3000" "$out"
+assert_contains "ready means Grafana answered" "curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:3000/api/health" "$(cat "$calls")"
+assert_contains "and Prometheus too" "http://127.0.0.1:9090/-/ready" "$(cat "$calls")"
 
 describe rerun
 : > "$calls"
@@ -121,6 +142,40 @@ assert_status "an unusable ROUTER_HOST is refused" 1 run install
 printf 'ROUTER_PORT=99999\n' > "${router}/.env"
 assert_status "and so is an impossible port" 1 run install
 : > "${router}/.env"
+
+describe show_login
+new_ct "s3cret-key"
+out="$(run install 2>/dev/null)"
+password="$(sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' "${fs}/etc/grafana/osr.env")"
+assert_contains "an install ends with Grafana's address" "Grafana:  http://10.1.2.3:3000" "$out"
+assert_contains "the user name on its own line" "Username: admin" "$out"
+assert_contains "and the password, ready to copy" "Password: ${password}" "$out"
+: > "$calls"
+out="$(run login 2>&1)"; rc=$?
+assert_eq "login shows them again" "0|Password: ${password}" "${rc}|$(grep '^Password' <<< "$out")"
+assert_not_contains "and changes nothing" "systemctl" "$(cat "$calls")"
+assert_not_contains "the password is on no command line" "$password" "$(cat "$calls")"
+assert_eq "curl reads it on stdin" "user = \"admin:${password}\"" "$(cat "${state}/login-stdin")"
+printf 401 > "${state}/login-code"
+out="$(run login 2>&1)"
+assert_contains "a password changed in Grafana is said to be changed" "has been changed since setup" "$out"
+assert_not_contains "and the old one is not shown" "$password" "$out"
+assert_contains "the address still is" "http://10.1.2.3:3000" "$out"
+rm -f "${state}/login-code"; touch "${state}/grafana-down"
+out="$(run login 2>&1)"
+assert_contains "a Grafana that is down still gets its first password" "Password: ${password}" "$out"
+assert_contains "marked as unchecked" "not checked" "$out"
+rm -f "${state}/grafana-down"
+: > "${fs}/etc/grafana/osr.env"
+out="$(run login 2>&1)"
+assert_contains "a preserved login has no password to show" "kept the login it already had" "$out"
+assert_not_contains "so none is" "Password:" "$out"
+new_ct "s3cret-key"
+assert_eq "a CT without the stack prints nothing" "0|" "$(run login 2>&1; echo "$?|")"
+out="$(run nonsense 2>&1)"
+assert_contains "the usage names the mode" "install|sync-key|login" "$out"
+# The cases below continue from an installed CT.
+run install >/dev/null 2>&1
 
 describe sync_key
 : > "$calls"
@@ -160,6 +215,19 @@ new_ct "s3cret-key"
 touch "${state}/grafana-unavailable"
 assert_status "a failed Grafana install fails the setup" 100 run install
 assert_ok "and starts nothing" bash -c "! grep -q 'restart' '$calls'"
+# Started, but it never answers: that is not ready, and the log is shown.
+new_ct "s3cret-key"
+touch "${state}/grafana-silent"
+out="$(READY_TIMEOUT=6 run install 2>&1)"; rc=$?
+assert_eq "a Grafana that does not answer fails the setup" "1" "$rc"
+assert_contains "saying which service and where" "grafana-server.service does not answer on http://127.0.0.1:3000/api/health" "$out"
+assert_contains "with the end of its journal" "the reason it stopped" "$out"
+assert_not_contains "and it is not called ready" "ready: Grafana answers" "$out"
+assert_eq "it was asked more than once before giving up" "2" "$(grep -c ':3000/api/health' "$calls")"
+new_ct "s3cret-key"
+touch "${state}/grafana-silent" "${state}/failed-grafana-server.service"
+out="$(run install 2>&1)"; rc=$?
+assert_eq "a unit systemd reports failed is not waited for" "1|0" "${rc}|$(grep -c ':3000/api/health' "$calls")"
 new_ct "s3cret-key"
 rm -f "${router}/secrets.env"
 assert_status "no secrets file is refused" 1 run install

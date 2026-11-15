@@ -145,6 +145,9 @@ case $cmd in
                 fi
                 if [[ $3 == *systemctl* ]]; then grep -v '^ct:' "$MOCK/$id.state"; fi ;;
             hostname) echo "10.0.0.$((id % 250))" ;;
+            # setup-metrics.sh login: <id>.grafana is what it prints.
+            bash) [[ $* == *'setup-metrics.sh login' && -e $MOCK/$id.grafana ]] || exit 1
+                  cat "$MOCK/$id.grafana" ;;
             sed)
                 case "$*" in
                     *service.env*) [[ ! -e $MOCK/$id.port ]] || cat "$MOCK/$id.port" ;;
@@ -628,6 +631,33 @@ assert_eq 'after an upgrade' 1 "$(push_with upgraded current)"
 assert_eq 'after an Open WebUI upgrade' 1 "$(push_with current upgraded)"
 assert_eq 'not when nothing changed' 0 "$(push_with current current)"
 assert_eq 'not after a rollback' 0 "$(push_with rolled-back upgraded)"
+
+describe 'the Grafana login is shown after the summary, on the terminal only'
+reset_mock
+# shellcheck disable=SC2034  # I_RESULT is read by show_grafana_login
+login_case() {
+    add_item router 280
+    I_RESULT[0]=$1
+    print_summary
+    show_grafana_login
+}
+printf 'Grafana:  http://10.0.0.30:3000\nUsername: admin\nPassword: s3cr3t-first\n' > "$tmp/mock/280.grafana"
+out=$(in_tool login_case upgraded 2>&1)
+assert_contains 'the address' 'Grafana:  http://10.0.0.30:3000' "$out"
+assert_contains 'the user name' 'Username: admin' "$out"
+assert_contains 'the password on its own line' $'\nPassword: s3cr3t-first' "$out"
+[[ $(grep -n 'Password:' <<< "$out" | cut -d: -f1) -gt $(grep -n '^COMPONENT' <<< "$out" | cut -d: -f1) ]] &&
+    _pass 'below the summary' || _fail 'below the summary' 'after the table' "$out"
+assert_eq 'no log holds the password' '' "$(grep -rl 's3cr3t-first' "$tmp/run" 2>/dev/null)"
+assert_file_contains 'it asks the CT copy of the script' 'exec 280 -- bash /app/config-repo/install/setup-metrics.sh login' "$tmp/mock/pct.log"
+out=$(in_tool login_case filtered 2>&1)
+assert_not_contains 'not when the router was left out of the run' 'Password:' "$out"
+rm "$tmp/mock/280.grafana"
+out=$(in_tool login_case upgraded 2>&1)
+assert_not_contains 'a router without the stack shows no Grafana section' 'Grafana' "$out"
+echo 'metrics setup: usage: setup-metrics.sh [install|sync-key]' > "$tmp/mock/280.grafana"
+out=$(in_tool login_case upgraded 2>&1)
+assert_not_contains 'nor does anything that is not the login' 'Grafana' "$out"
 
 describe 'the hcom probe reads what the installer recorded'
 probe_root=$tmp/probe

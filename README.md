@@ -603,12 +603,20 @@ scrapes `GET /metrics` on the CT's loopback address using a protected copy of
 `ROUTER_API_KEY`; its HTTP API stays on `127.0.0.1:9090`. Grafana has a
 provisioned `OSR Prometheus` data source and an **Open Smart Router** dashboard
 with request rates, failures, latency, in-flight load and server state. Open
-`http://<ct-ip>:3000` and sign in as `admin`. On a new Grafana database the
-initial random password is in `/etc/grafana/osr.env` (root-readable):
+`http://<ct-ip>:3000` and sign in as `admin`. A new Grafana database starts
+with a random password, kept in `/etc/grafana/osr.env` (root-readable). The
+installer, `setup-metrics.sh install` and `tools/upgrade-all.sh` print the
+address, user name and password at the end, ready to copy; to see them again:
 
 ```bash
-pct exec <CT_ID> -- sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' /etc/grafana/osr.env
+pct exec <CT_ID> -- bash /app/config-repo/install/setup-metrics.sh login
 ```
+
+The password is checked against Grafana first. Once you change it in Grafana
+the first one is no longer shown, only a line saying it has changed.
+`upgrade-all.sh` prints it to the terminal only, never to its logs. Use
+`http://`: Grafana here has no TLS, and a browser that switches to `https://`
+gets no answer.
 
 The installer allows port 3000 from `API_ALLOW_CIDR` when it configures the CT
 firewall. If Grafana package installation fails, the router keeps running; rerun

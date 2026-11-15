@@ -475,6 +475,11 @@ assert_file_contains "the installer can leave the metrics stack out" 'INSTALL_ME
 assert_ok "the firewall rule for Grafana cannot undo a finished install" bash -c \
   "[[ \$(grep -n -- '-dport 3000 -log nolog' '$INSTALLER' | head -1 | cut -d: -f1) -gt \$(grep -n '^trap - ERR' '$INSTALLER' | tail -1 | cut -d: -f1) ]]"
 assert_file_contains "the installer opens Grafana to the trusted CIDR" '-dport 3000 -log nolog' "$INSTALLER"
+assert_file_contains "the installer's summary shows the Grafana login" 'install/setup-metrics.sh" login' "$INSTALLER"
+assert_file_contains "upgrade-all shows it too" 'setup-metrics.sh login' "${ROOT}/tools/upgrade-all.sh"
+assert_ok "and only after its summary, which is what gets logged" bash -c \
+  '! sed -n "/^print_summary() {/,/^}/p" "$1" | grep -q grafana' _ "${ROOT}/tools/upgrade-all.sh"
+assert_file_contains "the README says how to see the login again" 'setup-metrics.sh login' "${ROOT}/README.md"
 assert_ok "provisioned dashboard is valid JSON with all metric families" python3 - "$metrics_setup" <<'PY'
 import json
 import pathlib

@@ -9931,7 +9931,8 @@ chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
 cat > "${REPO_DIR}/install/setup-metrics.sh" <<'METRICSEOF'
 #!/usr/bin/env bash
 # Install a small local Prometheus + Grafana stack in the router CT.
-# Run as root: bash /app/config-repo/install/setup-metrics.sh [install|sync-key]
+# Run as root: bash /app/config-repo/install/setup-metrics.sh [install|sync-key|login]
+# login prints Grafana's address and first login and changes nothing.
 set -euo pipefail
 
 MODE="${1:-install}"
@@ -9952,7 +9953,7 @@ die() { printf 'metrics setup: %s\n' "$*" >&2; exit 1; }
 note() { printf 'metrics setup: %s\n' "$*" >&2; }
 
 [[ $EUID -eq 0 || -n $FS ]] || die 'run as root in the router CT'
-[[ $MODE == install || $MODE == sync-key ]] || die 'usage: setup-metrics.sh [install|sync-key]'
+[[ $MODE == install || $MODE == sync-key || $MODE == login ]] || die 'usage: setup-metrics.sh [install|sync-key|login]'
 
 env_value() {
   local file=$1 key=$2
@@ -9988,8 +9989,37 @@ sync_key() {
   note 'router scrape key updated'
 }
 
+# Grafana's address and first login, on stdout so that whoever ran the setup
+# can copy them. osr.env holds only the password a new Grafana database started
+# with, so it is tried first: one that no longer signs in is not shown as if it
+# did. It reaches curl on stdin, never on a command line. Says nothing where
+# this script has not set Grafana up.
+show_login() {
+  local address password code
+  [[ -e ${FS}/etc/systemd/system/grafana-server.service.d/osr.conf ]] || return 0
+  address="$(hostname -I 2>/dev/null | awk '{ print $1 }')" || true
+  password="$(env_value "${FS}/etc/grafana/osr.env" GF_SECURITY_ADMIN_PASSWORD)"
+  printf 'Grafana:  http://%s:3000\n' "${address:-<ct-ip>}"
+  if [[ -z $password ]]; then
+    printf '  No password was set here: Grafana kept the login it already had.\n'
+    return 0
+  fi
+  code="$(printf 'user = "admin:%s"\n' "$password" |
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 -K - http://127.0.0.1:3000/api/user 2>/dev/null)" || true
+  if [[ $code == 401 ]]; then
+    printf '  The admin password has been changed since setup; the first one no longer signs in.\n'
+    return 0
+  fi
+  printf 'Username: admin\nPassword: %s\n' "$password"
+  [[ $code == 200 ]] || printf '  (not checked: Grafana did not answer. This is the password it started with.)\n'
+}
+
 if [[ $MODE == sync-key ]]; then
   sync_key
+  exit 0
+fi
+if [[ $MODE == login ]]; then
+  show_login
   exit 0
 fi
 
@@ -10161,10 +10191,27 @@ systemctl enable osr-prometheus.service
 systemctl restart osr-prometheus.service
 systemctl enable grafana-server.service
 systemctl restart grafana-server.service
-systemctl is-active --quiet osr-prometheus.service || die 'Prometheus failed to start'
-systemctl is-active --quiet grafana-server.service || die 'Grafana failed to start'
-note 'ready: Grafana port 3000, Prometheus loopback port 9090, dashboard Open Smart Router'
-note 'new Grafana admin password (if generated): /etc/grafana/osr.env'
+# "active" only says the process was started: a service that exits a moment
+# later, or one still migrating its database, is active too. Ready means it
+# answers. Grafana's first start can take a while, so it gets READY_TIMEOUT
+# seconds (default 180); on failure the end of its journal says why.
+wait_ready() {
+  local unit=$1 url=$2 waited=0 limit="${READY_TIMEOUT:-180}"
+  while (( waited < limit )); do
+    if systemctl is-failed --quiet "$unit"; then break; fi
+    if curl -fsS -o /dev/null --max-time 5 "$url" 2>/dev/null; then return 0; fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  note "${unit} does not answer on ${url}. Its last log lines:"
+  journalctl -u "$unit" -n 25 --no-pager >&2 2>/dev/null || true
+  return 1
+}
+wait_ready osr-prometheus.service http://127.0.0.1:9090/-/ready || die 'Prometheus failed to start'
+wait_ready grafana-server.service http://127.0.0.1:3000/api/health || die 'Grafana failed to start'
+note 'ready: Grafana answers on port 3000, Prometheus on loopback port 9090; dashboard Open Smart Router'
+note 'if a browser cannot reach port 3000, allow it in the CT firewall (README, Local Grafana dashboard)'
+show_login
 METRICSEOF
 chmod 0755 "${REPO_DIR}/install/setup-metrics.sh"
 
@@ -10569,7 +10616,10 @@ echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to OSR."
 if $METRICS_INSTALLED; then
   echo "Grafana (router metrics):     http://${ROUTER_IP}:3000"
-  echo "  -> admin initial password: /etc/grafana/osr.env inside the CT"
+  # Username and password, ready to copy (setup-metrics.sh login).
+  run_ct bash "${CONFIG_REPO_DIR}/install/setup-metrics.sh" login 2>/dev/null |
+    sed -e '/^Grafana:/d' -e 's/^ */  /' ||
+    echo "  -> admin initial password: /etc/grafana/osr.env inside the CT"
 fi
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
 if [[ "$CONFIG_SOURCE" == "repo" ]]; then
