@@ -47,7 +47,9 @@ OpenCode agents; Open Terminal and ComfyUI tools. Enter names or menu numbers
 
 You enter the router's CT ID and static IP/CIDR, then a CT ID, static IP/CIDR
 and storage for each selected target (Strata, Basalt, Maya, Xolotl, Avalon and
-Kindi also a template). Each CT ID defaults to the cluster's next free ID,
+Kindi also a template; Strata also its RAM, `STRATA_MEMORY_MB`, default 65536
+MiB, at least 32768, shown beside the host's RAM: it holds its model in RAM,
+about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S). Each CT ID defaults to the cluster's next free ID,
 skipping IDs already given out in this run (Enter takes it; type another, or
 preset `CT_ID` / `<NAME>_CT_ID`, to override). Addresses are never chosen;
 presets prefill prompts. It then checks the host GPU, creates
@@ -142,10 +144,15 @@ smallest chosen. A llama.cpp window is multiplied by `PARALLEL_SLOTS` for
 **Strata KV cache.** After the windows, the installer asks how Strata stores
 its context (`STRATA_KV`): `int8` (8-bit keys and values, Strata's default),
 `k8v4` (8-bit keys, 4-bit values: 23% smaller) or `q4_0` (4-bit: 45% smaller,
-less precise on long documents). It suggests `k8v4` for cards under 24 GB (12
-and 16 GB), where the freed memory holds more of the model, and `int8` for 24
-and 32 GB cards or a card it cannot read yet. A Strata window of 8192 or less
-keeps a 16-bit cache, so nothing is asked.
+less precise on long documents). From a 64K window, when Strata's CT (the RAM
+chosen for it, `STRATA_MEMORY_MB`) holds the model and the cache, Strata keeps the
+cache in RAM with only a 32K window on the GPU, and `int8` is suggested on any
+card. Otherwise it suggests `k8v4` for cards under 24 GB (12 and 16 GB), where
+the freed memory holds more of the model, and `int8` for 24 and 32 GB cards or
+a card it cannot read yet. It then asks about Strata's message cache
+(`STRATA_MESSAGE_CACHE`, default `false`): one more checkpoint before the last
+message of a long conversation, for agents that rewrite it. A Strata window of
+8192 or less keeps a 16-bit cache, so neither is asked.
 
 **Host drivers.** Before creating CTs, the installer checks for a working
 driver for each chosen card and once for the NVIDIA-only targets. If one is
@@ -222,7 +229,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
 | Cluster | `CLUSTER_SSH` (`fix`, the default: check and repair root SSH between nodes; `check`: report only; `skip`) |
-| Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
+| Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `STRATA_MEMORY_MB` (65536), `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
 
 `NONINTERACTIVE=true` requires `IP_CIDR`, `GATEWAY` and every
 `MODEL_SERVER_<n>`, takes the next free CT ID unless `CT_ID` is set, accepts

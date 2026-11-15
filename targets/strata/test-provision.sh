@@ -97,45 +97,67 @@ reject 'MEMORY_MB' MEMORY_MB=8192
 reject 'STRATA_COMMIT' STRATA_COMMIT=bad
 reject 'GPU_GID' GPU_GID=0
 
-# The KV cache: suggested from the GPU's memory (k8v4 under 24 GB, int8 from
-# 24 GB or for an unknown card); a preset is kept; up to 8192 tokens nothing is
-# asked. Unattended runs take the suggestion.
+# The KV cache. From a 64K context, when the CT's RAM holds the model, the
+# 8-bit cache and 1 GB, Strata keeps the cache in RAM (a 32K window on the
+# GPU): int8 is suggested on any card. Otherwise by the card: k8v4 under 24 GB,
+# int8 from 24 GB or for an unknown card. A preset is kept; up to 8192 tokens
+# nothing is asked. Unattended runs take the suggestion.
 plan
 has 'STRATA_KV=int8'; has 'KV cache int8'
-plan "${gpu[@]}" FAKE_VRAM_MIB=12282
-has 'STRATA_KV=k8v4'
-plan "${gpu[@]}" FAKE_VRAM_MIB=16311
-has 'STRATA_KV=k8v4'; has 'context 65536, KV cache k8v4, port 8080'
-plan "${gpu[@]}" FAKE_VRAM_MIB=24564
-has 'STRATA_KV=int8'
-plan "${gpu[@]}" FAKE_VRAM_MIB=32607
-has 'STRATA_KV=int8'
-plan "${gpu[@]}" GPU_DEVICES='/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm'
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311          # 64K, 64 GiB, IQ2_XS: streamed
+has 'STRATA_KV=int8'; has 'context 65536, KV cache int8, message cache false, port 8080'
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=IQ3_S STRATA_CONTEXT=262144 MEMORY_MB=90112
+has 'STRATA_KV=int8'                          # 96 GB host: IQ3_S at 256K in an 88 GiB CT
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=IQ3_XXS STRATA_CONTEXT=131072 MEMORY_MB=61440
+has 'STRATA_KV=k8v4'                          # 60 GiB: IQ3_XXS's 128K cache stays on the GPU
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=IQ3_S STRATA_CONTEXT=262144
+has 'STRATA_KV=k8v4'                          # 64 GiB is short of 62 + 3.6 + 1 GB
+plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=Q9_X STRATA_CONTEXT=262144 MEMORY_MB=131072
+has 'STRATA_KV=k8v4'                          # an unknown model: by the card
+for ram_case in '12282 k8v4' '16311 k8v4' '24564 int8' '32607 int8'; do
+    read -r mib kv <<< "$ram_case"
+    plan "${gpu[@]}" FAKE_VRAM_MIB="$mib" STRATA_CONTEXT=32768   # below 64K: never streamed
+    has "STRATA_KV=$kv"
+done
+plan "${gpu[@]}" GPU_DEVICES='/dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm' STRATA_CONTEXT=32768
 has 'STRATA_KV=int8'   # minor 1 is the 32 GB card, not GPU 0
 plan "${gpu[@]}" STRATA_KV=q4_0
 has 'STRATA_KV=q4_0'
 plan "${gpu[@]}" STRATA_CONTEXT=8192
-has 'STRATA_KV=int8'
+has 'STRATA_KV=int8'; has 'STRATA_MESSAGE_CACHE=false'
 reject 'STRATA_KV must be int8, k8v4 or q4_0' STRATA_KV=q8
 
-# Interactive: the question shows the suggestion; Enter takes it, a bad answer
+# The message cache: off unless chosen; a preset is passed on.
+plan
+has 'STRATA_MESSAGE_CACHE=false'
+plan STRATA_MESSAGE_CACHE=true
+has 'STRATA_MESSAGE_CACHE=true'; has 'message cache true'
+reject 'STRATA_MESSAGE_CACHE must be true or false' STRATA_MESSAGE_CACHE=yes
+
+# Interactive: each question shows its suggestion; Enter takes it, a bad answer
 # is asked again.
 ask() {
-    output=$(printf '%b' "$1" | env -i "PATH=$fake/bin:$PATH" "${common[@]}" "NVIDIA_PROC=$fake/proc" \
-        PVE_INTERACTIVE=true FAKE_VRAM_MIB=16311 bash "$provision" --dry-run 2>&1) || {
+    local input=$1; shift
+    output=$(printf '%b' "$input" | env -i "PATH=$fake/bin:$PATH" "${common[@]}" "NVIDIA_PROC=$fake/proc" \
+        PVE_INTERACTIVE=true FAKE_VRAM_MIB=16311 "$@" bash "$provision" --dry-run 2>&1) || {
         printf 'FAIL interactive plan\n%s\n' "$output" >&2; exit 1;
     }
     passed=$((passed + 1))
 }
-ask '\n'
+ask '\n\n' STRATA_CONTEXT=32768
 has '== Strata settings =='
-has 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards.'
-has 'This GPU: k8v4 (its 16311 MiB GPU'
+has 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards;'
+has "int8 on any card when the cache fits in the CT's RAM (from a 64K context)."
+has 'This CT: k8v4 (its 16311 MiB GPU'
 has 'KV cache (int8, k8v4 or q4_0) [k8v4]:'
-has 'STRATA_KV=k8v4'
-ask 'q8\nint8\n'
+has 'Message cache for agents that rewrite their last message [y/N]:'
+has 'STRATA_KV=k8v4'; has 'STRATA_MESSAGE_CACHE=false'
+ask 'q8\nint8\ny\n' STRATA_CONTEXT=32768
 has 'Choose int8, k8v4 or q4_0.'
-has 'STRATA_KV=int8'
+has 'STRATA_KV=int8'; has 'STRATA_MESSAGE_CACHE=true'
+ask '\n\n' STRATA_MODEL=IQ3_S STRATA_CONTEXT=262144 MEMORY_MB=90112
+has "This CT: int8 (at this context the cache is kept in the CT's RAM with only a 32K window on the GPU)."
+has 'KV cache (int8, k8v4 or q4_0) [int8]:'
 
 plan GPU_GID=1000
 has 'path=/dev/nvidia0\,gid=1000\,mode=0660'

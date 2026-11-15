@@ -1735,7 +1735,7 @@ ensure_target_template() {
 # Strata, Basalt, Maya, Xolotl, Avalon and Kindi). Presets: <NAME>_CT_ID,
 # <NAME>_IP_CIDR, <NAME>_STORAGE, <NAME>_TEMPLATE.
 prompt_target_settings() {
-  local name prefix id_var ip_var storage_var template_var default ip id_default
+  local name prefix id_var ip_var storage_var template_var default ip id_default host_mib
   [[ -n "${TARGETS:-}" ]] || return 0
   echo
   echo "--- Target containers ---"
@@ -1816,7 +1816,29 @@ prompt_target_settings() {
           "$template_var" "$default" valid_target_template || return 1
       fi
     fi
+    if [[ $name == strata ]]; then
+      host_mib="$(host_memory_mib)"
+      echo "    Strata holds its model in RAM: about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S,"
+      echo "    plus from a 64K window the context's cache (1.8 GB at 128K, 3.6 GB at 256K)."
+      [[ -z $host_mib ]] || echo "    This host has ${host_mib} MiB; leave some for Proxmox."
+      prompt_until_valid "    RAM (MiB, 32768 or more)" STRATA_MEMORY_MB "${STRATA_MEMORY_MB:-65536}" \
+        valid_strata_memory_mb || return 1
+      if [[ -n $host_mib ]] && (( STRATA_MEMORY_MB > host_mib )); then
+        echo "    WARNING: ${STRATA_MEMORY_MB} MiB is more than this host's ${host_mib} MiB." >&2
+      fi
+    fi
   done
+}
+# valid_strata_memory_mb MIB: Strata's CT memory, 32768 MiB or more (its
+# provisioner's minimum).
+valid_strata_memory_mb() { [[ $1 =~ ^[1-9][0-9]{4,8}$ ]] && (( $1 >= 32768 )); }
+# host_memory_mib: this host's RAM in MiB (MemTotal), or nothing when it cannot
+# be read. HOST_MEMINFO overrides /proc/meminfo (tests).
+host_memory_mib() {
+  local kib
+  kib="$(awk '/^MemTotal:/ { print $2; exit }' "${HOST_MEMINFO:-/proc/meminfo}" 2>/dev/null)"
+  if [[ $kib =~ ^[0-9]+$ ]]; then echo $(( kib / 1024 )); fi
+  return 0
 }
 
 # --- context windows ----------------------------------------------------------
@@ -2040,12 +2062,52 @@ prompt_target_contexts() {
 # smaller, less precise on long documents). A smaller cache leaves room for more
 # of the model on the GPU. Strata uses it above an 8192-token context.
 valid_strata_kv() { [[ $1 == int8 || $1 == k8v4 || $1 == q4_0 ]]; }
-# strata_kv_recommendation VRAM: VALUE|REASON, the cache to suggest (Strata's
-# provisioner suggests the same). VRAM is target_vram's answer. Below 24 GB
-# (12 and 16 GB cards) k8v4, where every GB freed holds about 700 more experts
-# on the GPU; on 24 and 32 GB cards, and when the card is not known, int8.
+# strata_model_ram_gb MODEL: the RAM (GB) Strata's setup counts for MODEL beside
+# a streamed KV cache (its MODELS ram_gb at the tested commit); nothing for a
+# model this installer does not know.
+strata_model_ram_gb() {
+  case "$1" in
+    IQ1_M) echo 32 ;;
+    Q2_0|IQ2_XS|UD-IQ4_XS|UD-Q4_K_XL) echo 48 ;;
+    IQ3_XXS) echo 60 ;;
+    IQ3_S) echo 62 ;;
+  esac
+}
+# strata_target_model: the model Strata's provisioner installs (STRATA_MODEL, or
+# STRATA_FAMILY's default).
+strata_target_model() {
+  case "${STRATA_FAMILY:-qwen}" in
+    coder) echo "${STRATA_MODEL:-IQ1_M}" ;;
+    unsloth) echo "${STRATA_MODEL:-UD-IQ4_XS}" ;;
+    *) echo "${STRATA_MODEL:-IQ2_XS}" ;;
+  esac
+}
+# strata_ct_memory_mib: the RAM assigned to Strata's CT in MiB: STRATA_MEMORY_MB
+# (asked with its container settings and passed to the provisioner as
+# MEMORY_MB), else the provisioner's default.
+strata_ct_memory_mib() { echo "${STRATA_MEMORY_MB:-65536}"; }
+# strata_kv_streams CONTEXT MODEL RAM_MIB: will Strata's setup keep the KV cache
+# in RAM, with only a 32K-token window on the GPU? Its rule: from 65536 tokens,
+# when the RAM (GiB) holds the model's RAM, the 8-bit cache (13 x 1056 bytes
+# per token, in GB) and 1 GB more. Compared in integers.
+strata_kv_streams() {
+  local ram_gb
+  [[ $1 =~ ^[0-9]+$ && $3 =~ ^[0-9]+$ ]] && (( $1 >= 65536 )) || return 1
+  ram_gb="$(strata_model_ram_gb "$2")"
+  [[ -n $ram_gb ]] || return 1
+  (( $3 * 1000000000 >= 1024 * ((ram_gb + 1) * 1000000000 + $1 * 13728) ))
+}
+# strata_kv_recommendation VRAM [CONTEXT MODEL RAM_MIB]: VALUE|REASON, the cache
+# to suggest (Strata's provisioner suggests the same). VRAM is target_vram's
+# answer. A cache streamed to RAM: int8 (the GPU holds only a 32K window, so the
+# most precise cache costs it about 0.1 GB more). Otherwise by the card: below
+# 24 GB (12 and 16 GB cards) k8v4, where every GB freed holds about 700 more
+# experts on the GPU; on 24 and 32 GB cards, and when the card is not known,
+# int8.
 strata_kv_recommendation() {
-  if [[ ! $1 =~ ^[0-9]+$ ]]; then
+  if strata_kv_streams "${2:-}" "${3:-}" "${4:-}"; then
+    echo "int8|at this context the cache is kept in the CT's RAM with only a 32K window on the GPU"
+  elif [[ ! $1 =~ ^[0-9]+$ ]]; then
     echo "int8|its GPU's memory is not known yet; int8 is Strata's default"
   elif (( $1 >= 24000 )); then
     echo "int8|its $1 MiB GPU has room for the most precise cache"
@@ -2061,16 +2123,34 @@ prompt_strata_kv_cache() {
   [[ " ${TARGETS:-} " == *" strata "* ]] || return 0
   if [[ ${STRATA_CONTEXT:-} =~ ^[0-9]+$ ]] && (( STRATA_CONTEXT <= 8192 )); then return 0; fi
   vram="$(target_vram strata)"
-  IFS='|' read -r rec reason <<< "$(strata_kv_recommendation "$vram")"
+  IFS='|' read -r rec reason <<< "$(strata_kv_recommendation "$vram" "${STRATA_CONTEXT:-65536}" \
+    "$(strata_target_model)" "$(strata_ct_memory_mib)")"
   echo
   echo "--- Strata KV cache ---"
   echo "  How Strata stores the text it is working on (its context):"
   echo "    int8  8-bit keys and values: the most precise, Strata's default"
   echo "    k8v4  8-bit keys, 4-bit values: 23% smaller, more of the model fits on the GPU"
   echo "    q4_0  4-bit keys and values: 45% smaller, less precise on long documents"
-  echo "  Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards."
+  echo "  Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards;"
+  echo "    int8 on any card when the cache fits in the CT's RAM (from a 64K context)."
   echo "  strata: ${rec} recommended (${reason})."
   prompt_until_valid "    KV cache (int8, k8v4 or q4_0)" STRATA_KV "${STRATA_KV:-$rec}" valid_strata_kv || return 1
+}
+# prompt_strata_message_cache: Strata's opt-in message cache (STRATA_MESSAGE_CACHE):
+# one more checkpoint before the last message of a prompt of 8192+ tokens, so an
+# agent that rewrites its last message reuses the history. Not asked for a
+# window of 8192 or less. A preset is the default; otherwise false, as upstream.
+prompt_strata_message_cache() {
+  [[ " ${TARGETS:-} " == *" strata "* ]] || return 0
+  if [[ ${STRATA_CONTEXT:-} =~ ^[0-9]+$ ]] && (( STRATA_CONTEXT <= 8192 )); then return 0; fi
+  echo
+  echo "--- Strata message cache ---"
+  echo "  One more checkpoint before the last message of a long conversation (8192+"
+  echo "  tokens), so an agent that rewrites its last message does not make Strata read"
+  echo "  the history again. Off upstream by default: it adds about 0.2 s to a fresh"
+  echo "  long request."
+  prompt_until_valid "    Message cache (true/false)" STRATA_MESSAGE_CACHE \
+    "${STRATA_MESSAGE_CACHE:-false}" valid_bool || return 1
 }
 
 # target_default_port NAME: the API port a model target serves by default
@@ -2181,6 +2261,9 @@ run_target_provisioner() {
     [[ -z "$cuda_env" ]] || export "${cuda_env?}"
     [[ -z "$context_env" ]] || export "${context_env?}"
     [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
+    [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
+    # The router's MEMORY is unset above; Strata gets the RAM chosen for its CT.
+    [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
     if [[ "$phase" == companion ]]; then
       export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
       if [[ "$name" == honcho ]]; then
@@ -3379,8 +3462,10 @@ prompt_target_settings || exit 1
 prompt_target_gpus || exit 1
 # Each model target's context window, recommended from its GPU and the agents.
 prompt_target_contexts || exit 1
-# Strata's KV cache precision, suggested from its GPU's memory.
+# Strata's KV cache precision (suggested from its context, CT memory and GPU)
+# and its opt-in message cache.
 prompt_strata_kv_cache || exit 1
+prompt_strata_message_cache || exit 1
 prepare_host_gpu || exit 1
 # Root SSH between the cluster's nodes, for later upgrades from any node.
 prepare_cluster_ssh || exit 1

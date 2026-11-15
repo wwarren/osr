@@ -41,8 +41,12 @@ Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           unsloth: whatever the checkout's setup.sh offers),
           STRATA_CONTEXT=65536,
           STRATA_KV=<asked> (the KV cache: int8, k8v4 = 8-bit keys and 4-bit
-                    values, or q4_0; suggested from the GPU's memory: k8v4 for
-                    12 and 16 GB cards, int8 for 24 and 32 GB cards),
+                    values, or q4_0; suggested: int8 when the cache fits in
+                    the CT's RAM from a 64K context, else k8v4 for 12 and 16 GB
+                    cards and int8 for 24 and 32 GB cards),
+          STRATA_MESSAGE_CACHE=<asked, default false> (true: checkpoint a long
+                    conversation before its last message, for agents that
+                    rewrite it),
           STRATA_VISION=no, STRATA_PORT=8080 (or 11434),
           STRATA_READY_TIMEOUT=900, STRATA_ALLOW_NO_KEY=false.
 
@@ -104,13 +108,40 @@ strata_gpu_vram_mib() {
     done
     return 0
 }
-# strata_kv_recommendation VRAM_MIB: VALUE|REASON, the KV cache to suggest (the
-# OSR installer suggests the same). Below 24 GB (12 and 16 GB cards) k8v4: its
-# 23% smaller cache leaves room for more of the model on the GPU, about 700
-# experts per GB freed, and it reads long documents better than q4_0. On 24 and
-# 32 GB cards, and on an unknown card, int8: Strata's default and most precise.
+# strata_model_ram_gb MODEL: the RAM (GB) Strata's setup counts for MODEL
+# beside a streamed KV cache (setup.py MODELS ram_gb at the tested commit);
+# nothing for a model this script does not know.
+strata_model_ram_gb() {
+    case $1 in
+        IQ1_M) echo 32 ;;
+        Q2_0|IQ2_XS|UD-IQ4_XS|UD-Q4_K_XL) echo 48 ;;
+        IQ3_XXS) echo 60 ;;
+        IQ3_S) echo 62 ;;
+    esac
+}
+# strata_kv_streams CONTEXT MODEL RAM_MIB: will setup keep this context's KV
+# cache in RAM, with only a 32K-token window on the GPU? Its rule: from 65536
+# tokens, when the RAM (GiB) holds the model's RAM, the 8-bit cache (13 x 1056
+# bytes per token, in GB) and 1 GB more. Compared in integers.
+strata_kv_streams() {
+    local ram_gb
+    [[ $1 =~ ^[0-9]+$ && $3 =~ ^[0-9]+$ ]] && (( $1 >= 65536 )) || return 1
+    ram_gb=$(strata_model_ram_gb "$2")
+    [[ -n $ram_gb ]] || return 1
+    (( $3 * 1000000000 >= 1024 * ((ram_gb + 1) * 1000000000 + $1 * 13728) ))
+}
+# strata_kv_recommendation VRAM_MIB [CONTEXT MODEL RAM_MIB]: VALUE|REASON, the
+# KV cache to suggest (the OSR installer suggests the same). When the cache is
+# streamed to RAM (strata_kv_streams), int8: the GPU holds only a 32K window,
+# so the most precise cache costs it about 0.1 GB more than k8v4. Otherwise by
+# the card: below 24 GB (12 and 16 GB cards) k8v4, whose 23% smaller cache
+# leaves room for more of the model on the GPU (about 700 experts per GB
+# freed) and reads long documents better than q4_0; on 24 and 32 GB cards,
+# and on an unknown card, int8, Strata's default.
 strata_kv_recommendation() {
-    if [[ ! $1 =~ ^[0-9]+$ ]]; then
+    if strata_kv_streams "${2:-}" "${3:-}" "${4:-}"; then
+        echo "int8|at this context the cache is kept in the CT's RAM with only a 32K window on the GPU"
+    elif [[ ! $1 =~ ^[0-9]+$ ]]; then
         echo "int8|the GPU's memory is not known; int8 is Strata's default"
     elif (( $1 >= 24000 )); then
         echo "int8|its $1 MiB GPU has room for the most precise cache"
@@ -173,6 +204,7 @@ case $STRATA_FAMILY in
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
 STRATA_KV=${STRATA_KV:-}
+STRATA_MESSAGE_CACHE=${STRATA_MESSAGE_CACHE:-}
 STRATA_VISION=${STRATA_VISION:-no}
 STRATA_PORT=${STRATA_PORT:-8080}
 STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}
@@ -246,17 +278,30 @@ done
 if [[ -z $STRATA_KV ]] && (( STRATA_CONTEXT <= 8192 )); then
     STRATA_KV=int8   # Strata keeps a 16-bit cache up to 8192 tokens: nothing to choose.
 elif [[ -z $STRATA_KV ]]; then
-    IFS='|' read -r kv_suggestion kv_reason <<< "$(strata_kv_recommendation "$(strata_gpu_vram_mib "${devices[@]}")")"
+    IFS='|' read -r kv_suggestion kv_reason <<< "$(strata_kv_recommendation "$(strata_gpu_vram_mib "${devices[@]}")" \
+        "$STRATA_CONTEXT" "$STRATA_MODEL" "$MEMORY_MB")"
     pve_section 'Strata settings'
     pve_note 'KV cache: how Strata stores the text it is working on (its context).'
     pve_note "  int8  8-bit keys and values: the most precise, Strata's default"
     pve_note '  k8v4  8-bit keys, 4-bit values: 23% smaller, more of the model fits on the GPU'
     pve_note '  q4_0  4-bit keys and values: 45% smaller, less precise on long documents'
-    pve_note 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards.'
-    pve_note "This GPU: $kv_suggestion ($kv_reason)."
+    pve_note 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards;'
+    pve_note '  int8 on any card when the cache fits in the CT'"'"'s RAM (from a 64K context).'
+    pve_note "This CT: $kv_suggestion ($kv_reason)."
     pve_ask STRATA_KV 'KV cache (int8, k8v4 or q4_0)' "$kv_suggestion" valid_strata_kv 'Choose int8, k8v4 or q4_0.'
 fi
 valid_strata_kv "$STRATA_KV" || die 'STRATA_KV must be int8, k8v4 or q4_0.'
+if [[ -z $STRATA_MESSAGE_CACHE ]] && (( STRATA_CONTEXT <= 8192 )); then
+    STRATA_MESSAGE_CACHE=false   # it only checkpoints prompts of 8192 tokens or more
+elif [[ -z $STRATA_MESSAGE_CACHE ]]; then
+    pve_section 'Strata settings'
+    pve_note 'Message cache: one more checkpoint before the last message of a long'
+    pve_note '  conversation (8192+ tokens), so an agent that rewrites its last message does'
+    pve_note '  not make Strata read the history again. Off upstream by default: it adds'
+    pve_note '  about 0.2 s to a fresh long request.'
+    pve_ask_yes_no STRATA_MESSAGE_CACHE 'Message cache for agents that rewrite their last message' false
+fi
+[[ $STRATA_MESSAGE_CACHE =~ ^(true|false)$ ]] || die 'STRATA_MESSAGE_CACHE must be true or false.'
 
 ostype=debian
 [[ $TEMPLATE == *:vztmpl/ubuntu-* ]] && ostype=ubuntu
@@ -309,7 +354,7 @@ pve_summary "Strata: create"
 pve_row 'Strata CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Server' "context $STRATA_CONTEXT, KV cache $STRATA_KV, port $STRATA_PORT"
+pve_row 'Server' "context $STRATA_CONTEXT, KV cache $STRATA_KV, message cache $STRATA_MESSAGE_CACHE, port $STRATA_PORT"
 pve_confirm "Create Strata CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Strata pins tens of GiB of model memory. systemd's LimitMEMLOCK must be
@@ -359,7 +404,8 @@ run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/strata-target-deploy/nvidi
 nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/strata-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "STRATA_REF=$STRATA_REF" "STRATA_COMMIT=$STRATA_COMMIT" \
     "STRATA_MODEL=$STRATA_MODEL" "STRATA_FAMILY=$STRATA_FAMILY" \
-    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_KV=$STRATA_KV" "STRATA_VISION=$STRATA_VISION" "STRATA_PORT=$STRATA_PORT" \
+    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_KV=$STRATA_KV" "STRATA_MESSAGE_CACHE=$STRATA_MESSAGE_CACHE" \
+    "STRATA_VISION=$STRATA_VISION" "STRATA_PORT=$STRATA_PORT" \
     "STRATA_READY_TIMEOUT=$STRATA_READY_TIMEOUT" "STRATA_ALLOW_NO_KEY=$STRATA_ALLOW_NO_KEY" \
     bash /root/strata-target-deploy/install-target.sh
 

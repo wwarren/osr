@@ -179,6 +179,8 @@ printf 'prompt-env %s|%s|%s\n' "${PVE_ACCEPT_DEFAULTS:-}" "${PVE_CONFIRM:-}" "${
 _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_CONTEXT:-}|${HONCHO_CONTEXT_TOKENS-unset}|${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-}"
 [[ $_ctx == '||||unset|' ]] || printf 'context-env %s\n' "$_ctx" >> "$MOCK_LOG"
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
+[[ -z ${STRATA_MESSAGE_CACHE:-} ]] || printf 'strata-message-cache %s\n' "$STRATA_MESSAGE_CACHE" >> "$MOCK_LOG"
+[[ -z ${MEMORY_MB:-} ]] || printf 'memory-env %s\n' "$MEMORY_MB" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != opencode ]] ||
   printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != deepseek-harness ]] ||
@@ -1060,6 +1062,21 @@ assert_contains "offers the alternate template at the prompt" \
   local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$(cat "$_out")"
 assert_eq "accepts the alternate template location" \
   local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst "$STRATA_TEMPLATE"
+assert_eq "Strata's CT RAM defaults to the provisioner's 64 GiB" 65536 "$STRATA_MEMORY_MB"
+_meminfo="$(mktemp)"; printf 'MemTotal:       98304000 kB\nMemFree:        1 kB\n' > "$_meminfo"
+unset STRATA_MEMORY_MB
+HOST_MEMINFO="$_meminfo" prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n\n8192\n90112\n'
+assert_contains "the host's RAM is shown" "This host has 96000 MiB" "$(cat "$_out")"
+assert_contains "and what the models need" "about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S" "$(cat "$_out")"
+assert_contains "less than 32768 MiB is asked again" "Not a valid value: '8192'" "$(cat "$_out")"
+assert_eq "the chosen RAM is kept" 90112 "$STRATA_MEMORY_MB"
+assert_not_contains "within the host, no warning" "WARNING" "$(cat "$_out")"
+HOST_MEMINFO="$_meminfo" prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n\n131072\n'
+assert_contains "more than the host has is flagged" "131072 MiB is more than this host's 96000 MiB" "$(cat "$_out")"
+STRATA_MEMORY_MB=90112
+HOST_MEMINFO="$_meminfo" prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\n\n\n'
+assert_eq "a preset is the default" 90112 "$STRATA_MEMORY_MB"
+unset STRATA_MEMORY_MB
 TARGETS=avalon; AVALON_CT_ID=932; AVALON_IP_CIDR=192.0.2.94/24; AVALON_STORAGE=router-store; AVALON_TEMPLATE=""
 prompt_target_settings > "$_out" 2>&1 <<< $'\n\n\nlocal:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst\n\n'
 assert_contains "a Debian template is refused for Avalon" "Not a valid value: 'local:vztmpl/debian-13" "$(cat "$_out")"
@@ -1391,6 +1408,45 @@ assert_ok "q4_0" valid_strata_kv q4_0
 assert_fail "an unknown cache" valid_strata_kv q8
 assert_fail "empty" valid_strata_kv ""
 
+describe strata_model_ram_gb
+assert_eq "IQ2_XS counts 48 GB" 48 "$(strata_model_ram_gb IQ2_XS)"
+assert_eq "IQ3_XXS 60" 60 "$(strata_model_ram_gb IQ3_XXS)"
+assert_eq "IQ3_S 62" 62 "$(strata_model_ram_gb IQ3_S)"
+assert_eq "the Coder 32" 32 "$(strata_model_ram_gb IQ1_M)"
+assert_eq "an Unsloth size 48" 48 "$(strata_model_ram_gb UD-Q4_K_XL)"
+assert_eq "an unknown model, nothing" "" "$(strata_model_ram_gb Q9_X)"
+
+describe strata_target_model
+assert_eq "the default family's model" IQ2_XS "$(unset STRATA_FAMILY STRATA_MODEL; strata_target_model)"
+assert_eq "the Coder's" IQ1_M "$(unset STRATA_MODEL; STRATA_FAMILY=coder strata_target_model)"
+assert_eq "Unsloth's" UD-IQ4_XS "$(unset STRATA_MODEL; STRATA_FAMILY=unsloth strata_target_model)"
+assert_eq "a preset model" IQ3_S "$(STRATA_MODEL=IQ3_S strata_target_model)"
+
+describe strata_ct_memory_mib
+assert_eq "the provisioner's default CT memory" 65536 "$(unset STRATA_MEMORY_MB; strata_ct_memory_mib)"
+assert_eq "the RAM chosen for Strata's CT" 90112 "$(STRATA_MEMORY_MB=90112 strata_ct_memory_mib)"
+
+describe valid_strata_memory_mb
+assert_ok "64 GiB" valid_strata_memory_mb 65536
+assert_ok "the provisioner's minimum" valid_strata_memory_mb 32768
+assert_fail "less than 32768" valid_strata_memory_mb 16384
+assert_fail "not a number" valid_strata_memory_mb 88G
+assert_fail "empty" valid_strata_memory_mb ""
+
+describe host_memory_mib
+_meminfo="$(mktemp)"; printf 'MemTotal:       98304000 kB\n' > "$_meminfo"
+assert_eq "MemTotal in MiB" 96000 "$(HOST_MEMINFO="$_meminfo" host_memory_mib)"
+assert_eq "nothing when it cannot be read" "" "$(HOST_MEMINFO=/nonexistent host_memory_mib)"
+
+describe strata_kv_streams
+assert_ok "IQ2_XS at 64K in 64 GiB" strata_kv_streams 65536 IQ2_XS 65536
+assert_fail "never below 64K" strata_kv_streams 32768 IQ2_XS 131072
+assert_ok "IQ3_S at 256K in 88 GiB" strata_kv_streams 262144 IQ3_S 90112
+assert_fail "but not in 64 GiB (62 + 3.6 + 1 GB)" strata_kv_streams 262144 IQ3_S 65536
+assert_fail "IQ3_XXS at 128K in 60 GiB stays on the GPU" strata_kv_streams 131072 IQ3_XXS 61440
+assert_fail "an unknown model" strata_kv_streams 262144 Q9_X 131072
+assert_fail "no context" strata_kv_streams "" IQ2_XS 65536
+
 describe strata_kv_recommendation
 assert_eq "a 12 GB card takes k8v4" k8v4 "$(strata_kv_recommendation 12282 | cut -d'|' -f1)"
 assert_eq "a 16 GB card takes k8v4" k8v4 "$(strata_kv_recommendation 16311 | cut -d'|' -f1)"
@@ -1398,20 +1454,41 @@ assert_eq "a 24 GB card takes int8" int8 "$(strata_kv_recommendation 24564 | cut
 assert_eq "a 32 GB card takes int8" int8 "$(strata_kv_recommendation 32607 | cut -d'|' -f1)"
 assert_eq "an unknown card takes Strata's default" "int8|its GPU's memory is not known yet; int8 is Strata's default" "$(strata_kv_recommendation "")"
 assert_contains "the reason names the card's memory" "its 16311 MiB GPU" "$(strata_kv_recommendation 16311)"
+assert_eq "below 64K a 16 GB card still takes k8v4" k8v4 "$(strata_kv_recommendation 16311 32768 IQ2_XS 65536 | cut -d'|' -f1)"
+assert_eq "a cache kept in RAM takes int8 on a 16 GB card" \
+  "int8|at this context the cache is kept in the CT's RAM with only a 32K window on the GPU" \
+  "$(strata_kv_recommendation 16311 262144 IQ3_S 90112)"
+assert_eq "a cache that does not fit in RAM goes by the card" k8v4 "$(strata_kv_recommendation 16311 131072 IQ3_XXS 61440 | cut -d'|' -f1)"
 
 describe prompt_strata_kv_cache
 HOST_GPU_CARDS=""
-unset STRATA_KV STRATA_CONTEXT
+unset STRATA_KV STRATA_CONTEXT STRATA_MODEL STRATA_FAMILY
 _out="$(mktemp)"
 TARGETS="ollama hermes"
 assert_eq "no Strata, nothing asked" "" "$(prompt_strata_kv_cache)"
 TARGETS="strata hermes"
 nvidia-smi() { printf '00000000:01:00.0, 16311\n'; }
+STRATA_CONTEXT=32768
 prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
 assert_eq "Enter takes the 16 GB card's suggestion" k8v4 "$STRATA_KV"
 assert_contains "the suggestion names its card" "strata: k8v4 recommended (its 16311 MiB GPU" "$(cat "$_out")"
-assert_contains "the sizes are explained" "Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards." "$(cat "$_out")"
+assert_contains "the sizes are explained" "Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards;" "$(cat "$_out")"
+assert_contains "and when RAM decides" "int8 on any card when the cache fits in the CT's RAM (from a 64K context)." "$(cat "$_out")"
 unset STRATA_KV
+STRATA_CONTEXT=65536
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "at 64K the default IQ2_XS cache fits a 64 GiB CT: int8" int8 "$STRATA_KV"
+assert_contains "and says why" "the cache is kept in the CT's RAM" "$(cat "$_out")"
+unset STRATA_KV
+STRATA_MODEL=IQ3_S; STRATA_CONTEXT=262144
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "IQ3_S at 256K does not fit the 64 GiB CT: by the card" k8v4 "$STRATA_KV"
+unset STRATA_KV
+STRATA_MEMORY_MB=90112
+prompt_strata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "but fits an 88 GiB CT: int8" int8 "$STRATA_KV"
+unset STRATA_KV STRATA_MODEL STRATA_MEMORY_MB
+STRATA_CONTEXT=32768
 nvidia-smi() { printf '00000000:01:00.0, 24564\n'; }
 prompt_strata_kv_cache > "$_out" 2>&1 <<< $'q8\n\n'
 assert_contains "a bad answer is asked again" "Not a valid value: 'q8'" "$(cat "$_out")"
@@ -1431,6 +1508,26 @@ assert_eq "a window of 8192 or less asks nothing" "" "$(prompt_strata_kv_cache)"
 assert_eq "and chooses nothing" "" "${STRATA_KV:-}"
 unset -f nvidia-smi
 unset STRATA_KV STRATA_CONTEXT
+TARGETS=""
+
+describe prompt_strata_message_cache
+unset STRATA_MESSAGE_CACHE STRATA_CONTEXT
+TARGETS="ollama"
+assert_eq "no Strata, nothing asked" "" "$(prompt_strata_message_cache)"
+TARGETS="strata"
+prompt_strata_message_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "Enter keeps it off" false "$STRATA_MESSAGE_CACHE"
+assert_contains "it is explained" "an agent that rewrites its last message" "$(cat "$_out")"
+unset STRATA_MESSAGE_CACHE
+prompt_strata_message_cache > "$_out" 2>&1 <<< $'yes\ntrue\n'
+assert_contains "true/false only" "Not a valid value: 'yes'" "$(cat "$_out")"
+assert_eq "turned on" true "$STRATA_MESSAGE_CACHE"
+prompt_strata_message_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "a preset is the default" true "$STRATA_MESSAGE_CACHE"
+unset STRATA_MESSAGE_CACHE
+STRATA_CONTEXT=8192
+assert_eq "a window of 8192 or less asks nothing" "" "$(prompt_strata_message_cache)"
+unset STRATA_MESSAGE_CACHE STRATA_CONTEXT
 TARGETS=""
 
 describe run_target_provisioner
@@ -1543,10 +1640,26 @@ STRATA_KV=k8v4
 mock_reset_log
 run_target_provisioner strata
 assert_contains "Strata gets the KV cache chosen for it" "strata-kv k8v4" "$(mock_calls)"
+STRATA_MESSAGE_CACHE=true
+mock_reset_log
+run_target_provisioner strata
+assert_contains "and the message cache" "strata-message-cache true" "$(mock_calls)"
 mock_reset_log
 run_target_provisioner ollama
 assert_not_contains "another target does not" "strata-kv" "$(mock_calls)"
-unset STRATA_KV
+assert_not_contains "nor the message cache" "strata-message-cache" "$(mock_calls)"
+unset STRATA_KV STRATA_MESSAGE_CACHE
+STRATA_MEMORY_MB=90112
+mock_reset_log
+MEMORY_MB=4096 run_target_provisioner strata
+assert_contains "Strata's CT gets the RAM chosen for it" "memory-env 90112" "$(mock_calls)"
+mock_reset_log
+MEMORY_MB=4096 run_target_provisioner ollama
+assert_not_contains "another target gets neither it nor the router's" "memory-env" "$(mock_calls)"
+unset STRATA_MEMORY_MB
+mock_reset_log
+MEMORY_MB=4096 run_target_provisioner strata
+assert_not_contains "without a choice, the provisioner's default applies" "memory-env" "$(mock_calls)"
 mock_reset_log
 OLLAMA_CONTEXT_LENGTH=32768 run_target_provisioner ollama
 assert_contains "Ollama as its server default" "context-env 32768||||unset|" "$(mock_calls)"

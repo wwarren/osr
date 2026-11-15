@@ -44,14 +44,26 @@ checkout's `setup.sh --help` and:
 | `q4_0` | 4-bit / 4-bit | 45% smaller | measurably less precise on long documents |
 
 The provisioner (and the OSR installer when it creates Strata) asks for it and
-suggests one from the GPU's memory: `k8v4` for 12 and 16 GB cards, where each GB
-freed holds about 700 more of the model's experts on the GPU, and `int8` for 24
-and 32 GB cards or a card it cannot read. Unattended runs take the suggestion.
-Strata uses it above an 8192-token context (at 8192 or less it keeps a 16-bit
-cache, so nothing is asked). From a 64K context, when the CT's RAM allows,
-Strata keeps the cache in RAM with only a 32K-token window on the GPU, and the
-choice matters less. Change it on an existing CT with a rerun (setup, restart,
-rollback on failure):
+suggests one by Strata's own rule for where the cache lives:
+
+- From a 64K context, when the CT's RAM holds the model's RAM (32 GB for the
+  Coder, 48 for Q2_0, IQ2_XS and the Unsloth sizes, 60 for IQ3_XXS, 62 for
+  IQ3_S), the 8-bit cache (about 13.7 KB per token: 1.8 GB at 128K, 3.6 GB at
+  256K) and 1 GB more, Strata keeps the cache in RAM with only a 32K-token
+  window on the GPU. Then `int8`, on any card: the most precise cache costs the
+  GPU about 0.1 GB more than `k8v4`.
+- Otherwise the cache sits on the GPU, and the card decides: `k8v4` for 12 and
+  16 GB cards, where each GB freed holds about 700 more of the model's experts,
+  and `int8` for 24 and 32 GB cards or a card it cannot read.
+
+For example, IQ3_S at 256K in an 88 GiB CT gets `int8`, and IQ3_XXS at 128K
+in a 60 GiB CT on a 16 GB card gets `k8v4`. The provisioner uses `MEMORY_MB`;
+the OSR installer asks for the CT's RAM with its container settings
+(`STRATA_MEMORY_MB`, default 65536) and passes it on as `MEMORY_MB`, so the
+suggestion uses the RAM the CT gets. Unattended runs take the suggestion.
+Strata uses the setting above an 8192-token context (at 8192 or less it keeps a
+16-bit cache, so nothing is asked). Change it on an existing CT with a rerun
+(setup, restart, rollback on failure):
 
 ```bash
 pct exec <id> -- env STRATA_KV=k8v4 bash /root/strata-target-deploy/install-target.sh
@@ -60,6 +72,23 @@ pct exec <id> -- env STRATA_KV=k8v4 bash /root/strata-target-deploy/install-targ
 Installs from before this setting ran `int8` and keep it; their unchanged reruns
 still do nothing. Strata's setup prints `KV cache: 4-bit (Hadamard-rotated)` for
 `k8v4`, but writes `--kv k8v4`.
+
+### Message cache
+
+Strata keeps up to six conversation checkpoints by default (at each assistant
+turn, every 16K tokens, and the end of a system prompt of 2,048+ tokens), so
+each agent turn reads only what is new. An agent that rewrites its last message
+on a long history misses the last of them and makes Strata read the gap again.
+`STRATA_MESSAGE_CACHE=true` sets Strata's opt-in `STRATA_CACHE_MESSAGE_BOUNDARY=1`
+in the service environment (`/etc/strata-target/strata.env`): one more
+checkpoint before the last message of a prompt of 8,192+ tokens. Upstream
+measured the first edit of a long agent task 33% faster; a fresh long request
+costs about 0.2 s more, which is why it is off by default here too. Both
+prompts ask for it (default `false`); turn it on or off with a rerun:
+
+```bash
+pct exec <id> -- env STRATA_MESSAGE_CACHE=true bash /root/strata-target-deploy/install-target.sh
+```
 
 ## Requirements
 
@@ -193,7 +222,8 @@ Healthy unchanged reruns backfill a missing record.
 
 **Rollback.** A rerun fetches the source while the service runs (a failed
 fetch changes nothing) and does nothing if commit, settings (family, model,
-context, KV cache, vision, port, data dir, key), unit and health are unchanged.
+context, KV cache, message cache, vision, port, data dir, key), unit and health
+are unchanged.
 Otherwise it stops the service, snapshots the runnable checkout, venv,
 launcher and unit to the root-only `/var/lib/strata-target/` (a snapshot
 failure restarts the original), re-runs setup and health-checks. On failure it

@@ -83,7 +83,10 @@ STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen
 checkout's setup.sh lists, e.g. swift, coder, unsloth), STRATA_CONTEXT=65536,
 STRATA_KV=int8 (the KV cache: int8, k8v4 = 8-bit keys and 4-bit values, or
 q4_0; used above an 8192-token context; installs from before this setting keep
-int8), STRATA_VISION=no, STRATA_PORT=8080, STRATA_READY_TIMEOUT=900 (seconds),
+int8), STRATA_MESSAGE_CACHE=false (true: also checkpoint a long conversation
+before its last message, for agents that rewrite it; Strata's
+STRATA_CACHE_MESSAGE_BOUNDARY=1 in the service environment),
+STRATA_VISION=no, STRATA_PORT=8080, STRATA_READY_TIMEOUT=900 (seconds),
 STRATA_ALLOW_NO_KEY=false (true: accept a checkout without --api-key support).
 USAGE
 }
@@ -202,15 +205,17 @@ settings_fingerprint() {
     # Only a non-default cache adds a line: an install from before STRATA_KV
     # ran int8 and keeps its fingerprint, so an unchanged rerun stays a no-op.
     if [[ $STRATA_KV != int8 ]]; then printf 'kv=%s\n' "$STRATA_KV"; fi
+    if [[ $STRATA_MESSAGE_CACHE == true ]]; then printf 'message_cache=true\n'; fi
 }
 
 # The settings that decide how setup runs. save_settings records them after
 # every successful install or upgrade, so a failed upgrade can roll back to
 # what last worked rather than re-running setup with the settings that failed.
-SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_KV STRATA_VISION STRATA_PORT STRATA_ALLOW_NO_KEY)
+SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_KV STRATA_MESSAGE_CACHE STRATA_VISION STRATA_PORT
+              STRATA_ALLOW_NO_KEY)
 # Settings added after records existed, with the value those installs ran with.
 # A record without one of them is still complete.
-declare -gA SETTING_LEGACY_DEFAULTS=([STRATA_KV]=int8)
+declare -gA SETTING_LEGACY_DEFAULTS=([STRATA_KV]=int8 [STRATA_MESSAGE_CACHE]=false)
 
 # required_setting_keys: the settings every record must hold.
 required_setting_keys() {
@@ -227,6 +232,7 @@ validate_settings() {
     [[ $STRATA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STRATA_MODEL.'
     [[ $STRATA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid STRATA_CONTEXT.'
     [[ $STRATA_KV =~ ^(int8|k8v4|q4_0)$ ]] || die 'STRATA_KV must be int8, k8v4 or q4_0.'
+    [[ $STRATA_MESSAGE_CACHE =~ ^(true|false)$ ]] || die 'STRATA_MESSAGE_CACHE must be true or false.'
     [[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'Invalid STRATA_VISION.'
     [[ $STRATA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( STRATA_PORT <= 65535 )) || die 'Invalid STRATA_PORT.'
     [[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
@@ -264,9 +270,13 @@ load_settings() {
     for key in "${SETTING_KEYS[@]}"; do printf -v "$key" '%s' "${found[$key]}"; done
 }
 
-# start_env: the EnvironmentFile path the unit expands into ExecStart.
+# start_env: the unit's EnvironmentFile: the launcher path ExecStart expands,
+# and engine settings (the server passes its environment to the engine).
 start_env() {
     printf '# Written by install-target.sh for this Strata checkout; do not edit.\n'
+    # Opt-in upstream: one more checkpoint at the previous turn boundary of a
+    # prompt of 8192+ tokens, so a rewritten last message reuses the history.
+    if [[ ${STRATA_MESSAGE_CACHE:-false} == true ]]; then printf 'STRATA_CACHE_MESSAGE_BOUNDARY=1\n'; fi
     printf 'STRATA_RUN_SCRIPT=%s\n' "$run_script"
 }
 
@@ -277,6 +287,7 @@ fingerprint_env() {
         -e 's/^model=/STRATA_MODEL=/p' \
         -e 's/^context=/STRATA_CONTEXT=/p' \
         -e 's/^kv=/STRATA_KV=/p' \
+        -e 's/^message_cache=/STRATA_MESSAGE_CACHE=/p' \
         -e 's/^vision=/STRATA_VISION=/p' \
         -e 's/^port=/STRATA_PORT=/p' \
         -e 's/^allow_no_key=/STRATA_ALLOW_NO_KEY=/p' "$1"
@@ -674,7 +685,8 @@ do_install() {
         printf '+ bash setup.sh --setup --no-start --yes [--no-browser] [--family %s] --model %s [--context %s] [--kv %s] [--vision %s] --host 0.0.0.0 --port %s [--data-dir %s] --api-key [redacted]\n' \
             "$STRATA_FAMILY" "$STRATA_MODEL" "$STRATA_CONTEXT" "$STRATA_KV" "$STRATA_VISION" "$STRATA_PORT" "$STRATA_DATA_DIR"
         printf '+ if setup needs a local engine build: install NVIDIA CUDA toolkit as root (13.0 on Ubuntu/Debian 12, 13.1 on Debian 13), then retry setup once\n'
-        printf '+ verify setup generated run-<model>.sh; write %s/strata.env (STRATA_RUN_SCRIPT) and %s/strata.service\n' "$STRATA_ETC_DIR" "$UNIT_DIR"
+        printf '+ verify setup generated run-<model>.sh; write %s/strata.env (%sSTRATA_RUN_SCRIPT) and %s/strata.service\n' \
+            "$STRATA_ETC_DIR" "$( [[ $STRATA_MESSAGE_CACHE == true ]] && printf 'STRATA_CACHE_MESSAGE_BOUNDARY=1, ' )" "$UNIT_DIR"
         run systemctl enable strata.service
         run systemctl restart strata.service
         printf '+ wait for http://127.0.0.1:%s/health to report loaded=true (up to %ss)\n' "$STRATA_PORT" "$STRATA_READY_TIMEOUT"
@@ -880,6 +892,7 @@ case $STRATA_FAMILY in
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
 STRATA_KV=${STRATA_KV:-int8}
+STRATA_MESSAGE_CACHE=${STRATA_MESSAGE_CACHE:-false}
 STRATA_VISION=${STRATA_VISION:-no}
 STRATA_PORT=${STRATA_PORT:-8080}
 STRATA_READY_TIMEOUT=${STRATA_READY_TIMEOUT:-900}

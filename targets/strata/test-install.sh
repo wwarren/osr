@@ -62,7 +62,7 @@ for helper in help_has help_choices check_choice validate_setup_options setup_ar
               validate_settings settings_env load_settings fingerprint_env saved_settings; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
-STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_KV=int8 STRATA_VISION=no
+STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_KV=int8 STRATA_MESSAGE_CACHE=false STRATA_VISION=no
 STRATA_PORT=8080 STRATA_DATA_DIR=/var/lib/strata STRATA_ALLOW_NO_KEY=false
 
 SETUP_HELP=$(< "$help_documented")
@@ -157,7 +157,7 @@ pass 'an unnamed launcher falls back to the one setup just wrote, never a guess'
 # all-or-nothing, never sourced.
 STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_VISION=no STRATA_PORT=8080
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 7 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 8 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
 STRATA_MODEL=IQ3_S STRATA_PORT=11434
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $STRATA_MODEL == IQ2_XS && $STRATA_PORT == 8080 ]] || fail "record not restored: $STRATA_MODEL $STRATA_PORT"
@@ -187,6 +187,28 @@ load_settings <(fingerprint_env "$tmp_root/fingerprint-kv") || fail 'a fingerpri
 [[ $STRATA_KV == k8v4 ]] || fail "the fingerprint's cache was not read back: $STRATA_KV"
 STRATA_KV=int8
 pass 'records and fingerprints from before STRATA_KV mean int8'
+
+# The message cache: off in older records and fingerprints; when on, a
+# fingerprint line and the engine setting in the unit's environment file.
+grep -v '^STRATA_MESSAGE_CACHE=' "$tmp_root/installed-env" > "$tmp_root/legacy-env"
+STRATA_MESSAGE_CACHE=true
+load_settings "$tmp_root/legacy-env" || fail 'a record from before STRATA_MESSAGE_CACHE was not loaded'
+[[ $STRATA_MESSAGE_CACHE == false ]] || fail "a record from before STRATA_MESSAGE_CACHE is not false: $STRATA_MESSAGE_CACHE"
+[[ $(settings_fingerprint) != *message_cache* ]] || fail 'an off message cache changed the fingerprint'
+[[ $(start_env) != *STRATA_CACHE_MESSAGE_BOUNDARY* ]] || fail 'an off message cache reached the environment file'
+STRATA_MESSAGE_CACHE=true
+settings_fingerprint > "$tmp_root/fingerprint-mc"
+grep -qx 'message_cache=true' "$tmp_root/fingerprint-mc" || fail 'the message cache is not in the fingerprint'
+[[ $(start_env) == *$'\nSTRATA_CACHE_MESSAGE_BOUNDARY=1\n'* ]] || fail "environment file: $(start_env)"
+[[ $(start_env | tail -n1) == STRATA_RUN_SCRIPT=* ]] || fail 'the launcher is no longer the last line'
+STRATA_MESSAGE_CACHE=false
+load_settings <(fingerprint_env "$tmp_root/fingerprint-mc") || fail 'a fingerprint with message_cache= was not loaded'
+[[ $STRATA_MESSAGE_CACHE == true ]] || fail "the fingerprint's message cache was not read back"
+STRATA_MESSAGE_CACHE=yes
+out=$( (validate_settings) 2>&1 ) && fail 'a message cache other than true/false was accepted'
+[[ $out == *'STRATA_MESSAGE_CACHE must be true or false'* ]] || fail "message cache validation: $out"
+STRATA_MESSAGE_CACHE=false
+pass 'the message cache is off for older installs and reaches the engine environment when on'
 
 # Exercise the GPU access decision without root or Proxmox. A root-group node
 # is accepted only when the service user can actually read and write it.
@@ -466,9 +488,27 @@ contains '--kv int8' "$log"
 grep -q '^kv=' "$tree/etc/strata-target/installed-settings" && fail 'int8 left a kv line in the fingerprint'
 pass 'a KV cache change re-runs setup with --kv, is recorded and kept'
 
-# A record written before STRATA_KV existed (no STRATA_KV line) is int8: an
-# unchanged rerun does nothing.
-sed -i '/^STRATA_KV=/d' "$tree/etc/strata-target/installed-env"
+# The message cache: turning it on re-applies with the engine setting in the
+# unit's environment; turning it off again removes it.
+: > "$log"
+STRATA_MESSAGE_CACHE=true STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'message cache rerun'; }
+contains 'Re-applying Strata' "$tmp_root/out"
+contains 'STRATA_CACHE_MESSAGE_BOUNDARY=1' "$tree/etc/strata-target/strata.env"
+contains 'STRATA_MESSAGE_CACHE=true' "$tree/etc/strata-target/installed-env"
+: > "$log"
+STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'rerun keeping the message cache'; }
+contains 'nothing to do' "$tmp_root/out"
+: > "$log"
+STRATA_MESSAGE_CACHE=false STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'message cache off'; }
+grep -q 'STRATA_CACHE_MESSAGE_BOUNDARY' "$tree/etc/strata-target/strata.env" && fail 'the message cache stayed on'
+grep -q '^message_cache=' "$tree/etc/strata-target/installed-settings" && fail 'off left a message_cache line'
+pass 'the message cache is switched through the unit environment and recorded'
+
+# A record written before STRATA_KV and STRATA_MESSAGE_CACHE existed (neither
+# line) is int8 without the message cache: an unchanged rerun does nothing.
+sed -i -e '/^STRATA_KV=/d' -e '/^STRATA_MESSAGE_CACHE=/d' "$tree/etc/strata-target/installed-env"
 : > "$log"
 STRATA_PORT=11434 STRATA_COMMIT=$commit run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'legacy-record rerun'; }
 contains 'nothing to do' "$tmp_root/out"
