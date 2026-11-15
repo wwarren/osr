@@ -392,6 +392,31 @@ for name in "${TARGET_ORDER[@]}"; do
 done
 assert_ok "the router CT is tagged osr-router" grep -qE -- '-tags "([^"]*;)?osr-router(;[^"]*)?"' "$INSTALLER"
 
+# env/router.env says where things are; what the installer writes there must be
+# read by something, and the sample in the repository must show the same keys.
+describe env_settings
+template="$(sed -n '/^cat > "\${REPO_DIR}\/env\/router.env" <<EOF$/,/^EOF$/p' "$INSTALLER")"
+written="$(grep -oE '^[A-Z][A-Z0-9_]*=' <<< "$template" | tr -d '=')"
+sample="$(grep -oE '^[A-Z][A-Z0-9_]*=' "${ROOT}/env/router.env" | tr -d '=')"
+assert_ok "the installer's router.env template is found" test -n "$written"
+assert_eq "the sample env/router.env has the installer's keys, in its order" "$written" "$sample"
+readers=("${ROOT}/services/ollama-router/router.py" "${ROOT}/services/ollama-monitor/monitor.py"
+         "${ROOT}/install/manage-model-servers.sh")
+for key in $written KEEP_ALIVE_REFRESH_SECONDS; do
+  case $key in
+    CLOUD_*_MODELS) pattern='CLOUD_[{%]' ;;     # read by name pattern, per provider
+    *) pattern="\\b${key}\\b" ;;
+  esac
+  assert_ok "${key} is read by the router, the monitor or the manager" grep -Eq "$pattern" "${readers[@]}"
+done
+for key in LITELLM_HEALTH_URL LITELLM_URL MODEL_SERVER_COUNT MONITOR_INTERVAL_SECONDS; do
+  assert_not_contains "the installer no longer writes ${key}" "${key}=" "$template"
+done
+assert_fail "a comment in the template cannot expand anything" grep -Eq '^#.*[$`]' <<< "$template"
+for name in $(sed -n '/^ENV_OVERRIDES = (/,/^)/p' "${ROOT}/services/ollama-monitor/monitor.py" | grep -oE '"(MONITOR|KEEP)_[A-Z_]+"' | tr -d '"'); do
+  assert_ok "README names the monitor override ${name}" grep -q "$name" "${ROOT}/README.md"
+done
+
 describe router_requirements
 req="${ROOT}/services/ollama-router/requirements.txt"
 for package in fastapi uvicorn httpx uvloop httptools; do
@@ -434,5 +459,39 @@ for name in $companions; do
 done
 count="$(grep -o ',' <<< "${listed#, }" | wc -l)"
 assert_eq "and no target that is not a companion" "$(wc -w <<< "$companions" | tr -d ' ')" "$count"
+
+describe router_metrics_stack
+metrics_setup="${ROOT}/install/setup-metrics.sh"
+assert_ok "metrics setup is valid bash" bash -n "$metrics_setup"
+assert_file_contains "Prometheus uses a protected router key" 'credentials_file: ${KEY_FILE}' "$metrics_setup"
+assert_file_contains "Prometheus only listens on loopback" '--web.listen-address=127.0.0.1:9090' "$metrics_setup"
+assert_file_contains "the package Prometheus listener is masked" 'systemctl mask prometheus.service' "$metrics_setup"
+assert_file_contains "metrics storage has a size limit" '--storage.tsdb.retention.size=512MB' "$metrics_setup"
+assert_file_contains "Grafana does not allow anonymous access" 'GF_AUTH_ANONYMOUS_ENABLED=false' "$metrics_setup"
+assert_file_contains "apply refreshes the Prometheus key" 'setup-metrics.sh" sync-key' "${ROOT}/install/manage-model-servers.sh"
+assert_ok "Prometheus is installed without its recommended node exporter" \
+  grep -q 'apt-get install -y --no-install-recommends ca-certificates wget prometheus' "$metrics_setup"
+assert_file_contains "the installer can leave the metrics stack out" 'INSTALL_METRICS' "$INSTALLER"
+assert_ok "the firewall rule for Grafana cannot undo a finished install" bash -c \
+  "[[ \$(grep -n -- '-dport 3000 -log nolog' '$INSTALLER' | head -1 | cut -d: -f1) -gt \$(grep -n '^trap - ERR' '$INSTALLER' | tail -1 | cut -d: -f1) ]]"
+assert_file_contains "the installer opens Grafana to the trusted CIDR" '-dport 3000 -log nolog' "$INSTALLER"
+assert_ok "provisioned dashboard is valid JSON with all metric families" python3 - "$metrics_setup" <<'PY'
+import json
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert source.index("EnvironmentFile=/etc/grafana/osr.env") < source.index('apt-get install -y "grafana')
+assert source.index("systemctl mask prometheus.service") < source.index("apt-get install -y --no-install-recommends ca-certificates wget prometheus")
+marker = "cat > \"${FS}/etc/grafana/osr-dashboards/router.json\" <<'EOF'\n"
+dashboard = json.loads(source.split(marker, 1)[1].split("\nEOF", 1)[0])
+expressions = "\n".join(target["expr"] for panel in dashboard["panels"]
+                   for target in panel["targets"])
+for name in ("osr_requests_total", "osr_upstream_failures_total",
+             "osr_response_start_seconds_bucket", "osr_request_duration_seconds_bucket",
+             "osr_in_flight_requests", "osr_server_up", "osr_server_models"):
+    assert name in expressions, name
+assert dashboard["uid"] == "osr-router"
+PY
 
 summary

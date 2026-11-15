@@ -46,6 +46,7 @@ add_suite() {
 }
 add_suite repo          shell "${HERE}/test-repo.sh"
 add_suite cloud-config  shell "${HERE}/test-cloud-config.sh"
+add_suite metrics-setup shell "${HERE}/test-metrics-setup.sh"
 add_suite nvidia        shell "${HERE}/test-nvidia.sh"
 add_suite host-gpu      shell "${HERE}/test-host-gpu.sh"
 add_suite gpu-drivers   shell "${HERE}/test-gpu-drivers.sh"

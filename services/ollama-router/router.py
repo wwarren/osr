@@ -1,5 +1,6 @@
 import asyncio
 import configparser
+import contextvars
 import hashlib
 import hmac
 import ipaddress
@@ -7,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -24,6 +26,106 @@ logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
 log = logging.getLogger("router")
 # httpx logs every request at INFO; the router logs its own decisions instead.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# --- request IDs ---------------------------------------------------------------
+# Every request has an ID: the caller's X-Request-ID when it sends a plain one,
+# else a new one. It is returned as X-Router-Request-ID (and as X-Request-ID
+# unless the upstream answer already carries its own), sent upstream as
+# X-Request-ID, and put in front of every line the router logs for the request,
+# so one grep finds the routing decision, the failovers and the backend's side.
+_REQUEST_ID = contextvars.ContextVar("osr_request_id", default="")
+_REQUEST_ID_OK = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+def request_id() -> str:
+    """The ID of the request being handled, or "" outside one (discovery)."""
+    return _REQUEST_ID.get()
+
+
+def accept_request_id(supplied) -> str:
+    """A caller's X-Request-ID when it is a plain token of up to 64 characters;
+    otherwise (none, too long, or with characters that could confuse a log or a
+    header) a new random one."""
+    if supplied and _REQUEST_ID_OK.fullmatch(supplied):
+        return supplied
+    return secrets.token_hex(8)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        current = _REQUEST_ID.get()
+        if current:
+            record.msg = "[%s] %s" % (current, record.msg)
+        return True
+
+
+# The logger outlives a reload of this module (the tests load it many times).
+log.filters[:] = [f for f in log.filters if type(f).__name__ != "_RequestIdFilter"]
+log.addFilter(_RequestIdFilter())
+
+# --- metrics ---------------------------------------------------------------------
+# Counters and histograms behind GET /metrics, in Prometheus text format, kept
+# in this process (they start again at zero with the router). Label values come
+# from the router's own configuration and inventory (servers, models, classes,
+# statuses), never from what a client sent, so the number of series is bounded.
+_STARTED = time.time()
+_COUNTERS = {}      # (name, ((label, value), ...)) -> count
+_HISTOGRAMS = {}    # (name, ((label, value), ...)) -> [per-bucket counts..., sum, count]
+DURATION_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+METRIC_SERIES_MAX = 5000   # a last guard; never reached with bounded labels
+METRICS = {
+    "osr_requests_total": ("counter", "Requests answered, by route (chat, v1, routing), "
+                           "how they were served and the HTTP status returned."),
+    "osr_upstream_failures_total": ("counter", "Attempts on a model server that failed, by reason: "
+                                    "connect, transport, no_reply, http_<status>, tool_rejection."),
+    "osr_response_start_seconds": ("histogram", "Chat requests answered below 400: seconds from "
+                                   "arrival until the response headers were sent (model load and "
+                                   "prompt processing included, where the server waits for them)."),
+    "osr_request_duration_seconds": ("histogram", "Chat requests answered below 400: seconds from "
+                                     "arrival until the last byte of the body was sent."),
+    "osr_in_flight_requests": ("gauge", "Requests this router has in flight on a model server."),
+    "osr_server_up": ("gauge", "1 when the last discovery poll (or dispatch) found the server up, else 0."),
+    "osr_server_models": ("gauge", "Models the server listed at the last discovery poll."),
+    "osr_inventory_age_seconds": ("gauge", "Seconds since the inventory was last refreshed."),
+    "osr_remembered_conversations": ("gauge", "Conversations whose last server is remembered (affinity)."),
+    "osr_start_time_seconds": ("gauge", "Unix time at which this router process started."),
+}
+
+
+def count(name: str, **labels) -> None:
+    """Add one to a counter."""
+    key = (name, tuple(sorted(labels.items())))
+    if key in _COUNTERS or len(_COUNTERS) < METRIC_SERIES_MAX:
+        _COUNTERS[key] = _COUNTERS.get(key, 0) + 1
+
+
+def observe(name: str, seconds: float, **labels) -> None:
+    """Record one duration in a histogram."""
+    key = (name, tuple(sorted(labels.items())))
+    series = _HISTOGRAMS.get(key)
+    if series is None:
+        if len(_HISTOGRAMS) >= METRIC_SERIES_MAX:
+            return
+        series = _HISTOGRAMS[key] = [0] * len(DURATION_BUCKETS) + [0.0, 0]
+    for index, bound in enumerate(DURATION_BUCKETS):
+        if seconds <= bound:
+            series[index] += 1
+            break
+    series[-2] += seconds
+    series[-1] += 1
+
+
+def _label_text(labels, extra: str = "") -> str:
+    """{a="b",...} for a series, values escaped as the text format requires."""
+    parts = ['%s="%s"' % (name, str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n"))
+             for name, value in labels]
+    if extra:
+        parts.append(extra)
+    return "{%s}" % ",".join(parts) if parts else ""
+
+
+def _number(value) -> str:
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
 
 # The router is a drop-in OpenAI endpoint in front of the LiteLLM proxy.
 # /v1/chat/completions has its model chosen by complexity analysis; every other
@@ -1139,7 +1241,76 @@ class RouterKeyMiddleware:
         await self.app(scope, receive, send)
 
 
+def _metrics_route(path: str) -> str:
+    """Which family of requests a path belongs to in osr_requests_total; ""
+    for the ones not counted (/healthz and /metrics are polled by machines)."""
+    if path == "/v1/chat/completions":
+        return "chat"
+    if path.startswith("/v1/"):
+        return "v1"
+    if path.startswith("/routing/"):
+        return "routing"
+    return ""
+
+
+class RequestMiddleware:
+    """Gives each request its ID and counts and times it for /metrics.
+
+    Plain ASGI, like the key check: the only thing put between the application
+    and the server is one function call per message sent. The labels are read
+    from the X-Router-* headers the router itself puts on an answer."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        current = accept_request_id(Headers(scope=scope).get("x-request-id"))
+        token = _REQUEST_ID.set(current)
+        route = _metrics_route(scope["path"])
+        started = time.monotonic()
+        timed = {}
+
+        async def send_with_id(message):
+            kind = message["type"]
+            record_start = record_duration = False
+            if kind == "http.response.start":
+                headers = list(message.get("headers") or [])
+                given = {name.lower(): value for name, value in headers}
+                headers.append((b"x-router-request-id", current.encode("ascii")))
+                if b"x-request-id" not in given:
+                    headers.append((b"x-request-id", current.encode("ascii")))
+                message = dict(message, headers=headers)
+                if route:
+                    labels = {label: given.get(b"x-router-" + label.encode(), b"").decode("latin-1")
+                              for label in ("mode", "model", "server")}
+                    count("osr_requests_total", route=route, status=str(message["status"]),
+                          **{"class": given.get(b"x-router-class", b"").decode("latin-1")}, **labels)
+                    if route == "chat" and message["status"] < 400:
+                        timed.update(labels)
+                        record_start = True
+            elif kind == "http.response.body" and timed and not message.get("more_body"):
+                record_duration = True
+            await send(message)
+            # ASGI send completion is the closest available point to headers
+            # and the final body reaching the server's output transport.
+            if record_start:
+                observe("osr_response_start_seconds", time.monotonic() - started, **timed)
+            if record_duration:
+                observe("osr_request_duration_seconds", time.monotonic() - started, **timed)
+                timed.clear()
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            _REQUEST_ID.reset(token)
+
+
 app.add_middleware(RouterKeyMiddleware)
+# Added last, so it is outermost: a refused request has an ID and is counted too.
+app.add_middleware(RequestMiddleware)
 
 
 # --- request analysis ---------------------------------------------------------
@@ -1462,11 +1633,15 @@ def known_chat_model(model_name: str) -> bool:
 # --- proxying -----------------------------------------------------------------
 def _forward_headers(request: Request, drop_auth: bool = False) -> dict:
     """Request headers to send upstream. drop_auth strips Authorization, so the
-    router's own API key is never handed to an Ollama host."""
-    return {k: v for k, v in request.headers.items()
-            if k.lower() not in HOP_BY_HOP
-            and k.lower() not in ("x-router-api-key", "x-router-subscription")
-            and not (drop_auth and k.lower() == "authorization")}
+    router's own API key is never handed to an Ollama host. The request's ID
+    goes along as X-Request-ID (the caller's own, when the router adopted it)."""
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in HOP_BY_HOP
+               and k.lower() not in ("x-router-api-key", "x-router-subscription", "x-request-id")
+               and not (drop_auth and k.lower() == "authorization")}
+    if request_id():
+        headers["X-Request-ID"] = request_id()
+    return headers
 
 
 async def _proxy_subscription(request: Request) -> Response:
@@ -1484,7 +1659,10 @@ async def _proxy_subscription(request: Request) -> Response:
 
 def _response_headers(upstream: httpx.Response, extra: dict = None) -> dict:
     headers = {k: v for k, v in upstream.headers.items()
-               if k.lower() not in RESPONSE_HOP_BY_HOP}
+               if k.lower() not in RESPONSE_HOP_BY_HOP
+               and not k.lower().startswith("x-router-")}
+    # Only this router may set X-Router-* response headers. Metrics use them
+    # as labels, so forwarding an upstream value could create unbounded series.
     if extra:
         headers.update(extra)
     return headers
@@ -1686,6 +1864,10 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
     last_error = None
     no_reply = kindi_was_busy = False
     encoded: dict = {}
+
+    def failed(entry: dict, reason: str) -> None:
+        count("osr_upstream_failures_total", server=entry["server"], reason=reason)
+
     if not any(key.lower() == "content-type" for key in headers):
         headers = dict(headers, **{"Content-Type": "application/json"})
     for position, entry in enumerate(candidates):
@@ -1712,6 +1894,7 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 upstream_response = await client.send(upstream_request, stream=True)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                failed(entry, "connect")
                 mark_server_down(entry["server"], last_error)
                 continue
             except httpx.RequestError as exc:
@@ -1719,12 +1902,18 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 if entry["kind"] == "kindi" and isinstance(exc, httpx.ReadTimeout):
                     # Sent, but no reply: Kindi may still be working on it.
                     no_reply = True
+                    failed(entry, "no_reply")
                     mark_kindi_draining(entry["server"])
                     log.warning("dispatch: Kindi %s sent no reply; not sending it again", entry["server"])
                     continue
+                failed(entry, "transport")
                 log.warning("dispatch: %s", last_error)
                 continue
             is_last = position == len(candidates) - 1
+            if upstream_response.status_code in RETRYABLE_STATUS:
+                # Counted whether another candidate follows or this answer is
+                # passed on as it is.
+                failed(entry, f"http_{upstream_response.status_code}")
             if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
                 await upstream_response.aclose()
                 last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
@@ -1735,6 +1924,8 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 # A later error must not turn an unanswered Kindi POST into a
                 # response that makes clients replay the whole call.
                 last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+                if upstream_response.status_code not in RETRYABLE_STATUS:
+                    failed(entry, f"http_{upstream_response.status_code}")
                 await upstream_response.aclose()
                 continue
             buffered = None
@@ -1748,6 +1939,7 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                     # (which rebuilds the entry) instead of failing every turn.
                     # The last candidate is remembered too; its 400 is returned.
                     entry["tools"] = False
+                    failed(entry, "tool_rejection")
                     last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
                     if not is_last:
                         log.warning("dispatch: %s; trying the next candidate", last_error)
@@ -1770,11 +1962,13 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 except httpx.ReadTimeout as exc:
                     last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
                     no_reply = True
+                    failed(entry, "no_reply")
                     mark_kindi_draining(entry["server"])
                     await upstream_response.aclose()
                     continue
                 except httpx.RequestError as exc:
                     last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                    failed(entry, "transport")
                     mark_server_down(entry["server"], last_error)
                     await upstream_response.aclose()
                     continue
@@ -1841,6 +2035,53 @@ async def routing_inventory():
         # with the budget their CT was configured for.
         "kindi_read_timeout_seconds": KINDI_READ_TIMEOUT,
     })
+
+
+def render_metrics() -> str:
+    """Everything /metrics reports, in Prometheus text format (version 0.0.4)."""
+    servers = INVENTORY.get("servers", {})
+    known = list(dict.fromkeys([*SERVERS, *servers, *_IN_FLIGHT]))
+    gauges = {
+        "osr_in_flight_requests": [((("server", s),), _IN_FLIGHT.get(s, 0)) for s in known],
+        "osr_server_up": [((("kind", server_kind(s)), ("server", s)), 1 if state.get("up") else 0)
+                          for s, state in servers.items()],
+        "osr_server_models": [((("server", s),), state.get("model_count", 0))
+                              for s, state in servers.items()],
+        "osr_inventory_age_seconds": ([((), round(time.time() - INVENTORY["updated_at"], 3))]
+                                      if INVENTORY.get("updated_at") else []),
+        "osr_remembered_conversations": [((), len(_STICKY))],
+        "osr_start_time_seconds": [((), round(_STARTED, 3))],
+    }
+    lines = []
+    for name, (kind, text) in METRICS.items():
+        lines.append(f"# HELP {name} {text}")
+        lines.append(f"# TYPE {name} {kind}")
+        if kind == "counter":
+            lines += [f"{name}{_label_text(labels)} {_number(value)}"
+                      for (metric, labels), value in sorted(_COUNTERS.items()) if metric == name]
+        elif kind == "gauge":
+            lines += [f"{name}{_label_text(labels)} {_number(value)}" for labels, value in gauges[name]]
+        else:
+            for (metric, labels), series in sorted(_HISTOGRAMS.items()):
+                if metric != name:
+                    continue
+                running = 0
+                for bound, hits in zip(DURATION_BUCKETS, series, strict=False):
+                    running += hits
+                    upper = 'le="%s"' % _number(bound)
+                    lines.append(f"{name}_bucket{_label_text(labels, upper)} {running}")
+                upper = 'le="+Inf"'
+                lines.append(f"{name}_bucket{_label_text(labels, upper)} {series[-1]}")
+                lines.append(f"{name}_sum{_label_text(labels)} {repr(float(series[-2]))}")
+                lines.append(f"{name}_count{_label_text(labels)} {series[-1]}")
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics. Like every path but /healthz it needs the router key:
+    the labels name the model servers and models."""
+    return Response(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.post("/routing/refresh")

@@ -111,6 +111,11 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"
 # The Gitea and Mattermost services are targets too (targets/gitea,
 # targets/mattermost); true pre-selects them in the targets menu below.
 INSTALL_GITEA="${INSTALL_GITEA:-false}"
+# Prometheus and Grafana in the router CT (install/setup-metrics.sh): a local
+# dashboard of the router's /metrics. true (default) tries to install them,
+# which needs Debian's and Grafana's package repositories; a failure leaves the
+# router running. false leaves them out; add them later with that script.
+INSTALL_METRICS="${INSTALL_METRICS:-true}"
 INSTALL_MATTERMOST="${INSTALL_MATTERMOST:-false}"
 # Optional targets from targets/ (the Gitea and Mattermost services, model
 # servers, Honcho memory, the Hermes / OpenClaw / DeepSeek / OpenCode agents and the Open Terminal /
@@ -200,6 +205,7 @@ INSTALLER_OWNED_CODE=(
   services/open-webui/open-webui.service
   install/apply-config.sh
   install/manage-model-servers.sh
+  install/setup-metrics.sh
 )
 # Repo owner: discovered from the deploy token at runtime; this is the fallback.
 GITEA_OWNER="${GITEA_ADMIN_USER}"
@@ -3470,7 +3476,16 @@ mkdir -p \
 # --- env/router.env ---
 # Shared by the router, litellm-proxy and monitor units (they run from one venv).
 # Backend URLs are per-tier so the monitor can probe each Ollama box directly.
+# Every key written here is read by the router, the monitor or
+# manage-model-servers (tests/test-repo.sh checks that, and that env/router.env
+# in the repository shows the same keys). How the services behave is tuned in
+# router.ini and monitor.ini, not here.
 cat > "${REPO_DIR}/env/router.env" <<EOF
+# Where things are, for the router, LiteLLM and the monitor. How they behave
+# is tuned in services/ollama-router/router.ini and
+# services/ollama-monitor/monitor.ini. No secrets: tokens, the webhook and keys
+# live in /app/router/secrets.env (see manage-model-servers set-token,
+# set-webhook, set-api-key, set-cloud-key).
 GITEA_SERVER_URL=${GITEA_SERVER_URL}
 GITEA_ADMIN_USER=${GITEA_ADMIN_USER}
 GITEA_VERIFY_TLS=${GITEA_VERIFY_TLS}
@@ -3478,24 +3493,37 @@ MATTERMOST_MONITOR_USER=${MATTERMOST_MONITOR_USER}
 MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL}
 MATTERMOST_VERIFY_TLS=${MATTERMOST_VERIFY_TLS}
 LITELLM_BASE_URL=http://127.0.0.1:4000
-LITELLM_URL=http://127.0.0.1:4000/v1/chat/completions
-LITELLM_HEALTH_URL=http://127.0.0.1:4000/health
+# Explicit cloud models (provider model IDs, comma-separated), set with
+# manage-model-servers set-cloud-models. Empty keeps a provider off; cloud
+# models are never chosen by auto routing.
+CLOUD_OPENAI_MODELS=
+CLOUD_ANTHROPIC_MODELS=
+CLOUD_GEMINI_MODELS=
+# Optional separate LiteLLM gateway for signed-in Codex and Claude Code
+# clients: its root URL (HTTPS, or loopback HTTP).
+SUBSCRIPTION_GATEWAY_BASE_URL=
+# Model servers, and which of them serves each tier (manage-model-servers
+# add, remove, set-tier, set-model).
 BACKEND_FAST=$(indices_to_urls "$TIER_FAST_IDX")
 BACKEND_MEDIUM=$(indices_to_urls "$TIER_MEDIUM_IDX")
 BACKEND_LARGE=$(indices_to_urls "$TIER_LARGE_IDX")
 BACKEND_XLARGE=$(indices_to_urls "$TIER_XLARGE_IDX")
-MODEL_SERVER_COUNT=${MODEL_SERVER_COUNT}
 MODEL_SERVERS=$(IFS=,; printf '%s' "${MODEL_SERVERS[*]}")
 MODEL_FAST=${MODEL_FAST}
 MODEL_MEDIUM=${MODEL_MEDIUM}
 MODEL_LARGE=${MODEL_LARGE}
 MODEL_XLARGE=${MODEL_XLARGE}
+# How long Ollama keeps a model loaded (manage-model-servers set-keepalive).
 OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
-KEEP_ALIVE_REFRESH_SECONDS=${KEEP_ALIVE_REFRESH_SECONDS}
 TORCH_CPU_ONLY=${TORCH_CPU_ONLY}
-MONITOR_INTERVAL_SECONDS=15
 OPENWEBUI_HEALTH_URL=http://127.0.0.1:${OPENWEBUI_PORT}/health
 EOF
+# The monitor's settings live in monitor.ini. A keep-alive refresh asked for at
+# install is the one exception: it is written as an override, since monitor.ini
+# is seeded as it stands. The default is left to the file.
+if [[ "$KEEP_ALIVE_REFRESH_SECONDS" != "240" ]]; then
+  printf 'KEEP_ALIVE_REFRESH_SECONDS=%s\n' "$KEEP_ALIVE_REFRESH_SECONDS" >> "${REPO_DIR}/env/router.env"
+fi
 # --- secrets.env (NOT part of the repo tree) ---
 # The deploy token and the webhook URL (whose path is itself a credential) never
 # enter the config repo. They are pushed straight into the container as
@@ -3518,6 +3546,7 @@ unset GITEA_DEPLOY_TOKEN
 cat > "${REPO_DIR}/services/ollama-router/router.py" <<'PYEOF'
 import asyncio
 import configparser
+import contextvars
 import hashlib
 import hmac
 import ipaddress
@@ -3525,6 +3554,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -3542,6 +3572,106 @@ logging.basicConfig(level=os.getenv("ROUTER_LOG_LEVEL", "INFO").upper(),
 log = logging.getLogger("router")
 # httpx logs every request at INFO; the router logs its own decisions instead.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# --- request IDs ---------------------------------------------------------------
+# Every request has an ID: the caller's X-Request-ID when it sends a plain one,
+# else a new one. It is returned as X-Router-Request-ID (and as X-Request-ID
+# unless the upstream answer already carries its own), sent upstream as
+# X-Request-ID, and put in front of every line the router logs for the request,
+# so one grep finds the routing decision, the failovers and the backend's side.
+_REQUEST_ID = contextvars.ContextVar("osr_request_id", default="")
+_REQUEST_ID_OK = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+def request_id() -> str:
+    """The ID of the request being handled, or "" outside one (discovery)."""
+    return _REQUEST_ID.get()
+
+
+def accept_request_id(supplied) -> str:
+    """A caller's X-Request-ID when it is a plain token of up to 64 characters;
+    otherwise (none, too long, or with characters that could confuse a log or a
+    header) a new random one."""
+    if supplied and _REQUEST_ID_OK.fullmatch(supplied):
+        return supplied
+    return secrets.token_hex(8)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        current = _REQUEST_ID.get()
+        if current:
+            record.msg = "[%s] %s" % (current, record.msg)
+        return True
+
+
+# The logger outlives a reload of this module (the tests load it many times).
+log.filters[:] = [f for f in log.filters if type(f).__name__ != "_RequestIdFilter"]
+log.addFilter(_RequestIdFilter())
+
+# --- metrics ---------------------------------------------------------------------
+# Counters and histograms behind GET /metrics, in Prometheus text format, kept
+# in this process (they start again at zero with the router). Label values come
+# from the router's own configuration and inventory (servers, models, classes,
+# statuses), never from what a client sent, so the number of series is bounded.
+_STARTED = time.time()
+_COUNTERS = {}      # (name, ((label, value), ...)) -> count
+_HISTOGRAMS = {}    # (name, ((label, value), ...)) -> [per-bucket counts..., sum, count]
+DURATION_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+METRIC_SERIES_MAX = 5000   # a last guard; never reached with bounded labels
+METRICS = {
+    "osr_requests_total": ("counter", "Requests answered, by route (chat, v1, routing), "
+                           "how they were served and the HTTP status returned."),
+    "osr_upstream_failures_total": ("counter", "Attempts on a model server that failed, by reason: "
+                                    "connect, transport, no_reply, http_<status>, tool_rejection."),
+    "osr_response_start_seconds": ("histogram", "Chat requests answered below 400: seconds from "
+                                   "arrival until the response headers were sent (model load and "
+                                   "prompt processing included, where the server waits for them)."),
+    "osr_request_duration_seconds": ("histogram", "Chat requests answered below 400: seconds from "
+                                     "arrival until the last byte of the body was sent."),
+    "osr_in_flight_requests": ("gauge", "Requests this router has in flight on a model server."),
+    "osr_server_up": ("gauge", "1 when the last discovery poll (or dispatch) found the server up, else 0."),
+    "osr_server_models": ("gauge", "Models the server listed at the last discovery poll."),
+    "osr_inventory_age_seconds": ("gauge", "Seconds since the inventory was last refreshed."),
+    "osr_remembered_conversations": ("gauge", "Conversations whose last server is remembered (affinity)."),
+    "osr_start_time_seconds": ("gauge", "Unix time at which this router process started."),
+}
+
+
+def count(name: str, **labels) -> None:
+    """Add one to a counter."""
+    key = (name, tuple(sorted(labels.items())))
+    if key in _COUNTERS or len(_COUNTERS) < METRIC_SERIES_MAX:
+        _COUNTERS[key] = _COUNTERS.get(key, 0) + 1
+
+
+def observe(name: str, seconds: float, **labels) -> None:
+    """Record one duration in a histogram."""
+    key = (name, tuple(sorted(labels.items())))
+    series = _HISTOGRAMS.get(key)
+    if series is None:
+        if len(_HISTOGRAMS) >= METRIC_SERIES_MAX:
+            return
+        series = _HISTOGRAMS[key] = [0] * len(DURATION_BUCKETS) + [0.0, 0]
+    for index, bound in enumerate(DURATION_BUCKETS):
+        if seconds <= bound:
+            series[index] += 1
+            break
+    series[-2] += seconds
+    series[-1] += 1
+
+
+def _label_text(labels, extra: str = "") -> str:
+    """{a="b",...} for a series, values escaped as the text format requires."""
+    parts = ['%s="%s"' % (name, str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n"))
+             for name, value in labels]
+    if extra:
+        parts.append(extra)
+    return "{%s}" % ",".join(parts) if parts else ""
+
+
+def _number(value) -> str:
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
 
 # The router is a drop-in OpenAI endpoint in front of the LiteLLM proxy.
 # /v1/chat/completions has its model chosen by complexity analysis; every other
@@ -4657,7 +4787,76 @@ class RouterKeyMiddleware:
         await self.app(scope, receive, send)
 
 
+def _metrics_route(path: str) -> str:
+    """Which family of requests a path belongs to in osr_requests_total; ""
+    for the ones not counted (/healthz and /metrics are polled by machines)."""
+    if path == "/v1/chat/completions":
+        return "chat"
+    if path.startswith("/v1/"):
+        return "v1"
+    if path.startswith("/routing/"):
+        return "routing"
+    return ""
+
+
+class RequestMiddleware:
+    """Gives each request its ID and counts and times it for /metrics.
+
+    Plain ASGI, like the key check: the only thing put between the application
+    and the server is one function call per message sent. The labels are read
+    from the X-Router-* headers the router itself puts on an answer."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        current = accept_request_id(Headers(scope=scope).get("x-request-id"))
+        token = _REQUEST_ID.set(current)
+        route = _metrics_route(scope["path"])
+        started = time.monotonic()
+        timed = {}
+
+        async def send_with_id(message):
+            kind = message["type"]
+            record_start = record_duration = False
+            if kind == "http.response.start":
+                headers = list(message.get("headers") or [])
+                given = {name.lower(): value for name, value in headers}
+                headers.append((b"x-router-request-id", current.encode("ascii")))
+                if b"x-request-id" not in given:
+                    headers.append((b"x-request-id", current.encode("ascii")))
+                message = dict(message, headers=headers)
+                if route:
+                    labels = {label: given.get(b"x-router-" + label.encode(), b"").decode("latin-1")
+                              for label in ("mode", "model", "server")}
+                    count("osr_requests_total", route=route, status=str(message["status"]),
+                          **{"class": given.get(b"x-router-class", b"").decode("latin-1")}, **labels)
+                    if route == "chat" and message["status"] < 400:
+                        timed.update(labels)
+                        record_start = True
+            elif kind == "http.response.body" and timed and not message.get("more_body"):
+                record_duration = True
+            await send(message)
+            # ASGI send completion is the closest available point to headers
+            # and the final body reaching the server's output transport.
+            if record_start:
+                observe("osr_response_start_seconds", time.monotonic() - started, **timed)
+            if record_duration:
+                observe("osr_request_duration_seconds", time.monotonic() - started, **timed)
+                timed.clear()
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            _REQUEST_ID.reset(token)
+
+
 app.add_middleware(RouterKeyMiddleware)
+# Added last, so it is outermost: a refused request has an ID and is counted too.
+app.add_middleware(RequestMiddleware)
 
 
 # --- request analysis ---------------------------------------------------------
@@ -4980,11 +5179,15 @@ def known_chat_model(model_name: str) -> bool:
 # --- proxying -----------------------------------------------------------------
 def _forward_headers(request: Request, drop_auth: bool = False) -> dict:
     """Request headers to send upstream. drop_auth strips Authorization, so the
-    router's own API key is never handed to an Ollama host."""
-    return {k: v for k, v in request.headers.items()
-            if k.lower() not in HOP_BY_HOP
-            and k.lower() not in ("x-router-api-key", "x-router-subscription")
-            and not (drop_auth and k.lower() == "authorization")}
+    router's own API key is never handed to an Ollama host. The request's ID
+    goes along as X-Request-ID (the caller's own, when the router adopted it)."""
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in HOP_BY_HOP
+               and k.lower() not in ("x-router-api-key", "x-router-subscription", "x-request-id")
+               and not (drop_auth and k.lower() == "authorization")}
+    if request_id():
+        headers["X-Request-ID"] = request_id()
+    return headers
 
 
 async def _proxy_subscription(request: Request) -> Response:
@@ -5002,7 +5205,10 @@ async def _proxy_subscription(request: Request) -> Response:
 
 def _response_headers(upstream: httpx.Response, extra: dict = None) -> dict:
     headers = {k: v for k, v in upstream.headers.items()
-               if k.lower() not in RESPONSE_HOP_BY_HOP}
+               if k.lower() not in RESPONSE_HOP_BY_HOP
+               and not k.lower().startswith("x-router-")}
+    # Only this router may set X-Router-* response headers. Metrics use them
+    # as labels, so forwarding an upstream value could create unbounded series.
     if extra:
         headers.update(extra)
     return headers
@@ -5204,6 +5410,10 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
     last_error = None
     no_reply = kindi_was_busy = False
     encoded: dict = {}
+
+    def failed(entry: dict, reason: str) -> None:
+        count("osr_upstream_failures_total", server=entry["server"], reason=reason)
+
     if not any(key.lower() == "content-type" for key in headers):
         headers = dict(headers, **{"Content-Type": "application/json"})
     for position, entry in enumerate(candidates):
@@ -5230,6 +5440,7 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 upstream_response = await client.send(upstream_request, stream=True)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                failed(entry, "connect")
                 mark_server_down(entry["server"], last_error)
                 continue
             except httpx.RequestError as exc:
@@ -5237,12 +5448,18 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 if entry["kind"] == "kindi" and isinstance(exc, httpx.ReadTimeout):
                     # Sent, but no reply: Kindi may still be working on it.
                     no_reply = True
+                    failed(entry, "no_reply")
                     mark_kindi_draining(entry["server"])
                     log.warning("dispatch: Kindi %s sent no reply; not sending it again", entry["server"])
                     continue
+                failed(entry, "transport")
                 log.warning("dispatch: %s", last_error)
                 continue
             is_last = position == len(candidates) - 1
+            if upstream_response.status_code in RETRYABLE_STATUS:
+                # Counted whether another candidate follows or this answer is
+                # passed on as it is.
+                failed(entry, f"http_{upstream_response.status_code}")
             if upstream_response.status_code in RETRYABLE_STATUS and not is_last:
                 await upstream_response.aclose()
                 last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
@@ -5253,6 +5470,8 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 # A later error must not turn an unanswered Kindi POST into a
                 # response that makes clients replay the whole call.
                 last_error = f"{entry['server']}: HTTP {upstream_response.status_code}"
+                if upstream_response.status_code not in RETRYABLE_STATUS:
+                    failed(entry, f"http_{upstream_response.status_code}")
                 await upstream_response.aclose()
                 continue
             buffered = None
@@ -5266,6 +5485,7 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                     # (which rebuilds the entry) instead of failing every turn.
                     # The last candidate is remembered too; its 400 is returned.
                     entry["tools"] = False
+                    failed(entry, "tool_rejection")
                     last_error = f"{entry['server']}: {entry['name']} rejected the tools (HTTP 400)"
                     if not is_last:
                         log.warning("dispatch: %s; trying the next candidate", last_error)
@@ -5288,11 +5508,13 @@ async def _dispatch_direct(candidates: list, body: dict, headers: dict,
                 except httpx.ReadTimeout as exc:
                     last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
                     no_reply = True
+                    failed(entry, "no_reply")
                     mark_kindi_draining(entry["server"])
                     await upstream_response.aclose()
                     continue
                 except httpx.RequestError as exc:
                     last_error = f"{entry['server']}: {type(exc).__name__}: {exc}"
+                    failed(entry, "transport")
                     mark_server_down(entry["server"], last_error)
                     await upstream_response.aclose()
                     continue
@@ -5359,6 +5581,53 @@ async def routing_inventory():
         # with the budget their CT was configured for.
         "kindi_read_timeout_seconds": KINDI_READ_TIMEOUT,
     })
+
+
+def render_metrics() -> str:
+    """Everything /metrics reports, in Prometheus text format (version 0.0.4)."""
+    servers = INVENTORY.get("servers", {})
+    known = list(dict.fromkeys([*SERVERS, *servers, *_IN_FLIGHT]))
+    gauges = {
+        "osr_in_flight_requests": [((("server", s),), _IN_FLIGHT.get(s, 0)) for s in known],
+        "osr_server_up": [((("kind", server_kind(s)), ("server", s)), 1 if state.get("up") else 0)
+                          for s, state in servers.items()],
+        "osr_server_models": [((("server", s),), state.get("model_count", 0))
+                              for s, state in servers.items()],
+        "osr_inventory_age_seconds": ([((), round(time.time() - INVENTORY["updated_at"], 3))]
+                                      if INVENTORY.get("updated_at") else []),
+        "osr_remembered_conversations": [((), len(_STICKY))],
+        "osr_start_time_seconds": [((), round(_STARTED, 3))],
+    }
+    lines = []
+    for name, (kind, text) in METRICS.items():
+        lines.append(f"# HELP {name} {text}")
+        lines.append(f"# TYPE {name} {kind}")
+        if kind == "counter":
+            lines += [f"{name}{_label_text(labels)} {_number(value)}"
+                      for (metric, labels), value in sorted(_COUNTERS.items()) if metric == name]
+        elif kind == "gauge":
+            lines += [f"{name}{_label_text(labels)} {_number(value)}" for labels, value in gauges[name]]
+        else:
+            for (metric, labels), series in sorted(_HISTOGRAMS.items()):
+                if metric != name:
+                    continue
+                running = 0
+                for bound, hits in zip(DURATION_BUCKETS, series, strict=False):
+                    running += hits
+                    upper = 'le="%s"' % _number(bound)
+                    lines.append(f"{name}_bucket{_label_text(labels, upper)} {running}")
+                upper = 'le="+Inf"'
+                lines.append(f"{name}_bucket{_label_text(labels, upper)} {series[-1]}")
+                lines.append(f"{name}_sum{_label_text(labels)} {repr(float(series[-2]))}")
+                lines.append(f"{name}_count{_label_text(labels)} {series[-1]}")
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics. Like every path but /healthz it needs the router key:
+    the labels name the model servers and models."""
+    return Response(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.post("/routing/refresh")
@@ -5622,8 +5891,10 @@ MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OllamaMonitor")
 MATTERMOST_CHANNEL = os.getenv("MATTERMOST_CHANNEL", "ollama-monitor")
 MATTERMOST_VERIFY_TLS = os.getenv("MATTERMOST_VERIFY_TLS", "true").lower() == "true"
 
-# Polling behaviour comes from monitor.ini (version controlled); environment
-# variables still win, so an operator can override without a commit.
+# Polling behaviour comes from monitor.ini (version controlled). An environment
+# variable of the names in ENV_OVERRIDES still wins when it is set to a value,
+# so an operator can override one without a commit; the overrides that differ
+# from monitor.ini are logged at start, so none is in force unnoticed.
 _DEFAULTS = {
     "polling": {"interval_seconds": "15", "timeout_seconds": "5",
                 "health_path": "/api/tags"},
@@ -5645,15 +5916,52 @@ _cfg.read_dict(_DEFAULTS)
 if os.path.exists(MONITOR_INI):
     _cfg.read(MONITOR_INI)
 
-CHECK_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",
-                               _cfg.get("polling", "interval_seconds")))
-CHECK_TIMEOUT = float(os.getenv("MONITOR_TIMEOUT_SECONDS",
-                                _cfg.get("polling", "timeout_seconds")))
-HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH", _cfg.get("polling", "health_path"))
-FAIL_THRESHOLD = max(1, int(os.getenv("MONITOR_FAIL_THRESHOLD",
-                                      _cfg.get("alerting", "fail_threshold"))))
-RECOVER_THRESHOLD = max(1, int(os.getenv("MONITOR_RECOVER_THRESHOLD",
-                                         _cfg.get("alerting", "recover_threshold"))))
+# (environment variable, monitor.ini section, option, default without the file)
+ENV_OVERRIDES = (
+    ("MONITOR_INTERVAL_SECONDS", "polling", "interval_seconds", "15"),
+    ("MONITOR_TIMEOUT_SECONDS", "polling", "timeout_seconds", "5"),
+    ("MONITOR_HEALTH_PATH", "polling", "health_path", "/api/tags"),
+    ("MONITOR_FAIL_THRESHOLD", "alerting", "fail_threshold", "3"),
+    ("MONITOR_RECOVER_THRESHOLD", "alerting", "recover_threshold", "2"),
+    ("KEEP_ALIVE_REFRESH_SECONDS", "keep_alive", "refresh_seconds", "240"),
+)
+
+
+def _ini(section: str, option: str, default: str) -> str:
+    return _cfg.get(section, option, fallback=default).strip()
+
+
+def _setting(name: str) -> str:
+    """One ENV_OVERRIDES setting: the environment's value when it has one (an
+    empty variable counts as not set), else monitor.ini's."""
+    for env_name, section, option, default in ENV_OVERRIDES:
+        if env_name == name:
+            return (os.getenv(env_name) or "").strip() or _ini(section, option, default)
+    raise KeyError(name)
+
+
+def env_overrides() -> list:
+    """The settings an environment variable changes from what monitor.ini
+    says, as text for the log."""
+    def same(left: str, right: str) -> bool:
+        try:
+            return float(left) == float(right)
+        except ValueError:
+            return left == right
+
+    found = []
+    for env_name, section, option, default in ENV_OVERRIDES:
+        value, ini = (os.getenv(env_name) or "").strip(), _ini(section, option, default)
+        if value and not same(value, ini):
+            found.append(f"{env_name}={value} (monitor.ini has [{section}] {option} = {ini})")
+    return found
+
+
+CHECK_INTERVAL = int(_setting("MONITOR_INTERVAL_SECONDS"))
+CHECK_TIMEOUT = float(_setting("MONITOR_TIMEOUT_SECONDS"))
+HEALTH_PATH = _setting("MONITOR_HEALTH_PATH")
+FAIL_THRESHOLD = max(1, int(_setting("MONITOR_FAIL_THRESHOLD")))
+RECOVER_THRESHOLD = max(1, int(_setting("MONITOR_RECOVER_THRESHOLD")))
 # The startup notice is posted at most once per this many seconds, so a crash
 # loop (Restart=always) does not flood the channel. The timestamp lives in the
 # unit's StateDirectory; without one, every start posts as before.
@@ -5668,9 +5976,7 @@ STATE_DIR = os.getenv("MONITOR_STATE_DIR", "")
 # its unload timer without generating anything.
 KEEP_ALIVE = (os.getenv("OLLAMA_KEEP_ALIVE", "") or "").strip()
 KEEP_ALIVE_MODE = _cfg.get("keep_alive", "enabled", fallback="auto").strip().lower()
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_REFRESH_SECONDS",
-                                    _cfg.get("keep_alive", "refresh_seconds",
-                                             fallback="240")))
+KEEP_ALIVE_INTERVAL = int(_setting("KEEP_ALIVE_REFRESH_SECONDS"))
 KEEP_ALIVE_TIMEOUT = float(_cfg.get("keep_alive", "timeout_seconds", fallback="120"))
 if KEEP_ALIVE_MODE == "auto":
     KEEP_ALIVE_ENABLED = bool(KEEP_ALIVE)
@@ -6140,6 +6446,8 @@ def run_health_checks() -> None:
     logging.info("Monitoring %d endpoint(s): %s (alert after %d failures, "
                  "recover after %d passes)", len(checks),
                  ", ".join(c.key for c in checks), FAIL_THRESHOLD, RECOVER_THRESHOLD)
+    for override in env_overrides():
+        logging.info("The environment (router.env) overrides monitor.ini: %s", override)
     stop = threading.Event()
     if KEEP_ALIVE_ENABLED:
         logging.info("keep-alive maintainer active: keep_alive=%s every %ds",
@@ -6601,6 +6909,7 @@ ROUTER_DIR="${ROUTER_DIR:-/app/router}"
 ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
+MONITOR_INI="${REPO_DIR}/services/ollama-monitor/monitor.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
@@ -7205,6 +7514,65 @@ migrate_secrets() {
     note "  They may still be in the repo's git history. Rotate any exposed"
     note "  provider API keys, deploy tokens or webhooks if the repo was pushed."
   fi
+}
+
+# ini_get FILE SECTION KEY: the value of KEY in [SECTION], or nothing.
+ini_get() {
+  [[ -f "$1" ]] || return 0
+  awk -v section="[$2]" -v key="$3" '
+    /^[[:space:]]*\[/ { inside = ($1 == section); next }
+    inside && !/^[[:space:]]*[#;]/ {
+      at = index($0, "=")
+      if (!at) next
+      name = substr($0, 1, at - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != key) next
+      value = substr($0, at + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      print value; exit
+    }' "$1"
+}
+
+# Take out of the version-controlled env file the settings older installers
+# wrote there that do nothing, or only repeat another setting:
+#   * LITELLM_HEALTH_URL and MODEL_SERVER_COUNT are read by nothing;
+#   * LITELLM_URL, when it is LITELLM_BASE_URL plus the chat path, which is
+#     what the router uses without it;
+#   * MONITOR_INTERVAL_SECONDS and KEEP_ALIVE_REFRESH_SECONDS, when they say
+#     what monitor.ini says (or nothing). They override monitor.ini, so left in
+#     place they keep a later edit of monitor.ini from taking effect.
+# Nothing that runs changes: a value that differs from what it would repeat
+# was put there on purpose and stays. Runs before every commit and apply.
+tidy_env() {
+  local key value base section option fallback removed=""
+  $DRY_RUN && return 0
+  [[ -f "$ENV_FILE" ]] || return 0
+  for key in LITELLM_HEALTH_URL MODEL_SERVER_COUNT; do
+    if kv_has "$ENV_FILE" "$key"; then
+      kv_del "$ENV_FILE" "$key"; removed+=" ${key}"
+    fi
+  done
+  if kv_has "$ENV_FILE" LITELLM_URL; then
+    base="$(kv_get "$ENV_FILE" LITELLM_BASE_URL)"
+    base="${base:-http://127.0.0.1:4000}"
+    if [[ "$(kv_get "$ENV_FILE" LITELLM_URL)" == "${base%/}/v1/chat/completions" ]]; then
+      kv_del "$ENV_FILE" LITELLM_URL; removed+=" LITELLM_URL"
+    fi
+  fi
+  while read -r key section option fallback; do
+    kv_has "$ENV_FILE" "$key" || continue
+    value="$(kv_get "$ENV_FILE" "$key")"
+    base="$(ini_get "$MONITOR_INI" "$section" "$option")"
+    if [[ -z "$value" || "$value" == "${base:-$fallback}" ]]; then
+      kv_del "$ENV_FILE" "$key"; removed+=" ${key}"
+    fi
+  done <<'SETTINGS'
+MONITOR_INTERVAL_SECONDS polling interval_seconds 15
+KEEP_ALIVE_REFRESH_SECONDS keep_alive refresh_seconds 240
+SETTINGS
+  if [[ -n "$removed" ]]; then
+    note "Tidied $(basename "$ENV_FILE"): removed${removed} (unused, or the same as the setting"
+    note "  it repeated). Nothing that runs changes; the next commit records it."
+  fi
+  return 0
 }
 
 # NOTE for callers: this dies on an unknown tier, but a `die` inside $(...)
@@ -8709,6 +9077,16 @@ restart_and_check() {
   done
 }
 
+# Give the local Prometheus (install/setup-metrics.sh) the router key again
+# after an apply, in case the key changed. Does nothing where that stack is not
+# installed, and never fails an apply: the scrape only shows 401 until fixed.
+sync_metrics_key() {
+  [[ -f "${REPO_DIR}/install/setup-metrics.sh" && -f "${UNIT_DIR}/osr-prometheus.service" ]] || return 0
+  bash "${REPO_DIR}/install/setup-metrics.sh" sync-key ||
+    note 'WARNING: Prometheus scrape key could not be updated; rerun setup-metrics.sh sync-key.'
+  return 0
+}
+
 # Open WebUI's data directory (its SQLite database lives there).
 openwebui_data_dir() {
   local dir
@@ -8749,6 +9127,7 @@ cmd_apply() {
   # preserve the executable bit, and we invoke it via `bash` anyway.
   [[ -f "$APPLY_SCRIPT" ]] || die "apply script not found: ${APPLY_SCRIPT}"
   migrate_secrets
+  tidy_env
   sync_kindi_timeouts
 
   echo "Validating configuration..."
@@ -8813,12 +9192,14 @@ cmd_apply() {
   if (( ${#affected[@]} == 0 )); then
     echo "No service is affected by this change; nothing restarted."
     secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    sync_metrics_key
     kindi_budget_note "$budget_before" "$budget_after"
     return 0
   fi
   echo "Restarting: ${affected[*]}"
   if failed="$(restart_and_check "${affected[@]}")"; then
     secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    sync_metrics_key
     echo "Applied; all restarted services are healthy."
     kindi_budget_note "$budget_before" "$budget_after"
     return 0
@@ -9214,6 +9595,7 @@ cmd_commit() {
     return 0
   }
   migrate_secrets
+  tidy_env
   git -C "$REPO_DIR" add -A
   if git -C "$REPO_DIR" diff --cached --quiet; then
     note "Nothing to commit."
@@ -9544,6 +9926,247 @@ case "$COMMAND" in
 esac
 MANAGEEOF
 chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
+
+# --- optional local metrics stack (Prometheus + Grafana) ---
+cat > "${REPO_DIR}/install/setup-metrics.sh" <<'METRICSEOF'
+#!/usr/bin/env bash
+# Install a small local Prometheus + Grafana stack in the router CT.
+# Run as root: bash /app/config-repo/install/setup-metrics.sh [install|sync-key]
+set -euo pipefail
+
+MODE="${1:-install}"
+ROUTER_DIR="${ROUTER_DIR:-/app/router}"
+SECRETS_FILE="${SECRETS_FILE:-${ROUTER_DIR}/secrets.env}"
+# Optional: an exact Grafana package version (apt's grafana=<version>) instead
+# of the newest in Grafana's stable repository, and the fingerprint its signing
+# key must have (40 hex digits, spaces allowed). Without a fingerprint the key
+# is trusted as downloaded over HTTPS.
+GRAFANA_VERSION="${GRAFANA_VERSION:-}"
+GRAFANA_KEY_FINGERPRINT="${GRAFANA_KEY_FINGERPRINT:-}"
+# Tests only: a directory that stands in for / when files are written. What the
+# written files say (paths in units and configuration) is never prefixed.
+FS="${OSR_METRICS_ROOT:-}"
+KEY_FILE=/etc/prometheus/osr-router-key
+
+die() { printf 'metrics setup: %s\n' "$*" >&2; exit 1; }
+note() { printf 'metrics setup: %s\n' "$*" >&2; }
+
+[[ $EUID -eq 0 || -n $FS ]] || die 'run as root in the router CT'
+[[ $MODE == install || $MODE == sync-key ]] || die 'usage: setup-metrics.sh [install|sync-key]'
+
+env_value() {
+  local file=$1 key=$2
+  [[ -f $file ]] || return 0
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+sync_key() {
+  local key tmp
+  [[ -d ${FS}/etc/prometheus ]] || { [[ $MODE == sync-key ]] && return 0; die 'Prometheus is not installed'; }
+  key="$(env_value "$SECRETS_FILE" ROUTER_API_KEY)"
+  if [[ -z $key && -f ${FS}${KEY_FILE} ]]; then
+    # An older router may deliberately have authentication off. Retain an
+    # existing token: the router ignores it while authentication is disabled.
+    return 0
+  fi
+  # No key and no file yet: the scrape needs the file to exist, so it starts
+  # empty. The router asks for nothing while it has no key, and the next apply
+  # after `set-api-key` fills it in.
+  [[ $key != *$'\n'* && $key != *$'\r'* ]] || die 'invalid router key'
+  tmp="$(mktemp "${FS}/etc/prometheus/.osr-router-key.XXXXXX")"
+  if [[ -n $key ]]; then printf '%s\n' "$key" > "$tmp"; fi
+  chown prometheus:prometheus "$tmp"
+  chmod 0600 "$tmp"
+  if [[ -f ${FS}${KEY_FILE} ]] && cmp -s "$tmp" "${FS}${KEY_FILE}"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  mv -f "$tmp" "${FS}${KEY_FILE}"
+  if [[ $MODE == sync-key ]] && systemctl is-active --quiet osr-prometheus.service; then
+    systemctl restart osr-prometheus.service
+  fi
+  note 'router scrape key updated'
+}
+
+if [[ $MODE == sync-key ]]; then
+  sync_key
+  exit 0
+fi
+
+[[ -f $SECRETS_FILE ]] || die "missing ${SECRETS_FILE}"
+if [[ -n $GRAFANA_KEY_FINGERPRINT ]]; then
+  GRAFANA_KEY_FINGERPRINT="${GRAFANA_KEY_FINGERPRINT// /}"
+  [[ ${GRAFANA_KEY_FINGERPRINT^^} =~ ^[0-9A-F]{40}$ ]] || die 'GRAFANA_KEY_FINGERPRINT must be 40 hex digits'
+fi
+[[ -z $GRAFANA_VERSION || $GRAFANA_VERSION =~ ^[0-9][0-9A-Za-z.+~:-]*$ ]] || die 'invalid GRAFANA_VERSION'
+
+# Put authentication in place before the package is installed: a package
+# post-install step may start Grafana immediately. systemd reads EnvironmentFile
+# itself, so Grafana needs no access to the file; the package may still make
+# files under /etc/grafana readable by the grafana group, which changes
+# nothing: Grafana has the password in its environment either way.
+install -d -m 0755 "${FS}/etc/grafana" "${FS}/etc/systemd/system/grafana-server.service.d"
+if [[ ! -e ${FS}/etc/grafana/osr.env && ! -e ${FS}/var/lib/grafana/grafana.db ]]; then
+  password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  ( umask 077; printf 'GF_SECURITY_ADMIN_PASSWORD=%s\n' "$password" > "${FS}/etc/grafana/osr.env" )
+  chmod 0600 "${FS}/etc/grafana/osr.env"
+elif [[ ! -e ${FS}/etc/grafana/osr.env ]]; then
+  note 'Grafana already has a database; preserving its existing admin login'
+  : > "${FS}/etc/grafana/osr.env"
+  chmod 0600 "${FS}/etc/grafana/osr.env"
+fi
+cat > "${FS}/etc/systemd/system/grafana-server.service.d/osr.conf" <<'EOF'
+[Service]
+EnvironmentFile=/etc/grafana/osr.env
+Environment=GF_SERVER_HTTP_ADDR=0.0.0.0 GF_SERVER_HTTP_PORT=3000 GF_AUTH_ANONYMOUS_ENABLED=false GF_USERS_ALLOW_SIGN_UP=false GF_ANALYTICS_REPORTING_ENABLED=false GF_ANALYTICS_CHECK_FOR_UPDATES=false
+EOF
+systemctl daemon-reload
+
+# Debian's Prometheus package supplies the binary and its unprivileged user.
+# Use our own loopback-only unit, so the package's default web listener is not
+# exposed and its storage budget is explicit.
+if systemctl is-active --quiet prometheus.service; then
+  die 'an existing prometheus.service is running; stop it or keep using it instead of the local OSR stack'
+fi
+systemctl mask prometheus.service
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+# --no-install-recommends: Debian's prometheus recommends prometheus-node-exporter,
+# which would start an unauthenticated listener on every address (port 9100).
+apt-get install -y --no-install-recommends ca-certificates wget prometheus
+systemctl mask --now prometheus.service
+
+# Grafana OSS from the vendor's signed stable Debian repository.
+install -d -m 0755 "${FS}/etc/apt/keyrings" "${FS}/etc/apt/sources.list.d"
+key_tmp="$(mktemp "${FS}/etc/apt/keyrings/.grafana.XXXXXX")"
+wget -qO "$key_tmp" https://apt.grafana.com/gpg-full.key || { rm -f "$key_tmp"; die 'could not download the Grafana signing key'; }
+if [[ -n $GRAFANA_KEY_FINGERPRINT ]]; then
+  command -v gpg >/dev/null 2>&1 || apt-get install -y --no-install-recommends gnupg
+  # Every primary key in the file must be the expected one.
+  found="$(gpg --show-keys --with-colons "$key_tmp" 2>/dev/null |
+    awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }' | sort -u)"
+  if [[ ${found^^} != "${GRAFANA_KEY_FINGERPRINT^^}" ]]; then
+    rm -f "$key_tmp"
+    die "the Grafana signing key is not ${GRAFANA_KEY_FINGERPRINT} (found: ${found:-none}); nothing was installed from it"
+  fi
+fi
+chmod 0644 "$key_tmp"
+mv -f "$key_tmp" "${FS}/etc/apt/keyrings/grafana.asc"
+printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main' > "${FS}/etc/apt/sources.list.d/grafana.list"
+apt-get update
+apt-get install -y "grafana${GRAFANA_VERSION:+=${GRAFANA_VERSION}}"
+systemctl stop grafana-server.service 2>/dev/null || true
+
+sync_key
+
+router_host="$(env_value "${ROUTER_DIR}/.env" ROUTER_HOST)"
+router_port="$(env_value "${ROUTER_DIR}/.env" ROUTER_PORT)"
+router_port="${router_port:-8000}"
+[[ $router_port =~ ^[0-9]+$ ]] && (( router_port >= 1 && router_port <= 65535 )) || die 'invalid ROUTER_PORT'
+case "$router_host" in
+  ''|0.0.0.0|127.0.0.1|localhost|::|::1) router_host=127.0.0.1 ;;
+  *:*) [[ $router_host =~ ^[0-9a-fA-F:]+$ ]] || die 'invalid ROUTER_HOST'; router_host="[$router_host]" ;;
+  *) [[ $router_host =~ ^[a-zA-Z0-9.-]+$ ]] || die 'invalid ROUTER_HOST' ;;
+esac
+
+cat > "${FS}/etc/prometheus/osr.yml" <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: osr
+    metrics_path: /metrics
+    authorization:
+      credentials_file: ${KEY_FILE}
+    static_configs:
+      - targets: ['${router_host}:${router_port}']
+EOF
+chmod 0644 "${FS}/etc/prometheus/osr.yml"
+promtool check config "${FS}/etc/prometheus/osr.yml"
+mkdir -p "${FS}/var/lib/prometheus/osr"
+chown prometheus:prometheus "${FS}/var/lib/prometheus/osr"
+chmod 0750 "${FS}/var/lib/prometheus/osr"
+
+cat > "${FS}/etc/systemd/system/osr-prometheus.service" <<'EOF'
+[Unit]
+Description=Open Smart Router Prometheus scraper
+After=network-online.target ollama-router.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+ExecStart=/usr/bin/prometheus --config.file=/etc/prometheus/osr.yml --storage.tsdb.path=/var/lib/prometheus/osr --storage.tsdb.retention.time=7d --storage.tsdb.retention.size=512MB --web.listen-address=127.0.0.1:9090
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prometheus/osr
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+[Install]
+WantedBy=multi-user.target
+EOF
+
+install -d -m 0755 "${FS}/etc/grafana/provisioning/datasources" "${FS}/etc/grafana/provisioning/dashboards" "${FS}/etc/grafana/osr-dashboards"
+cat > "${FS}/etc/grafana/provisioning/datasources/osr.yml" <<'EOF'
+apiVersion: 1
+datasources:
+  - name: OSR Prometheus
+    uid: osr-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
+EOF
+cat > "${FS}/etc/grafana/provisioning/dashboards/osr.yml" <<'EOF'
+apiVersion: 1
+providers:
+  - name: Open Smart Router
+    orgId: 1
+    folder: Open Smart Router
+    type: file
+    disableDeletion: false
+    editable: false
+    options:
+      path: /etc/grafana/osr-dashboards
+EOF
+cat > "${FS}/etc/grafana/osr-dashboards/router.json" <<'EOF'
+{
+  "uid": "osr-router", "title": "Open Smart Router", "schemaVersion": 39,
+  "version": 1, "refresh": "15s", "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Requests per second", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "sum by (route, status) (rate(osr_requests_total[5m]))", "legendFormat": "{{route}} {{status}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Upstream failures per second", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "sum by (server, reason) (rate(osr_upstream_failures_total[5m]))", "legendFormat": "{{server}} {{reason}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Response start p95", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "s"}}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le, model) (rate(osr_response_start_seconds_bucket[5m])))", "legendFormat": "{{model}}"}]},
+    {"id": 4, "type": "timeseries", "title": "Request duration p95", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "s"}}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le, model) (rate(osr_request_duration_seconds_bucket[5m])))", "legendFormat": "{{model}}"}]},
+    {"id": 5, "type": "timeseries", "title": "Requests in flight", "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_in_flight_requests", "legendFormat": "{{server}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Servers up", "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_server_up", "legendFormat": "{{server}}"}]},
+    {"id": 7, "type": "timeseries", "title": "Models per server", "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_server_models", "legendFormat": "{{server}}"}]}
+  ]
+}
+EOF
+chmod 0644 "${FS}/etc/grafana/provisioning/datasources/osr.yml" "${FS}/etc/grafana/provisioning/dashboards/osr.yml" "${FS}/etc/grafana/osr-dashboards/router.json"
+
+systemctl daemon-reload
+# restart, not enable --now: a rerun must pick up a changed unit or scrape
+# target, and --now leaves a running service as it is.
+systemctl enable osr-prometheus.service
+systemctl restart osr-prometheus.service
+systemctl enable grafana-server.service
+systemctl restart grafana-server.service
+systemctl is-active --quiet osr-prometheus.service || die 'Prometheus failed to start'
+systemctl is-active --quiet grafana-server.service || die 'Grafana failed to start'
+note 'ready: Grafana port 3000, Prometheus loopback port 9090, dashboard Open Smart Router'
+note 'new Grafana admin password (if generated): /etc/grafana/osr.env'
+METRICSEOF
+chmod 0755 "${REPO_DIR}/install/setup-metrics.sh"
 
 # --- repo README so the tree is self-documenting in Gitea ---
 cat > "${REPO_DIR}/README.md" <<'RDEOF'
@@ -9911,9 +10534,31 @@ run_ct systemctl daemon-reload
 run_ct systemctl enable --now \
   litellm-proxy.service ollama-router.service ollama-monitor.service open-webui.service
 
+METRICS_INSTALLED=false
+if [[ "$INSTALL_METRICS" != "true" ]]; then
+  echo "Skipping the local Prometheus and Grafana (INSTALL_METRICS=${INSTALL_METRICS})."
+  echo "  Add them later inside the CT: bash ${CONFIG_REPO_DIR}/install/setup-metrics.sh install"
+else
+  echo "Installing local Prometheus and Grafana."
+  if run_ct bash "${CONFIG_REPO_DIR}/install/setup-metrics.sh" install; then
+    METRICS_INSTALLED=true
+  else
+    echo "WARNING: Metrics dashboard setup failed; the router remains available." >&2
+    echo "         Retry inside the CT: bash ${CONFIG_REPO_DIR}/install/setup-metrics.sh install" >&2
+  fi
+fi
+
 # Provisioning succeeded — disarm the failure trap so we keep the container.
 CT_CREATED=""
 trap - ERR
+
+# After the trap is disarmed: a firewall file that cannot be written must not
+# remove a container that is otherwise complete.
+if $METRICS_INSTALLED && [[ "$FIREWALL" == "1" && -n "$API_ALLOW_CIDR" ]]; then
+  ensure_fw_rule "/etc/pve/firewall/${CT_ID}.fw" \
+    "IN ACCEPT -source ${API_ALLOW_CIDR} -p tcp -dport 3000 -log nolog" ||
+    echo "WARNING: could not allow tcp/3000 (Grafana) from ${API_ALLOW_CIDR} in the CT firewall; add the rule by hand." >&2
+fi
 
 echo "=============================================================================="
 echo "Provisioning complete."
@@ -9922,6 +10567,10 @@ echo "Service IP: ${ROUTER_IP}"
 echo "OpenAI-compatible API base URL: http://${ROUTER_IP}:8000/v1"
 echo "Open WebUI (chat UI):          http://${ROUTER_IP}:${OPENWEBUI_PORT}"
 echo "  -> create the admin account on first visit; it is pre-connected to OSR."
+if $METRICS_INSTALLED; then
+  echo "Grafana (router metrics):     http://${ROUTER_IP}:3000"
+  echo "  -> admin initial password: /etc/grafana/osr.env inside the CT"
+fi
 echo "Config directory (in container): ${CONFIG_REPO_DIR}"
 if [[ "$CONFIG_SOURCE" == "repo" ]]; then
   echo "Config source: git clone of ${GITEA_SERVER_URL%/}/${GITEA_OWNER}/${GITEA_REPO_NAME}"

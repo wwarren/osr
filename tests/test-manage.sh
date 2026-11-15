@@ -33,6 +33,7 @@ OPENWEBUI_DIR="${WORK}/openwebui"
 ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
+MONITOR_INI="${REPO_DIR}/services/ollama-monitor/monitor.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
 # Exported so `bash -c "source $FUNCS; ..."` subshells see it too.
@@ -331,6 +332,67 @@ kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "STALE"
 migrate_secrets >/dev/null 2>&1
 assert_eq "an existing secret is not clobbered" "NEWER" "$(kv_get "$SECRETS_FILE" GITEA_DEPLOY_TOKEN)"
 assert_eq "nothing to move is silent" "" "$(migrate_secrets 2>&1)"
+reset_repo
+
+describe ini_get
+_ini="${WORK}/sample.ini"
+printf '[polling]\n# interval_seconds = 99\ninterval_seconds = 30\n  timeout_seconds=5  \n[keep_alive]\nrefresh_seconds = 120\nenabled = auto\n; refresh_seconds = 1\n' > "$_ini"
+assert_eq "reads a value"                         "30"   "$(ini_get "$_ini" polling interval_seconds)"
+assert_eq "without spaces around ="               "5"    "$(ini_get "$_ini" polling timeout_seconds)"
+assert_eq "from the section asked for"            "120"  "$(ini_get "$_ini" keep_alive refresh_seconds)"
+assert_eq "a key of another section is not found" ""     "$(ini_get "$_ini" polling refresh_seconds)"
+assert_eq "a commented line is not a value"       "auto" "$(ini_get "$_ini" keep_alive enabled)"
+assert_eq "a missing key is empty"                ""     "$(ini_get "$_ini" keep_alive nothing)"
+assert_eq "a missing file is empty"               ""     "$(ini_get "${WORK}/no-such.ini" polling interval_seconds)"
+
+describe tidy_env
+reset_repo
+# What an installer before the tidy-up wrote.
+kv_set "$ENV_FILE" LITELLM_BASE_URL "http://127.0.0.1:4000"
+kv_set "$ENV_FILE" LITELLM_URL "http://127.0.0.1:4000/v1/chat/completions"
+kv_set "$ENV_FILE" LITELLM_HEALTH_URL "http://127.0.0.1:4000/health"
+kv_set "$ENV_FILE" MODEL_SERVER_COUNT 3
+kv_set "$ENV_FILE" MONITOR_INTERVAL_SECONDS 15
+kv_set "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS 240
+_servers_before="$(kv_get "$ENV_FILE" MODEL_SERVERS)"
+mkdir -p "$(dirname "$MONITOR_INI")"
+printf '[polling]\ninterval_seconds = 15\n[keep_alive]\nrefresh_seconds = 240\n' > "$MONITOR_INI"
+out="$(tidy_env 2>&1)"
+for _key in LITELLM_URL LITELLM_HEALTH_URL MODEL_SERVER_COUNT MONITOR_INTERVAL_SECONDS KEEP_ALIVE_REFRESH_SECONDS; do
+  assert_fail "${_key} is removed" kv_has "$ENV_FILE" "$_key"
+  assert_contains "and named" " ${_key}" "$out"
+done
+assert_eq "the settings that are used stay" "http://127.0.0.1:4000|${_servers_before}" \
+  "$(kv_get "$ENV_FILE" LITELLM_BASE_URL)|$(kv_get "$ENV_FILE" MODEL_SERVERS)"
+assert_eq "a tidy file is left alone, silently" "" "$(tidy_env 2>&1)"
+# A value that differs from what it would repeat was chosen: it stays.
+kv_set "$ENV_FILE" LITELLM_URL "http://127.0.0.1:4010/v1/chat/completions"
+kv_set "$ENV_FILE" MONITOR_INTERVAL_SECONDS 60
+kv_set "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS 120
+assert_eq "chosen values are kept, silently" "" "$(tidy_env 2>&1)"
+assert_eq "all three" "http://127.0.0.1:4010/v1/chat/completions|60|120" \
+  "$(kv_get "$ENV_FILE" LITELLM_URL)|$(kv_get "$ENV_FILE" MONITOR_INTERVAL_SECONDS)|$(kv_get "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS)"
+# monitor.ini was edited to the same value since: the repeat can go.
+printf '[polling]\ninterval_seconds = 60\n' > "$MONITOR_INI"
+tidy_env >/dev/null 2>&1
+assert_fail "a setting monitor.ini now repeats is removed" kv_has "$ENV_FILE" MONITOR_INTERVAL_SECONDS
+assert_ok   "one it does not repeat stays"                 kv_has "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS
+# LITELLM_URL follows a LITELLM_BASE_URL that was moved; an empty setting sets nothing.
+kv_set "$ENV_FILE" LITELLM_BASE_URL "http://127.0.0.1:4010/"
+kv_set "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS ""
+tidy_env >/dev/null 2>&1
+assert_fail "LITELLM_URL that only repeats the base is removed" kv_has "$ENV_FILE" LITELLM_URL
+assert_fail "an empty override is removed"                     kv_has "$ENV_FILE" KEEP_ALIVE_REFRESH_SECONDS
+# Without monitor.ini the monitor's built-in values are what an override repeats.
+rm -f "$MONITOR_INI"
+kv_set "$ENV_FILE" MONITOR_INTERVAL_SECONDS 15
+tidy_env >/dev/null 2>&1
+assert_fail "the built-in value counts when the file is missing" kv_has "$ENV_FILE" MONITOR_INTERVAL_SECONDS
+kv_set "$ENV_FILE" MODEL_SERVER_COUNT 3
+DRY_RUN=true
+assert_eq "a dry run changes nothing" "" "$(tidy_env 2>&1)"
+assert_ok "and leaves the file" kv_has "$ENV_FILE" MODEL_SERVER_COUNT
+DRY_RUN=false
 reset_repo
 
 describe tier_env_key
@@ -1506,6 +1568,24 @@ assert_eq "old snapshots count towards the limit" "2" "$(ls -1d "$APPLY_BACKUP_D
 assert_ok "the oldest pre-rename snapshot is the one pruned" bash -c "[[ ! -e '$APPLY_BACKUP_DIR/20260103T000000-3' && -d '$APPLY_BACKUP_DIR/20260104T000000-4' ]]"
 assert_ok "and the old directory is gone" bash -c "[[ ! -e '$APPLY_BACKUP_DIR_LEGACY' ]]"
 
+describe sync_metrics_key
+reset_repo
+_metrics="${REPO_DIR}/install/setup-metrics.sh"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/metrics.calls"\n[[ ! -e "%s/metrics.fail" ]]\n' "$WORK" "$WORK" > "$_metrics"
+rm -f "${WORK}/metrics.calls" "${UNIT_DIR}/osr-prometheus.service"
+assert_ok "does nothing without the metrics stack" sync_metrics_key
+assert_ok "and does not run the script" bash -c "[[ ! -e '${WORK}/metrics.calls' ]]"
+mkdir -p "$UNIT_DIR"; : > "${UNIT_DIR}/osr-prometheus.service"
+sync_metrics_key
+assert_eq "asks the stack to take the key again" "sync-key" "$(cat "${WORK}/metrics.calls")"
+touch "${WORK}/metrics.fail"
+out="$(sync_metrics_key 2>&1)"; rc=$?
+assert_eq "a failure does not fail the apply" "0" "$rc"
+assert_contains "but is reported" "scrape key could not be updated" "$out"
+rm -f "$_metrics"
+assert_ok "a config repo without the script is fine" sync_metrics_key
+rm -f "${WORK}/metrics.fail" "${WORK}/metrics.calls" "${UNIT_DIR}/osr-prometheus.service"
+
 describe restore_runtime
 snap="$(snapshot_runtime)"
 echo "broken" > "${ROUTER_DIR}/router.ini"
@@ -1593,6 +1673,18 @@ mock_command systemctl 0 "active"
 mock_command curl 0
 out="$(cmd_apply 2>&1)"
 assert_contains "nothing changed -> nothing restarted" "nothing restarted" "$out"
+# An env file from an older installer: tidied by the apply, which then restarts
+# the services that read it, once.
+kv_set "$ENV_FILE" MODEL_SERVER_COUNT 4
+kv_set "$ENV_FILE" LITELLM_HEALTH_URL "http://127.0.0.1:4000/health"
+cp "$ENV_FILE" "${ROUTER_DIR}/.env"          # what that installer deployed
+out="$(cmd_apply 2>&1)"
+assert_contains "apply tidies an older env file" "Tidied router.env: removed LITELLM_HEALTH_URL MODEL_SERVER_COUNT" "$out"
+assert_fail "the unused settings are gone" grep -Eq '^(MODEL_SERVER_COUNT|LITELLM_HEALTH_URL)=' "$ENV_FILE"
+assert_contains "the services reading it restart" "Restarting: litellm-proxy ollama-router ollama-monitor" "$out"
+out="$(cmd_apply 2>&1)"
+assert_contains "and only once" "nothing restarted" "$out"
+assert_not_contains "a tidy file is not mentioned again" "Tidied" "$out"
 echo "# tweak" >> "$ROUTER_INI"
 mock_reset_log
 out="$(cmd_apply 2>&1)"
@@ -1807,6 +1899,10 @@ mkdir -p "${REPO_DIR}/.git"
 kv_set "$ENV_FILE" GITEA_DEPLOY_TOKEN "LEAKED"
 cmd_commit "msg" >/dev/null 2>&1
 assert_fail "a token is moved out before anything is staged" grep -q LEAKED "$ENV_FILE"
+kv_set "$ENV_FILE" MODEL_SERVER_COUNT 4
+out="$(cmd_commit "msg" 2>&1)"
+assert_contains "an older env file is tidied before it is staged" "Tidied router.env: removed MODEL_SERVER_COUNT" "$out"
+assert_fail "so the commit records the tidy file" kv_has "$ENV_FILE" MODEL_SERVER_COUNT
 unset REQUIRE_PUSH
 assert_ok "by default a failed push still succeeds (the commit is kept)" cmd_commit "msg"
 out="$(cmd_commit "msg" 2>&1)"

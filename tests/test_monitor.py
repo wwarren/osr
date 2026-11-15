@@ -349,6 +349,41 @@ def test_keep_alive_runs_off_the_health_loop(monkeypatch):
     stop.set()
 
 
+def test_monitor_ini_governs_and_an_empty_variable_is_not_a_setting(monkeypatch):
+    module = load_monitor(monkeypatch)
+    assert (module.CHECK_INTERVAL, module.CHECK_TIMEOUT, module.HEALTH_PATH) == (15, 5.0, "/api/tags")
+    assert (module.FAIL_THRESHOLD, module.RECOVER_THRESHOLD, module.KEEP_ALIVE_INTERVAL) == (3, 2, 240)
+    assert module.env_overrides() == []
+    # An empty variable (KEY= in router.env) used to stop the monitor at start.
+    empty = load_monitor(monkeypatch, MONITOR_INTERVAL_SECONDS="", KEEP_ALIVE_REFRESH_SECONDS=" ",
+                         MONITOR_FAIL_THRESHOLD="")
+    assert (empty.CHECK_INTERVAL, empty.KEEP_ALIVE_INTERVAL, empty.FAIL_THRESHOLD) == (15, 240, 3)
+    assert empty.env_overrides() == []
+
+
+def test_environment_overrides_win_and_are_reported(monkeypatch, tmp_path, caplog):
+    ini = tmp_path / "monitor.ini"
+    ini.write_text("[polling]\ninterval_seconds = 30\n[keep_alive]\nrefresh_seconds = 120\n")
+    module = load_monitor(monkeypatch, MONITOR_INI=str(ini), MONITOR_INTERVAL_SECONDS="15",
+                          KEEP_ALIVE_REFRESH_SECONDS="120", MONITOR_TIMEOUT_SECONDS="5.0",
+                          MONITOR_HEALTH_PATH="/api/version")
+    assert (module.CHECK_INTERVAL, module.KEEP_ALIVE_INTERVAL, module.HEALTH_PATH) == (15, 120, "/api/version")
+    # Only the ones that change something: 120 and 5.0 repeat what the file says.
+    assert module.env_overrides() == [
+        "MONITOR_INTERVAL_SECONDS=15 (monitor.ini has [polling] interval_seconds = 30)",
+        "MONITOR_HEALTH_PATH=/api/version (monitor.ini has [polling] health_path = /api/tags)"]
+    monkeypatch.setattr(module, "build_checks", lambda: [module.Check("x", "http://x", "x")])
+    monkeypatch.setattr(module, "send_startup_notice", lambda checks: None)
+    monkeypatch.setattr(module, "run_cycle", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with caplog.at_level("INFO"), pytest.raises(KeyboardInterrupt):
+        module.run_health_checks()
+    assert "overrides monitor.ini: MONITOR_INTERVAL_SECONDS=15" in caplog.text
+    assert "KEEP_ALIVE_REFRESH_SECONDS" not in caplog.text
+    for key in ("MONITOR_INTERVAL_SECONDS", "KEEP_ALIVE_REFRESH_SECONDS", "MONITOR_TIMEOUT_SECONDS",
+                "MONITOR_HEALTH_PATH", "MONITOR_INI"):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_keep_alive_value(monkeypatch):
     assert load_monitor(monkeypatch, OLLAMA_KEEP_ALIVE="-1")._keep_alive_value() == -1
     assert load_monitor(monkeypatch, OLLAMA_KEEP_ALIVE="2h")._keep_alive_value() == "2h"

@@ -141,7 +141,7 @@ MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
 
 # Services that must be active afterwards if they were active before.
 declare -A UNITS=(
-    [router]='ollama-router litellm-proxy ollama-monitor open-webui'
+    [router]='ollama-router litellm-proxy ollama-monitor open-webui osr-prometheus grafana-server'
     [open-webui]='open-webui ollama-router'
     [llamacpp]='llama-server llama-ollama-bridge llama-dashboard'
     [airllm]='airllm-ollama-api'

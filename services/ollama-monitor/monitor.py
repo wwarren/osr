@@ -29,8 +29,10 @@ MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OllamaMonitor")
 MATTERMOST_CHANNEL = os.getenv("MATTERMOST_CHANNEL", "ollama-monitor")
 MATTERMOST_VERIFY_TLS = os.getenv("MATTERMOST_VERIFY_TLS", "true").lower() == "true"
 
-# Polling behaviour comes from monitor.ini (version controlled); environment
-# variables still win, so an operator can override without a commit.
+# Polling behaviour comes from monitor.ini (version controlled). An environment
+# variable of the names in ENV_OVERRIDES still wins when it is set to a value,
+# so an operator can override one without a commit; the overrides that differ
+# from monitor.ini are logged at start, so none is in force unnoticed.
 _DEFAULTS = {
     "polling": {"interval_seconds": "15", "timeout_seconds": "5",
                 "health_path": "/api/tags"},
@@ -52,15 +54,52 @@ _cfg.read_dict(_DEFAULTS)
 if os.path.exists(MONITOR_INI):
     _cfg.read(MONITOR_INI)
 
-CHECK_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",
-                               _cfg.get("polling", "interval_seconds")))
-CHECK_TIMEOUT = float(os.getenv("MONITOR_TIMEOUT_SECONDS",
-                                _cfg.get("polling", "timeout_seconds")))
-HEALTH_PATH = os.getenv("MONITOR_HEALTH_PATH", _cfg.get("polling", "health_path"))
-FAIL_THRESHOLD = max(1, int(os.getenv("MONITOR_FAIL_THRESHOLD",
-                                      _cfg.get("alerting", "fail_threshold"))))
-RECOVER_THRESHOLD = max(1, int(os.getenv("MONITOR_RECOVER_THRESHOLD",
-                                         _cfg.get("alerting", "recover_threshold"))))
+# (environment variable, monitor.ini section, option, default without the file)
+ENV_OVERRIDES = (
+    ("MONITOR_INTERVAL_SECONDS", "polling", "interval_seconds", "15"),
+    ("MONITOR_TIMEOUT_SECONDS", "polling", "timeout_seconds", "5"),
+    ("MONITOR_HEALTH_PATH", "polling", "health_path", "/api/tags"),
+    ("MONITOR_FAIL_THRESHOLD", "alerting", "fail_threshold", "3"),
+    ("MONITOR_RECOVER_THRESHOLD", "alerting", "recover_threshold", "2"),
+    ("KEEP_ALIVE_REFRESH_SECONDS", "keep_alive", "refresh_seconds", "240"),
+)
+
+
+def _ini(section: str, option: str, default: str) -> str:
+    return _cfg.get(section, option, fallback=default).strip()
+
+
+def _setting(name: str) -> str:
+    """One ENV_OVERRIDES setting: the environment's value when it has one (an
+    empty variable counts as not set), else monitor.ini's."""
+    for env_name, section, option, default in ENV_OVERRIDES:
+        if env_name == name:
+            return (os.getenv(env_name) or "").strip() or _ini(section, option, default)
+    raise KeyError(name)
+
+
+def env_overrides() -> list:
+    """The settings an environment variable changes from what monitor.ini
+    says, as text for the log."""
+    def same(left: str, right: str) -> bool:
+        try:
+            return float(left) == float(right)
+        except ValueError:
+            return left == right
+
+    found = []
+    for env_name, section, option, default in ENV_OVERRIDES:
+        value, ini = (os.getenv(env_name) or "").strip(), _ini(section, option, default)
+        if value and not same(value, ini):
+            found.append(f"{env_name}={value} (monitor.ini has [{section}] {option} = {ini})")
+    return found
+
+
+CHECK_INTERVAL = int(_setting("MONITOR_INTERVAL_SECONDS"))
+CHECK_TIMEOUT = float(_setting("MONITOR_TIMEOUT_SECONDS"))
+HEALTH_PATH = _setting("MONITOR_HEALTH_PATH")
+FAIL_THRESHOLD = max(1, int(_setting("MONITOR_FAIL_THRESHOLD")))
+RECOVER_THRESHOLD = max(1, int(_setting("MONITOR_RECOVER_THRESHOLD")))
 # The startup notice is posted at most once per this many seconds, so a crash
 # loop (Restart=always) does not flood the channel. The timestamp lives in the
 # unit's StateDirectory; without one, every start posts as before.
@@ -75,9 +114,7 @@ STATE_DIR = os.getenv("MONITOR_STATE_DIR", "")
 # its unload timer without generating anything.
 KEEP_ALIVE = (os.getenv("OLLAMA_KEEP_ALIVE", "") or "").strip()
 KEEP_ALIVE_MODE = _cfg.get("keep_alive", "enabled", fallback="auto").strip().lower()
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_REFRESH_SECONDS",
-                                    _cfg.get("keep_alive", "refresh_seconds",
-                                             fallback="240")))
+KEEP_ALIVE_INTERVAL = int(_setting("KEEP_ALIVE_REFRESH_SECONDS"))
 KEEP_ALIVE_TIMEOUT = float(_cfg.get("keep_alive", "timeout_seconds", fallback="120"))
 if KEEP_ALIVE_MODE == "auto":
     KEEP_ALIVE_ENABLED = bool(KEEP_ALIVE)
@@ -547,6 +584,8 @@ def run_health_checks() -> None:
     logging.info("Monitoring %d endpoint(s): %s (alert after %d failures, "
                  "recover after %d passes)", len(checks),
                  ", ".join(c.key for c in checks), FAIL_THRESHOLD, RECOVER_THRESHOLD)
+    for override in env_overrides():
+        logging.info("The environment (router.env) overrides monitor.ini: %s", override)
     stop = threading.Event()
     if KEEP_ALIVE_ENABLED:
         logging.info("keep-alive maintainer active: keep_alive=%s every %ds",

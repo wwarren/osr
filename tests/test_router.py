@@ -381,6 +381,22 @@ def test_upstream_framing_headers_are_not_copied(served):
     assert json.loads(response.content)["model"] == "qwen3:14b"
 
 
+def test_upstream_cannot_set_router_metric_labels(router):
+    upstream = httpx.Response(200, headers={
+        "X-Router-Model": "arbitrary-upstream-value",
+        "X-Router-Server": "arbitrary-upstream-host",
+        "X-Router-Request-ID": "arbitrary-upstream-id",
+        "X-Request-ID": "provider-id",
+        "X-Upstream": "yes",
+    })
+    headers = router._response_headers(upstream, {"X-Router-Mode": "discovery"})
+    assert headers["X-Router-Mode"] == "discovery"
+    assert not any(name.lower() in ("x-router-model", "x-router-server",
+                                    "x-router-request-id") for name in headers)
+    assert headers["x-request-id"] == "provider-id"
+    assert headers["x-upstream"] == "yes"
+
+
 def test_vision_without_vision_model_is_flagged(served):
     _, _, client = served
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
@@ -2136,8 +2152,8 @@ def test_body_for_model_caches_per_name(router):
 def test_the_key_check_does_not_wrap_responses(router):
     from starlette.middleware.base import BaseHTTPMiddleware
     classes = [middleware.cls for middleware in router.app.user_middleware]
-    assert classes == [router.RouterKeyMiddleware]
-    assert not issubclass(router.RouterKeyMiddleware, BaseHTTPMiddleware)
+    assert classes == [router.RequestMiddleware, router.RouterKeyMiddleware]   # outermost first
+    assert not any(issubclass(cls, BaseHTTPMiddleware) for cls in classes)
 
 
 def test_api_key_failure_decides_from_path_and_headers(router, monkeypatch):
@@ -2462,3 +2478,226 @@ def test_the_route_log_says_when_a_conversation_kept_its_server(served, caplog):
         assert "same server as last turn" not in caplog.text
         _served_by(client, _turns("logged", 1))
         assert "same server as last turn" in caplog.text
+
+
+# --- request IDs -------------------------------------------------------------------
+def _upstream_headers(upstream, path="/v1/chat/completions"):
+    return [call[2] for call in upstream.calls if call[1] == path]
+
+
+def test_every_answer_carries_a_request_id(served):
+    router, upstream, client = served
+    response = chat(client)
+    made = response.headers["x-router-request-id"]
+    assert re.fullmatch(r"[0-9a-f]{16}", made)
+    assert response.headers["x-request-id"] == made                 # where OpenAI clients look
+    assert _upstream_headers(upstream)[-1]["x-request-id"] == made   # and the backend's log has it
+    other = chat(client).headers["x-router-request-id"]
+    assert other != made
+    # Paths that route nothing have one as well, and so does a refusal.
+    assert client.get("/healthz").headers["x-router-request-id"]
+    assert client.post("/v1/chat/completions", content=b"{not json").headers["x-router-request-id"]
+
+
+def test_a_callers_request_id_is_kept_when_it_is_plain(served):
+    router, upstream, client = served
+    response = chat_with(client, {"X-Request-ID": "ticket-4711.a:b_c"})
+    assert response.headers["x-router-request-id"] == "ticket-4711.a:b_c"
+    assert _upstream_headers(upstream)[-1]["x-request-id"] == "ticket-4711.a:b_c"
+    for odd in ("has space", "x" * 65, "semi;colon", "quote\"d", "a/b"):
+        response = chat_with(client, {"X-Request-ID": odd})
+        made = response.headers["x-router-request-id"]
+        assert made != odd and re.fullmatch(r"[0-9a-f]{16}", made)
+        assert _upstream_headers(upstream)[-1]["x-request-id"] == made   # the odd one goes no further
+    assert router.accept_request_id(None) != router.accept_request_id("")
+
+
+def chat_with(client, headers, **body):
+    payload = {"model": "auto", "messages": [user("hi")]}
+    payload.update(body)
+    return client.post("/v1/chat/completions", json=payload, headers=headers)
+
+
+def test_a_refused_request_has_an_id_and_is_counted(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "ROUTER_API_KEY", "s3cret")
+    response = chat(client)
+    assert response.status_code == 401 and response.headers["x-router-request-id"]
+    assert 'osr_requests_total{class="",mode="",model="",route="chat",server="",status="401"} 1' in \
+        router.render_metrics()
+
+
+def test_an_upstream_request_id_on_the_answer_is_left_alone(router):
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"x-request-id", b"req_from_the_provider")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    response = TestClient(router.RequestMiddleware(app)).get("/v1/models", headers={"X-Request-ID": "mine-1"})
+    assert response.headers["x-request-id"] == "req_from_the_provider"
+    assert response.headers["x-router-request-id"] == "mine-1"
+
+
+def test_log_lines_of_a_request_start_with_its_id(served, caplog):
+    router, upstream, client = served
+    upstream.chat = {HOST_A: 500, HOST_B: 500}
+    with caplog.at_level("INFO", logger="router"):
+        made = chat_with(client, {"X-Request-ID": "trace-me"}).headers["x-router-request-id"]
+        client.post("/routing/refresh")
+    assert made == "trace-me"
+    mine = [r.getMessage() for r in caplog.records if r.name == "router" and "trace-me" in r.getMessage()]
+    assert any(m.startswith("[trace-me] dispatch: ") and "trying the next candidate" in m for m in mine)
+    assert any(m.startswith("[trace-me] route class=") for m in mine)
+    assert all(m.startswith("[trace-me] ") for m in mine)
+    assert router.request_id() == ""                                # nothing lingers after the request
+    # The logger is shared across reloads of the module: still one prefix only.
+    assert not any(m.startswith("[trace-me] [trace-me]") for m in mine)
+
+
+# --- /metrics ------------------------------------------------------------------------
+def _metric(text, name, **labels):
+    """The value of one series in a /metrics page, or None."""
+    upper = labels.pop("le", None)                  # a histogram's bound comes last
+    pairs = sorted(labels.items()) + ([("le", upper)] if upper else [])
+    want = "{%s}" % ",".join('%s="%s"' % item for item in pairs) if pairs else ""
+    for line in text.splitlines():
+        if line.startswith(name + want + " "):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def test_metrics_count_requests_by_how_they_were_served(served):
+    router, upstream, client = served
+    for n in range(3):
+        assert chat(client, messages=[user(f"question {n}")]).status_code == 200
+    upstream.chat = {HOST_A: 500, HOST_B: 500}
+    assert chat(client, messages=[user("fails")]).status_code == 500
+    client.post("/v1/chat/completions", content=b"{not json")
+    client.get("/routing/inventory")
+    client.get("/healthz")
+    page = client.get("/metrics")
+    assert page.status_code == 200 and page.headers["content-type"].startswith("text/plain; version=0.0.4")
+    text = page.text
+    served_ok = [_metric(text, "osr_requests_total", **{"class": "fast"}, mode="discovery", model="qwen3:14b",
+                         route="chat", server=host, status="200") or 0 for host in (HOST_A, HOST_B)]
+    assert sum(served_ok) == 3
+    assert sum(_metric(text, "osr_requests_total", **{"class": "fast"}, mode="discovery", model="qwen3:14b",
+                       route="chat", server=host, status="500") or 0 for host in (HOST_A, HOST_B)) == 1
+    assert _metric(text, "osr_requests_total", **{"class": ""}, mode="", model="", route="chat",
+                   server="", status="400") == 1
+    assert _metric(text, "osr_requests_total", **{"class": ""}, mode="", model="", route="routing",
+                   server="", status="200") == 1
+    assert "healthz" not in text and 'route="other"' not in text and "/metrics" not in text
+    # Both failing servers were tried, and counted, once each.
+    for host in (HOST_A, HOST_B):
+        assert _metric(text, "osr_upstream_failures_total", reason="http_500", server=host) == 1
+    # Timings: one observation per request answered below 400, in every bucket above it.
+    counts = [_metric(text, "osr_request_duration_seconds_count", mode="discovery", model="qwen3:14b",
+                      server=host) or 0 for host in (HOST_A, HOST_B)]
+    assert sum(counts) == 3
+    starts = [_metric(text, "osr_response_start_seconds_bucket", mode="discovery", model="qwen3:14b",
+                      server=host, le="+Inf") or 0 for host in (HOST_A, HOST_B)]
+    assert sum(starts) == 3
+    assert "# TYPE osr_request_duration_seconds histogram" in text
+    assert "# TYPE osr_requests_total counter" in text and "# HELP osr_requests_total " in text
+
+
+def test_metric_timing_includes_sending_headers_and_final_body(router):
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        await asyncio.sleep(0.02)
+
+    scope = {"type": "http", "path": "/v1/chat/completions", "headers": []}
+    asyncio.run(router.RequestMiddleware(app)(scope, receive, send))
+    text = router.render_metrics()
+    assert _metric(text, "osr_response_start_seconds_sum", mode="", model="", server="") >= 0.02
+    assert _metric(text, "osr_request_duration_seconds_sum", mode="", model="", server="") >= 0.04
+
+
+def test_metrics_report_servers_and_load(served):
+    router, upstream, client = served
+    upstream.chat = {HOST_A: "connect"}
+    for n in range(2):
+        chat(client, messages=[user(f"to the other one {n}")])
+    slot = router.InFlight(HOST_B)
+    text = client.get("/metrics").text
+    assert _metric(text, "osr_server_up", kind="ollama", server=HOST_A) == 0       # marked down by the failed attempt
+    assert _metric(text, "osr_server_up", kind="ollama", server=HOST_B) == 1
+    assert _metric(text, "osr_server_models", server=HOST_B) == 1
+    assert _metric(text, "osr_in_flight_requests", server=HOST_B) == 1
+    assert _metric(text, "osr_in_flight_requests", server=HOST_A) == 0
+    assert _metric(text, "osr_upstream_failures_total", reason="connect", server=HOST_A) == 1
+    assert _metric(text, "osr_remembered_conversations") == 2
+    assert _metric(text, "osr_inventory_age_seconds") >= 0
+    assert _metric(text, "osr_start_time_seconds") == pytest.approx(time.time(), abs=120)
+    slot.release()
+
+
+def test_metrics_count_a_tool_rejection(served):
+    router, upstream, client = served
+    upstream.capabilities["qwen3:14b"] = ["completion", "tools"]
+    client.post("/routing/refresh")
+    upstream.tool_less.add("qwen3:14b")
+    chat(client, tools=TOOLS)
+    text = client.get("/metrics").text
+    rejected = [_metric(text, "osr_upstream_failures_total", reason="tool_rejection", server=host) or 0
+                for host in (HOST_A, HOST_B)]
+    assert sum(rejected) == 2
+
+
+def test_metrics_need_the_router_key(served, monkeypatch):
+    router, upstream, client = served
+    monkeypatch.setattr(router, "ROUTER_API_KEY", "s3cret")
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"authorization": "Bearer s3cret"}).status_code == 200
+
+
+def test_metric_labels_never_come_from_the_client(served):
+    router, upstream, client = served
+    chat_with(client, {"X-Request-ID": "client-chosen-id", "X-Router-Model": "spoofed",
+                       "X-Router-Server": "http://evil.example"},
+              model="no-such-model-the-client-made-up", messages=[user("hi there")])
+    text = client.get("/metrics").text
+    for word in ("client-chosen-id", "spoofed", "evil.example", "no-such-model"):
+        assert word not in text
+
+
+def test_metric_text_format(router):
+    assert router._label_text((("server", 'a"b\\c\nd'),)) == '{server="a\\"b\\\\c\\nd"}'
+    assert router._label_text((), 'le="1"') == '{le="1"}' and router._label_text(()) == ""
+    assert (router._number(3), router._number(2.0), router._number(0.25)) == ("3", "2", "0.25")
+    router.observe("osr_request_duration_seconds", 0.2, server="s")
+    router.observe("osr_request_duration_seconds", 7.0, server="s")
+    router.observe("osr_request_duration_seconds", 9999.0, server="s")     # beyond the last bucket
+    text = router.render_metrics()
+    series = {line.rsplit(" ", 1)[0]: float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+              if line.startswith("osr_request_duration_seconds") and 'server="s"' in line}
+    assert series['osr_request_duration_seconds_bucket{server="s",le="0.1"}'] == 0
+    assert series['osr_request_duration_seconds_bucket{server="s",le="0.25"}'] == 1
+    assert series['osr_request_duration_seconds_bucket{server="s",le="5"}'] == 1
+    assert series['osr_request_duration_seconds_bucket{server="s",le="10"}'] == 2      # cumulative
+    assert series['osr_request_duration_seconds_bucket{server="s",le="600"}'] == 2
+    assert series['osr_request_duration_seconds_bucket{server="s",le="+Inf"}'] == 3
+    assert series['osr_request_duration_seconds_count{server="s"}'] == 3
+    assert series['osr_request_duration_seconds_sum{server="s"}'] == pytest.approx(10006.2)
+    # Every sample line is "name{labels} number", and every metric is described.
+    for line in text.splitlines():
+        assert line.startswith("# ") or re.fullmatch(r'[a-z_]+(\{.*\})? [-+0-9.e]+', line), line
+    for name in router.METRICS:
+        assert f"# TYPE {name} " in text
+
+
+def test_the_number_of_series_is_capped(router, monkeypatch):
+    monkeypatch.setattr(router, "METRIC_SERIES_MAX", 3)
+    for n in range(10):
+        router.count("osr_requests_total", route=f"r{n}")
+        router.observe("osr_request_duration_seconds", 1.0, server=f"s{n}")
+    router.count("osr_requests_total", route="r0")           # an existing series still counts
+    assert len(router._COUNTERS) == 3 and len(router._HISTOGRAMS) == 3
+    assert router._COUNTERS[("osr_requests_total", (("route", "r0"),))] == 2

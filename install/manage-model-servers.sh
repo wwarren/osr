@@ -22,6 +22,7 @@ ROUTER_DIR="${ROUTER_DIR:-/app/router}"
 ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
 ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
+MONITOR_INI="${REPO_DIR}/services/ollama-monitor/monitor.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
@@ -626,6 +627,65 @@ migrate_secrets() {
     note "  They may still be in the repo's git history. Rotate any exposed"
     note "  provider API keys, deploy tokens or webhooks if the repo was pushed."
   fi
+}
+
+# ini_get FILE SECTION KEY: the value of KEY in [SECTION], or nothing.
+ini_get() {
+  [[ -f "$1" ]] || return 0
+  awk -v section="[$2]" -v key="$3" '
+    /^[[:space:]]*\[/ { inside = ($1 == section); next }
+    inside && !/^[[:space:]]*[#;]/ {
+      at = index($0, "=")
+      if (!at) next
+      name = substr($0, 1, at - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != key) next
+      value = substr($0, at + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      print value; exit
+    }' "$1"
+}
+
+# Take out of the version-controlled env file the settings older installers
+# wrote there that do nothing, or only repeat another setting:
+#   * LITELLM_HEALTH_URL and MODEL_SERVER_COUNT are read by nothing;
+#   * LITELLM_URL, when it is LITELLM_BASE_URL plus the chat path, which is
+#     what the router uses without it;
+#   * MONITOR_INTERVAL_SECONDS and KEEP_ALIVE_REFRESH_SECONDS, when they say
+#     what monitor.ini says (or nothing). They override monitor.ini, so left in
+#     place they keep a later edit of monitor.ini from taking effect.
+# Nothing that runs changes: a value that differs from what it would repeat
+# was put there on purpose and stays. Runs before every commit and apply.
+tidy_env() {
+  local key value base section option fallback removed=""
+  $DRY_RUN && return 0
+  [[ -f "$ENV_FILE" ]] || return 0
+  for key in LITELLM_HEALTH_URL MODEL_SERVER_COUNT; do
+    if kv_has "$ENV_FILE" "$key"; then
+      kv_del "$ENV_FILE" "$key"; removed+=" ${key}"
+    fi
+  done
+  if kv_has "$ENV_FILE" LITELLM_URL; then
+    base="$(kv_get "$ENV_FILE" LITELLM_BASE_URL)"
+    base="${base:-http://127.0.0.1:4000}"
+    if [[ "$(kv_get "$ENV_FILE" LITELLM_URL)" == "${base%/}/v1/chat/completions" ]]; then
+      kv_del "$ENV_FILE" LITELLM_URL; removed+=" LITELLM_URL"
+    fi
+  fi
+  while read -r key section option fallback; do
+    kv_has "$ENV_FILE" "$key" || continue
+    value="$(kv_get "$ENV_FILE" "$key")"
+    base="$(ini_get "$MONITOR_INI" "$section" "$option")"
+    if [[ -z "$value" || "$value" == "${base:-$fallback}" ]]; then
+      kv_del "$ENV_FILE" "$key"; removed+=" ${key}"
+    fi
+  done <<'SETTINGS'
+MONITOR_INTERVAL_SECONDS polling interval_seconds 15
+KEEP_ALIVE_REFRESH_SECONDS keep_alive refresh_seconds 240
+SETTINGS
+  if [[ -n "$removed" ]]; then
+    note "Tidied $(basename "$ENV_FILE"): removed${removed} (unused, or the same as the setting"
+    note "  it repeated). Nothing that runs changes; the next commit records it."
+  fi
+  return 0
 }
 
 # NOTE for callers: this dies on an unknown tier, but a `die` inside $(...)
@@ -2130,6 +2190,16 @@ restart_and_check() {
   done
 }
 
+# Give the local Prometheus (install/setup-metrics.sh) the router key again
+# after an apply, in case the key changed. Does nothing where that stack is not
+# installed, and never fails an apply: the scrape only shows 401 until fixed.
+sync_metrics_key() {
+  [[ -f "${REPO_DIR}/install/setup-metrics.sh" && -f "${UNIT_DIR}/osr-prometheus.service" ]] || return 0
+  bash "${REPO_DIR}/install/setup-metrics.sh" sync-key ||
+    note 'WARNING: Prometheus scrape key could not be updated; rerun setup-metrics.sh sync-key.'
+  return 0
+}
+
 # Open WebUI's data directory (its SQLite database lives there).
 openwebui_data_dir() {
   local dir
@@ -2170,6 +2240,7 @@ cmd_apply() {
   # preserve the executable bit, and we invoke it via `bash` anyway.
   [[ -f "$APPLY_SCRIPT" ]] || die "apply script not found: ${APPLY_SCRIPT}"
   migrate_secrets
+  tidy_env
   sync_kindi_timeouts
 
   echo "Validating configuration..."
@@ -2234,12 +2305,14 @@ cmd_apply() {
   if (( ${#affected[@]} == 0 )); then
     echo "No service is affected by this change; nothing restarted."
     secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    sync_metrics_key
     kindi_budget_note "$budget_before" "$budget_after"
     return 0
   fi
   echo "Restarting: ${affected[*]}"
   if failed="$(restart_and_check "${affected[@]}")"; then
     secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+    sync_metrics_key
     echo "Applied; all restarted services are healthy."
     kindi_budget_note "$budget_before" "$budget_after"
     return 0
@@ -2635,6 +2708,7 @@ cmd_commit() {
     return 0
   }
   migrate_secrets
+  tidy_env
   git -C "$REPO_DIR" add -A
   if git -C "$REPO_DIR" diff --cached --quiet; then
     note "Nothing to commit."

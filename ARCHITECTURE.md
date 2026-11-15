@@ -3,7 +3,7 @@
 **System:** `open-smart-router`
 **Platform:** Proxmox VE; an unprivileged Debian 13 router LXC and separate target LXCs
 **Built by:** `open-smart-router-install.sh` and `targets/*/provision-lxc.sh`
-**Last reviewed:** 2026-11-14
+**Last reviewed:** 2026-11-15
 
 ---
 
@@ -12,7 +12,7 @@
 The router gives clients one OpenAI-compatible endpoint for 1–20 configured
 model hosts. It inventories their models and picks a host per request by size,
 capabilities and a load-spreading score. The router CT also runs Open WebUI,
-a LiteLLM fallback and health monitoring. Optional `targets/` LXCs provide model
+a LiteLLM fallback, health monitoring, and local Prometheus and Grafana. Optional `targets/` LXCs provide model
 servers, Gitea, Mattermost, Honcho memory, the Hermes, OpenClaw, OpenCode and DeepSeek
 Harness agent frameworks, Open Terminal and ComfyUI. Standalone MQTT and hcom tool
 targets coordinate the agent CTs, with optional Mattermost handoffs (§17.7).
@@ -35,6 +35,8 @@ flowchart LR
         webui["Open WebUI<br/>:8080"]
         litellm["LiteLLM<br/>127.0.0.1:4000"]
         monitor["Health Monitor"]
+        prometheus["Prometheus<br/>127.0.0.1:9090"]
+        grafana["Grafana<br/>:3000"]
     end
     subgraph pool["Model pool (1-20 hosts)"]
         o1["Ollama / llama.cpp bridge / AirLLM<br/>:11434"]
@@ -56,6 +58,9 @@ flowchart LR
 
     api --> router
     browser --> webui
+    browser --> grafana
+    prometheus -->|"GET /metrics + router key"| router
+    grafana -->|"queries"| prometheus
     webui -->|OpenAI API| router
     webui -->|terminal tool| term
     webui -->|"OpenAI API (hermes-agent)"| hermes
@@ -113,8 +118,9 @@ flowchart LR
 
 ## 3. Deployment view
 
-All four services run in one unprivileged LXC (default 2 vCPU, 4 GB, 32 GB)
-as the non-login account `ollama-router`.
+The four core services run in one unprivileged LXC (default 2 vCPU, 4 GB,
+32 GB) as the non-login account `ollama-router`. Prometheus runs in the same
+CT as `prometheus`, and Grafana runs there as `grafana`.
 
 ```mermaid
 flowchart TB
@@ -168,6 +174,7 @@ FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 | `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state, the router's requests in flight per server (`in_flight`) and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll, which also asks every Ollama model for its capabilities again unless `?probe=false` |
 | `POST /routing/explain` | Decision and scored candidates, without executing |
 | `GET /healthz` | Liveness (never needs the key) |
+| `GET /metrics` | Prometheus text format: requests by route, mode, class, model, server and status; upstream failures by server and reason; response-start and duration histograms; per-server load and state (§12) |
 | `ANY /v1/{path}` | Passthrough to LiteLLM (embeddings, etc.) |
 
 With `ROUTER_API_KEY` set, every path except `/healthz` needs
@@ -400,7 +407,10 @@ Seeded at `install/manage-model-servers.sh` and symlinked to
   keep-alive pinning.
 * The env rewrite keeps `0640 root:ollama-router`; secret keys are refused in
   `env/router.env` and written to `secrets.env`. Anything `router.ini` omits
-  uses `router.py`'s defaults.
+  uses `router.py`'s defaults. `apply` and `commit` also remove settings older
+  installers left in `router.env` that nothing reads or that only repeat
+  another setting (`tidy_env`); a value that differs from what it would repeat
+  is kept.
 * **`apply` validates, snapshots, applies, health-checks and restores on
   failure**, restarting only services whose inputs changed and syncing the
   LiteLLM and Open WebUI venvs with their pins (backing up `webui.db`). The
@@ -473,7 +483,8 @@ since the router itself does not need it. Selected Gitea and Mattermost CTs
 are created on the node running the installer, as are all other new CTs. They
 come first and supply their URL, token and webhook as prompt defaults. It then
 seeds missing configuration in Gitea (or ships a local tree), creates the
-router CT, clones and applies the configuration and starts the four services;
+router CT, clones and applies the configuration, starts the four core services,
+then attempts the local Prometheus and Grafana setup;
 a failed router build removes its half-built CT. Every new CT's ID defaults
 to the cluster's next free ID (`pvesh get /cluster/nextid`); the installer
 steps past IDs it has already given out in the run, since none of its CTs
@@ -517,6 +528,8 @@ service account before its venv is built.
 | 8000 | Smart Router | `0.0.0.0` | LAN API |
 | 8080 | Open WebUI | `0.0.0.0` | LAN UI (port chosen at install) |
 | 4000 | LiteLLM | `127.0.0.1` | CT-local only |
+| 9090 | OSR Prometheus | `127.0.0.1` | CT-local scrape store and query API; 15-second authenticated scrape, 7-day/512-MB block retention |
+| 3000 | Grafana in router CT | `0.0.0.0` | Browser dashboard with login; installer adds a trusted-CIDR firewall rule when enabled |
 | 443 | Cloud APIs; subscription gateway | Outbound | LiteLLM → providers; router → gateway (any HTTPS port, or loopback HTTP) |
 | 11434 / 1234 / 8080 / 8093 | Model hosts | Outbound | Router, LiteLLM, monitor, agent and Honcho dispatchers → pool |
 | 8000 / 20000-29999 | Open Terminal gateway / per-user workspaces | `0.0.0.0` / `127.0.0.1` in its CT | Open WebUI and connected agents → gateway → each user's workspace |
@@ -657,7 +670,20 @@ post: delivery is at least once (§17.7).
 The router exposes inventory, scored explanations and per-decision response
 headers; the monitor logs failed webhook deliveries and posts host and
 local-service transitions to Mattermost; the
-[README](README.md#troubleshooting) lists the commands. Agent dispatchers log
+[README](README.md#troubleshooting) lists the commands.
+
+Each request has an ID (`RequestMiddleware`, plain ASGI and outermost, so a
+refused request has one too): the caller's `X-Request-ID` when it is a plain
+token, else a random one. A context variable carries it, a filter on the
+`router` logger puts it in front of every line logged for the request, the
+answer returns it as `X-Router-Request-ID` (and `X-Request-ID` unless the
+upstream set one), and upstream requests carry it as `X-Request-ID`. The same
+middleware feeds `GET /metrics`: it reads the `X-Router-*` headers the router
+put on the answer, so labels come only from the router's own inventory and
+configuration, never from a request, and the series stay bounded (with a cap
+as a last guard). Counters and histograms live in the process, without a
+client library, and restart at zero; gauges are read from the inventory and
+the in-flight counts when scraped. `/metrics` needs the router key. Agent dispatchers log
 their own decisions (`hermes-direct`, `openclaw-direct`, `honcho-proxy`). The
 coordination plane logs to `mosquitto.service` (broker),
 `osr-hcom-relay.service` (each participant), `osr-hcom-bus@` units (each bus
@@ -1178,7 +1204,7 @@ Coordination paths (§17.7):
 |---|---|
 | `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict, tool_kinds), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe and its cache), `[weights]`, `[balancing]` (busy_penalty, sticky_seconds), `[model_sizes]` |
 | `monitor.ini` | Interval, timeout, Ollama health path, alert thresholds, startup notice, local services, keep-alive |
-| `env/router.env` | Hosts, per-tier backends and tags, keep-alive, LiteLLM URLs, `CLOUD_*_MODELS`, `SUBSCRIPTION_GATEWAY_BASE_URL`, Gitea/Mattermost settings (no credentials) |
+| `env/router.env` | Where things are: hosts, per-tier backends and tags, keep-alive, the LiteLLM base URL, `CLOUD_*_MODELS`, `SUBSCRIPTION_GATEWAY_BASE_URL`, Gitea/Mattermost settings (no credentials). Every key is read by the router, the monitor or the manager (`tests/test-repo.sh`). The monitor's `MONITOR_*` and `KEEP_ALIVE_REFRESH_SECONDS` variables override `monitor.ini` and are logged when they do |
 | `secrets.env` (not in git) | Gitea token, webhook, router key, backend tokens, cloud keys |
 | `env/openwebui.env` | UI port, data dir, upstream API base, auth toggle |
 | `litellm_config.yaml` | Static tier → host deployments, strategy, fallbacks, Kindi timeouts and retry policies |

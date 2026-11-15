@@ -9,8 +9,8 @@ serves a chat UI and alerts on host health. Design and rationale are in
 
 ## What gets deployed
 
-An unprivileged Debian 13 CT (default 2 vCPU, 4 GB RAM, 32 GB disk) running four
-hardened systemd services as the `ollama-router` user:
+An unprivileged Debian 13 CT (default 2 vCPU, 4 GB RAM, 32 GB disk) running
+the router services as `ollama-router`, plus a small local metrics stack:
 
 | Service | Unit | Port | Role |
 |---|---|---|---|
@@ -18,6 +18,8 @@ hardened systemd services as the `ollama-router` user:
 | Open WebUI | `open-webui.service` | 8080 | Chat UI; talks to the router |
 | LiteLLM | `litellm-proxy.service` | 127.0.0.1:4000 | Static tier fallback, cloud models and non-chat `/v1` routes |
 | Health monitor | `ollama-monitor.service` | — | Probes hosts and local services, alerts to Mattermost, keeps Ollama models loaded |
+| Prometheus | `osr-prometheus.service` | 127.0.0.1:9090 | Scrapes the router every 15 seconds with its API key; retains up to 7 days or 512 MB of blocks |
+| Grafana | `grafana-server.service` | 3000 | Authenticated dashboard for router metrics |
 
 Normal request path: **client or Open WebUI → router :8000 → model host**.
 LiteLLM serves static tiers only when discovery is off or the inventory is
@@ -520,9 +522,11 @@ timeouts, 404s, 5xx and tool-support rejections try the next candidate until
 streaming starts; other 400s go back to the client. With discovery off or an
 empty inventory, LiteLLM serves static tiers (`X-Router-Mode: litellm`).
 `X-Router-Model`, `-Server`, `-Class`, `-Mode`, `-Candidates` and `-Warning`
-explain each choice.
+explain each choice, and `X-Router-Request-ID` names the request in the
+router's log.
 
 ```text
+GET  /metrics             Prometheus metrics (below)
 GET  /routing/inventory   host models, capabilities, context, errors and requests in flight
 POST /routing/refresh     poll now and ask every Ollama model for its capabilities again (?probe=false: poll only)
 POST /routing/explain     {"prompt": "..."} -> scored candidates
@@ -551,6 +555,86 @@ unless you pass it, and does not remember a custom URL.
 non-loopback address the router logs a warning. For an older install run
 `manage-model-servers set-api-key --apply` and paste the key into Open WebUI
 **Admin Settings > Connections > OpenAI**.
+
+### Request IDs and metrics
+
+**Request IDs.** Every answer carries `X-Router-Request-ID`. It is the
+caller's own `X-Request-ID` when that is a plain token (letters, digits and
+`. _ : -`, up to 64 characters), otherwise 16 random hex digits. The same
+value is returned as `X-Request-ID` (where OpenAI clients look for it) unless
+the upstream answer already has one, is sent to the model server or LiteLLM as
+`X-Request-ID`, and starts every line the router logs for the request:
+
+```bash
+journalctl -u ollama-router | grep -F '[4c1f0e6a9b2d7730]'   # the decision and every failover of one request
+```
+
+**Metrics.** `GET /metrics` serves Prometheus text format. Like every path but
+`/healthz` it needs the router key, because the labels name your servers and
+models. The values start at zero with each router start and count only what
+goes through the router (not what agents send a server directly).
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `osr_requests_total` | `route` (`chat`, `v1`, `routing`), `mode`, `class`, `model`, `server`, `status` | Requests answered, with the HTTP status returned. Refused and failed ones have empty `model` and `server` |
+| `osr_upstream_failures_total` | `server`, `reason` (`connect`, `transport`, `no_reply`, `http_<status>`, `tool_rejection`) | Attempts on a model server that failed, whether or not another server then answered |
+| `osr_response_start_seconds` | `mode`, `model`, `server` | Histogram: chat requests answered below 400, from arrival until the response headers went out |
+| `osr_request_duration_seconds` | `mode`, `model`, `server` | Histogram: the same requests, until the last byte of the body |
+| `osr_in_flight_requests`, `osr_server_up`, `osr_server_models` | `server` (`osr_server_up` also `kind`) | Per model server: the router's requests in flight, up (1) or down (0), models listed |
+| `osr_inventory_age_seconds`, `osr_remembered_conversations`, `osr_start_time_seconds` | — | Seconds since the last discovery poll, conversations with a remembered server, start time |
+
+```yaml
+scrape_configs:
+  - job_name: osr
+    authorization:
+      credentials_file: /etc/prometheus/osr-router-key   # ROUTER_API_KEY, alone on one line
+    static_configs:
+      - targets: ['<ct-ip>:8000']
+```
+
+`/healthz` and `/metrics` themselves are not counted. No label is taken from a
+request, so the number of series stays bounded by your servers and models.
+
+### Local Grafana dashboard
+
+New router installs install Prometheus and Grafana in the router CT
+(`INSTALL_METRICS=false` leaves them out). Prometheus
+scrapes `GET /metrics` on the CT's loopback address using a protected copy of
+`ROUTER_API_KEY`; its HTTP API stays on `127.0.0.1:9090`. Grafana has a
+provisioned `OSR Prometheus` data source and an **Open Smart Router** dashboard
+with request rates, failures, latency, in-flight load and server state. Open
+`http://<ct-ip>:3000` and sign in as `admin`. On a new Grafana database the
+initial random password is in `/etc/grafana/osr.env` (root-readable):
+
+```bash
+pct exec <CT_ID> -- sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' /etc/grafana/osr.env
+```
+
+The installer allows port 3000 from `API_ALLOW_CIDR` when it configures the CT
+firewall. If Grafana package installation fails, the router keeps running; rerun
+the setup inside the CT after fixing package access:
+
+```bash
+pct exec <CT_ID> -- bash /app/config-repo/install/setup-metrics.sh install
+```
+
+For an existing router CT, first update its config repo using
+`install/update-router.sh` as described under [Updating](#updating),
+then run the setup command above. Add a firewall allow rule for TCP 3000 from
+your trusted CIDR if the CT firewall is enabled. Re-running the command keeps
+Grafana's database and initial password. `manage-model-servers apply` refreshes
+Prometheus's scrape key when `ROUTER_API_KEY` changes. Prometheus is installed
+without Debian's recommended node exporter, so nothing else starts listening.
+Grafana is the newest release in Grafana's stable repository unless
+`GRAFANA_VERSION=<version>` is set for the setup command; set
+`GRAFANA_KEY_FINGERPRINT` to the fingerprint Grafana publishes for its
+signing key to have the downloaded key checked before anything is installed
+from it. Update both later with `apt-get install --only-upgrade prometheus
+grafana` in the CT; `tools/upgrade-all.sh` checks that the two services still
+run after a router upgrade but does not upgrade them. Check the scrape with
+`systemctl status osr-prometheus grafana-server` and Grafana's data source
+health. Prometheus retention is limited to 7 days and 512 MB of persistent
+blocks; its write-ahead log needs additional disk space.
 
 ## Managing model servers
 
@@ -711,6 +795,20 @@ tiers and writes Kindi's own for Kindi tiers
 live only in `/app/router/secrets.env` (`0640 root:ollama-router`); `apply` and
 `commit` move any found in `env/router.env` there. Commits made before 2026-09
 contain the old deploy token: rotate it in Gitea.
+
+**Where settings live.** `env/router.env` says where things are: Gitea and
+Mattermost, the model servers and tiers, LiteLLM, cloud model IDs; every key in
+it is read by the router, the monitor or `manage-model-servers`. How the
+services behave is tuned in `router.ini` and `monitor.ini`. The monitor still
+lets an environment variable override its file (`MONITOR_INTERVAL_SECONDS`,
+`MONITOR_TIMEOUT_SECONDS`, `MONITOR_HEALTH_PATH`, `MONITOR_FAIL_THRESHOLD`,
+`MONITOR_RECOVER_THRESHOLD`, `KEEP_ALIVE_REFRESH_SECONDS`) and logs at start
+each one that changes what `monitor.ini` says. `apply` and `commit` remove what
+older installers wrote to `router.env` without effect: `LITELLM_HEALTH_URL` and
+`MODEL_SERVER_COUNT` (read by nothing), `LITELLM_URL` when it only repeats
+`LITELLM_BASE_URL`, and `MONITOR_INTERVAL_SECONDS` or
+`KEEP_ALIVE_REFRESH_SECONDS` when they repeat `monitor.ini`; a value that
+differs was chosen and is kept.
 
 **Config lock.** `update-router.sh` and every writing command take
 `/run/lock/open-smart-router-config.lock`. A second change fails at once
@@ -1023,6 +1121,7 @@ there. The router shows their inventory and `/routing/explain` requests but no
 | Open WebUI venv ~7.5 GB | `TORCH_CPU_ONLY=false`, or `download.pytorch.org` was unreachable; `apply` installs CPU torch and purges `nvidia-*`/`triton` wheels |
 | Open WebUI shows no models / 401 | The router key changed: paste it into Admin Settings > Connections > OpenAI |
 | A host or its models are missing | `/routing/inventory` shows the error: a wrong or missing `set-<kind>-token` (401), a Strata-style engine not running (empty `/v1/models`), or a server bound to `127.0.0.1`. A refused connection removes a host until its next good poll |
+| Following one request | Take `X-Router-Request-ID` from the answer (or send your own `X-Request-ID`) and grep the router's journal for it; `/metrics` shows failures per server and reason |
 | Request went to an unexpected model | Check the `X-Router-*` headers or `POST /routing/explain`. `model-unavailable`: the named model's hosts were down. Unknown sizes score low: add `[model_sizes]` |
 | Long prompt fails with 4xx | Context windows are not considered and 4xx does not fail forward; use a larger-context model |
 | "does not support tools" | No model reports tools (`X-Router-Warning: no-tool-model`); check `tools` in `/routing/inventory`; for llama.cpp add `tools` to `MODEL_CAPABILITIES` |

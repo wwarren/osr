@@ -41,6 +41,7 @@ fails instead of blocking.
 |---|---|
 | `installer`, `manage` | Every extracted function in the main installer and `install/manage-model-servers.sh`; return values and external calls |
 | `repo` | Embedded-file sync, owned-code list, text encoding, secret placement, unit hardening, target layout, pins and upgrade contract |
+| `metrics-setup` | `install/setup-metrics.sh` run against stand-ins for apt, systemctl and wget under a scratch root: packages asked for, key file, scrape target, reruns, pins and refusals |
 | `cloud-config`, `router`, `monitor`, `litellm-retries` | Routing, cloud/subscription configuration, health and LiteLLM retry behavior |
 | `gitea`, `mattermost` | `tools/install-gitea.sh` and `tools/install-mattermost.sh` forward to their targets' `provision-lxc.sh --create-only` and pass an explicit mode through |
 | `update`, `remote-update`, `signal-rollback` | In-container and host-side updates, config preservation, rollback and interrupted upgrades |

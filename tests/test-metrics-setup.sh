@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# install/setup-metrics.sh, run for real against stand-ins for apt-get,
+# systemctl, wget, chown, promtool and gpg, writing under a scratch directory
+# (OSR_METRICS_ROOT) instead of /. Nothing is installed and no network is used.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${HERE}/.." && pwd)"
+# shellcheck source=lib/assert.sh
+source "${HERE}/lib/assert.sh"
+
+script="${ROOT}/install/setup-metrics.sh"
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+bin="${tmp}/bin"; calls="${tmp}/calls"; state="${tmp}/state"
+mkdir -p "$bin" "$state"
+export STUB_CALLS="$calls" STUB_STATE="$state"
+
+cat > "${bin}/systemctl" <<'STUB'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$STUB_CALLS"
+unit="${*: -1}"
+case "$1" in
+  is-active) [[ -e "$STUB_STATE/active-$unit" ]] ;;
+  restart|start) touch "$STUB_STATE/active-$unit" ;;
+  stop) rm -f "$STUB_STATE/active-$unit" ;;
+  mask) [[ "$2" == --now ]] && rm -f "$STUB_STATE/active-$unit"; true ;;
+  *) true ;;
+esac
+STUB
+cat > "${bin}/apt-get" <<'STUB'
+#!/usr/bin/env bash
+echo "apt-get $*" >> "$STUB_CALLS"
+case " $* " in
+  *" prometheus "*) mkdir -p "$OSR_METRICS_ROOT/etc/prometheus" ;;
+  *" grafana"*) [[ ! -e "$STUB_STATE/grafana-unavailable" ]] || exit 100
+                 [[ ! -s "$OSR_METRICS_ROOT/etc/grafana/osr.env" ]] || echo "password-ready-before-grafana" >> "$STUB_CALLS" ;;
+esac
+exit 0
+STUB
+cat > "${bin}/wget" <<'STUB'
+#!/usr/bin/env bash
+echo "wget $*" >> "$STUB_CALLS"
+[[ "$1" == -qO ]] && echo "-----BEGIN PGP PUBLIC KEY BLOCK-----" > "$2"
+STUB
+cat > "${bin}/gpg" <<'STUB'
+#!/usr/bin/env bash
+echo "gpg $*" >> "$STUB_CALLS"
+printf 'pub:-:4096:1:963FA27710458545:1:::-:::scESC::::::23::0:\nfpr:::::::::%s:\nsub:-:4096:1:AAAA:1::::::e::::::23:\nfpr:::::::::FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:\n' "$(cat "$STUB_STATE/fingerprint")"
+STUB
+for name in chown promtool; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >> "$STUB_CALLS"\n' "$name" > "${bin}/${name}"
+done
+chmod +x "${bin}"/*
+
+# new_ct KEY: an empty stand-in for the router CT, with that router key.
+new_ct() {
+  fs="${tmp}/fs.$RANDOM$RANDOM"; router="${fs}/app/router"
+  mkdir -p "$router"
+  printf 'GITEA_DEPLOY_TOKEN=x\nROUTER_API_KEY=%s\n' "$1" > "${router}/secrets.env"
+  : > "${router}/.env"
+  rm -f "$state"/*; : > "$calls"
+}
+run() { OSR_METRICS_ROOT="$fs" ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" "$@"; }
+mode_of() { stat -c '%a' "$1" 2>/dev/null || echo missing; }
+keyfile() { printf '%s\n' "${fs}/etc/prometheus/osr-router-key"; }
+
+describe install
+new_ct "s3cret-key"
+out="$(run install 2>&1)"; rc=$?
+assert_eq "a first install succeeds" "0" "$rc"
+[[ $rc -eq 0 ]] || printf '%s\n' "$out" >&2
+assert_contains "Prometheus comes without its recommended packages" \
+  "apt-get install -y --no-install-recommends ca-certificates wget prometheus" "$(cat "$calls")"
+assert_not_contains "nothing asks for the node exporter" "node-exporter" "$(cat "$calls")"
+assert_contains "the package's own Prometheus is masked before it is installed" "systemctl mask prometheus.service" \
+  "$(sed -n '1,/apt-get install/p' "$calls")"
+assert_eq "the scrape key is the router key" "s3cret-key" "$(cat "$(keyfile)")"
+assert_eq "and private" "600" "$(mode_of "$(keyfile)")"
+assert_contains "it is handed to prometheus" "chown prometheus:prometheus" "$(cat "$calls")"
+config="${fs}/etc/prometheus/osr.yml"
+assert_file_contains "the scrape goes to the router on loopback" "targets: ['127.0.0.1:8000']" "$config"
+assert_file_contains "with the key file's real path" "credentials_file: /etc/prometheus/osr-router-key" "$config"
+assert_contains "the scrape configuration is checked" "promtool check config ${config}" "$(cat "$calls")"
+unit="${fs}/etc/systemd/system/osr-prometheus.service"
+assert_file_contains "Prometheus listens on loopback only" "--web.listen-address=127.0.0.1:9090" "$unit"
+assert_file_contains "with a bounded store" "--storage.tsdb.retention.size=512MB" "$unit"
+password_file="${fs}/etc/grafana/osr.env"
+password="$(sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' "$password_file")"
+assert_ok "Grafana gets a random admin password" bash -c "[[ ${#password} -ge 32 ]]"
+assert_eq "kept private" "600" "$(mode_of "$password_file")"
+assert_contains "written before Grafana is installed" "password-ready-before-grafana" "$(cat "$calls")"
+assert_file_contains "anonymous access is off" "GF_AUTH_ANONYMOUS_ENABLED=false" \
+  "${fs}/etc/systemd/system/grafana-server.service.d/osr.conf"
+assert_eq "Grafana is the newest release unless pinned" "1" "$(grep -c '^apt-get install -y grafana$' "$calls")"
+assert_file_contains "from Grafana's signed repository" "signed-by=/etc/apt/keyrings/grafana.asc" \
+  "${fs}/etc/apt/sources.list.d/grafana.list"
+assert_not_contains "the key is not inspected unless a fingerprint is given" "gpg " "$(cat "$calls")"
+assert_ok "the dashboard is valid JSON on the provisioned data source" python3 -c '
+import json, sys
+board = json.load(open(sys.argv[1]))
+assert board["uid"] == "osr-router" and len(board["panels"]) >= 6
+assert all(p["datasource"]["uid"] == "osr-prometheus" for p in board["panels"])' "${fs}/etc/grafana/osr-dashboards/router.json"
+assert_file_contains "the data source is the local Prometheus" "url: http://127.0.0.1:9090" \
+  "${fs}/etc/grafana/provisioning/datasources/osr.yml"
+assert_contains "both services are started" "systemctl restart grafana-server.service" "$(cat "$calls")"
+assert_contains "Prometheus too" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
+assert_contains "and it says where things are" "ready: Grafana port 3000" "$out"
+
+describe rerun
+: > "$calls"
+printf 'ROUTER_PORT=8123\nROUTER_HOST=0.0.0.0\n' > "${router}/.env"
+out="$(run install 2>&1)"; rc=$?
+assert_eq "a second run succeeds" "0" "$rc"
+assert_eq "the admin password is kept" "$password" "$(sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' "$password_file")"
+assert_file_contains "a changed router port reaches the scrape" "targets: ['127.0.0.1:8123']" "$config"
+assert_contains "and the running Prometheus is restarted to use it" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
+assert_not_contains "enable --now, which leaves a running service alone, is not relied on" "enable --now osr-prometheus" "$(cat "$calls")"
+printf 'ROUTER_HOST=bad host;rm\n' > "${router}/.env"
+assert_status "an unusable ROUTER_HOST is refused" 1 run install
+printf 'ROUTER_PORT=99999\n' > "${router}/.env"
+assert_status "and so is an impossible port" 1 run install
+: > "${router}/.env"
+
+describe sync_key
+: > "$calls"
+run sync-key >/dev/null 2>&1
+assert_not_contains "an unchanged key restarts nothing" "restart" "$(cat "$calls")"
+printf 'ROUTER_API_KEY=rotated\n' > "${router}/secrets.env"
+out="$(run sync-key 2>&1)"; rc=$?
+assert_eq "a changed key is synced" "0|rotated" "${rc}|$(cat "$(keyfile)")"
+assert_eq "still private" "600" "$(mode_of "$(keyfile)")"
+assert_contains "and Prometheus restarted" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
+assert_contains "it says so" "router scrape key updated" "$out"
+assert_eq "no temporary key file is left" "" "$(find "${fs}/etc/prometheus" -name '.osr-router-key.*')"
+: > "${router}/secrets.env"
+run sync-key >/dev/null 2>&1
+assert_eq "a key turned off leaves the old one (the router ignores it)" "rotated" "$(cat "$(keyfile)")"
+new_ct "s3cret-key"
+assert_status "without the stack, sync-key does nothing and succeeds" 0 run sync-key
+assert_ok "and creates nothing" bash -c "[[ ! -e '${fs}/etc/prometheus' ]]"
+
+describe router_without_a_key
+new_ct ""
+out="$(run install 2>&1)"; rc=$?
+assert_eq "a router with authentication off can install the stack" "0" "$rc"
+assert_ok "with an empty key file for the scrape" bash -c "[[ -f '$(keyfile)' && ! -s '$(keyfile)' ]]"
+printf 'ROUTER_API_KEY=set-later\n' > "${router}/secrets.env"
+run sync-key >/dev/null 2>&1
+assert_eq "a key set later is picked up" "set-later" "$(cat "$(keyfile)")"
+
+describe refusals
+new_ct "s3cret-key"
+touch "${state}/active-prometheus.service"
+out="$(run install 2>&1)"; rc=$?
+assert_eq "an existing running Prometheus is left alone" "1" "$rc"
+assert_contains "and named" "existing prometheus.service is running" "$out"
+assert_not_contains "before anything is installed" "apt-get" "$(cat "$calls")"
+new_ct "s3cret-key"
+touch "${state}/grafana-unavailable"
+assert_status "a failed Grafana install fails the setup" 100 run install
+assert_ok "and starts nothing" bash -c "! grep -q 'restart' '$calls'"
+new_ct "s3cret-key"
+rm -f "${router}/secrets.env"
+assert_status "no secrets file is refused" 1 run install
+assert_status "an unknown mode is refused" 1 run uninstall
+if [[ $EUID -ne 0 ]]; then
+  out="$(ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" install 2>&1)"; rc=$?
+  assert_eq "outside a test it must be root" "1|metrics setup: run as root in the router CT" "${rc}|${out}"
+fi
+
+describe grafana_pins
+new_ct "s3cret-key"
+assert_status "a pinned Grafana version installs" 0 env GRAFANA_VERSION=12.2.1 OSR_METRICS_ROOT="$fs" \
+  ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" install
+assert_contains "as that exact package version" "apt-get install -y grafana=12.2.1" "$(cat "$calls")"
+new_ct "s3cret-key"
+assert_status "a version that is not one is refused" 1 env 'GRAFANA_VERSION=1; rm -rf /' OSR_METRICS_ROOT="$fs" \
+  ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" install
+assert_not_contains "before anything is installed" "apt-get" "$(cat "$calls")"
+new_ct "s3cret-key"
+echo "ABCDEF0123456789ABCDEF0123456789ABCDEF01" > "${state}/fingerprint"
+out="$(GRAFANA_KEY_FINGERPRINT='abcd ef01 2345 6789 abcd  ef01 2345 6789 abcd ef01' run install 2>&1)"; rc=$?
+assert_eq "a signing key with the expected fingerprint is accepted" "0" "$rc"
+assert_ok "and installed for apt" test -s "${fs}/etc/apt/keyrings/grafana.asc"
+new_ct "s3cret-key"
+echo "1111111111111111111111111111111111111111" > "${state}/fingerprint"
+out="$(GRAFANA_KEY_FINGERPRINT=ABCDEF0123456789ABCDEF0123456789ABCDEF01 run install 2>&1)"; rc=$?
+assert_eq "another key is refused" "1" "$rc"
+assert_contains "naming what was found" "found: 1111111111111111111111111111111111111111" "$out"
+assert_ok "it is not left for apt" bash -c "[[ -z \$(ls -A '${fs}/etc/apt/keyrings') ]]"
+assert_not_contains "and Grafana is not installed" "install -y grafana" "$(cat "$calls")"
+assert_status "a fingerprint that is not one is refused" 1 env GRAFANA_KEY_FINGERPRINT=abc OSR_METRICS_ROOT="$fs" \
+  ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" install
+
+summary
