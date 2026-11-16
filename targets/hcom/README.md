@@ -176,7 +176,7 @@ that channel, so a payload, even one sent with a leaked URL, cannot post
 anywhere else; a rerun locks one made by an earlier release in place. It
 refuses the health webhook's channel, whatever its name (a health webhook
 since deleted in Mattermost is noted and skipped), and leaves the health
-webhook and `ollama-monitor` untouched. Incoming webhooks must already be enabled (the
+webhook and its channel untouched. Incoming webhooks must already be enabled (the
 Mattermost target does this). For a non-Proxmox observer, run it in the
 Mattermost CT (`--dry-run` first) and transfer the webhook file privately.
 

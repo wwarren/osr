@@ -140,9 +140,11 @@ TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl 
 MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
 
 # Services that must be active afterwards if they were active before.
+# NAME=OLD: the unit was called OLD before it was renamed; either one being
+# active counts as NAME, so a router upgrade that renames it is no regression.
 declare -A UNITS=(
-    [router]='ollama-router litellm-proxy ollama-monitor open-webui osr-prometheus grafana-server'
-    [open-webui]='open-webui ollama-router'
+    [router]='osr-router=ollama-router litellm-proxy osr-monitor=ollama-monitor open-webui osr-prometheus grafana-server'
+    [open-webui]='open-webui osr-router=ollama-router'
     [llamacpp]='llama-server llama-ollama-bridge llama-dashboard'
     [airllm]='airllm-ollama-api'
     [ollama]='ollama'
@@ -744,7 +746,8 @@ collect_state() {
         [[ $agent == observer ]] || units+=" ${UNITS[$agent]:-}"
     fi
     # shellcheck disable=SC2086  # unit names are single words
-    pct exec "$id" -- sh -c 'for u in "$@"; do systemctl is-active --quiet "$u.service" 2>/dev/null && echo "unit:$u"; done
+    pct exec "$id" -- sh -c 'for u in "$@"; do for c in $(echo "$u" | tr = " "); do
+            systemctl is-active --quiet "$c.service" 2>/dev/null && { echo "unit:${u%%=*}"; break; }; done; done
         if command -v ss >/dev/null 2>&1; then ss -Hltn 2>/dev/null | sed "s/^/ss: /"; fi' sh $units 2>/dev/null |
         # Ephemeral ports (such as Ollama's per-model runners) come and go by
         # themselves, and so do Open Terminal's workspaces (20000-29999).
@@ -1658,7 +1661,7 @@ process_item() {
         sleep "$POLL_INTERVAL"
     fi
     collect_state "$i" | csort -u > "$pre"
-    for unit in ${UNITS[$t]:-}; do grep -qx "unit:$unit" "$pre" || inactive+=("$unit"); done
+    for unit in ${UNITS[$t]:-}; do unit=${unit%%=*}; grep -qx "unit:$unit" "$pre" || inactive+=("$unit"); done
     (( ${#inactive[@]} == 0 )) || note "Not active before the upgrade, so not checked afterwards: ${inactive[*]}"
     # A CT started here (--include-stopped) could not be looked at before.
     if [[ $t == llamacpp && -z $(info_value "$i" dashboard) ]]; then note_llamacpp_dashboard "$i"; fi

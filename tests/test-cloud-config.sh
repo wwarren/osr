@@ -10,10 +10,10 @@ case "$(realpath "$scratch")" in
   *) echo 'unsafe temporary test path' >&2; exit 1 ;;
 esac
 mkdir -p "$scratch/repo/env" "$scratch/repo/services/litellm-proxy" \
-  "$scratch/repo/services/ollama-router" "$scratch/runtime"
+  "$scratch/repo/services/osr-router" "$scratch/runtime"
 cp "$repo/env/router.env" "$scratch/repo/env/"
 cp "$repo/services/litellm-proxy/litellm_config.yaml" "$scratch/repo/services/litellm-proxy/"
-cp "$repo/services/ollama-router/router.ini" "$scratch/repo/services/ollama-router/"
+cp "$repo/services/osr-router/router.ini" "$scratch/repo/services/osr-router/"
 
 export CONFIG_REPO_DIR="$scratch/repo"
 export ROUTER_DIR="$scratch/runtime"

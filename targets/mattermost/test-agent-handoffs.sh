@@ -11,7 +11,7 @@ if printf '%s' '[]' | find_field name absent id; then echo 'FAIL: absent object 
 if printf '%s' 'bad JSON' | find_field name absent id 2>/dev/null; then echo 'FAIL: invalid JSON accepted'; exit 1; fi
 output=$(bash "$here/configure-agent-handoffs.sh" --dry-run)
 [[ $output == *agent-handoffs-webhook-url* && $output != *'/hooks/'* ]] || exit 1
-if HCOM_MATTERMOST_CHANNEL=ollama-monitor bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
+if HCOM_MATTERMOST_CHANNEL=osr-monitor bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
 if MATTERMOST_CHANNEL=health HCOM_MATTERMOST_CHANNEL=health bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
 if HCOM_MATTERMOST_CHANNEL='unsafe channel' bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
 # Whole runs against a fake mmctl that, like the real one, prints help text for
@@ -56,7 +56,7 @@ PY
 chmod +x "$bin/mmctl" "$bin/runuser"
 health=h0000000000000000000000001
 printf '{"users":[{"id":"u0000000000000000000000001","username":"admin"}],
- "channels":[{"id":"c0000000000000000000000001","name":"ollama-monitor"}],
+ "channels":[{"id":"c0000000000000000000000001","name":"osr-monitor"}],
  "hooks":[{"id":"%s","channel_id":"c0000000000000000000000001","channel_locked":false}]}' "$health" > "$tmp/mm.json"
 printf 'http://192.0.2.77:8065/hooks/%s\n' "$health" > "$etc/webhook-url"
 run() { env PATH="$bin:$PATH" FAKE_MM="$tmp/mm.json" MM_TARGET_ETC="$etc" MMCTL="$bin/mmctl" bash "$here/configure-agent-handoffs.sh" 2>&1; }

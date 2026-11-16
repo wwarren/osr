@@ -68,7 +68,7 @@ mapfile -t owned < <(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$repo_root/open-s
 files=(open-smart-router-install.sh install/update-router.sh "${owned[@]}")
 for arg in "${update_args[@]}"; do
     if [[ $arg == --with-tunables ]]; then
-        files+=(services/ollama-router/router.ini services/ollama-monitor/monitor.ini)
+        files+=(services/osr-router/router.ini services/osr-monitor/monitor.ini)
         break
     fi
 done
@@ -146,8 +146,22 @@ unit_property() {
 }
 valid_ct_path() { [[ $1 == /* && $1 != *$'\n'* && /$1/ != */../* && /$1/ != */./* ]]; }
 
+# Units from before the rename (ollama-router, ollama-monitor) are still on a
+# CT not yet updated (the apply this update runs moves them), so whichever is
+# installed is used.
+resolve_unit() {
+    local name path
+    for name in "$@"; do
+        path=$(unit_property "$name" FragmentPath) || return 1
+        [[ -z $path ]] || { printf '%s\n' "$name"; return 0; }
+    done
+    printf '%s\n' "$1"
+}
+router_unit=$(resolve_unit osr-router ollama-router) || die "Cannot inspect osr-router.service in $target_label."
+monitor_unit=$(resolve_unit osr-monitor ollama-monitor) || die "Cannot inspect osr-monitor.service in $target_label."
+
 unit_dir=''
-for service in litellm-proxy ollama-router ollama-monitor open-webui; do
+for service in litellm-proxy "$router_unit" "$monitor_unit" open-webui; do
     unit_path=$(unit_property "$service" FragmentPath) || die "Cannot inspect $service.service in $target_label."
     valid_ct_path "$unit_path" && [[ ${unit_path##*/} == "$service.service" ]] ||
         die "$target_label does not have an installed $service.service unit."
@@ -157,8 +171,8 @@ for service in litellm-proxy ollama-router ollama-monitor open-webui; do
         die "$target_label has service units in different directories; inspect them before updating."
     fi
 done
-router_dir=$(unit_property ollama-router WorkingDirectory) || die 'Cannot inspect the router working directory.'
-monitor_dir=$(unit_property ollama-monitor WorkingDirectory) || die 'Cannot inspect the monitor working directory.'
+router_dir=$(unit_property "$router_unit" WorkingDirectory) || die 'Cannot inspect the router working directory.'
+monitor_dir=$(unit_property "$monitor_unit" WorkingDirectory) || die 'Cannot inspect the monitor working directory.'
 proxy_dir=$(unit_property litellm-proxy WorkingDirectory) || die 'Cannot inspect the LiteLLM working directory.'
 webui_dir=$(unit_property open-webui WorkingDirectory) || die 'Cannot inspect the Open WebUI working directory.'
 valid_ct_path "$router_dir" && valid_ct_path "$webui_dir" || die 'A service has an invalid working directory.'

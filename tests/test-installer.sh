@@ -55,6 +55,7 @@ CONFIG_UPDATE_CODE=true
 # The owned-code list is data, not a function: lift it from the real script so
 # the tests exercise the list that actually ships.
 eval "$(sed -n '/^INSTALLER_OWNED_CODE=(/,/^)/p' "$SCRIPT")"
+eval "$(grep -m1 '^LEGACY_SERVICE_DIRS=(' "$SCRIPT")"
 # shellcheck source=/dev/null
 source "$FUNCS"
 
@@ -2949,9 +2950,9 @@ assert_eq   "no repo API calls are attempted" "0" "$(mock_call_count 'contents')
 # ── repo seeding ──────────────────────────────────────────────────────────────
 describe seed_gitea_repo
 seedtree="$(mktemp -d)"
-mkdir -p "${seedtree}/env" "${seedtree}/services/ollama-router"
+mkdir -p "${seedtree}/env" "${seedtree}/services/osr-router"
 echo "A=1" > "${seedtree}/env/router.env"
-echo "[tiers]" > "${seedtree}/services/ollama-router/router.ini"
+echo "[tiers]" > "${seedtree}/services/osr-router/router.ini"
 CONFIG_SEED_IF_MISSING=true
 assert_fail "no token means no seeding" seed_gitea_repo "$seedtree" ""
 CONFIG_SEED_IF_MISSING=false
@@ -2994,6 +2995,49 @@ assert_contains "counts the failure"      "1 failed"       "$out"
 assert_eq "and returns failure, so the clone is checked" 1 "$_rc"
 unset _rc
 
+# A repository from before the services were renamed: services/ollama-router
+# holds the operator's router.ini, the old unit and old code. The tuned
+# router.ini is copied to services/osr-router before seeding (so the default
+# is not seeded over it), installer-owned files are not copied, and every old
+# file is removed with its sha.
+_gitea="$(mktemp -d)"
+mock_script curl <<EOF
+m=GET; for ((i = 1; i <= \$#; i++)); do [[ \${!i} == -X ]] && { j=\$((i + 1)); m=\${!j}; }; done
+url=\${!#}; path=\${url#*/contents/}
+case "\$m \$path" in
+  "GET services/ollama-router")
+    printf '%s\n' '[{"type":"file","path":"services/ollama-router/router.ini","sha":"s1"},{"type":"file","path":"services/ollama-router/router.py","sha":"s2"},{"type":"file","path":"services/ollama-router/ollama-router.service","sha":"s3"}]'
+    echo 200 ;;
+  "GET services/ollama-router/router.ini")
+    printf '{"content":"%s","sha":"s1"}\n' "\$(printf '# tuned\n' | base64 -w0)"; echo 200 ;;
+  POST\ *) cat > "${_gitea}/post-\${path//\//_}"; echo '{}'; echo 201 ;;
+  DELETE\ *) cat > "${_gitea}/delete-\${path//\//_}"; echo '{}'; echo 200 ;;
+  GET\ *) if [[ -e "${_gitea}/post-\${path//\//_}" ]]; then echo '{"path":"x"}'; echo 200
+          else echo '{"message":"Not Found"}'; echo 404; fi ;;
+  *) echo '{"message":"Not Found"}'; echo 404 ;;
+esac
+exit 0
+EOF
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"; _rc=$?
+assert_eq "seeding a pre-rename repository succeeds" 0 "$_rc"
+assert_contains "the operator's router.ini is moved" "moved: services/ollama-router/router.ini -> services/osr-router/router.ini" "$out"
+assert_eq "with its content" "# tuned" \
+  "$(python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(open(sys.argv[1]))["content"]).decode().strip())' "${_gitea}/post-services_osr-router_router.ini")"
+assert_contains "so the default is not seeded over it" "1 created" "$out"
+for _f in router.ini router.py ollama-router.service; do
+  assert_eq "old ${_f} removed with its sha" 1 \
+    "$(python3 -c 'import json,sys; print(int(bool(json.load(open(sys.argv[1]))["sha"])))' "${_gitea}/delete-services_ollama-router_${_f}" 2>/dev/null)"
+done
+assert_fail "installer-owned code is not copied" test -e "${_gitea}/post-services_osr-router_router.py"
+# A copy that cannot be made keeps the old file.
+rm -f "${_gitea}"/*
+sed -i 's/POST\\ \*) cat/POST\\ *services\/osr-router\/router.ini) echo nope; echo 500 ;;\n  POST\\ *) cat/' "${MOCK_BIN}/curl"
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"; _rc=$?
+assert_eq "a failed move fails the seeding" 1 "$_rc"
+assert_contains "and says the old file stays" "left in place" "$out"
+assert_fail "the old router.ini is not removed" test -e "${_gitea}/delete-services_ollama-router_router.ini"
+rm -rf "$_gitea"; unset _gitea _rc _f
+
 # A file whose base64 is over 128 KiB (install/manage-model-servers.sh is) is
 # seeded whole: its content never goes through a command-line argument.
 _seen="$(mktemp)"
@@ -3015,8 +3059,8 @@ rm -rf "$_bigtree" "$_seen"; unset _bigtree _seen _rc
 
 # Installer-owned code that differs is UPDATED (PUT with the blob sha); the
 # user's config files are still never touched.
-mkdir -p "${seedtree}/services/ollama-monitor"
-echo "new code" > "${seedtree}/services/ollama-monitor/monitor.py"
+mkdir -p "${seedtree}/services/osr-monitor"
+echo "new code" > "${seedtree}/services/osr-monitor/monitor.py"
 _old_b64="$(printf 'old code\n' | base64 -w0)"
 mock_script curl <<EOF
 case "\$*" in *--data-binary*) { printf 'body: '; cat; echo; } >> "\$MOCK_LOG";; esac
@@ -3030,7 +3074,7 @@ mock_reset_log
 CONFIG_UPDATE_CODE=true
 out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"
 assert_contains "updates stale installer-owned code" "1 updated" "$out"
-assert_contains "names the updated file" "updated: services/ollama-monitor/monitor.py" "$out"
+assert_contains "names the updated file" "updated: services/osr-monitor/monitor.py" "$out"
 assert_eq "exactly one PUT is issued" "1" "$(mock_call_count '-X PUT')"
 assert_contains "sends the blob sha" "abc123" "$(mock_calls)"
 assert_contains "leaves config alone" "2 already present" "$out"
@@ -3115,9 +3159,9 @@ assert_not_contains "Ollama keeps LiteLLM's timeout" "timeout: 3600" "$out"
 MODEL_SERVERS=("${_saved_servers[@]}")
 
 describe is_installer_owned
-assert_ok   "router.py is owned"         is_installer_owned services/ollama-router/router.py
+assert_ok   "router.py is owned"         is_installer_owned services/osr-router/router.py
 assert_ok   "the manage tool is owned"   is_installer_owned install/manage-model-servers.sh
-assert_fail "router.ini is a tunable"    is_installer_owned services/ollama-router/router.ini
+assert_fail "router.ini is a tunable"    is_installer_owned services/osr-router/router.ini
 assert_fail "env files are config"       is_installer_owned env/router.env
 
 describe gitea_sha_if_changed
@@ -3133,12 +3177,12 @@ rm -f "$_f"
 # ── container clone ───────────────────────────────────────────────────────────
 describe verify_config_clone
 _vtree="$(mktemp -d)"; _vclone="$(mktemp -d)"
-mkdir -p "${_vtree}/install" "${_vtree}/services/ollama-router" "${_vclone}/install" "${_vclone}/services/ollama-router"
+mkdir -p "${_vtree}/install" "${_vtree}/services/osr-router" "${_vclone}/install" "${_vclone}/services/osr-router"
 echo "tool v2" > "${_vtree}/install/manage-model-servers.sh"
-echo "router v2" > "${_vtree}/services/ollama-router/router.py"
+echo "router v2" > "${_vtree}/services/osr-router/router.py"
 echo "A=1" > "${_vtree}/router.env"        # not installer-owned: never checked
 cp "${_vtree}/install/manage-model-servers.sh" "${_vclone}/install/"
-cp "${_vtree}/services/ollama-router/router.py" "${_vclone}/services/ollama-router/"
+cp "${_vtree}/services/osr-router/router.py" "${_vclone}/services/osr-router/"
 # pct exec <id> -- CMD...: run CMD here, against the fake clone.
 mock_script pct <<'EOF'
 [ "$1" = exec ] && { shift 3; exec "$@"; }

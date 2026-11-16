@@ -6,10 +6,10 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 etc=${MM_TARGET_ETC:-/etc/mattermost-target}
 mmctl=${MMCTL:-/opt/mattermost/bin/mmctl}
 service_user=${MM_SERVICE_USER:-mattermost}
-team=${MATTERMOST_TEAM:-ollama}
+team=${MATTERMOST_TEAM:-osr}
 channel=${HCOM_MATTERMOST_CHANNEL:-agent-handoffs}
 [[ $team =~ ^[a-z0-9][a-z0-9_-]{1,63}$ && $channel =~ ^[a-z0-9][a-z0-9_-]{1,63}$ ]] || die 'Invalid team or handoff channel.'
-[[ $channel != "${MATTERMOST_CHANNEL:-ollama-monitor}" ]] || die 'Handoffs must use a channel separate from health alerts.'
+[[ $channel != "${MATTERMOST_CHANNEL:-osr-monitor}" ]] || die 'Handoffs must use a channel separate from health alerts.'
 dry_run=0
 for arg in "$@"; do
   case $arg in

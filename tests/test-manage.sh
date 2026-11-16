@@ -32,8 +32,8 @@ ROUTER_DIR="${WORK}/router"
 OPENWEBUI_DIR="${WORK}/openwebui"
 ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
-ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
-MONITOR_INI="${REPO_DIR}/services/ollama-monitor/monitor.ini"
+ROUTER_INI="${REPO_DIR}/services/osr-router/router.ini"
+MONITOR_INI="${REPO_DIR}/services/osr-monitor/monitor.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
 # Exported so `bash -c "source $FUNCS; ..."` subshells see it too.
@@ -56,7 +56,12 @@ MODEL_SERVER_MIN=1
 MODEL_SERVER_MAX=20
 ROUTER_URL="http://127.0.0.1:65999"
 PROBE_TIMEOUT=2
-SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
+SERVICES=(litellm-proxy osr-router osr-monitor open-webui)
+LEGACY_UNITS=(ollama-router=osr-router ollama-monitor=osr-monitor)
+STATE_ROOT="${WORK}/state"
+LEGACY_ACCOUNT=ollama-router
+ACCOUNT_RENAMED=false
+ACCOUNT_STOPPED=()
 declare -A TIER_MODEL_OVERRIDE=()
 declare -A PAIR_MODEL_OVERRIDE=()
 CHANGED=false; DRY_RUN=false; NO_PROBE=false
@@ -1408,7 +1413,7 @@ assert_eq "reports a venv it cannot repair" "1" "$rc"
 assert_contains "with a hint" "parent directories" "$out"
 SERVICE_USER=no-such-user-xyz
 assert_ok "no service account (not a router container): nothing to do" repair_venv_access
-SERVICE_USER=ollama-router
+SERVICE_USER=osr-router
 rm -f "${MOCK_BIN}/runuser"; rm -rf "$LITELLM_DIR"; reset_repo
 
 describe openwebui_install
@@ -1475,13 +1480,13 @@ assert_contains "a negative sticky_seconds fails" "[balancing] sticky_seconds mu
 printf '[discovery]\nshow_cache_seconds = -1\n' > "$ROUTER_INI"
 assert_contains "a negative show_cache_seconds fails" "[discovery] show_cache_seconds must not be negative" "$(validate_config)"
 reset_repo
-printf 'def broken(:\n' > "${REPO_DIR}/services/ollama-router/router.py"
+printf 'def broken(:\n' > "${REPO_DIR}/services/osr-router/router.py"
 assert_contains "a syntax error fails" "does not compile" "$(validate_config)"
 reset_repo
 
 describe apply_map
 assert_eq "maps every installed file" "11" "$(apply_map | grep -c '|')"
-assert_contains "env feeds three services" "litellm-proxy ollama-router ollama-monitor" "$(apply_map)"
+assert_contains "env feeds three services" "litellm-proxy osr-router osr-monitor" "$(apply_map)"
 
 describe secrets_fingerprint
 rm -f "$SECRETS_FILE"
@@ -1505,14 +1510,14 @@ reset_repo; install_runtime
 mock_command systemctl 0
 assert_eq "nothing changed -> nothing to restart" "" "$(affected_services)"
 echo "# tweak" >> "$ROUTER_INI"
-assert_eq "router.ini -> router only" "ollama-router" "$(affected_services)"
+assert_eq "router.ini -> router only" "osr-router" "$(affected_services)"
 install_runtime
 echo "EXTRA=1" >> "$ENV_FILE"
-assert_eq "router.env -> its three services" "litellm-proxy ollama-router ollama-monitor" \
+assert_eq "router.env -> its three services" "litellm-proxy osr-router osr-monitor" \
   "$(affected_services | paste -sd' ')"
 install_runtime
 kv_set "$SECRETS_FILE" ROUTER_API_KEY "k"
-assert_eq "secrets -> the services that load them" "ollama-router ollama-monitor open-webui" \
+assert_eq "secrets -> the services that load them" "osr-router osr-monitor open-webui" \
   "$(affected_services | paste -sd' ')"
 install_runtime
 mock_script systemctl <<'EOF'
@@ -1524,6 +1529,98 @@ APPLY_ALL=true
 assert_eq "--all restarts everything" "4" "$(affected_services | grep -c .)"
 APPLY_ALL=false
 rm -f "$SECRETS_FILE"
+
+describe migrate_legacy_units
+# Units from before the rename (ollama-router, ollama-monitor) beside the new
+# ones apply-config.sh installed: stopped, disabled, removed; the new unit is
+# printed for enabling only when the old one was enabled; state is moved.
+reset_repo; install_runtime
+STATE_ROOT="${WORK}/state"; mkdir -p "${STATE_ROOT}/ollama-monitor"; echo 1700000000 > "${STATE_ROOT}/ollama-monitor/notice"
+# (the test apply-config.sh installs no units, so the new ones are put in place here)
+touch "${UNIT_DIR}/osr-router.service" "${UNIT_DIR}/osr-monitor.service"
+touch "${UNIT_DIR}/ollama-router.service" "${UNIT_DIR}/ollama-monitor.service"
+mock_script systemctl <<'EOF'
+[[ "$*" == "is-enabled --quiet ollama-monitor.service" ]] && exit 1
+exit 0
+EOF
+mock_reset_log
+out="$(migrate_legacy_units 2>"${WORK}/migrate.err")"
+assert_eq "only the enabled old unit's successor is enabled" "osr-router" "$out"
+assert_fail "the old router unit is removed" test -e "${UNIT_DIR}/ollama-router.service"
+assert_fail "the old monitor unit is removed" test -e "${UNIT_DIR}/ollama-monitor.service"
+assert_ok "the new units stay" test -f "${UNIT_DIR}/osr-router.service" -a -f "${UNIT_DIR}/osr-monitor.service"
+assert_ok "the old router is stopped and disabled" mock_called "systemctl disable --now ollama-router.service"
+assert_ok "the old monitor is stopped and disabled" mock_called "systemctl disable --now ollama-monitor.service"
+assert_file_contains "the monitor's state moves to its new directory" 1700000000 "${STATE_ROOT}/osr-monitor/notice"
+assert_fail "and not left behind" test -e "${STATE_ROOT}/ollama-monitor"
+assert_contains "the move is reported" "ollama-router.service is now osr-router.service" "$(cat "${WORK}/migrate.err")"
+mock_reset_log
+assert_eq "nothing to move, nothing done" "" "$(migrate_legacy_units 2>/dev/null)"
+assert_eq "and systemd is not called" "0" "$(mock_call_count 'systemctl')"
+touch "${UNIT_DIR}/ollama-router.service"; rm -f "${UNIT_DIR}/osr-router.service"
+assert_eq "an old unit without its successor installed is left alone" "" "$(migrate_legacy_units 2>/dev/null)"
+assert_ok "and kept" test -f "${UNIT_DIR}/ollama-router.service"
+rm -f "${UNIT_DIR}/ollama-router.service"; rm -rf "${STATE_ROOT}"
+
+describe migrate_legacy_account
+# An install from before the rename runs its services as ollama-router: the
+# account is renamed in place (usermod/groupmod keep the UID), with the units
+# that run as it stopped first; the monitor's old alert defaults are pinned.
+reset_repo; install_runtime
+mkdir -p "$UNIT_DIR"
+printf '[Service]\nUser=ollama-router\n' > "${UNIT_DIR}/ollama-router.service"
+printf '[Service]\nUser=ollama-router\n' > "${UNIT_DIR}/open-webui.service"
+printf '[Service]\nUser=prometheus\n'    > "${UNIT_DIR}/osr-prometheus.service"
+sed -i '/^MATTERMOST_/d' "$ENV_FILE"
+mock_script getent <<'EOF'
+[[ "$*" == "passwd ollama-router" || "$*" == "group ollama-router" ]] && exit 0
+exit 2
+EOF
+mock_command usermod 0; mock_command groupmod 0; mock_command systemctl 0
+hash -r   # getent was run (and cached) before it was mocked
+mock_reset_log
+migrate_legacy_account 2>"${WORK}/acct.err"; rc=$?
+assert_eq "the rename succeeds" "0" "$rc"
+assert_eq "and is recorded" "true" "$ACCOUNT_RENAMED"
+assert_eq "the units running as the account are stopped" "ollama-router open-webui" "${ACCOUNT_STOPPED[*]}"
+assert_ok "before the rename" mock_called "systemctl stop ollama-router.service open-webui.service"
+assert_ok "the account is renamed" mock_called "usermod -l osr-router ollama-router"
+assert_ok "with its group" mock_called "groupmod -n osr-router ollama-router"
+assert_file_contains "alerts keep their old channel" "MATTERMOST_CHANNEL=ollama-monitor" "$ENV_FILE"
+assert_file_contains "and posting name" "MATTERMOST_MONITOR_USER=OllamaMonitor" "$ENV_FILE"
+assert_contains "the rename is reported" "ollama-router is now osr-router" "$(cat "${WORK}/acct.err")"
+kv_set "$ENV_FILE" MATTERMOST_CHANNEL alerts
+migrate_legacy_account 2>/dev/null
+assert_file_contains "a channel the env sets is kept" "MATTERMOST_CHANNEL=alerts" "$ENV_FILE"
+# The rename refused (a process still runs as the account): the services start
+# again and the apply stops there.
+mock_command usermod 1
+mock_reset_log
+migrate_legacy_account 2>"${WORK}/acct.err"; rc=$?
+assert_eq "a refused rename fails" "1" "$rc"
+assert_eq "nothing is recorded as renamed" "false" "$ACCOUNT_RENAMED"
+assert_ok "the stopped services start again" mock_called "systemctl start ollama-router.service open-webui.service"
+assert_contains "and the reason is given" "could not rename the service account" "$(cat "${WORK}/acct.err")"
+# The group rename refused: the account gets its old name back.
+mock_command usermod 0; mock_command groupmod 1
+mock_reset_log
+migrate_legacy_account 2>/dev/null; rc=$?
+assert_eq "a refused group rename fails" "1" "$rc"
+assert_ok "and renames the account back" mock_called "usermod -l ollama-router osr-router"
+# No old account, or both: nothing is touched.
+mock_command groupmod 0; mock_command getent 2
+mock_reset_log
+migrate_legacy_account 2>/dev/null; rc=$?
+assert_eq "no old account: nothing to do" "0" "$rc"
+assert_eq "and nothing is stopped" "0" "$(mock_call_count 'systemctl')"
+mock_command getent 0
+mock_reset_log
+migrate_legacy_account 2>"${WORK}/acct.err"; rc=$?
+assert_eq "both accounts: nothing renamed" "0:0" "${rc}:$(mock_call_count 'usermod')"
+assert_contains "and that is reported" "both ollama-router and osr-router accounts exist" "$(cat "${WORK}/acct.err")"
+rm -f "${UNIT_DIR}/ollama-router.service" "${UNIT_DIR}/open-webui.service" "${UNIT_DIR}/osr-prometheus.service"
+rm -f "${MOCK_BIN}/getent" "${MOCK_BIN}/usermod" "${MOCK_BIN}/groupmod"; hash -r
+ACCOUNT_RENAMED=false; ACCOUNT_STOPPED=()
 
 describe snapshot_runtime
 reset_repo; install_runtime
@@ -1594,35 +1691,35 @@ assert_ok "puts the previous file back" cmp -s "$ROUTER_INI" "${ROUTER_DIR}/rout
 assert_fail "a snapshot without a manifest is refused" restore_runtime "${WORK}/nope"
 
 describe health_url
-assert_eq "router"     "${ROUTER_URL}/healthz"            "$(health_url ollama-router)"
+assert_eq "router"     "${ROUTER_URL}/healthz"            "$(health_url osr-router)"
 assert_eq "litellm"    "$LITELLM_HEALTH_URL"              "$(health_url litellm-proxy)"
 assert_eq "open webui" "http://127.0.0.1:8080/health"     "$(health_url open-webui)"
-assert_eq "monitor has none" ""                           "$(health_url ollama-monitor)"
+assert_eq "monitor has none" ""                           "$(health_url osr-monitor)"
 
 describe wait_healthy
 mock_command sleep 0
 mock_command systemctl 0 "active"
 mock_command curl 0
-assert_ok   "active and answering"     wait_healthy ollama-router 4
+assert_ok   "active and answering"     wait_healthy osr-router 4
 mock_command curl 7
-assert_fail "never answers -> timeout" wait_healthy ollama-router 4
+assert_fail "never answers -> timeout" wait_healthy osr-router 4
 mock_command systemctl 3 "failed"
 mock_reset_log
-assert_fail "a failed unit gives up at once" wait_healthy ollama-router 60
+assert_fail "a failed unit gives up at once" wait_healthy osr-router 60
 assert_eq   "without waiting it out" "0" "$(mock_call_count 'sleep')"
 mock_command systemctl 0 "active"
-assert_ok   "no URL -> stays active" wait_healthy ollama-monitor 4
+assert_ok   "no URL -> stays active" wait_healthy osr-monitor 4
 
 describe restart_and_check
 mock_command systemctl 0 "active"
 mock_command curl 0
-assert_eq "all healthy -> no output" "" "$(restart_and_check litellm-proxy ollama-router 2>/dev/null)"
+assert_eq "all healthy -> no output" "" "$(restart_and_check litellm-proxy osr-router 2>/dev/null)"
 mock_script curl <<'EOF'
 [[ "$*" == *healthz* ]] && exit 7
 exit 0
 EOF
-out="$(restart_and_check litellm-proxy ollama-router open-webui 2>/dev/null)"; rc=$?
-assert_eq "names the first unhealthy service" "ollama-router" "$out"
+out="$(restart_and_check litellm-proxy osr-router open-webui 2>/dev/null)"; rc=$?
+assert_eq "names the first unhealthy service" "osr-router" "$out"
 assert_ne "and fails" "0" "$rc"
 
 describe openwebui_data_dir
@@ -1673,6 +1770,18 @@ mock_command systemctl 0 "active"
 mock_command curl 0
 out="$(cmd_apply 2>&1)"
 assert_contains "nothing changed -> nothing restarted" "nothing restarted" "$out"
+# An install from before the rename: apply replaces its old units, enables the
+# new ones and starts them even though no file changed.
+touch "${UNIT_DIR}/osr-router.service" "${UNIT_DIR}/osr-monitor.service"
+touch "${UNIT_DIR}/ollama-router.service" "${UNIT_DIR}/ollama-monitor.service"
+mock_reset_log
+out="$(cmd_apply 2>&1)"
+assert_contains "apply moves the old router unit" "ollama-router.service is now osr-router.service" "$out"
+assert_fail "and removes it" test -e "${UNIT_DIR}/ollama-router.service"
+assert_ok "the renamed units are enabled" mock_called "systemctl enable osr-router.service osr-monitor.service"
+assert_contains "and started" "Restarting: osr-router osr-monitor" "$out"
+out="$(cmd_apply 2>&1)"
+assert_contains "after that, nothing to do" "nothing restarted" "$out"
 # An env file from an older installer: tidied by the apply, which then restarts
 # the services that read it, once.
 kv_set "$ENV_FILE" MODEL_SERVER_COUNT 4
@@ -1681,14 +1790,14 @@ cp "$ENV_FILE" "${ROUTER_DIR}/.env"          # what that installer deployed
 out="$(cmd_apply 2>&1)"
 assert_contains "apply tidies an older env file" "Tidied router.env: removed LITELLM_HEALTH_URL MODEL_SERVER_COUNT" "$out"
 assert_fail "the unused settings are gone" grep -Eq '^(MODEL_SERVER_COUNT|LITELLM_HEALTH_URL)=' "$ENV_FILE"
-assert_contains "the services reading it restart" "Restarting: litellm-proxy ollama-router ollama-monitor" "$out"
+assert_contains "the services reading it restart" "Restarting: litellm-proxy osr-router osr-monitor" "$out"
 out="$(cmd_apply 2>&1)"
 assert_contains "and only once" "nothing restarted" "$out"
 assert_not_contains "a tidy file is not mentioned again" "Tidied" "$out"
 echo "# tweak" >> "$ROUTER_INI"
 mock_reset_log
 out="$(cmd_apply 2>&1)"
-assert_contains "restarts only the router" "Restarting: ollama-router" "$out"
+assert_contains "restarts only the router" "Restarting: osr-router" "$out"
 assert_eq "exactly one restart issued" "1" "$(mock_call_count 'restart ')"
 assert_contains "reports health" "healthy" "$out"
 assert_not_contains "no Kindi budget note without a change" "Kindi read budget" "$out"
@@ -1722,9 +1831,42 @@ EOF
 export ROUTER_DIR_WATCH="$ROUTER_DIR"
 out="$(cmd_apply 2>&1)"; rc=$?
 assert_ne "an unhealthy restart fails the apply" "0" "$rc"
-assert_contains "names the service" "ollama-router did not become healthy" "$out"
+assert_contains "names the service" "osr-router did not become healthy" "$out"
 assert_contains "rolls back" "Rolled back; the previous configuration is running again" "$out"
 assert_eq "the previous file is back in place" "$good" "$(cat "${ROUTER_DIR}/router.ini")"
+
+# The same failure on an install whose account this apply renamed: the account
+# keeps its new name, so the restored units are pointed at it; a refused
+# rename applies nothing.
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
+mkdir -p "$UNIT_DIR"
+printf '[Service]\nUser=ollama-router\nGroup=ollama-router\n' > "${UNIT_DIR}/litellm-proxy.service"
+mock_script getent <<'EOF'
+[[ "$*" == *" ollama-router" ]] && exit 0
+exit 2
+EOF
+mock_command usermod 1; mock_command groupmod 0
+hash -r
+echo "# change" >> "$ROUTER_INI"
+mock_reset_log
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_eq "a refused account rename fails the apply" "1" "$rc"
+assert_contains "and applies nothing" "Nothing was applied" "$out"
+assert_not_contains "apply-config did not run" "apply-config ran" "$out"
+mock_command usermod 0
+echo "# bad change" >> "$ROUTER_INI"
+mock_script curl <<'EOF'
+grep -q "bad change" "$ROUTER_DIR_WATCH/router.ini" && exit 7
+exit 0
+EOF
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_ne "a failed apply after the rename fails" "0" "$rc"
+assert_contains "and rolls back" "Rolled back" "$out"
+assert_file_contains "the restored unit runs as the renamed account" "User=osr-router" "${UNIT_DIR}/litellm-proxy.service"
+assert_file_contains "in the renamed group" "Group=osr-router" "${UNIT_DIR}/litellm-proxy.service"
+rm -f "${MOCK_BIN}/getent" "${MOCK_BIN}/usermod" "${MOCK_BIN}/groupmod" "${UNIT_DIR}/litellm-proxy.service"; hash -r
+ACCOUNT_RENAMED=false; ACCOUNT_STOPPED=()
+mock_command curl 0
 
 # A failed Open WebUI upgrade: the old version is reinstalled and the database
 # (migrated by the new version) is put back.

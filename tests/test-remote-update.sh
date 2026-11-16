@@ -89,7 +89,7 @@ check contains 'exec 280 -- rm -rf -- /root/osr-update.ABCDEFGH' "$MOCK_LOG"
 tar -tzf "$MOCK_ARCHIVE" > "$tmp/manifest"
 check contains 'open-smart-router-install.sh' "$tmp/manifest"
 check contains 'install/update-router.sh' "$tmp/manifest"
-check contains 'services/ollama-router/router.py' "$tmp/manifest"
+check contains 'services/osr-router/router.py' "$tmp/manifest"
 check lacks 'env/router.env' "$tmp/manifest"
 check lacks 'litellm_config.yaml' "$tmp/manifest"
 check lacks 'router.ini' "$tmp/manifest"
@@ -102,8 +102,8 @@ check contains 'list' "$MOCK_LOG"
 check contains 'Updating router CT 280 from ' <(printf '%s\n' "$output")
 check contains 'exec 280 -- env CONFIG_REPO_DIR=/app/config-repo ROUTER_DIR=/app/router bash /root/osr-update.ABCDEFGH/install/update-router.sh --with-tunables --no-push' "$MOCK_LOG"
 tar -tzf "$MOCK_ARCHIVE" > "$tmp/manifest"
-check contains 'services/ollama-router/router.ini' "$tmp/manifest"
-check contains 'services/ollama-monitor/monitor.ini' "$tmp/manifest"
+check contains 'services/osr-router/router.ini' "$tmp/manifest"
+check contains 'services/osr-monitor/monitor.ini' "$tmp/manifest"
 
 : > "$MOCK_LOG"
 output=$(CT_ID=280 MOCK_MANAGER_LINK=missing bash "$tool" --host --dry-run 2>&1)
@@ -121,7 +121,7 @@ check lacks 'exec ' "$MOCK_LOG"
 if CT_ID=281 bash "$tool" --host --dry-run > "$tmp/output" 2>&1; then
     printf 'FAIL: non-router CT was accepted\n' >&2; exit 1
 fi
-check contains 'Cannot inspect litellm-proxy.service in CT 281' "$tmp/output"
+check contains 'Cannot inspect osr-router.service in CT 281' "$tmp/output"
 check lacks 'push ' "$MOCK_LOG"
 
 : > "$MOCK_LOG"
@@ -157,6 +157,12 @@ cat > "$tmp/bin/systemctl" <<'MOCK'
 #!/bin/sh
 printf 'systemctl %s\n' "$*" >> "$MOCK_LOG"
 service=${5%.service}
+# MOCK_LEGACY_UNITS=1: a CT from before the rename (ollama-router and
+# ollama-monitor installed, no osr-* units); systemd answers an empty
+# FragmentPath for a unit it does not have.
+case "${MOCK_LEGACY_UNITS:-}:$service" in
+    1:osr-router|1:osr-monitor|:ollama-router|:ollama-monitor) [ "$3" = FragmentPath ] && { echo; exit 0; } ;;
+esac
 case $3 in
     FragmentPath) printf '/etc/systemd/system/%s.service\n' "$service" ;;
     WorkingDirectory)
@@ -195,6 +201,16 @@ check contains 'systemctl show -p FragmentPath --value litellm-proxy.service' "$
 check contains 'find /app/router -maxdepth 1' "$MOCK_LOG"
 check contains "container-updater: repo=/app/config-repo runtime=/app/router args=$root/install/update-router.sh --dry-run --diff $root" "$MOCK_LOG"
 check lacks 'exec 280' "$MOCK_LOG"
+check contains 'systemctl show -p WorkingDirectory --value osr-router.service' "$MOCK_LOG"
+
+# A CT from before the rename still has ollama-router and ollama-monitor: they
+# are inspected instead, and the update (which renames them) goes ahead.
+: > "$MOCK_LOG"
+output=$(cd "$tmp/elsewhere" && MOCK_LEGACY_UNITS=1 "$real_bash" "$tool" --container --dry-run 2>&1)
+check contains 'Found this container installation: config /app/config-repo, runtime /app/router' <(printf '%s\n' "$output")
+check contains 'systemctl show -p WorkingDirectory --value ollama-router.service' "$MOCK_LOG"
+check contains 'systemctl show -p WorkingDirectory --value ollama-monitor.service' "$MOCK_LOG"
+check contains 'container-updater: repo=/app/config-repo' "$MOCK_LOG"
 
 : > "$MOCK_LOG"
 output=$(cd "$tmp/elsewhere" && printf '2\n' | "$real_bash" "$tool" --no-push 2>&1)
@@ -245,12 +261,12 @@ chmod +x "$tmp/bin/id"
 clone=$tmp/clone
 mkdir -p "$clone"
 (cd "$root" && tar -cf - tools install services open-smart-router-install.sh) | tar -xf - -C "$clone"
-printf 'x = 1\r\n' >> "$clone/services/ollama-router/router.py"
+printf 'x = 1\r\n' >> "$clone/services/osr-router/router.py"
 : > "$MOCK_LOG"
 if CT_ID=280 "$real_bash" "$clone/tools/update-router-services.sh" --host --dry-run > "$tmp/output" 2>&1; then
     printf 'FAIL: CRLF source was accepted\n' >&2; exit 1
 fi
-check contains 'services/ollama-router/router.py' "$tmp/output"
+check contains 'services/osr-router/router.py' "$tmp/output"
 check contains 'CRLF' "$tmp/output"
 check lacks 'exec ' "$MOCK_LOG"
 
@@ -296,7 +312,7 @@ cat > "$tmp/bin/bash" <<'MOCK'
 printf 'container-updater: repo=%s args=%s\n' "$CONFIG_REPO_DIR" "$*" >> "$MOCK_LOG"
 MOCK
 chmod +x "$tmp/bin/systemctl" "$tmp/bin/find" "$tmp/bin/sh" "$tmp/bin/readlink" "$tmp/bin/test" "$tmp/bin/bash"
-sed -i 's/\r$//' "$clone/services/ollama-router/router.py"
+sed -i 's/\r$//' "$clone/services/osr-router/router.py"
 
 : > "$MOCK_LOG"
 output=$("$real_bash" "$clone/tools/update-router-services.sh" --container --dry-run 2>&1)

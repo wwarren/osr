@@ -22,7 +22,7 @@ source <(awk '/^# Install helpers/{c=1;next} /^# End install helpers\./{c=0} c' 
 for helper in valid_handle valid_username valid_email json_find config_value dropin write_secret; do
   declare -F "$helper" >/dev/null || fail "helper extraction failed: $helper"
 done
-valid_handle ollama-monitor && valid_username mmadmin || fail 'valid names refused'
+valid_handle osr-monitor && valid_username mmadmin || fail 'valid names refused'
 for bad in 'Ollama Monitor' -x UPPER; do if valid_handle "$bad"; then fail "accepted handle '$bad'"; fi; done
 for bad in X 9admin ab; do if valid_username "$bad"; then fail "accepted user name '$bad'"; fi; done
 [[ $(printf '[{"id":"a1","name":"ops"},{"id":"b2","name":"ollama"}]' | json_find name ollama) == b2 ]] || fail 'json_find in a list'
@@ -36,7 +36,7 @@ if printf '[]' | json_find name nope >/dev/null; then fail 'json_find matched no
 pass 'helpers: names, JSON lookups in every mmctl output shape, config values and the drop-in'
 
 out=$(bash "$script" --dry-run) || fail 'dry run'
-[[ $out == *'MM_SERVICESETTINGS_ENABLELOCALMODE=true'* && $out == *'incoming webhook for ollama:ollama-monitor'* ]] || fail "dry run: $out"
+[[ $out == *'MM_SERVICESETTINGS_ENABLELOCALMODE=true'* && $out == *'incoming webhook for osr:osr-monitor'* ]] || fail "dry run: $out"
 for bad in 'MATTERMOST_TEAM=Ops Team' MATTERMOST_CHANNEL=x MATTERMOST_ADMIN_USER=Admin MATTERMOST_ADMIN_EMAIL=nope; do
   if env "$bad" bash "$script" --dry-run >/dev/null 2>&1; then fail "accepted $bad"; fi
 done
@@ -154,8 +154,8 @@ grep -qx 'Environment=MM_SERVICESETTINGS_ENABLELOCALMODE=true' "$dropins/10-loca
 grep -q 'systemctl daemon-reload' "$log" && grep -q 'systemctl restart mattermost.service' "$log" || fail 'not restarted for local mode'
 grep -q 'mmctl --local --suppress-warnings user create --email mmadmin@mattermost.local --username mmadmin .*--system-admin' "$log" ||
   fail 'administrator'
-[[ $(mm_state '[t["name"] for t in s["teams"]]') == "['ollama']" ]] || fail 'team'
-[[ $(mm_state '[c["name"] for c in s["channels"]]') == "['ollama-monitor']" ]] || fail 'channel'
+[[ $(mm_state '[t["name"] for t in s["teams"]]') == "['osr']" ]] || fail 'team'
+[[ $(mm_state '[c["name"] for c in s["channels"]]') == "['osr-monitor']" ]] || fail 'channel'
 for setting in EnableIncomingWebhooks EnablePostUsernameOverride EnablePostIconOverride; do
   [[ $(mm_state "s['config']['ServiceSettings.$setting']") == true ]] || fail "$setting not enabled"
 done
@@ -186,6 +186,23 @@ out=$(guest FAKE_SITE_URL= MATTERMOST_TEAM=ops MATTERMOST_CHANNEL=alerts) || fai
 [[ $(< "$target/webhook-url") == http://192.0.2.76:8065/hooks/* ]] || fail 'webhook URL without SiteURL'
 [[ $(mm_state '[c["name"] for c in s["channels"]]') == "['alerts']" ]] || fail 'MATTERMOST_CHANNEL was not used'
 pass 'an empty SiteURL is set to the CT address; team and channel names are honoured'
+[[ $(< "$target/team") == ops && $(< "$target/channel") == alerts ]] || fail 'the team and channel were not recorded'
+: > "$log"
+out=$(guest) || fail "rerun without names: $out"
+[[ $out == *'Alerts go to ops:alerts.'* ]] && ! grep -q 'create' "$log" || fail "a rerun did not keep the recorded team and channel: $out"
+pass 'the team and channel are recorded, and a rerun without them keeps them'
+
+# A target set up before the team and channel were recorded (and before the
+# rename): its webhook, no record. The pre-rename defaults are kept.
+reset
+out=$(guest) || fail "setup: $out"
+rm -f -- "$target/team" "$target/channel"
+python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["teams"]=[]; s["channels"]=[]; s["hooks"]=[]; json.dump(s, open(p,"w"))' "$state/mm.json"
+out=$(guest) || fail "pre-rename target: $out"
+[[ $(mm_state '[t["name"] for t in s["teams"]]') == "['ollama']" && $(mm_state '[c["name"] for c in s["channels"]]') == "['ollama-monitor']" ]] ||
+  fail "an unrecorded target did not keep the pre-rename team and channel: $out"
+[[ $(< "$target/team") == ollama && $(< "$target/channel") == ollama-monitor ]] || fail 'and records them'
+pass 'a target set up before the team and channel were recorded keeps ollama and ollama-monitor'
 
 reset
 if out=$(guest FAKE_NO_START=1); then fail 'a Mattermost that never answered was accepted'; fi

@@ -22,7 +22,7 @@ source <(awk '/^# Install helpers/{c=1;next} /^# End install helpers\./{c=0} c' 
 for helper in valid_username valid_email app_ini install_locked token_from_output root_url user_listed write_secret; do
   declare -F "$helper" >/dev/null || fail "helper extraction failed: $helper"
 done
-valid_username ollama-router && valid_username gitea-admin || fail 'valid names refused'
+valid_username osr-router && valid_username gitea-admin || fail 'valid names refused'
 for bad in admin Admin api -x 'two words' a; do
   if valid_username "$bad"; then fail "accepted user name '$bad'"; fi
 done
@@ -47,13 +47,13 @@ tok=0123456789abcdef0123456789abcdef01234567
 if printf 'error\n' | token_from_output >/dev/null; then fail 'no token was accepted'; fi
 users=$'ID   Username       Email   IsActive IsAdmin 2FA\n1    gitea-admin    a@b.c   true     true    false'
 user_listed gitea-admin <<< "$users" || fail 'user_listed missed a user'
-if user_listed ollama-router <<< "$users"; then fail 'user_listed invented a user'; fi
+if user_listed osr-router <<< "$users"; then fail 'user_listed invented a user'; fi
 if user_listed Username <<< "$users"; then fail 'the header counted as a user'; fi
 pass 'helpers: names, app.ini, the lock, ROOT_URL, token output and the user list'
 
 out=$(bash "$script" --dry-run) || fail 'dry run'
 [[ $out == *'INSTALL_LOCK, registration off'* && $out == *'write:repository,write:user token'* ]] || fail "dry run: $out"
-for bad in GITEA_ROUTER_USER=admin GITEA_SITE_ADMIN=ollama-router GITEA_SITE_ADMIN_EMAIL=nope; do
+for bad in GITEA_ROUTER_USER=admin GITEA_SITE_ADMIN=osr-router GITEA_SITE_ADMIN_EMAIL=nope; do
   if env "$bad" bash "$script" --dry-run >/dev/null 2>&1; then fail "accepted $bad"; fi
 done
 pass 'the dry run plans the setup; reserved or clashing names and bad emails are refused'
@@ -140,10 +140,10 @@ migrate_line=$(grep -n 'gitea .*migrate' "$log" | cut -d: -f1 | head -n1)
 restart_line=$(grep -n 'systemctl restart gitea.service' "$log" | cut -d: -f1 | head -n1)
 (( migrate_line < restart_line )) || fail 'the database was not migrated before the start'
 grep -q 'admin user create --admin --username gitea-admin .*--must-change-password=true' "$log" || fail 'administrator'
-grep -q 'admin user create --username ollama-router .*--random-password --must-change-password=false' "$log" || fail 'router account'
-grep -q 'generate-access-token --username ollama-router .*--scopes write:repository,write:user --raw' "$log" || fail 'token scopes'
+grep -q 'admin user create --username osr-router .*--random-password --must-change-password=false' "$log" || fail 'router account'
+grep -q 'generate-access-token --username osr-router .*--scopes write:repository,write:user --raw' "$log" || fail 'token scopes'
 [[ $(< "$target/router-token") =~ ^[0-9a-f]{40}$ ]] || fail 'token file'
-[[ $(< "$target/url") == http://192.0.2.75:3000 && $(< "$target/router-user") == ollama-router ]] || fail 'url/router-user'
+[[ $(< "$target/url") == http://192.0.2.75:3000 && $(< "$target/router-user") == osr-router ]] || fail 'url/router-user'
 [[ $(< "$target/admin-user") == gitea-admin && -s $target/admin-password ]] || fail 'admin files'
 for f in url admin-user admin-password router-user router-token; do
   [[ $(stat -c %a "$target/$f") == 600 ]] || fail "$f is not 0600"
@@ -164,6 +164,15 @@ pass 'a rerun keeps the configuration, the accounts and a working token'
 out=$(guest) || fail "token repair: $out"
 [[ $(< "$target/router-token") != "$token" ]] || fail 'a revoked token was kept'
 pass 'a token Gitea no longer accepts is replaced'
+
+# A target set up before the rename recorded ollama-router: a rerun without
+# GITEA_ROUTER_USER keeps that account and does not create osr-router.
+printf 'ollama-router\n' > "$target/router-user"; : > "$state/tokens"; : > "$log"
+out=$(guest) || fail "rerun of a pre-rename target: $out"
+grep -q 'username osr-router' "$log" && fail 'a pre-rename target got a second router account'
+grep -q 'generate-access-token --username ollama-router ' "$log" || fail "the recorded account was not used: $(grep -c . "$log")"
+[[ $(< "$target/router-user") == ollama-router ]] || fail 'the recorded account was replaced'
+pass 'a rerun keeps the router account the target recorded (ollama-router from before the rename)'
 
 reset
 printf '[server]\nROOT_URL = https://git.example.net/\n[security]\nINSTALL_LOCK = true\n' > "$etc/app.ini"

@@ -1,4 +1,4 @@
-"""Unit tests for services/ollama-router/router.py.
+"""Unit tests for services/osr-router/router.py.
 
 Every upstream (Ollama hosts, LiteLLM) is an httpx.MockTransport, so nothing
 leaves the process. Run: python3 -m pytest -q tests/test_router.py
@@ -23,7 +23,7 @@ HOST_B = "http://10.0.0.2:11434"
 
 def load_router(monkeypatch, **env):
     base = {
-        "ROUTER_INI": str(ROOT / "services/ollama-router/router.ini"),
+        "ROUTER_INI": str(ROOT / "services/osr-router/router.ini"),
         "MODEL_SERVERS": f"{HOST_A},{HOST_B}",
         "ROUTER_API_KEY": "",
         "LMSTUDIO_API_TOKEN": "",
@@ -44,7 +44,7 @@ def load_router(monkeypatch, **env):
     for key, value in base.items():
         monkeypatch.setenv(key, value)
     spec = importlib.util.spec_from_file_location(
-        "router_under_test", ROOT / "services/ollama-router/router.py")
+        "router_under_test", ROOT / "services/osr-router/router.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules["router_under_test"] = module
     spec.loader.exec_module(module)
@@ -962,7 +962,7 @@ def _sizes_router(monkeypatch, tmp_path, ini_text, server, ids):
 
 
 def test_model_sizes_are_configurable(monkeypatch, tmp_path):
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    ini = (ROOT / "services/osr-router/router.ini").read_text()
     assert "\n[model_sizes]\n" in ini and "\nstrata = 125B\n" in ini
     # A blank value removes a built-in size; a sized tag still parses.
     sizes = _sizes_router(monkeypatch, tmp_path, ini.replace("\nstrata = 125B\n", "\nstrata =\n"),
@@ -978,7 +978,7 @@ def test_model_sizes_are_configurable(monkeypatch, tmp_path):
 def test_strata_quant_ids_are_sized_but_coder_is_not(monkeypatch, tmp_path):
     """Strata names its qwen models qwen3.8-flash-next-<quant>; every quant is
     the 125B model, so each is size-banded. The Coder is smaller and unlisted."""
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    ini = (ROOT / "services/osr-router/router.ini").read_text()
     ids = ["qwen3.8-flash-next-q2_0", "qwen3.8-flash-next-iq2_xs",
            "qwen3.8-flash-next-iq3_xxs", "qwen3.8-flash-next-iq3_s",
            "qwen3.8-flash-next-coder-iq1_m"]
@@ -1770,7 +1770,7 @@ def test_openai_kind_text_models_report_tools(router, kind):
 def test_tool_kinds_setting(monkeypatch, tmp_path, caplog):
     """A kind left out of tool_kinds is unknown again; a name that is not a
     /v1/models kind is ignored with a warning."""
-    ini = (ROOT / "services/ollama-router/router.ini").read_text()
+    ini = (ROOT / "services/osr-router/router.ini").read_text()
     assert "\ntool_kinds = strata, basalt, maya, xolotl, avalon, kindi\n" in ini
     custom = tmp_path / "router.ini"
     custom.write_text(ini.replace("tool_kinds = strata, basalt, maya, xolotl, avalon, kindi",
@@ -1858,7 +1858,7 @@ def test_tier_alias_still_pins_the_class_of_a_tool_request(served):
 
 def test_invalid_tools_min_class_is_ignored(monkeypatch, tmp_path):
     ini = tmp_path / "router.ini"
-    ini.write_text((ROOT / "services/ollama-router/router.ini").read_text()
+    ini.write_text((ROOT / "services/osr-router/router.ini").read_text()
                    .replace("tools_min_class = large", "tools_min_class = huge"))
     module = load_router(monkeypatch, ROUTER_INI=str(ini))
     assert module.TOOLS_MIN_CLASS == ""

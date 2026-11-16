@@ -27,7 +27,7 @@ automatically. The CT ID defaults to the cluster's next free ID (Enter, or an un
    sign-in required. Then migrates and restarts.
 2. Creates the administrator `GITEA_SITE_ADMIN` (`gitea-admin`) with a random
    password that must be changed at first sign-in.
-3. Creates the non-admin router account `GITEA_ROUTER_USER` (`ollama-router`)
+3. Creates the non-admin router account `GITEA_ROUTER_USER` (`osr-router`; a rerun keeps the recorded one)
    and a `write:repository,write:user` token, so the router installer can
    create its repository under that account.
 
@@ -40,7 +40,7 @@ Results are root-only (0600) files in `/etc/gitea-target/`: `url`,
 | `CT_ID`, `IP_CIDR`, `GATEWAY`, `STORAGE`, `BRIDGE`, `NAMESERVER`, `VLAN_TAG`, `SSH_PUBLIC_KEY` | ID: next free; IP required; gateway for static IP | Community script `var_*` presets. Use a static address: it is the router's Gitea URL |
 | `CORES`, `MEMORY_MB`, `ROOTFS_GB` | 1, 1024, 8 | CT size |
 | `GITEA_SITE_ADMIN`, `GITEA_SITE_ADMIN_EMAIL` | `gitea-admin`, `<name>@<address>.local` | Administrator |
-| `GITEA_ROUTER_USER`, `GITEA_ROUTER_EMAIL` | `ollama-router`, … | Router account (Gitea reserves `admin` and other route names) |
+| `GITEA_ROUTER_USER`, `GITEA_ROUTER_EMAIL` | `osr-router` (an existing target: the recorded one), … | Router account (Gitea reserves `admin` and other route names) |
 | `GITEA_DOMAIN` | Static IP, else the CT's address | Host name in `ROOT_URL` |
 | `READY_TIMEOUT` | 120 | Seconds to wait for the web UI |
 | `COMMUNITY_SCRIPT_URL`, `COMMUNITY_SCRIPT_SHA256` | ProxmoxVE `main` | Each run prints the checksum; a pin refuses other copies |

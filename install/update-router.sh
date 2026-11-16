@@ -38,8 +38,12 @@ CONFIG_LOCK_FILE="${CONFIG_LOCK_FILE:-/run/lock/open-smart-router-config.lock}"
 # tool installed before this update still takes it, so it is held as well.
 CONFIG_LOCK_FILE_LEGACY="${CONFIG_LOCK_FILE_LEGACY:-/run/lock/ollama-smart-router-config.lock}"
 CONFIG_LOCK_WAIT="${CONFIG_LOCK_WAIT:-0}"
-TUNABLES=(services/ollama-router/router.ini services/ollama-monitor/monitor.ini)
+TUNABLES=(services/osr-router/router.ini services/osr-monitor/monitor.ini)
 SELF=install/update-router.sh
+# OLD:NEW service directories renamed with the project; the unit file inside
+# is renamed too (ollama-router.service -> osr-router.service). A config repo
+# still laid out the old way is moved to the new names by this update.
+LEGACY_SERVICE_DIRS=(ollama-router:osr-router ollama-monitor:osr-monitor)
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
@@ -106,13 +110,78 @@ syntax_errors() {
   done
   return "$bad"
 }
-# Files (relative) whose source copy in $1 differs from the repo copy in $2.
+# legacy_rel REL: where REL lived before the service directories were renamed
+# (REL itself when it is not under a renamed directory).
+legacy_rel() {
+  local rel=$1 pair old new
+  for pair in "${LEGACY_SERVICE_DIRS[@]}"; do
+    old=${pair%%:*}; new=${pair#*:}
+    if [[ $rel == "services/$new/"* ]]; then
+      rel="services/$old/${rel#"services/$new/"}"
+      [[ $rel != */"$new.service" ]] || rel="${rel%/*}/$old.service"
+      break
+    fi
+  done
+  printf '%s\n' "$rel"
+}
+# repo_rel ROOT REL: REL in the tree at ROOT, or its pre-rename path when only
+# that one exists there.
+repo_rel() {
+  local root=$1 rel=$2 old
+  if [[ ! -e $root/$rel ]]; then
+    old=$(legacy_rel "$rel")
+    [[ ! -e $root/$old ]] || rel=$old
+  fi
+  printf '%s\n' "$rel"
+}
+# The renamed service directories still present in the config repo at $1.
+legacy_dirs() {
+  local pair
+  for pair in "${LEGACY_SERVICE_DIRS[@]}"; do
+    [[ ! -d $1/services/${pair%%:*} ]] || printf 'services/%s\n' "${pair%%:*}"
+  done
+  return 0
+}
+# Move the config repo's renamed service directories (git mv, so history and
+# the operator's router.ini and monitor.ini go along). When the new directory
+# exists as well, a file the installer owns keeps its new copy (this update
+# rewrites it anyway) and any other file keeps the old, operator's copy.
+# $@: the installer-owned files.
+migrate_service_dirs() {
+  local pair old new rel name target owned
+  for pair in "${LEGACY_SERVICE_DIRS[@]}"; do
+    old="services/${pair%%:*}"; new="services/${pair#*:}"
+    [[ -d $REPO_DIR/$old ]] || continue
+    if [[ ! -e $REPO_DIR/$new ]]; then
+      git -C "$REPO_DIR" mv -- "$old" "$new"
+      if [[ -e $REPO_DIR/$new/${pair%%:*}.service ]]; then
+        git -C "$REPO_DIR" mv -- "$new/${pair%%:*}.service" "$new/${pair#*:}.service"
+      fi
+    else
+      while IFS= read -r rel; do
+        name=${rel##*/}
+        [[ $name != "${pair%%:*}.service" ]] || name="${pair#*:}.service"
+        target="$new/$name"
+        owned=false
+        for name in "$@"; do [[ $name != "$target" ]] || owned=true; done
+        if [[ -e $REPO_DIR/$target ]] && $owned; then
+          git -C "$REPO_DIR" rm -q -- "$rel"
+        else
+          git -C "$REPO_DIR" mv -f -- "$rel" "$target"
+        fi
+      done < <(git -C "$REPO_DIR" ls-files -- "$old")
+    fi
+    echo "Moved ${old} to ${new}."
+  done
+}
+# Files (relative) whose source copy in $1 differs from the repo copy in $2
+# (compared with the pre-rename copy when that is the only one).
 changed_files() {
   local src=$1 dst=$2 rel
   shift 2
   for rel in "$@"; do
     [[ -f $src/$rel ]] || continue
-    cmp -s "$src/$rel" "$dst/$rel" || printf '%s\n' "$rel"
+    cmp -s "$src/$rel" "$dst/$(repo_rel "$dst" "$rel")" || printf '%s\n' "$rel"
   done
   return 0
 }
@@ -215,30 +284,35 @@ main() {
   local venv_changed=false
   for rel in "${changed[@]}"; do
     case "$rel" in
-      services/ollama-router/requirements.txt|services/ollama-monitor/requirements.txt)
+      services/osr-router/requirements.txt|services/osr-monitor/requirements.txt)
         venv_changed=true ;;
     esac
   done
   if $venv_changed && ! $do_apply && $do_push; then
     die 'router requirements changed with --no-apply; use --no-push, update the venv, then push separately.'
   fi
-  if (( ${#changed[@]} == 0 )); then
+  local -a legacy=()
+  mapfile -t legacy < <(legacy_dirs "$REPO_DIR")
+  if (( ${#changed[@]} == 0 && ${#legacy[@]} == 0 )); then
     echo "Already up to date with $(source_label "$source"); nothing to do."
     return 0
   fi
   echo "Updating from $(source_label "$source"):"
   for rel in "${changed[@]}"; do
-    if [[ -f $REPO_DIR/$rel ]]; then
-      printf '  %-50s %s\n' "$rel" "$(diff_stat "$REPO_DIR/$rel" "$source/$rel")"
+    if [[ -f $REPO_DIR/$(repo_rel "$REPO_DIR" "$rel") ]]; then
+      printf '  %-50s %s\n' "$rel" "$(diff_stat "$REPO_DIR/$(repo_rel "$REPO_DIR" "$rel")" "$source/$rel")"
     else
       printf '  %-50s new\n' "$rel"
     fi
+  done
+  for rel in "${legacy[@]}"; do
+    printf '  %-50s moved to %s/ (renamed)\n' "$rel/" "${rel/ollama-/osr-}"
   done
   if $dry_run; then
     if $show_diff; then
       local before
       for rel in "${changed[@]}"; do
-        before="$REPO_DIR/$rel"
+        before="$REPO_DIR/$(repo_rel "$REPO_DIR" "$rel")"
         [[ -f $before ]] || before=/dev/null
         diff -u --label "a/$rel" --label "b/$rel" "$before" "$source/$rel" 2>/dev/null || true
       done
@@ -294,22 +368,31 @@ PY
       fi
       "${ROUTER_VENV}/bin/pip" install -q --no-cache-dir -r "$freeze" >/dev/null 2>&1 || \
         note "  WARNING: restoring the router venv failed; see ${freeze}."
-      systemctl restart ollama-router.service ollama-monitor.service 2>/dev/null || true
+      # Whichever names the units have here (osr-* once an apply renamed them).
+      local unit
+      for unit in osr-router:ollama-router osr-monitor:ollama-monitor; do
+        if [[ $(systemctl show -p LoadState --value "${unit%%:*}.service" 2>/dev/null) == loaded ]]; then
+          systemctl restart "${unit%%:*}.service" 2>/dev/null || true
+        else
+          systemctl restart "${unit#*:}.service" 2>/dev/null || true
+        fi
+      done
     fi
   }
 
   # Any failure from the first filesystem mutation onward undoes the update.
   trap 'undo; exit 1' ERR
+  (( ${#legacy[@]} == 0 )) || migrate_service_dirs "${files[@]}"
   for rel in "${changed[@]}"; do
     mode=0644
     [[ $rel == *.sh ]] && mode=0755
     install -D -m "$mode" "$source/$rel" "$REPO_DIR/$rel"
   done
-  git -C "$REPO_DIR" add -- "${changed[@]}"
+  (( ${#changed[@]} == 0 )) || git -C "$REPO_DIR" add -- "${changed[@]}"
   git -C "$REPO_DIR" -c user.name="${GIT_AUTHOR_NAME:-open-smart-router}" \
       -c user.email="${GIT_AUTHOR_EMAIL:-router@localhost}" \
       commit -q -m "Update router components from $(source_label "$source")" \
-      -m "$(printf '%s\n' "${changed[@]}")"
+      -m "$(printf '%s\n' "${changed[@]}"; for rel in "${legacy[@]}"; do printf '%s -> %s\n' "$rel" "${rel/ollama-/osr-}"; done)"
   echo "Committed to ${REPO_DIR} (previous: ${prev_head:0:12})."
 
   # --- router venv -------------------------------------------------------------
@@ -319,10 +402,10 @@ PY
     "${ROUTER_VENV}/bin/pip" freeze > "$freeze"
     "${ROUTER_VENV}/bin/pip" list --format=json > "$venv_packages"
     echo "Router/monitor requirements changed; updating ${ROUTER_VENV}..."
-    # umask 022: the router runs as ollama-router from this root-owned venv.
+    # umask 022: the router runs as osr-router from this root-owned venv.
     if ! ( umask 022; "${ROUTER_VENV}/bin/pip" install -q --no-cache-dir \
-         -r "$REPO_DIR/services/ollama-router/requirements.txt" \
-         -r "$REPO_DIR/services/ollama-monitor/requirements.txt" ); then
+         -r "$REPO_DIR/services/osr-router/requirements.txt" \
+         -r "$REPO_DIR/services/osr-monitor/requirements.txt" ); then
       undo
       die 'installing the new router requirements failed; nothing was applied.'
     fi
@@ -333,7 +416,7 @@ PY
     echo "Not applied (--no-apply). Apply later with: manage-model-servers apply"
     if $venv_changed; then
       echo "  Update the router venv before applying:"
-      echo "    ${ROUTER_VENV}/bin/pip install -r ${REPO_DIR}/services/ollama-router/requirements.txt -r ${REPO_DIR}/services/ollama-monitor/requirements.txt"
+      echo "    ${ROUTER_VENV}/bin/pip install -r ${REPO_DIR}/services/osr-router/requirements.txt -r ${REPO_DIR}/services/osr-monitor/requirements.txt"
       echo "  Then restart with: manage-model-servers apply --all"
     fi
   else

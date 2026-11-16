@@ -21,8 +21,8 @@ REPO_DIR="${CONFIG_REPO_DIR:-/app/config-repo}"
 ROUTER_DIR="${ROUTER_DIR:-/app/router}"
 ENV_FILE="${REPO_DIR}/env/router.env"
 LITELLM_YAML="${REPO_DIR}/services/litellm-proxy/litellm_config.yaml"
-ROUTER_INI="${REPO_DIR}/services/ollama-router/router.ini"
-MONITOR_INI="${REPO_DIR}/services/ollama-monitor/monitor.ini"
+ROUTER_INI="${REPO_DIR}/services/osr-router/router.ini"
+MONITOR_INI="${REPO_DIR}/services/osr-monitor/monitor.ini"
 OPENWEBUI_REQ="${REPO_DIR}/services/open-webui/requirements.txt"
 OPENWEBUI_DIR="${OPENWEBUI_DIR:-/app/openwebui}"
 APPLY_SCRIPT="${REPO_DIR}/install/apply-config.sh"
@@ -45,8 +45,19 @@ MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
 MODEL_SERVER_MIN="${MODEL_SERVER_MIN:-1}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8000}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-5}"
-SERVICES=(litellm-proxy ollama-router ollama-monitor open-webui)
+SERVICES=(litellm-proxy osr-router osr-monitor open-webui)
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+# OLD=NEW: units renamed with the project (apply moves an installed OLD unit to
+# NEW), and the parent of their StateDirectory.
+LEGACY_UNITS=(ollama-router=osr-router ollama-monitor=osr-monitor)
+STATE_ROOT="${STATE_ROOT:-/var/lib}"
+# The service account's name before the rename; apply renames it in place to
+# SERVICE_USER (osr-router), keeping its UID, so file ownership is unchanged.
+LEGACY_ACCOUNT="${LEGACY_ACCOUNT:-ollama-router}"
+# Set by migrate_legacy_account: whether it renamed the account, and the units
+# it stopped to do so.
+ACCOUNT_RENAMED=false
+ACCOUNT_STOPPED=()
 # Snapshots of the runtime files taken before each apply (root-only).
 APPLY_BACKUP_DIR="${APPLY_BACKUP_DIR:-/var/backups/open-smart-router}"
 APPLY_BACKUP_KEEP="${APPLY_BACKUP_KEEP:-5}"
@@ -557,7 +568,7 @@ kv_set() {
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
   fi
   # Copy content rather than mv, so an existing file keeps its 0640
-  # root:ollama-router ownership and mode instead of inheriting the temp file's.
+  # root:osr-router ownership and mode instead of inheriting the temp file's.
   cat "$tmp" > "$file"
   rm -f "$tmp"
 }
@@ -575,7 +586,7 @@ ensure_secrets_file() {
   [[ -f "$SECRETS_FILE" ]] && return 0
   mkdir -p "$(dirname "$SECRETS_FILE")"
   ( umask 027; : > "$SECRETS_FILE" )
-  chown root:ollama-router "$SECRETS_FILE" 2>/dev/null || true
+  chown root:osr-router "$SECRETS_FILE" 2>/dev/null || true
   chmod 0640 "$SECRETS_FILE"
 }
 
@@ -909,7 +920,7 @@ cmd_discover() {
   fi
   if (( rc != 0 )) || [[ -z "$body" ]]; then
     note "Could not reach OSR at ${ROUTER_URL} (curl exit ${rc})."
-    note "  Check it is running:  systemctl status ollama-router"
+    note "  Check it is running:  systemctl status osr-router"
     note "  Or point elsewhere:   ROUTER_URL=http://host:8000 $0 discover"
     return 1
   fi
@@ -1791,7 +1802,7 @@ litellm_venv_ok() {
 # carries requirements.lock.
 litellm_install() {
   local pip="${LITELLM_DIR}/venv/bin/pip" rc=0
-  # The service runs as ollama-router from this root-owned tree: build it world-
+  # The service runs as osr-router from this root-owned tree: build it world-
   # readable whatever the calling shell's umask (a 077/027 umask here produced
   # "Failed to execute .../litellm: Permission denied", status=203/EXEC).
   (
@@ -1821,7 +1832,7 @@ venv_make_readable() {
 }
 
 # The service account every unit runs as.
-SERVICE_USER="${SERVICE_USER:-ollama-router}"
+SERVICE_USER="${SERVICE_USER:-osr-router}"
 
 # Before restarting anything, make sure the service account can actually run
 # each venv's interpreter; repair the permissions when a restrictive umask
@@ -1900,14 +1911,14 @@ for rel in ("env/router.env", "env/openwebui.env"):
                 err(rel, "SUBSCRIPTION_GATEWAY_BASE_URL needs HTTPS or loopback HTTP root URL")
 
 # Python services must at least compile.
-for rel in ("services/ollama-router/router.py", "services/ollama-monitor/monitor.py"):
+for rel in ("services/osr-router/router.py", "services/osr-monitor/monitor.py"):
     try:
         compile((repo / rel).read_text(), rel, "exec")
     except (OSError, SyntaxError) as exc:
         err(rel, "does not compile: %s" % exc)
 
 # router.ini
-rel = "services/ollama-router/router.ini"
+rel = "services/osr-router/router.ini"
 cp = configparser.ConfigParser()
 try:
     cp.read(repo / rel)
@@ -1940,7 +1951,7 @@ except (configparser.Error, ValueError) as exc:
     err(rel, str(exc))
 
 # monitor.ini
-rel = "services/ollama-monitor/monitor.ini"
+rel = "services/osr-monitor/monitor.ini"
 cp = configparser.ConfigParser()
 try:
     cp.read(repo / rel)
@@ -2034,16 +2045,16 @@ PYEOF
 # runtime path -> repo source, and the services that read it.
 apply_map() {
   cat <<EOF
-services/ollama-router/router.py|${ROUTER_DIR}/router.py|ollama-router
-services/ollama-router/router.ini|${ROUTER_DIR}/router.ini|ollama-router
-services/ollama-monitor/monitor.py|${ROUTER_DIR}/monitor.py|ollama-monitor
-services/ollama-monitor/monitor.ini|${ROUTER_DIR}/monitor.ini|ollama-monitor
+services/osr-router/router.py|${ROUTER_DIR}/router.py|osr-router
+services/osr-router/router.ini|${ROUTER_DIR}/router.ini|osr-router
+services/osr-monitor/monitor.py|${ROUTER_DIR}/monitor.py|osr-monitor
+services/osr-monitor/monitor.ini|${ROUTER_DIR}/monitor.ini|osr-monitor
 services/litellm-proxy/litellm_config.yaml|${ROUTER_DIR}/litellm_config.yaml|litellm-proxy
-env/router.env|${ROUTER_DIR}/.env|litellm-proxy ollama-router ollama-monitor
+env/router.env|${ROUTER_DIR}/.env|litellm-proxy osr-router osr-monitor
 env/openwebui.env|${OPENWEBUI_DIR}/.env|open-webui
 services/litellm-proxy/litellm-proxy.service|${UNIT_DIR}/litellm-proxy.service|litellm-proxy
-services/ollama-router/ollama-router.service|${UNIT_DIR}/ollama-router.service|ollama-router
-services/ollama-monitor/ollama-monitor.service|${UNIT_DIR}/ollama-monitor.service|ollama-monitor
+services/osr-router/osr-router.service|${UNIT_DIR}/osr-router.service|osr-router
+services/osr-monitor/osr-monitor.service|${UNIT_DIR}/osr-monitor.service|osr-monitor
 services/open-webui/open-webui.service|${UNIT_DIR}/open-webui.service|open-webui
 EOF
 }
@@ -2069,7 +2080,7 @@ affected_services() {
     fi
   done < <(apply_map)
   if [[ "$(secrets_fingerprint)" != "$(cat "${ROUTER_DIR}/.secrets.applied" 2>/dev/null)" ]]; then
-    want[ollama-router]=1; want[ollama-monitor]=1; want[open-webui]=1
+    want[osr-router]=1; want[osr-monitor]=1; want[open-webui]=1
   fi
   for svc in "${SERVICES[@]}"; do
     systemctl is-active --quiet "${svc}.service" 2>/dev/null || want[$svc]=1
@@ -2138,7 +2149,7 @@ health_url() {
   local port
   case "$1" in
     litellm-proxy) printf '%s\n' "$LITELLM_HEALTH_URL" ;;
-    ollama-router) printf '%s/healthz\n' "$ROUTER_URL" ;;
+    osr-router) printf '%s/healthz\n' "$ROUTER_URL" ;;
     open-webui)
       port="$(kv_get "${REPO_DIR}/env/openwebui.env" PORT)"
       printf 'http://127.0.0.1:%s/health\n' "${port:-8080}" ;;
@@ -2188,6 +2199,76 @@ restart_and_check() {
       printf '%s\n' "$svc"; return 1
     fi
   done
+}
+
+# Once apply-config.sh has installed osr-router and osr-monitor, take out the
+# pre-rename ollama-router and ollama-monitor units (same code, same port):
+# stop, disable and remove each, and move the old StateDirectory to the new
+# name. Prints the new units whose old unit was enabled, to enable in turn.
+# Never fails: a leftover old unit is reported, not fatal.
+migrate_legacy_units() {
+  local pair old new was_enabled
+  for pair in "${LEGACY_UNITS[@]}"; do
+    old="${pair%%=*}"; new="${pair#*=}"
+    [[ -f "${UNIT_DIR}/${old}.service" && -f "${UNIT_DIR}/${new}.service" ]] || continue
+    was_enabled=false
+    systemctl is-enabled --quiet "${old}.service" >/dev/null 2>&1 && was_enabled=true
+    echo "  ${old}.service is now ${new}.service: stopping and removing the old unit" >&2
+    systemctl disable --now "${old}.service" >/dev/null 2>&1 ||
+      systemctl stop "${old}.service" >/dev/null 2>&1 || true
+    rm -f -- "${UNIT_DIR}/${old}.service" ||
+      note "  WARNING: could not remove ${UNIT_DIR}/${old}.service; remove it by hand."
+    if [[ -d "${STATE_ROOT}/${old}" && ! -e "${STATE_ROOT}/${new}" ]]; then
+      mv -- "${STATE_ROOT}/${old}" "${STATE_ROOT}/${new}" 2>/dev/null || true
+    fi
+    if $was_enabled; then printf '%s\n' "$new"; fi
+  done
+  return 0
+}
+
+# Rename the pre-rename service account (LEGACY_ACCOUNT) to SERVICE_USER, with
+# its group: usermod/groupmod keep the UID and GID, so every file it owns
+# stays its own. Linux refuses to rename an account a process runs as, so the
+# units that run as it are stopped first (ACCOUNT_STOPPED; the caller restarts
+# them) and started again here if the rename fails. On such an install the
+# alert channel and posting name the monitor used by default are written to
+# env/router.env when missing, so alerts keep going where they went.
+# Returns 1 when the account could not be renamed (nothing else was changed).
+migrate_legacy_account() {
+  local old="$LEGACY_ACCOUNT" new="$SERVICE_USER" f
+  ACCOUNT_RENAMED=false; ACCOUNT_STOPPED=()
+  [[ -n "$old" && "$old" != "$new" ]] || return 0
+  getent passwd "$old" >/dev/null 2>&1 || return 0
+  if getent passwd "$new" >/dev/null 2>&1; then
+    note "WARNING: both ${old} and ${new} accounts exist; the services run as ${new}. Remove ${old} by hand."
+    return 0
+  fi
+  for f in "${UNIT_DIR}"/*.service; do
+    [[ -f "$f" ]] && grep -qx "User=${old}" "$f" && ACCOUNT_STOPPED+=("$(basename "$f" .service)")
+  done
+  echo "  The service account ${old} is now ${new}: stopping ${ACCOUNT_STOPPED[*]:-no service} to rename it" >&2
+  if (( ${#ACCOUNT_STOPPED[@]} )); then
+    systemctl stop "${ACCOUNT_STOPPED[@]/%/.service}" >/dev/null 2>&1 || true
+  fi
+  if usermod -l "$new" "$old" >/dev/null 2>&1; then
+    if ! getent group "$old" >/dev/null 2>&1 || groupmod -n "$new" "$old" >/dev/null 2>&1; then
+      ACCOUNT_RENAMED=true
+    else
+      usermod -l "$old" "$new" >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! $ACCOUNT_RENAMED; then
+    note "ERROR: could not rename the service account ${old} to ${new} (is a process still running as ${old}?)."
+    if (( ${#ACCOUNT_STOPPED[@]} )); then
+      systemctl start "${ACCOUNT_STOPPED[@]/%/.service}" >/dev/null 2>&1 || true
+    fi
+    ACCOUNT_STOPPED=()
+    return 1
+  fi
+  # The monitor's defaults before the rename:
+  kv_has "$ENV_FILE" MATTERMOST_CHANNEL || kv_set "$ENV_FILE" MATTERMOST_CHANNEL ollama-monitor  # pre-rename
+  kv_has "$ENV_FILE" MATTERMOST_MONITOR_USER || kv_set "$ENV_FILE" MATTERMOST_MONITOR_USER OllamaMonitor  # pre-rename
+  return 0
 }
 
 # Give the local Prometheus (install/setup-metrics.sh) the router key again
@@ -2254,6 +2335,12 @@ cmd_apply() {
   [[ ! -f "${ROUTER_DIR}/router.ini" ]] ||
     budget_before="$(ROUTER_INI="${ROUTER_DIR}/router.ini" kindi_timeout_seconds 2>/dev/null)" || budget_before=""
   budget_after="$(kindi_timeout_seconds 2>/dev/null)" || budget_after=""
+  # Before apply-config.sh, which gives the env files the new account's group.
+  if ! migrate_legacy_account; then
+    note "Nothing was applied."
+    return 1
+  fi
+  affected+=("${ACCOUNT_STOPPED[@]}")
   snapshot="$(snapshot_runtime)"
   echo "Applying configuration (previous files saved in ${snapshot})..."
   bash "$APPLY_SCRIPT" "$REPO_DIR"
@@ -2302,6 +2389,16 @@ cmd_apply() {
     note "           systemctl restart ${SERVICES[*]}"
     return 0
   fi
+  local -a renamed=()
+  mapfile -t renamed < <(migrate_legacy_units)
+  if (( ${#renamed[@]} )); then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable "${renamed[@]/%/.service}" >/dev/null 2>&1 ||
+      note "WARNING: could not enable ${renamed[*]}; run systemctl enable ${renamed[*]} so they start at boot."
+    affected+=("${renamed[@]}")
+    mapfile -t affected < <(for svc in "${SERVICES[@]}"; do
+      printf '%s\n' "${affected[@]}" | grep -qx -- "$svc" && echo "$svc"; done)
+  fi
   if (( ${#affected[@]} == 0 )); then
     echo "No service is affected by this change; nothing restarted."
     secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
@@ -2321,6 +2418,11 @@ cmd_apply() {
   note "ERROR: ${failed} did not become healthy. Rolling back to the previous files..."
   note "  (see: journalctl -u ${failed} -n 50)"
   restore_runtime "$snapshot"
+  # A renamed account is not renamed back: point the restored units at it.
+  if $ACCOUNT_RENAMED; then
+    sed -i -e "s/^User=${LEGACY_ACCOUNT}\$/User=${SERVICE_USER}/" -e "s/^Group=${LEGACY_ACCOUNT}\$/Group=${SERVICE_USER}/" \
+      "${UNIT_DIR}"/*.service 2>/dev/null || true
+  fi
   if [[ -n "$webui_from" ]]; then
     note "  Reinstalling open-webui ${webui_from} and restoring its database..."
     systemctl stop open-webui.service 2>/dev/null || true
@@ -2430,7 +2532,7 @@ cmd_test_alert() {
   local message="${1:-}" url channel user verify host
   url="$(env_get MATTERMOST_WEBHOOK_URL)"
   channel="$(env_get MATTERMOST_CHANNEL)"
-  user="$(env_get MATTERMOST_MONITOR_USER)"; [[ -n "$user" ]] || user="OllamaMonitor"
+  user="$(env_get MATTERMOST_MONITOR_USER)"; [[ -n "$user" ]] || user="OSRMonitor"
   verify="$(env_get MATTERMOST_VERIFY_TLS)"
   [[ -n "$message" ]] || message="Test alert from $(hostname) via ${0##*/} — if you can read this, monitor alerting works."
 

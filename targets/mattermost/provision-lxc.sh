@@ -38,8 +38,8 @@ Settings (environment; values shown here are presets or defaults):
   TEMPLATE_STORAGE=<vztmpl storage>  STORAGE=<rootdir storage>
   BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
-  MATTERMOST_CHANNEL=ollama-monitor   the alert channel (its URL name)
-  MATTERMOST_TEAM=ollama  MATTERMOST_ADMIN_USER=mmadmin  MATTERMOST_ADMIN_EMAIL
+  MATTERMOST_CHANNEL=osr-monitor   the alert channel (its URL name)
+  MATTERMOST_TEAM=osr  MATTERMOST_ADMIN_USER=mmadmin  MATTERMOST_ADMIN_EMAIL
   READY_TIMEOUT=120                   seconds to wait for Mattermost to answer
   MATTERMOST_CT_VERSION=24.04         the CT's Ubuntu release: 24.04 or 26.04
                                       (Mattermost's apt repository is Ubuntu-only)
@@ -133,7 +133,7 @@ SYS_NET_DIR=${SYS_NET_DIR:-/sys/class/net}
 valid_account() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]{2,21}$ ]]; }
 valid_team() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{1,63}$ ]]; }
 valid_channel() { [[ $1 =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; }
-recorded_admin='' recorded_channel=''
+recorded_admin='' recorded_channel='' recorded_team=''
 if [[ $mode == reconfigure ]]; then
     pve_ask_existing_ct mattermost Mattermost
     valid_container_id "$CT_ID" || die 'CT_ID must be a numeric ID of 100 or more.'
@@ -151,14 +151,22 @@ if [[ $mode != create ]]; then
        pct status "$CT_ID" 2>/dev/null | grep -q 'status: running'; then
         # What the CT records: the defaults for the settings below.
         recorded_admin=$(pct exec "$CT_ID" -- cat /etc/mattermost-target/admin-user 2>/dev/null | tr -d '\r' || true)
+        recorded_team=$(pct exec "$CT_ID" -- cat /etc/mattermost-target/team 2>/dev/null | tr -d '\r' || true)
+        recorded_channel=$(pct exec "$CT_ID" -- cat /etc/mattermost-target/channel 2>/dev/null | tr -d '\r' || true)
+        if [[ -z $recorded_team ]] && pct exec "$CT_ID" -- test -s /etc/mattermost-target/webhook-url 2>/dev/null; then
+            # Set up before the team and channel were recorded: the defaults
+            # from before the rename.
+            recorded_team=ollama recorded_channel=${recorded_channel:-ollama-monitor}
+        fi
     fi
     pve_section 'Mattermost settings'
     pve_note "The router's monitor posts alerts to this team's channel through an incoming webhook."
-    pve_ask MATTERMOST_TEAM 'Team' "${MATTERMOST_TEAM:-ollama}" valid_team 'Use 2-64 lowercase letters, digits or -.'
-    pve_ask MATTERMOST_CHANNEL 'Alert channel' "${recorded_channel:-ollama-monitor}" valid_channel 'Use lowercase letters, digits, - and _.'
+    pve_ask MATTERMOST_TEAM 'Team' "${MATTERMOST_TEAM:-${recorded_team:-osr}}" valid_team 'Use 2-64 lowercase letters, digits or -.'
+    pve_ask MATTERMOST_CHANNEL 'Alert channel' "${recorded_channel:-osr-monitor}" valid_channel 'Use lowercase letters, digits, - and _.'
     pve_ask MATTERMOST_ADMIN_USER 'Administrator account' "${recorded_admin:-mmadmin}" valid_account 'Use 3-22 lowercase letters, digits, ., _ or -.'
 fi
-MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-ollama-monitor}
+MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-${recorded_channel:-osr-monitor}}
+MATTERMOST_TEAM=${MATTERMOST_TEAM:-$recorded_team}
 valid_container_id "$CT_ID" || die 'CT_ID must be a numeric ID of 100 or more.'
 [[ $CT_HOSTNAME =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || die 'CT_HOSTNAME must be a DNS label.'
 for name in CORES MEMORY_MB ROOTFS_GB READY_TIMEOUT; do positive_int "$name" "${!name}"; done
@@ -218,7 +226,7 @@ else
     pve_row 'Ubuntu' "$MATTERMOST_CT_VERSION"
 fi
 if [[ $mode != create ]]; then
-    pve_row 'Alerts' "team ${MATTERMOST_TEAM:-ollama}, channel $MATTERMOST_CHANNEL"
+    pve_row 'Alerts' "team ${MATTERMOST_TEAM:-osr}, channel $MATTERMOST_CHANNEL"
     pve_row 'Administrator' "${MATTERMOST_ADMIN_USER:-mmadmin}"
 fi
 case $mode in

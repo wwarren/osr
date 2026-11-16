@@ -25,8 +25,8 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 MATTERMOST_WEBHOOK_URL = os.getenv("MATTERMOST_WEBHOOK_URL")
-MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OllamaMonitor")
-MATTERMOST_CHANNEL = os.getenv("MATTERMOST_CHANNEL", "ollama-monitor")
+MATTERMOST_USER = os.getenv("MATTERMOST_MONITOR_USER", "OSRMonitor")
+MATTERMOST_CHANNEL = os.getenv("MATTERMOST_CHANNEL", "osr-monitor")
 MATTERMOST_VERIFY_TLS = os.getenv("MATTERMOST_VERIFY_TLS", "true").lower() == "true"
 
 # Polling behaviour comes from monitor.ini (version controlled). An environment
@@ -41,7 +41,7 @@ _DEFAULTS = {
     "local_services": {
         "enabled": "true",
         "litellm-proxy": "http://127.0.0.1:4000/health/liveliness",
-        "ollama-router": "http://127.0.0.1:8000/healthz",
+        "osr-router": "http://127.0.0.1:8000/healthz",
         "open-webui": "http://127.0.0.1:8080/health",
     },
 }

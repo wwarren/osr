@@ -1,6 +1,6 @@
 # Mattermost service
 
-Mattermost receives the router's **health alerts**: `ollama-monitor` posts host
+Mattermost receives the router's **health alerts**: `osr-monitor` posts host
 and service state changes to an incoming webhook. This target creates an
 Ubuntu 24.04 LXC with the
 [Proxmox VE community script](https://community-scripts.org/scripts/mattermost)
@@ -30,8 +30,11 @@ summary is shown before anything changes. When Mattermost answers,
    `/var/tmp/mattermost_local.socket` is open only to root and `mattermost`.
 2. Creates the administrator `MATTERMOST_ADMIN_USER` (`mmadmin`) with a random
    password.
-3. Creates team `MATTERMOST_TEAM` (`ollama`) and channel `MATTERMOST_CHANNEL`
-   (`ollama-monitor`).
+3. Creates team `MATTERMOST_TEAM` (`osr`) and channel `MATTERMOST_CHANNEL`
+   (`osr-monitor`), and records both in `/etc/mattermost-target/team` and
+   `channel`. A rerun or `--reconfigure` keeps the recorded ones; a target set
+   up before they were recorded keeps the defaults from before the rename
+   (`ollama`, `ollama-monitor`).
 4. Enables incoming webhooks and username/icon overrides (the monitor posts as
    `MATTERMOST_MONITOR_USER`).
 5. Creates one incoming webhook for the channel (an empty `SiteURL` is first
@@ -44,7 +47,7 @@ Results are root-only (0600) files in `/etc/mattermost-target/`: `url`,
 |---|---|---|
 | `CT_ID`, `IP_CIDR`, `GATEWAY`, `STORAGE`, `BRIDGE`, `NAMESERVER`, `VLAN_TAG`, `SSH_PUBLIC_KEY` | ID: next free; IP required; gateway for static IP | Community script `var_*` presets |
 | `CORES`, `MEMORY_MB`, `ROOTFS_GB` | 2, 4096, 16 | CT size (Mattermost plus PostgreSQL) |
-| `MATTERMOST_TEAM`, `MATTERMOST_CHANNEL` | `ollama`, `ollama-monitor` | URL names (lowercase letters, digits, `-`, `_`) |
+| `MATTERMOST_TEAM`, `MATTERMOST_CHANNEL` | `osr`, `osr-monitor` (an existing target: the recorded ones) | URL names (lowercase letters, digits, `-`, `_`) |
 | `MATTERMOST_ADMIN_USER`, `MATTERMOST_ADMIN_EMAIL` | `mmadmin`, `<name>@<host>.local` | Administrator |
 | `READY_TIMEOUT` | 120 | Seconds to wait for Mattermost |
 | `MATTERMOST_CT_VERSION` | `24.04` | Ubuntu release; 26.04 is accepted for future testing but not yet supported by Mattermost |

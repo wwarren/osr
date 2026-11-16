@@ -6,12 +6,12 @@ Description=Open WebUI (chat frontend for the smart router)
 # takes far longer and drops its users' sessions, and every routing change
 # (router.ini, router.py, a key) restarts the router. While the router is away
 # the UI shows a connection error and carries on afterwards.
-After=network-online.target ollama-router.service
-Wants=network-online.target ollama-router.service
+After=network-online.target osr-router.service
+Wants=network-online.target osr-router.service
 [Service]
 Type=simple
-User=ollama-router
-Group=ollama-router
+User=osr-router
+Group=osr-router
 WorkingDirectory=/app/openwebui
 EnvironmentFile=/app/openwebui/.env
 # OPENAI_API_KEYS (the router API key) lives outside the repo and overrides

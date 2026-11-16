@@ -119,16 +119,16 @@ flowchart LR
 ## 3. Deployment view
 
 The four core services run in one unprivileged LXC (default 2 vCPU, 4 GB,
-32 GB) as the non-login account `ollama-router`. Prometheus runs in the same
+32 GB) as the non-login account `osr-router`. Prometheus runs in the same
 CT as `prometheus`, and Grafana runs there as `grafana`.
 
 ```mermaid
 flowchart TB
     subgraph ctr["LXC (unprivileged)"]
         A["open-webui.service<br/>0.0.0.0:8080"]
-        B["ollama-router.service<br/>0.0.0.0:8000"]
+        B["osr-router.service<br/>0.0.0.0:8000"]
         C["litellm-proxy.service<br/>127.0.0.1:4000"]
-        D["ollama-monitor.service<br/>no listener"]
+        D["osr-monitor.service<br/>no listener"]
     end
     A -.->|Wants| B
     B -.->|Wants| C
@@ -154,8 +154,8 @@ RestrictSUIDSGID=true          LockPersonality=true   SystemCallArchitectures=na
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-Writable exceptions: `open-webui` → `/app/openwebui`; `ollama-monitor` →
-`StateDirectory=ollama-monitor`; the router and LiteLLM → nothing.
+Writable exceptions: `open-webui` → `/app/openwebui`; `osr-monitor` →
+`StateDirectory=osr-monitor`; the router and LiteLLM → nothing.
 `tests/test-repo.sh` checks the hardening on every unit, and
 `manage-model-servers apply` rolls back a unit that cannot start (§6.1).
 
@@ -163,7 +163,7 @@ Writable exceptions: `open-webui` → `/app/openwebui`; `ollama-monitor` →
 
 ## 4. Component view
 
-### 4.1 Smart Router (`ollama-router.service`)
+### 4.1 Smart Router (`osr-router.service`)
 
 FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 
@@ -243,7 +243,7 @@ Chat UI on `:8080`, pointed at the **router** (not LiteLLM) with
 `ROUTER_API_KEY` as `OPENAI_API_KEYS`. Python 3.12 in its own venv (§7);
 version pinned in `services/open-webui/requirements.txt`.
 
-### 4.4 Health monitor (`ollama-monitor.service`)
+### 4.4 Health monitor (`osr-monitor.service`)
 
 No listener. Every `interval_seconds` (15) it probes each distinct host in
 `MODEL_SERVERS`/`BACKEND_*` once, labelling alerts with its tiers: Ollama on
@@ -359,9 +359,9 @@ shows it idle, answering a retryable 503 meanwhile. Details:
 Configuration is **version controlled in Gitea and injected at provisioning**.
 
 ```
-services/ollama-router/     router.py  router.ini  requirements.txt  *.service
+services/osr-router/     router.py  router.ini  requirements.txt  *.service
 services/litellm-proxy/     litellm_config.yaml  requirements.txt/.lock  *.service
-services/ollama-monitor/    monitor.py monitor.ini requirements.txt  *.service
+services/osr-monitor/    monitor.py monitor.ini requirements.txt  *.service
 services/open-webui/        requirements.txt  *.service
 env/router.env              shared env for router/LiteLLM/monitor (no secrets)
 env/openwebui.env           Open WebUI environment
@@ -405,7 +405,7 @@ Seeded at `install/manage-model-servers.sh` and symlinked to
   keeps each pair's tag and the whole `router_settings` block; fallbacks are
   rebuilt from existing tiers. A tier's tag governs only the LiteLLM path and
   keep-alive pinning.
-* The env rewrite keeps `0640 root:ollama-router`; secret keys are refused in
+* The env rewrite keeps `0640 root:osr-router`; secret keys are refused in
   `env/router.env` and written to `secrets.env`. Anything `router.ini` omits
   uses `router.py`'s defaults. `apply` and `commit` also remove settings older
   installers left in `router.env` that nothing reads or that only repeat
@@ -580,7 +580,7 @@ unchanged. No agent coordination API is added to the router.
 
 | Secret | At rest | Notes |
 |---|---|---|
-| Gitea deploy token, Mattermost webhook | `/app/router/secrets.env` (0640 root:ollama-router) | Never committed; moved out of `env/router.env` by `commit`/`apply` |
+| Gitea deploy token, Mattermost webhook | `/app/router/secrets.env` (0640 root:osr-router) | Never committed; moved out of `env/router.env` by `commit`/`apply` |
 | `ROUTER_API_KEY` (= Open WebUI `OPENAI_API_KEYS`) | `secrets.env` | Generated on new installs; `set-api-key` |
 | `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY`, `XOLOTL_API_KEY`, `AVALON_API_KEY`, `KINDI_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | `secrets.env` | `set-cloud-key`; never forwarded to clients |
@@ -713,7 +713,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
 | ComfyUI as Open WebUI's image engine | An image route in the router | The router is chat-only; Open WebUI already drives ComfyUI's workflow API |
 | Affinity and load only reorder or nudge near-equal candidates | Pin a conversation to its server, or always pick the idle one | Fit and residency must still decide: a pinned conversation would stay on a model too small for a later turn, and "always idle" would load a model on every server |
-| Keep `ollama-router`, `ollama-monitor`, the `ollama-router` account and `services/ollama-*` after the rename to Open Smart Router | Rename units, account and repository paths too | Running installs, committed configuration, `apply` snapshots and health alerts refer to them; a rename would need a migration for no change in behaviour. Renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
+| New installs use only `osr-*` names (units, `services/` directories, service account, Gitea router account, Mattermost team, channel and posting name); existing installs are migrated or keep what they recorded | Keep the `ollama-*` names; keep them on existing installs with drop-ins | The router routes to every kind of model server, so `ollama-*` misnamed it. `update-router.sh` moves the config repo's directories (`git mv`, keeping tuned `.ini` files), installer seeding moves them in an existing Gitea repo, and `apply` replaces the old units and renames the service account in place (same UID, so ownership is unchanged); `apply-config.sh` never installs a leftover old unit beside the new one. Gitea and Mattermost keep the accounts, team and channel they recorded, since renaming a login or moving a webhook would break running installs. Other renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
 
 ---
 
@@ -1176,7 +1176,7 @@ Router CT:
 | `/app/openwebui/.env`, `venv/`, `data/` | Open WebUI config, Python 3.12 environment and state |
 | `/app/config-repo/` | Root-only clone of the configuration repository |
 | `/usr/local/bin/manage-model-servers` | Link to the management script in the config repo |
-| `/var/lib/ollama-monitor/` | Monitor state and notice timestamp |
+| `/var/lib/osr-monitor/` | Monitor state and notice timestamp |
 | `/var/backups/open-smart-router/` | Root-only `apply` snapshots (those in the pre-rename `/var/backups/ollama-smart-router/` are moved here by the next `apply`) |
 | `/run/lock/open-smart-router-config.lock` | Configuration write lock |
 

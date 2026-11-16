@@ -6,8 +6,8 @@ Wants=network-online.target
 # LiteLLM has its own venv: litellm[proxy] pins fastapi/uvicorn versions that
 # conflict with the router's, so the two cannot share /app/router/venv.
 Type=simple
-User=ollama-router
-Group=ollama-router
+User=osr-router
+Group=osr-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
 # Model server API keys live outside the repo; litellm_config.yaml refers to

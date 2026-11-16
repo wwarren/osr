@@ -5,7 +5,7 @@ open-smart-router-install.sh is a single file that is copied to a Proxmox
 host on its own, so it carries every installer-owned service file as a quoted
 heredoc:
 
-    cat > "${REPO_DIR}/services/ollama-router/router.py" <<'PYEOF'
+    cat > "${REPO_DIR}/services/osr-router/router.py" <<'PYEOF'
     ...
     PYEOF
 

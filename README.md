@@ -10,14 +10,14 @@ serves a chat UI and alerts on host health. Design and rationale are in
 ## What gets deployed
 
 An unprivileged Debian 13 CT (default 2 vCPU, 4 GB RAM, 32 GB disk) running
-the router services as `ollama-router`, plus a small local metrics stack:
+the router services as `osr-router`, plus a small local metrics stack:
 
 | Service | Unit | Port | Role |
 |---|---|---|---|
-| Smart Router | `ollama-router.service` | 8000 | OpenAI API; picks a model and host per request |
+| Smart Router | `osr-router.service` | 8000 | OpenAI API; picks a model and host per request |
 | Open WebUI | `open-webui.service` | 8080 | Chat UI; talks to the router |
 | LiteLLM | `litellm-proxy.service` | 127.0.0.1:4000 | Static tier fallback, cloud models and non-chat `/v1` routes |
-| Health monitor | `ollama-monitor.service` | — | Probes hosts and local services, alerts to Mattermost, keeps Ollama models loaded |
+| Health monitor | `osr-monitor.service` | — | Probes hosts and local services, alerts to Mattermost, keeps Ollama models loaded |
 | Prometheus | `osr-prometheus.service` | 127.0.0.1:9090 | Scrapes the router every 15 seconds with its API key; retains up to 7 days or 512 MB of blocks |
 | Grafana | `grafana-server.service` | 3000 | Authenticated dashboard for router metrics |
 
@@ -227,7 +227,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` (1/20) |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
-| Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER`, `MATTERMOST_CHANNEL` (`ollama-monitor`) |
+| Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER` (`OSRMonitor`), `MATTERMOST_CHANNEL` (`osr-monitor`) |
 | Cluster | `CLUSTER_SSH` (`fix`, the default: check and repair root SSH between nodes; `check`: report only; `skip`) |
 | Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `STRATA_MEMORY_MB` (65536), `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
 
@@ -544,14 +544,15 @@ Capabilities and context come from Ollama's `/api/show`, asked once per model
 digest and again after `[discovery] show_cache_seconds` (an hour): a re-pulled
 or re-created model is asked at once, and `POST /routing/refresh` asks all of
 them. Tune thresholds, keywords, weights, timeouts and sizes in
-`services/ollama-router/router.ini`; the rules are in
+`services/osr-router/router.ini`; the rules are in
 [ARCHITECTURE.md](ARCHITECTURE.md#5-request-routing).
 
 **Binding.** The router reads `ROUTER_HOST`/`ROUTER_PORT` (default
 `0.0.0.0:8000`; the installer sets neither). To change them, set them in
 `env/router.env`, then update `OPENAI_API_BASE_URLS` in `env/openwebui.env`
 (and Open WebUI's saved connection under **Admin Settings > Connections**),
-`ollama-router` in `monitor.ini [local_services]`, the CT firewall and clients.
+`osr-router` (`ollama-router` in a `monitor.ini` from before the rename) in
+`monitor.ini [local_services]`, the CT firewall and clients.
 Management health checks use `ROUTER_URL` (default `http://127.0.0.1:8000`):
 set it when running `apply`, `discover` or the updater inside the CT (the
 host-side wrappers do not forward it). Reconfigure Hermes and OpenClaw: their
@@ -573,7 +574,7 @@ the upstream answer already has one, is sent to the model server or LiteLLM as
 `X-Request-ID`, and starts every line the router logs for the request:
 
 ```bash
-journalctl -u ollama-router | grep -F '[4c1f0e6a9b2d7730]'   # the decision and every failover of one request
+journalctl -u osr-router | grep -F '[4c1f0e6a9b2d7730]'   # the decision and every failover of one request
 ```
 
 **Metrics.** `GET /metrics` serves Prometheus text format. Like every path but
@@ -609,7 +610,9 @@ New router installs install Prometheus and Grafana in the router CT
 scrapes `GET /metrics` on the CT's loopback address using a protected copy of
 `ROUTER_API_KEY`; its HTTP API stays on `127.0.0.1:9090`. Grafana has a
 provisioned `OSR Prometheus` data source and an **Open Smart Router** dashboard
-with request rates, failures, latency, in-flight load and server state. Open
+with an at-a-glance scrape, traffic, 5xx, server, model and inventory summary;
+traffic and upstream failures by label; p50/p95 latency and per-model p95;
+and in-flight load, server state, model counts and conversation affinity. Open
 `http://<ct-ip>:3000` and sign in as `admin`. A new Grafana database starts
 with a random password, kept in `/etc/grafana/osr.env` (root-readable). The
 installer, `setup-metrics.sh install` and `tools/upgrade-all.sh` print the
@@ -807,7 +810,7 @@ tiers and writes Kindi's own for Kindi tiers
 ([Kindi timeouts](targets/kindi/README.md#timeouts-and-retries)).
 
 **Secrets** (deploy token, webhook, router key, backend tokens, cloud keys)
-live only in `/app/router/secrets.env` (`0640 root:ollama-router`); `apply` and
+live only in `/app/router/secrets.env` (`0640 root:osr-router`); `apply` and
 `commit` move any found in `env/router.env` there. Commits made before 2026-09
 contain the old deploy token: rotate it in Gitea.
 
@@ -1102,13 +1105,13 @@ alone).
 | Config lock `/run/lock/ollama-smart-router-config.lock` → `…/open-smart-router-config.lock` | `update-router.sh` also takes the old lock, so a management tool from before the update cannot overlap it |
 | Firewall rule tags and CT descriptions (`… for Ollama Smart Router`) | Old ones are recognised; Hermes, OpenClaw and OpenCode rewrite theirs on the next `--reconfigure` |
 | DeepSeek Harness's managed `AGENTS.md` block | Replaced in place on the next run |
+| Units `ollama-router.service`, `ollama-monitor.service` → `osr-router.service`, `osr-monitor.service`, and `services/ollama-router/`, `services/ollama-monitor/` → `services/osr-router/`, `services/osr-monitor/` in the configuration repository | The update moves the directories in the config repo with `git mv` (your `router.ini` and `monitor.ini` go along), and its `apply` stops, disables and removes the old units, enables the new ones if the old ones were enabled, and moves `/var/lib/ollama-monitor` to `/var/lib/osr-monitor`. The router is down for its restart. The installer moves the directories in an existing Gitea repository the same way when it seeds it. Logs from before stay under `journalctl -u ollama-router`. An existing `monitor.ini` keeps its `ollama-router` health-check name; rename that key to `osr-router` if you want alerts to use the new name |
+| Service account `ollama-router` → `osr-router` | The update's `apply` stops the services that run as it, renames the account and its group in place (`usermod`/`groupmod`: the UID and GID stay, so file ownership is unchanged) and starts them again. If a process still runs as the old account the rename is refused, the services start again and nothing is applied. A failed apply later on keeps the new name. `env/router.env` gets `MATTERMOST_CHANNEL=ollama-monitor` and `MATTERMOST_MONITOR_USER=OllamaMonitor` written in if it did not set them, so alerts keep going where they went |
+| Defaults for new installs: Gitea router account `ollama-router` → `osr-router`; Mattermost team `ollama` → `osr`, channel `ollama-monitor` → `osr-monitor`, posting name `OllamaMonitor` → `OSRMonitor` | Existing targets keep theirs: Gitea's `--reconfigure` uses its recorded router account, and Mattermost now records its team and channel (one set up before that keeps `ollama` and `ollama-monitor`). The router's `env/router.env` already names its channel and posting name |
 
-Kept, because running installs, commits and webhooks depend on them: the
-`ollama-router.service` and `ollama-monitor.service` units, the `ollama-router`
-account, `/app/router`, the `services/ollama-*` paths in the configuration
-repository, `manage-model-servers`, the `OLLAMA_*` settings, the
-`osr-router`/`osr-target` tags and the Mattermost defaults (`OllamaMonitor` in
-`ollama-monitor`).
+New installs use only the new names. Kept as they are: `/app/router`,
+`manage-model-servers`, the `OLLAMA_*` settings (they configure Ollama
+servers) and the `osr-router`/`osr-target` tags.
 
 ## Troubleshooting
 
@@ -1116,10 +1119,10 @@ Inside the router CT (`pct enter <CT_ID>`):
 
 ```bash
 KEY=$(sed -n 's/^ROUTER_API_KEY=//p' /app/router/secrets.env)
-systemctl status open-webui ollama-router litellm-proxy ollama-monitor
+systemctl status open-webui osr-router litellm-proxy osr-monitor
 manage-model-servers status           # configured hosts + live probe
 curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8000/routing/inventory
-journalctl -u ollama-router -f        # decisions for chats sent to /v1/chat/completions
+journalctl -u osr-router -f        # decisions for chats sent to /v1/chat/completions
 ```
 
 Hermes (`custom:osr`, including `auto`) and OpenClaw (`osr`) use the router
@@ -1141,7 +1144,7 @@ there. The router shows their inventory and `/routing/explain` requests but no
 | Long prompt fails with 4xx | Context windows are not considered and 4xx does not fail forward; use a larger-context model |
 | "does not support tools" | No model reports tools (`X-Router-Warning: no-tool-model`); check `tools` in `/routing/inventory`; for llama.cpp add `tools` to `MODEL_CAPABILITIES` |
 | Models unload after ~5 min | Set `OLLAMA_KEEP_ALIVE`, or on the host put `Environment="OLLAMA_KEEP_ALIVE=2h"` in the unit, `daemon-reload` and restart |
-| No Mattermost alerts | `journalctl -u ollama-monitor` shows rejected webhooks; `set-webhook`, `test-alert`. Alerts fire after 3 failed checks, recover after 2; the startup notice is at most hourly |
+| No Mattermost alerts | `journalctl -u osr-monitor` shows rejected webhooks; `set-webhook`, `test-alert`. Alerts fire after 3 failed checks, recover after 2; the startup notice is at most hourly |
 | hcom cannot connect across CTs | `osr-bus status` as the agent, broker `MQTT_CLIENT_CIDR`, agent egress rules, credentials, TLS trust; `journalctl -u osr-hcom-relay` (agent) and `-u mosquitto` (broker) |
 | No Mattermost handoff posts | `journalctl -u osr-hcom-mattermost` in the observer CT; check its webhook and outbound HTTP(S); one observer per group |
 | `apply` failed | The snapshot was restored and services restarted on the old files; read the reported check and `journalctl -u <unit>`. Snapshots: `/var/backups/open-smart-router/` |

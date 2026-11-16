@@ -42,7 +42,7 @@ plan --create-only TEMPLATE_STORAGE=local
 has 'var_template_storage=local var_container_storage=local-lvm'
 has 'api/v4/system/ping'
 has 'manage-model-servers set-webhook <webhook URL>'
-has 'Create the channel "ollama-monitor"'
+has 'Create the channel "osr-monitor"'
 has 'whoever creates it'
 lacks 'var_pw'
 pass '--create-only: the community script runs with the presets, then the webhook steps are printed'
@@ -75,14 +75,14 @@ pass 'invalid settings are refused before the community script is fetched or run
 plan
 has '+ env var_ctid=275 var_hostname=mattermost'
 has '+ pct push 275 '; has 'install-target.sh /root/mattermost-target-deploy/install-target.sh --perms 0755'
-has 'MATTERMOST_CHANNEL=ollama-monitor'
+has 'MATTERMOST_CHANNEL=osr-monitor'
 has 'Mattermost is configured in CT 275: http://192.0.2.75:8065'
 has 'cat /etc/mattermost-target/webhook-url'; lacks 'Add Incoming Webhook'
 pass 'the default run configures Mattermost in the CT and says where the webhook is'
 
 plan --reconfigure MATTERMOST_TEAM=ops
 lacks '+ curl -fsSL'; lacks '+ env var_'
-has '+ pct exec 275 -- env MATTERMOST_CHANNEL=ollama-monitor MATTERMOST_TEAM=ops'
+has '+ pct exec 275 -- env MATTERMOST_CHANNEL=osr-monitor MATTERMOST_TEAM=ops'
 pass '--reconfigure reruns the guest setup in the existing CT only'
 
 refuse 'Set CT_ID for unattended provisioning' --reconfigure CT_ID=
@@ -118,6 +118,9 @@ stub pct 'case "$*" in
     *"cat /etc/mattermost-target/url"*) echo "http://192.0.2.75:8065" ;;
     *"cat /etc/mattermost-target/admin-user"*) echo the-admin ;;
     *"cat /etc/mattermost-target/router-user"*) echo the-router ;;
+    *"cat /etc/mattermost-target/team"*) [[ -z ${FAKE_TEAM:-} ]] || echo "$FAKE_TEAM" ;;
+    *"cat /etc/mattermost-target/channel"*) [[ -z ${FAKE_CHANNEL:-} ]] || echo "$FAKE_CHANNEL" ;;
+    *"test -s /etc/mattermost-target/webhook-url"*) [[ ${FAKE_WEBHOOK:-0} == 1 ]] ;;
 esac'
 stub sleep 'exit 0'
 real() {
@@ -157,7 +160,7 @@ pass 'host checks run before the community script'
 : > "$log"; rm -f "$tmp/pings"
 out=$(real) || fail 'a full run failed'
 grep -q '^pct push 275 .*install-target.sh /root/mattermost-target-deploy/install-target.sh --perms 0755$' "$log" || fail "install-target.sh was not pushed: $(cat "$log")"
-grep -q 'pct exec 275 -- env MATTERMOST_CHANNEL=ollama-monitor .* bash /root/mattermost-target-deploy/install-target.sh' "$log" || fail 'the guest setup did not run'
+grep -q 'pct exec 275 -- env MATTERMOST_CHANNEL=osr-monitor .* bash /root/mattermost-target-deploy/install-target.sh' "$log" || fail 'the guest setup did not run'
 has 'Administrator: the-admin'; has 'http://192.0.2.75:8065'
 pass 'a full run creates the CT, configures Mattermost in it and reports the webhook location'
 
@@ -170,6 +173,20 @@ out=$(real --reconfigure) || fail '--reconfigure failed'
 grep -q '^community ' "$log" && fail '--reconfigure ran the community script'
 grep -q 'bash /root/mattermost-target-deploy/install-target.sh' "$log" || fail '--reconfigure did not run the guest setup'
 pass '--reconfigure runs only the guest setup in the existing CT'
+grep -q 'env MATTERMOST_CHANNEL=osr-monitor ' "$log" || fail '--reconfigure without a record: not the default channel'
+
+# --reconfigure keeps the team and channel the CT recorded; a CT set up
+# before they were recorded (a webhook, no record) keeps the pre-rename ones.
+: > "$log"
+out=$(real --reconfigure FAKE_TEAM=ops FAKE_CHANNEL=alerts) || fail "--reconfigure with records: $out"
+grep -q 'env MATTERMOST_CHANNEL=alerts MATTERMOST_TEAM=ops ' "$log" || fail "the recorded team and channel were not kept: $(grep 'env MATTERMOST' "$log")"
+: > "$log"
+out=$(real --reconfigure FAKE_WEBHOOK=1) || fail "--reconfigure of an unrecorded CT: $out"
+grep -q 'env MATTERMOST_CHANNEL=ollama-monitor MATTERMOST_TEAM=ollama ' "$log" || fail "an unrecorded CT did not keep ollama-monitor: $(grep 'env MATTERMOST' "$log")"
+: > "$log"
+out=$(real --reconfigure FAKE_WEBHOOK=1 MATTERMOST_CHANNEL=alerts2 MATTERMOST_TEAM=ops2) || fail "--reconfigure with names: $out"
+grep -q 'env MATTERMOST_CHANNEL=alerts2 MATTERMOST_TEAM=ops2 ' "$log" || fail 'names given on the command line did not win'
+pass '--reconfigure keeps the recorded team and channel (ollama and ollama-monitor for a CT from before the records); given names win'
 
 : > "$log"
 out=$(real --reconfigure FAKE_ID_UNAVAILABLE=1) || fail '--reconfigure refused the CT for having an ID in use'

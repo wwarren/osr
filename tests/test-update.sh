@@ -20,10 +20,10 @@ describe owned_code_list
 printf 'x=1\nINSTALLER_OWNED_CODE=(\n  services/a/a.py   # comment\n  install/b.sh\n  $(rm -rf /)\n)\n' > "$TMP/inst.sh"
 assert_eq "entries parsed as text, junk dropped" $'services/a/a.py\ninstall/b.sh' "$(owned_code_list "$TMP/inst.sh")"
 assert_eq "the real installer lists the router code" "yes" \
-  "$(owned_code_list "${ROOT}/open-smart-router-install.sh" | grep -qx services/ollama-router/router.py && echo yes)"
+  "$(owned_code_list "${ROOT}/open-smart-router-install.sh" | grep -qx services/osr-router/router.py && echo yes)"
 
 describe safe_rel_path
-assert_ok   "plain path"           safe_rel_path services/ollama-router/router.py
+assert_ok   "plain path"           safe_rel_path services/osr-router/router.py
 assert_fail "parent escape"        safe_rel_path ../etc/passwd
 assert_fail "absolute path"        safe_rel_path /etc/passwd
 assert_fail "embedded dot-dot"     safe_rel_path services/../x
@@ -40,6 +40,39 @@ describe changed_files
 mkdir -p "$TMP/a" "$TMP/b"; echo 1 > "$TMP/a/same"; echo 1 > "$TMP/b/same"; echo 2 > "$TMP/a/diff"; echo 3 > "$TMP/b/diff"; echo n > "$TMP/a/new"
 assert_eq "changed and new files" $'diff\nnew' "$(changed_files "$TMP/a" "$TMP/b" same diff new absent)"
 assert_eq "diff_stat" "+1 -1" "$(diff_stat "$TMP/b/diff" "$TMP/a/diff")"
+
+describe pre_rename_paths
+assert_eq "router file"  services/ollama-router/router.py "$(legacy_rel services/osr-router/router.py)"
+assert_eq "router unit"  services/ollama-router/ollama-router.service "$(legacy_rel services/osr-router/osr-router.service)"
+assert_eq "monitor unit" services/ollama-monitor/ollama-monitor.service "$(legacy_rel services/osr-monitor/osr-monitor.service)"
+assert_eq "other paths unchanged" install/apply-config.sh "$(legacy_rel install/apply-config.sh)"
+mkdir -p "$TMP/c/services/osr-router" "$TMP/d/services/ollama-router"
+echo same > "$TMP/c/services/osr-router/router.py"; echo same > "$TMP/d/services/ollama-router/router.py"
+assert_eq "compared with the old copy when only that exists" "" \
+  "$(changed_files "$TMP/c" "$TMP/d" services/osr-router/router.py)"
+assert_eq "no legacy directory, none listed" "" "$(legacy_dirs "$TMP/c")"
+assert_eq "a legacy directory is listed" services/ollama-router "$(legacy_dirs "$TMP/d")"
+
+describe apply_config_skips_renamed_units
+# install/apply-config.sh with a pre-rename unit left beside its successor: the
+# old one is not installed, so two routers never compete for port 8000. An old
+# unit with no successor in the repo is still installed. (`install` is wrapped
+# to drop -o/-g, so this runs without root or the service account.)
+ac="$TMP/ac"; mkdir -p "$ac/bin" "$ac/repo/env" "$ac/repo/install" "$ac/units"
+printf '#!/bin/sh\nargs=""; skip=0\nfor a; do if [ $skip = 1 ]; then skip=0; continue; fi\ncase $a in -o|-g) skip=1 ;; *) args="$args \\"$a\\"" ;; esac; done\neval "exec /usr/bin/install $args"\n' > "$ac/bin/install"
+chmod +x "$ac/bin/install"
+for d in osr-router osr-monitor ollama-router litellm-proxy; do mkdir -p "$ac/repo/services/$d"; echo "[Unit]" > "$ac/repo/services/$d/$d.service"; done
+touch "$ac/repo/services/osr-router/router.py" "$ac/repo/services/osr-router/router.ini" \
+      "$ac/repo/services/osr-monitor/monitor.py" "$ac/repo/services/osr-monitor/monitor.ini" \
+      "$ac/repo/services/litellm-proxy/litellm_config.yaml" "$ac/repo/env/router.env" "$ac/repo/env/openwebui.env"
+out="$(PATH="$ac/bin:$PATH" bash "${ROOT}/install/apply-config.sh" "$ac/repo" "$ac/router" "$ac/webui" "$ac/units" 2>&1)"; rc=$?
+assert_eq "apply-config succeeds" "0" "$rc"
+assert_ok "the new router unit is installed" test -f "$ac/units/osr-router.service"
+assert_fail "the old one beside it is not" test -e "$ac/units/ollama-router.service"
+assert_contains "and that is said" "it was renamed to osr-router.service" "$out"
+rm -rf "$ac/repo/services/osr-router/osr-router.service" "$ac/units"/*
+out="$(PATH="$ac/bin:$PATH" bash "${ROOT}/install/apply-config.sh" "$ac/repo" "$ac/router" "$ac/webui" "$ac/units" 2>&1)"
+assert_ok "an old unit with no successor is still installed" test -f "$ac/units/ollama-router.service"
 
 # --- whole-script runs ----------------------------------------------------------
 if (( EUID != 0 )); then
@@ -86,7 +119,7 @@ run_update() {
     PYTHON=python3 bash "$UPDATE" "$@" "$TMP/w/src" 2>&1
 }
 head_of() { git -C "$TMP/w/repo" rev-parse HEAD; }
-router="services/ollama-router/router.py"
+router="services/osr-router/router.py"
 
 describe up_to_date
 make_world
@@ -135,18 +168,18 @@ assert_ok "applied commit is kept locally" cmp -s "$TMP/w/src/$router" "$TMP/w/r
 
 describe tunables_and_config_are_kept
 make_world
-echo 'my_setting = 1' >> "$TMP/w/repo/services/ollama-router/router.ini"
+echo 'my_setting = 1' >> "$TMP/w/repo/services/osr-router/router.ini"
 echo 'OLLAMA_SERVERS=mine' >> "$TMP/w/repo/env/router.env"
 git -C "$TMP/w/repo" -c user.name=t -c user.email=t@t commit -qam local
-echo '# upstream' >> "$TMP/w/src/services/ollama-router/router.ini"
+echo '# upstream' >> "$TMP/w/src/services/osr-router/router.ini"
 echo '# upstream' >> "$TMP/w/src/env/router.env"
 echo '# upstream' >> "$TMP/w/src/$router"
 run_update >/dev/null
-assert_file_contains "router.ini edits kept" "my_setting = 1" "$TMP/w/repo/services/ollama-router/router.ini"
+assert_file_contains "router.ini edits kept" "my_setting = 1" "$TMP/w/repo/services/osr-router/router.ini"
 assert_file_contains "env untouched" "OLLAMA_SERVERS=mine" "$TMP/w/repo/env/router.env"
 assert_fail "env never gets upstream lines" grep -q upstream "$TMP/w/repo/env/router.env"
 run_update --with-tunables >/dev/null
-assert_file_contains "--with-tunables replaces router.ini" "# upstream" "$TMP/w/repo/services/ollama-router/router.ini"
+assert_file_contains "--with-tunables replaces router.ini" "# upstream" "$TMP/w/repo/services/osr-router/router.ini"
 assert_fail "env still untouched" grep -q upstream "$TMP/w/repo/env/router.env"
 
 describe failed_apply_is_undone
@@ -159,16 +192,68 @@ assert_eq "repo back to the previous commit" "$before" "$(head_of)"
 assert_fail "router.py restored" grep -q '# broken' "$TMP/w/repo/$router"
 assert_not_contains "nothing pushed" "manage commit" "$(cat "$TMP/w/calls")"
 
+# A config repo laid out before the services were renamed: services/ollama-*
+# with ollama-*.service units, and an operator's edit to router.ini.
+to_legacy() {
+  local r="$TMP/w/repo" s
+  for s in router monitor; do
+    git -C "$r" mv "services/osr-$s" "services/ollama-$s"
+    git -C "$r" mv "services/ollama-$s/osr-$s.service" "services/ollama-$s/ollama-$s.service"
+  done
+  echo '# tuned by the operator' >> "$r/services/ollama-router/router.ini"
+  git -C "$r" add -A && git -C "$r" -c user.name=t -c user.email=t@t commit -qm 'pre-rename layout'
+}
+
+describe pre_rename_layout_is_moved
+make_world; to_legacy
+out="$(run_update --dry-run)"; rc=$?
+assert_eq "a dry run succeeds" "0" "$rc"
+assert_contains "and names the move" "moved to services/osr-router/" "$out"
+assert_ok "a dry run moves nothing" test -d "$TMP/w/repo/services/ollama-router"
+out="$(run_update)"; rc=$?
+assert_eq "an update with only the move to do succeeds" "0" "$rc"
+assert_not_contains "it is not already up to date" "Already up to date" "$out"
+assert_fail "the old router directory is gone" test -e "$TMP/w/repo/services/ollama-router"
+assert_fail "the old monitor directory is gone" test -e "$TMP/w/repo/services/ollama-monitor"
+assert_ok "the operator's router.ini moved with it" grep -qx '# tuned by the operator' "$TMP/w/repo/services/osr-router/router.ini"
+assert_ok "the units have their new names" test -f "$TMP/w/repo/services/osr-router/osr-router.service" -a -f "$TMP/w/repo/services/osr-monitor/osr-monitor.service"
+assert_eq "nothing left uncommitted" "" "$(git -C "$TMP/w/repo" status --porcelain)"
+assert_contains "the commit records the move" "services/ollama-router -> services/osr-router" "$(git -C "$TMP/w/repo" log -1 --format=%B)"
+assert_contains "router.ini keeps its history" "pre-rename layout" \
+  "$(git -C "$TMP/w/repo" log --follow --format=%s -- services/osr-router/router.ini)"
+assert_contains "and the result is applied" "manage apply" "$(cat "$TMP/w/calls")"
+
+make_world; to_legacy
+before="$(head_of)"
+out="$(FAKE_APPLY=fail run_update)"; rc=$?
+assert_eq "a failed apply after the move fails" "1" "$rc"
+assert_eq "and puts the repo back" "$before" "$(head_of)"
+assert_ok "with the old layout" test -f "$TMP/w/repo/services/ollama-router/ollama-router.service"
+
+# Both layouts (an old directory left beside a seeded new one): the operator's
+# old copy of a tunable wins; installer-owned files keep the new copy.
+make_world
+cp -a "$TMP/w/repo/services/osr-router" "$TMP/w/repo/services/ollama-router"
+mv "$TMP/w/repo/services/ollama-router/osr-router.service" "$TMP/w/repo/services/ollama-router/ollama-router.service"
+echo '# tuned by the operator' >> "$TMP/w/repo/services/ollama-router/router.ini"
+echo '# stale code' >> "$TMP/w/repo/services/ollama-router/router.py"
+git -C "$TMP/w/repo" add -A && git -C "$TMP/w/repo" -c user.name=t -c user.email=t@t commit -qm 'both layouts'
+out="$(run_update)"; rc=$?
+assert_eq "an update with both layouts succeeds" "0" "$rc"
+assert_fail "the old directory is gone" test -e "$TMP/w/repo/services/ollama-router"
+assert_ok "the operator's router.ini won" grep -qx '# tuned by the operator' "$TMP/w/repo/services/osr-router/router.ini"
+assert_fail "the old router.py did not" grep -q '# stale code' "$TMP/w/repo/services/osr-router/router.py"
+
 describe requirements_change_updates_the_venv
 make_world
-echo 'rich==13.0.0' >> "$TMP/w/src/services/ollama-router/requirements.txt"
+echo 'rich==13.0.0' >> "$TMP/w/src/services/osr-router/requirements.txt"
 out="$(run_update)"; rc=$?
 assert_eq "succeeds" "0" "$rc"
-assert_contains "venv reinstalled from both requirements" "ollama-monitor/requirements.txt" "$(grep 'pip install' "$TMP/w/calls")"
+assert_contains "venv reinstalled from both requirements" "osr-monitor/requirements.txt" "$(grep 'pip install' "$TMP/w/calls")"
 assert_contains "apply restarts everything" "manage apply --all" "$(cat "$TMP/w/calls")"
 
 make_world
-echo 'rich==13.0.0' >> "$TMP/w/src/services/ollama-router/requirements.txt"
+echo 'rich==13.0.0' >> "$TMP/w/src/services/osr-router/requirements.txt"
 before="$(head_of)"
 out="$(FAKE_APPLY=fail run_update)"; rc=$?
 assert_eq "failed apply after a venv change fails" "1" "$rc"
@@ -176,7 +261,7 @@ assert_eq "repo reset" "$before" "$(head_of)"
 assert_contains "venv restored from the freeze" "pip install -q --no-cache-dir -r ${TMP}/w/router/.venv-before-update.txt" "$(cat "$TMP/w/calls")"
 
 make_world
-echo 'rich==13.0.0' >> "$TMP/w/src/services/ollama-router/requirements.txt"
+echo 'rich==13.0.0' >> "$TMP/w/src/services/osr-router/requirements.txt"
 before="$(head_of)"
 out="$(FAKE_PIP=fail run_update)"; rc=$?
 assert_eq "failed pip install fails" "1" "$rc"
@@ -185,7 +270,7 @@ assert_not_contains "nothing applied" "manage apply" "$(cat "$TMP/w/calls")"
 
 describe no_apply_requirements_must_not_push
 make_world
-echo 'rich==13.0.0' >> "$TMP/w/src/services/ollama-router/requirements.txt"
+echo 'rich==13.0.0' >> "$TMP/w/src/services/osr-router/requirements.txt"
 out="$(run_update --no-apply)"; rc=$?
 assert_eq "requirements no-apply push is refused" "1" "$rc"
 assert_contains "explains the safe follow-up" "--no-push" "$out"
@@ -206,15 +291,15 @@ assert_eq "CRLF source refused" "1" "$rc"
 assert_contains "names the file" "install/apply-config.sh" "$out"
 
 make_world
-printf 'def broken(:\n' >> "$TMP/w/src/services/ollama-monitor/monitor.py"
+printf 'def broken(:\n' >> "$TMP/w/src/services/osr-monitor/monitor.py"
 before="$(head_of)"
 out="$(run_update)"; rc=$?
 assert_eq "syntax error refused" "1" "$rc"
 assert_eq "nothing committed" "$before" "$(head_of)"
 
 make_world
-rm "$TMP/w/src/services/ollama-monitor/monitor.py"
-ln -s /etc/passwd "$TMP/w/src/services/ollama-monitor/monitor.py"
+rm "$TMP/w/src/services/osr-monitor/monitor.py"
+ln -s /etc/passwd "$TMP/w/src/services/osr-monitor/monitor.py"
 out="$(run_update)"; rc=$?
 assert_eq "source symlink refused" "1" "$rc"
 assert_contains "names the symlink refusal" "symlinked" "$out"

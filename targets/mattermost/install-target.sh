@@ -36,8 +36,8 @@ usage() {
 Usage: bash install-target.sh [--dry-run]
 
 Settings (environment; all optional):
-  MATTERMOST_TEAM=ollama               team (its URL name)
-  MATTERMOST_CHANNEL=ollama-monitor    alert channel (its URL name)
+  MATTERMOST_TEAM=osr               team (its URL name)
+  MATTERMOST_CHANNEL=osr-monitor    alert channel (its URL name)
   MATTERMOST_ADMIN_USER=mmadmin        administrator account
   MATTERMOST_ADMIN_EMAIL=<admin>@<host>.local
 Results (root-only, 0600) in /etc/mattermost-target: url, admin-user,
@@ -122,8 +122,16 @@ while (( $# )); do
   shift
 done
 
-MATTERMOST_TEAM=${MATTERMOST_TEAM:-ollama}
-MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-ollama-monitor}
+# Team and channel: as given, else as an earlier run recorded them, else the
+# defaults. A target set up before they were recorded (a webhook, no record)
+# used the defaults from before the rename, ollama and ollama-monitor.
+recorded() { [[ -s $MM_TARGET_ETC/$1 ]] && tr -d '\r\n' < "$MM_TARGET_ETC/$1"; }
+default_team=osr default_channel=osr-monitor
+if [[ ! -s $MM_TARGET_ETC/team && -s $MM_TARGET_ETC/webhook-url ]]; then
+  default_team=ollama default_channel=ollama-monitor
+fi
+MATTERMOST_TEAM=${MATTERMOST_TEAM:-$(recorded team || echo "$default_team")}
+MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-$(recorded channel || echo "$default_channel")}
 MATTERMOST_ADMIN_USER=${MATTERMOST_ADMIN_USER:-mmadmin}
 host=$(hostname 2>/dev/null || echo mattermost)
 host=${host//[^A-Za-z0-9.-]/}
@@ -220,7 +228,7 @@ mm team users add "$MATTERMOST_TEAM" "$MATTERMOST_ADMIN_USER" >/dev/null 2>&1 ||
 if channel_id=$(mm_json channel list "$MATTERMOST_TEAM" | json_find name "$MATTERMOST_CHANNEL"); then
   note "Channel $MATTERMOST_CHANNEL exists."
 else
-  mm channel create --team "$MATTERMOST_TEAM" --name "$MATTERMOST_CHANNEL" --display-name "Ollama monitor" >/dev/null
+  mm channel create --team "$MATTERMOST_TEAM" --name "$MATTERMOST_CHANNEL" --display-name "OSR monitor" >/dev/null
   channel_id=$(mm_json channel list "$MATTERMOST_TEAM" | json_find name "$MATTERMOST_CHANNEL") ||
     die "The channel $MATTERMOST_CHANNEL was not created."
   note "Created the channel $MATTERMOST_CHANNEL."
@@ -245,11 +253,15 @@ if [[ -s $MM_TARGET_ETC/webhook-url ]]; then
 fi
 if [[ -z $hook_id ]]; then
   hook_id=$(mm_json webhook create-incoming --channel "$channel_id" --user "$admin_id" \
-    --display-name "Open Smart Router monitor" --description "Health alerts from ollama-monitor" |
+    --display-name "Open Smart Router monitor" --description "Health alerts from osr-monitor" |
     json_find channel_id "$channel_id" id) || die 'Mattermost did not return the new webhook.'
   [[ $hook_id =~ ^[a-z0-9]{26}$ ]] || die "Unexpected webhook id: $hook_id"
   write_secret "$MM_TARGET_ETC/webhook-url" "$site_url/hooks/$hook_id"
   note "Created the incoming webhook for $MATTERMOST_TEAM:$MATTERMOST_CHANNEL."
 fi
 
+# Recorded for the next run (and --reconfigure), so a changed default never
+# moves an existing target's alerts to a new team or channel.
+printf '%s\n' "$MATTERMOST_TEAM" > "$MM_TARGET_ETC/team"
+printf '%s\n' "$MATTERMOST_CHANNEL" > "$MM_TARGET_ETC/channel"
 note "Mattermost is ready at $site_url. Alerts go to $MATTERMOST_TEAM:$MATTERMOST_CHANNEL."

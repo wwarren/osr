@@ -56,9 +56,11 @@ done
 for unit_file in "$ROOT"/targets/*/*.service "$ROOT"/services/*/*.service; do
     target=$(basename "$(dirname "$unit_file")")
     unit=$(basename "$unit_file" .service)
-    case $target in ollama-router|litellm-proxy|ollama-monitor|open-webui) target=router ;; esac
+    case $target in osr-router|litellm-proxy|osr-monitor|open-webui) target=router ;; esac
     [[ $unit != *@ ]] || continue   # a template is never active itself
-    assert_contains "$unit.service is checked for $target" " $unit " " $(tables eval "printf '%s' \"\${UNITS[$target]:-}\"") "
+    # NAME=OLD entries (a unit renamed since) are checked as NAME.
+    assert_contains "$unit.service is checked for $target" " $unit " \
+      " $(tables eval "printf '%s' \"\${UNITS[$target]:-}\"" | sed -E 's/=[^ ]*//g') "
 done
 
 describe 'repository pins are found'
@@ -143,7 +145,14 @@ case $cmd in
                     else printf 'dashboard=present\ndashboard_port=8082\ndashboard_state=active\ndashboard_http=ok\n'; fi
                     exit 0
                 fi
-                if [[ $3 == *systemctl* ]]; then grep -v '^ct:' "$MOCK/$id.state"; fi ;;
+                # collect_state's probe: each NAME[=OLD] argument is active when
+                # either name is listed in <id>.state, and is reported as NAME.
+                if [[ $3 == *systemctl* ]]; then
+                    grep -v -e '^ct:' -e '^unit:' "$MOCK/$id.state"
+                    for u in "${@:5}"; do
+                        for c in ${u//=/ }; do grep -qx "unit:$c" "$MOCK/$id.state" && { echo "unit:${u%%=*}"; break; }; done
+                    done
+                fi ;;
             hostname) echo "10.0.0.$((id % 250))" ;;
             # setup-metrics.sh login: <id>.grafana is what it prints.
             bash) [[ $* == *'setup-metrics.sh login' && -e $MOCK/$id.grafana ]] || exit 1
@@ -424,7 +433,7 @@ assert_eq 'without --upgrade' '' "$(grep -- '--upgrade' "$tmp/mock/installs.log"
 
 describe 'router, Open WebUI and hcom are found'
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router open-webui
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 osr-router open-webui
 echo 0.11.0 > "$tmp/mock/280.webui"; echo 0.11.0 > "$tmp/mock/280.ctpin"
 conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
 printf 'target=hermes\nnative=false\n' > "$tmp/mock/282.hcom"
@@ -457,6 +466,20 @@ in_tool() {
       DRY_RUN=false INTERACTIVE=false KEEP_PINS=false ROUTER_CT=280 REPO_REV=test
       "$@" )
 }
+
+describe 'router units with their pre-rename names count as the renamed ones'
+reset_mock
+state_of() { add_item "$1" "$2"; collect_state 0; }
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router ollama-monitor litellm-proxy open-webui
+before=$(in_tool state_of router 280 | grep '^unit:' | LC_ALL=C sort)
+assert_contains 'ollama-router counts as osr-router' 'unit:osr-router' "$before"
+assert_contains 'ollama-monitor counts as osr-monitor' 'unit:osr-monitor' "$before"
+assert_not_contains 'the old name is not reported' 'unit:ollama-' "$before"
+state 280 osr-router osr-monitor litellm-proxy open-webui
+after=$(in_tool state_of router 280 | grep '^unit:' | LC_ALL=C sort)
+assert_eq 'so renaming the units in an upgrade loses nothing' "$before" "$after"
+state 280 litellm-proxy open-webui
+assert_not_contains 'neither name active: not reported' 'unit:osr-router' "$(in_tool state_of router 280)"
 
 describe 'MQTT settings are read back from the broker'
 reset_mock
@@ -591,7 +614,7 @@ run_tool '' --yes --only comfyui --latest comfyui
 assert_file_contains 'ComfyUI gets the tag and its commit' "INSTALL 157 env COMFYUI_VERSION=v0.50.0 COMFYUI_COMMIT=$comfy_commit bash" "$tmp/mock/installs.log"
 # Open WebUI, Honcho, DeepSeek Harness and OpenCode: the chosen release replaces the pin.
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router open-webui
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 osr-router open-webui
 echo 0.11.0 > "$tmp/mock/280.webui"; echo 0.11.0 > "$tmp/mock/280.ctpin"
 upstream https://pypi.org/pypi/open-webui/json '{"info": {"version": "0.99.1"}}'
 run_tool '' --dry-run --skip router --latest open-webui
@@ -767,7 +790,7 @@ ask_with() {  # ask_with LINES: the run's output with LINES typed on the termina
     OSR_UPGRADE_TTY=$tmp/tty in_tool token_case 2>&1
 }
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router open-webui
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 osr-router open-webui
 conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
 touch "$tmp/mock/282.webui-api"
 echo good-token > "$tmp/mock/webui-token"
@@ -1041,7 +1064,7 @@ rm -rf "$tmp/run"
 
 describe 'CTs on other cluster nodes'
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 osr-router
 conf 351 'ai;ai-model;osr-target;strata' pve2; state 351 strata
 conf 361 'ai;ai-model;osr-target;maya' pve3; state 361 maya
 run_tool '' --list
@@ -1082,7 +1105,7 @@ run_tool '' --dry-run --node pve2
 assert_not_contains 'still uses the one router for checks' 'No router CT' "$out"
 
 describe 'several OSR installations in one cluster'
-conf 380 'ai;ai-tools;osr-router;openwebui' pve2; state 380 ollama-router
+conf 380 'ai;ai-tools;osr-router;openwebui' pve2; state 380 osr-router
 run_tool '' --list
 assert_eq 'two routers need a choice' 1 "$rc"
 assert_contains 'naming both with their nodes' '280 on pve1, 380 on pve2' "$out"
@@ -1094,7 +1117,7 @@ rm "$tmp/nodes/pve2/lxc/380.conf"
 
 describe 'what a CT needs on another node'
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui' pve2; state 280 ollama-router
+conf 280 'ai;ai-tools;osr-router;openwebui' pve2; state 280 osr-router
 conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
 conf 290 'ai;ai-tools;osr-target;mqtt' pve2; state 290 mosquitto
 printf 'target=hermes\nnative=false\n' > "$tmp/mock/282.hcom"
@@ -1150,7 +1173,7 @@ assert_eq 'releasing the lock afterwards' '' "$(cat "$tmp/cluster.lock" 2>/dev/n
 
 describe 'provisioners see the whole cluster'
 reset_mock
-conf 280 'ai;ai-tools;osr-router;openwebui' pve2; state 280 ollama-router
+conf 280 'ai;ai-tools;osr-router;openwebui' pve2; state 280 osr-router
 printf 'net0: name=eth0,bridge=vmbr0,ip=10.0.2.80/24,gw=10.0.2.1\n' >> "$tmp/nodes/pve2/lxc/280.conf"
 cluster_case() {
     printf 'LXC %s\n' "$(cd "$PVE_LXC_DIR" && ls | tr '\n' ' ')"

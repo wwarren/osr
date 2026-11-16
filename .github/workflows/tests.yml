@@ -39,8 +39,8 @@ jobs:
       - name: Router + monitor venv
         run: |
           python -m venv .venv-router
-          .venv-router/bin/pip install -r services/ollama-router/requirements.txt \
-            -r services/ollama-monitor/requirements.txt -r tests/requirements-dev.txt
+          .venv-router/bin/pip install -r services/osr-router/requirements.txt \
+            -r services/osr-monitor/requirements.txt -r tests/requirements-dev.txt
 
       - name: Bridge venv
         run: |

@@ -65,7 +65,7 @@ mock_script() {
 make_config_repo() {
   local root="$1"
   mkdir -p "${root}"/{env,install} \
-           "${root}"/services/{ollama-router,litellm-proxy,ollama-monitor,open-webui}
+           "${root}"/services/{osr-router,litellm-proxy,osr-monitor,open-webui}
   cat > "${root}/env/router.env" <<'EOF'
 GITEA_SERVER_URL=https://git.example.net
 GITEA_ADMIN_USER=tester
@@ -113,7 +113,7 @@ router_settings:
     - xlarge: ["large", "medium", "fast"]
     - large: ["medium", "fast"]
 EOF
-  cat > "${root}/services/ollama-router/router.ini" <<'EOF'
+  cat > "${root}/services/osr-router/router.ini" <<'EOF'
 [tiers]
 fast = fast
 medium = medium
@@ -121,10 +121,10 @@ large = large
 xlarge = xlarge
 EOF
   printf 'open-webui==0.6.5\n' > "${root}/services/open-webui/requirements.txt"
-  printf 'import sys\n' > "${root}/services/ollama-router/router.py"
-  printf 'import sys\n' > "${root}/services/ollama-monitor/monitor.py"
+  printf 'import sys\n' > "${root}/services/osr-router/router.py"
+  printf 'import sys\n' > "${root}/services/osr-monitor/monitor.py"
   printf '[polling]\ninterval_seconds = 15\n[alerting]\nfail_threshold = 3\n' \
-    > "${root}/services/ollama-monitor/monitor.ini"
+    > "${root}/services/osr-monitor/monitor.ini"
   printf 'PORT=8080\nOPENAI_API_BASE_URLS=http://127.0.0.1:8000/v1\n' > "${root}/env/openwebui.env"
   # A working stand-in for install/apply-config.sh: copies the same files to
   # the runtime locations named by ROUTER_DIR / OPENWEBUI_DIR (when exported).
@@ -133,8 +133,8 @@ EOF
 echo "apply-config ran for $1"
 [[ -n "${ROUTER_DIR:-}" ]] || exit 0
 mkdir -p "$ROUTER_DIR" "${OPENWEBUI_DIR:-/nonexistent}"
-cp "$1/services/ollama-router/router.py"  "$1/services/ollama-router/router.ini" \
-   "$1/services/ollama-monitor/monitor.py" "$1/services/ollama-monitor/monitor.ini" \
+cp "$1/services/osr-router/router.py"  "$1/services/osr-router/router.ini" \
+   "$1/services/osr-monitor/monitor.py" "$1/services/osr-monitor/monitor.ini" \
    "$1/services/litellm-proxy/litellm_config.yaml" "$ROUTER_DIR/"
 cp "$1/env/router.env" "$ROUTER_DIR/.env"
 [[ -n "${OPENWEBUI_DIR:-}" ]] && cp "$1/env/openwebui.env" "$OPENWEBUI_DIR/.env"

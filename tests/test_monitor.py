@@ -1,4 +1,4 @@
-"""Unit tests for services/ollama-monitor/monitor.py (no network)."""
+"""Unit tests for services/osr-monitor/monitor.py (no network)."""
 import importlib.util
 import sys
 import threading
@@ -15,7 +15,7 @@ A, B, C = "http://10.0.0.1:11434", "http://10.0.0.2:11434", "http://10.0.0.3:114
 
 def load_monitor(monkeypatch, **env):
     base = {
-        "MONITOR_INI": str(ROOT / "services/ollama-monitor/monitor.ini"),
+        "MONITOR_INI": str(ROOT / "services/osr-monitor/monitor.ini"),
         "MODEL_SERVERS": f"{A},{B},{C}",
         "BACKEND_FAST": A,
         "BACKEND_MEDIUM": B,
@@ -30,7 +30,7 @@ def load_monitor(monkeypatch, **env):
     for key, value in base.items():
         monkeypatch.setenv(key, value)
     spec = importlib.util.spec_from_file_location(
-        "monitor_under_test", ROOT / "services/ollama-monitor/monitor.py")
+        "monitor_under_test", ROOT / "services/osr-monitor/monitor.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules["monitor_under_test"] = module
     spec.loader.exec_module(module)
@@ -56,7 +56,7 @@ def test_a_shared_host_is_one_check_naming_all_its_tiers(monitor):
 
 def test_local_services_are_watched(monitor):
     keys = {c.key for c in monitor.build_checks()}
-    assert {"litellm-proxy", "ollama-router", "open-webui"} <= keys
+    assert {"litellm-proxy", "osr-router", "open-webui"} <= keys
 
 
 def test_openwebui_url_override(monkeypatch):
@@ -623,9 +623,9 @@ def test_router_monitor_and_manager_agree_on_server_kinds(monkeypatch):
     monitor = load_monitor(monkeypatch)
     for key in ("ROUTER_API_KEY", "MODEL_SERVERS"):
         monkeypatch.setenv(key, "")
-    monkeypatch.setenv("ROUTER_INI", str(ROOT / "services/ollama-router/router.ini"))
+    monkeypatch.setenv("ROUTER_INI", str(ROOT / "services/osr-router/router.ini"))
     spec = importlib.util.spec_from_file_location(
-        "router_kinds_under_test", ROOT / "services/ollama-router/router.py")
+        "router_kinds_under_test", ROOT / "services/osr-router/router.py")
     router = importlib.util.module_from_spec(spec)
     sys.modules["router_kinds_under_test"] = router
     spec.loader.exec_module(router)

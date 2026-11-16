@@ -36,7 +36,7 @@ Settings (environment; all optional):
   GITEA_DOMAIN=<this CT's IPv4>        host name or address in ROOT_URL
   GITEA_SITE_ADMIN=gitea-admin         administrator account
   GITEA_SITE_ADMIN_EMAIL=<admin>@<domain>.local
-  GITEA_ROUTER_USER=ollama-router      the router's non-admin account
+  GITEA_ROUTER_USER=osr-router      the router's non-admin account
   GITEA_ROUTER_EMAIL=<router>@<domain>.local
 Results (root-only, 0600) in /etc/gitea-target: url, admin-user,
 admin-password, router-user, router-token.
@@ -146,7 +146,12 @@ if [[ -z $GITEA_DOMAIN ]]; then
   (( ! dry_run )) || GITEA_DOMAIN=${GITEA_DOMAIN:-<CT address>}
 fi
 GITEA_SITE_ADMIN=${GITEA_SITE_ADMIN:-gitea-admin}
-GITEA_ROUTER_USER=${GITEA_ROUTER_USER:-ollama-router}
+# The router's account: as given, else the one an earlier run recorded (an
+# install from before the rename keeps ollama-router), else osr-router.
+if [[ -z ${GITEA_ROUTER_USER:-} && -s $GITEA_TARGET_ETC/router-user ]]; then
+  GITEA_ROUTER_USER=$(tr -d '\r\n' < "$GITEA_TARGET_ETC/router-user")
+fi
+GITEA_ROUTER_USER=${GITEA_ROUTER_USER:-osr-router}
 mail_domain=${GITEA_DOMAIN//[^A-Za-z0-9.-]/}
 [[ $mail_domain == *[A-Za-z]* ]] || mail_domain=gitea
 GITEA_SITE_ADMIN_EMAIL=${GITEA_SITE_ADMIN_EMAIL:-$GITEA_SITE_ADMIN@$mail_domain.local}

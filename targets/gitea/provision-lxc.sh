@@ -38,7 +38,7 @@ Settings (environment; values shown here are presets or defaults):
   BRIDGE=vmbr0  IP_CIDR=<a.b.c.d/nn|dhcp>  GATEWAY=<a.b.c.d>
   NAMESERVER=<a.b.c.d>  VLAN_TAG=<1-4094>  SSH_PUBLIC_KEY=<file>
   READY_TIMEOUT=120                   seconds to wait for the Gitea web UI
-  GITEA_SITE_ADMIN=gitea-admin  GITEA_ROUTER_USER=ollama-router
+  GITEA_SITE_ADMIN=gitea-admin  GITEA_ROUTER_USER=osr-router
   GITEA_SITE_ADMIN_EMAIL, GITEA_ROUTER_EMAIL, GITEA_DOMAIN (default: the CT address)
   COMMUNITY_SCRIPT_URL=<url>          default: the ProxmoxVE main-branch ct/gitea.sh
   COMMUNITY_SCRIPT_SHA256=<hex>       refuse to run a script with any other checksum
@@ -156,7 +156,7 @@ if [[ $mode != create ]]; then
     pve_note 'Blank host name: the address the CT reports.'
     pve_ask GITEA_DOMAIN 'Host name or address in Gitea URLs' "$domain_default" valid_domain 'Use a host name or IPv4 address.'
     pve_ask GITEA_SITE_ADMIN 'Administrator account' "${recorded_admin:-gitea-admin}" valid_account 'Use letters, digits, ., _ or -.'
-    pve_ask GITEA_ROUTER_USER "The router's (non-admin) account" "${recorded_router:-ollama-router}" valid_account 'Use letters, digits, ., _ or -.'
+    pve_ask GITEA_ROUTER_USER "The router's (non-admin) account" "${recorded_router:-osr-router}" valid_account 'Use letters, digits, ., _ or -.'
     # The guest's own dry run below checks them too.
     export GITEA_DOMAIN GITEA_SITE_ADMIN GITEA_ROUTER_USER
 fi

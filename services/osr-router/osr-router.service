@@ -11,8 +11,8 @@ After=network-online.target litellm-proxy.service
 Wants=network-online.target litellm-proxy.service
 [Service]
 Type=simple
-User=ollama-router
-Group=ollama-router
+User=osr-router
+Group=osr-router
 WorkingDirectory=/app/router
 EnvironmentFile=/app/router/.env
 # ROUTER_API_KEY (optional bearer token for the API) lives outside the repo.

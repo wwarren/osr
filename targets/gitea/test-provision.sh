@@ -99,7 +99,7 @@ pass '--reconfigure reruns the guest setup in the existing CT only'
 refuse 'Set CT_ID for unattended provisioning' --reconfigure CT_ID=
 refuse 'Use only one of' --create-only --reconfigure
 refuse 'not a usable Gitea user name' GITEA_ROUTER_USER=admin
-refuse 'must not be the administrator' GITEA_SITE_ADMIN=ollama-router
+refuse 'must not be the administrator' GITEA_SITE_ADMIN=osr-router
 pass 'the guest settings and modes are checked before anything is created'
 
 "$bash_bin" -n "$tool"

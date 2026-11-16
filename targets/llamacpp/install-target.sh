@@ -826,7 +826,9 @@ source "${OS_RELEASE_FILE:-/etc/os-release}"
 [[ ${ID:-} == debian && ( ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ) ]] ||
     die 'This target runs on a Debian 12 guest (CUDA, CPU) or a Debian 13 guest (CUDA, Vulkan, CPU).'
 [[ ! -d /app/router ]] || die 'The smart-router installation is present. Install this stack in a separate inference-target CT.'
-[[ $(systemctl show ollama-router.service -p LoadState --value) == not-found ]] || die 'The smart-router service is present. Install this stack in a separate inference-target CT.'
+# osr-router was ollama-router before it was renamed.
+[[ $(systemctl show osr-router.service -p LoadState --value) == not-found &&
+   $(systemctl show ollama-router.service -p LoadState --value) == not-found ]] || die 'The smart-router service is present. Install this stack in a separate inference-target CT.'  # either name: pre-rename too
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # A rebuild uses only what is installed, so it also runs from a lone copy of this script.

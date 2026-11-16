@@ -33,7 +33,7 @@ assert_eq "every embedded code file is updated on re-install" "" "$missing"
 # ...and every owned entry must be something the installer really ships.
 extra="$(comm -13 <(printf '%s\n' "$embedded") <(printf '%s\n' "$owned" | grep -v 'requirements\.lock$'))"
 assert_eq "no owned entry the installer does not ship" "" "$extra"
-assert_fail "tunables stay seed-if-missing" grep -qx 'services/ollama-router/router.ini' <<< "$owned"
+assert_fail "tunables stay seed-if-missing" grep -qx 'services/osr-router/router.ini' <<< "$owned"
 
 # scan_tracked_text MODE (crlf | mojibake | encoding): print offending files.
 # Lists the tracked files with git; outside a git checkout (a tarball, the
@@ -110,7 +110,7 @@ for f in "${ROOT}"/env/*.env; do
   assert_fail "$(basename "$f") has no router API key" grep -Eq '^ROUTER_API_KEY=.+' "$f"
 done
 assert_file_contains "the monitor loads the secrets file" \
-  "EnvironmentFile=-/app/router/secrets.env" "${ROOT}/services/ollama-monitor/ollama-monitor.service"
+  "EnvironmentFile=-/app/router/secrets.env" "${ROOT}/services/osr-monitor/osr-monitor.service"
 
 describe unit_hardening
 for unit in "${ROOT}"/services/*/*.service "${ROOT}"/targets/*/*.service; do
@@ -400,7 +400,7 @@ written="$(grep -oE '^[A-Z][A-Z0-9_]*=' <<< "$template" | tr -d '=')"
 sample="$(grep -oE '^[A-Z][A-Z0-9_]*=' "${ROOT}/env/router.env" | tr -d '=')"
 assert_ok "the installer's router.env template is found" test -n "$written"
 assert_eq "the sample env/router.env has the installer's keys, in its order" "$written" "$sample"
-readers=("${ROOT}/services/ollama-router/router.py" "${ROOT}/services/ollama-monitor/monitor.py"
+readers=("${ROOT}/services/osr-router/router.py" "${ROOT}/services/osr-monitor/monitor.py"
          "${ROOT}/install/manage-model-servers.sh")
 for key in $written KEEP_ALIVE_REFRESH_SECONDS; do
   case $key in
@@ -413,12 +413,12 @@ for key in LITELLM_HEALTH_URL LITELLM_URL MODEL_SERVER_COUNT MONITOR_INTERVAL_SE
   assert_not_contains "the installer no longer writes ${key}" "${key}=" "$template"
 done
 assert_fail "a comment in the template cannot expand anything" grep -Eq '^#.*[$`]' <<< "$template"
-for name in $(sed -n '/^ENV_OVERRIDES = (/,/^)/p' "${ROOT}/services/ollama-monitor/monitor.py" | grep -oE '"(MONITOR|KEEP)_[A-Z_]+"' | tr -d '"'); do
+for name in $(sed -n '/^ENV_OVERRIDES = (/,/^)/p' "${ROOT}/services/osr-monitor/monitor.py" | grep -oE '"(MONITOR|KEEP)_[A-Z_]+"' | tr -d '"'); do
   assert_ok "README names the monitor override ${name}" grep -q "$name" "${ROOT}/README.md"
 done
 
 describe router_requirements
-req="${ROOT}/services/ollama-router/requirements.txt"
+req="${ROOT}/services/osr-router/requirements.txt"
 for package in fastapi uvicorn httpx uvloop httptools; do
   assert_ok "the router pins ${package} exactly" grep -Eq "^${package}==[0-9][0-9A-Za-z.]*( *;.*)?$" "$req"
 done
@@ -427,9 +427,9 @@ for package in uvloop httptools; do
   assert_ok "${package} is skipped where it has no wheel" grep -Eq "^${package}==.*; *sys_platform == \"linux\" and \(platform_machine" "$req"
 done
 unit="${ROOT}/services/open-webui/open-webui.service"
-assert_fail "a router restart does not restart Open WebUI" grep -Eq '^(Requires|BindsTo|PartOf)=.*ollama-router' "$unit"
+assert_fail "a router restart does not restart Open WebUI" grep -Eq '^(Requires|BindsTo|PartOf)=.*osr-router' "$unit"
 assert_ok "Open WebUI still starts the router, and after it" bash -c \
-  "grep -Eq '^Wants=.*ollama-router\.service' '$unit' && grep -Eq '^After=.*ollama-router\.service' '$unit'"
+  "grep -Eq '^Wants=.*osr-router\.service' '$unit' && grep -Eq '^After=.*osr-router\.service' '$unit'"
 
 # Gitea reads .gitea/workflows, GitHub .github/workflows: one workflow, two
 # places, kept identical so neither forge runs a stale copy.
@@ -494,9 +494,50 @@ expressions = "\n".join(target["expr"] for panel in dashboard["panels"]
                    for target in panel["targets"])
 for name in ("osr_requests_total", "osr_upstream_failures_total",
              "osr_response_start_seconds_bucket", "osr_request_duration_seconds_bucket",
-             "osr_in_flight_requests", "osr_server_up", "osr_server_models"):
+             "osr_in_flight_requests", "osr_server_up", "osr_server_models",
+             "osr_inventory_age_seconds", "osr_remembered_conversations"):
     assert name in expressions, name
 assert dashboard["uid"] == "osr-router"
+assert len({panel["id"] for panel in dashboard["panels"]}) == len(dashboard["panels"])
+assert all(0 <= panel["gridPos"]["x"] < 24 and
+           panel["gridPos"]["x"] + panel["gridPos"]["w"] <= 24
+           for panel in dashboard["panels"])
+assert sum(panel["type"] == "stat" for panel in dashboard["panels"]) >= 4
+assert 'up{job="osr"}' in expressions
+assert 'status=~"5.."' in expressions
+for name in ("osr_response_start_seconds_bucket", "osr_request_duration_seconds_bucket"):
+    quantiles = [target["expr"] for panel in dashboard["panels"]
+                 for target in panel["targets"] if name in target["expr"]]
+    assert any(expr.startswith("histogram_quantile(0.5,") for expr in quantiles)
+    assert any(expr.startswith("histogram_quantile(0.95,") for expr in quantiles)
 PY
+
+describe new_names_only
+# A new install uses only the osr-* names: the units, their account, and the
+# defaults for the Gitea router account and the Mattermost team, channel and
+# posting name. Old names appear only where an existing install is migrated
+# or recognised.
+for unit in "$ROOT"/services/*/*.service; do
+  if grep -E '^(User|Group)=' "$unit" | grep -qv '=osr-router$'; then
+    assert_fail "${unit#"$ROOT"/} runs as osr-router" true
+  else
+    assert_ok "${unit#"$ROOT"/} runs as osr-router" true
+  fi
+done
+inst="$ROOT/open-smart-router-install.sh"
+assert_ok   "the installer creates the osr-router account" grep -q 'useradd --system --gid osr-router .* osr-router$' "$inst"
+assert_fail "and no ollama-router account" grep -Eq '(useradd|groupadd).*ollama-router' "$inst"
+assert_ok   "router.env posts as OSRMonitor" grep -qx 'MATTERMOST_MONITOR_USER=OSRMonitor' "$ROOT/env/router.env"
+assert_ok   "to osr-monitor" grep -qx 'MATTERMOST_CHANNEL=osr-monitor' "$ROOT/env/router.env"
+assert_ok   "the installer's channel default is osr-monitor" grep -q 'MATTERMOST_CHANNEL="${MATTERMOST_CHANNEL:-osr-monitor}"' "$inst"
+assert_ok   "Gitea's router account default is osr-router" grep -q 'GITEA_ROUTER_USER=${GITEA_ROUTER_USER:-osr-router}' "$ROOT/targets/gitea/install-target.sh"
+assert_ok   "Mattermost's team default is osr" grep -q 'default_team=osr default_channel=osr-monitor' "$ROOT/targets/mattermost/install-target.sh"
+# Every other mention of an old name sits beside the migration or recognition
+# code it belongs to: a line naming the old and the new name, or a comment
+# saying it is from before the rename.
+stray=$(cd "$ROOT" && git grep -n -E 'ollama-(router|monitor)|OllamaMonitor' -- \
+          'services' 'install' 'env' 'targets/*/install-target.sh' 'targets/*/provision-lxc.sh' 'tools' 'open-smart-router-install.sh' 2>/dev/null |
+        grep -viE 'osr-(router|monitor)|before (the|it was) renam|pre-rename|legacy|recorded|default_team=ollama')
+assert_eq "no old name outside migration code" "" "$stray"
 
 summary
