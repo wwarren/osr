@@ -1782,6 +1782,26 @@ assert_ok "the renamed units are enabled" mock_called "systemctl enable osr-rout
 assert_contains "and started" "Restarting: osr-router osr-monitor" "$out"
 out="$(cmd_apply 2>&1)"
 assert_contains "after that, nothing to do" "nothing restarted" "$out"
+# A failed first restart must leave the old unit installed and bring it back;
+# the two router units listen on the same port, so the new one is stopped first.
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
+touch "${UNIT_DIR}/osr-router.service"
+printf '[Service]\nUser=ollama-router\n' > "${UNIT_DIR}/ollama-router.service"
+mock_script systemctl <<'EOF'
+[[ "$*" == "restart osr-router.service" ]] && exit 1
+[[ "$1" == is-active && "${2:-}" != --quiet ]] && echo active
+exit 0
+EOF
+mock_command curl 0
+mock_reset_log
+out="$(cmd_apply 2>&1)"; rc=$?
+assert_ne "a failed renamed router restart fails apply" "0" "$rc"
+assert_ok "the old router unit remains installed" test -f "${UNIT_DIR}/ollama-router.service"
+assert_ok "the replacement is stopped before rollback" mock_called "systemctl stop osr-router.service"
+assert_ok "the old router is restarted" mock_called "systemctl restart ollama-router.service"
+assert_eq "the old router was not disabled" "0" "$(mock_call_count 'disable --now ollama-router.service')"
+mock_command systemctl 0 "active"
+reset_repo; make_fake_litellm_venv 1.75.5.post1; install_runtime
 # An env file from an older installer: tidied by the apply, which then restarts
 # the services that read it, once.
 kv_set "$ENV_FILE" MODEL_SERVER_COUNT 4

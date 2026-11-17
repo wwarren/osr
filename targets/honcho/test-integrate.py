@@ -15,6 +15,7 @@ spec = importlib.util.spec_from_file_location(
     "honcho_webui", Path(__file__).with_name("integrate-webui.py"))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+ALL_USERS = {"principal_type": "user", "principal_id": "*", "permission": "read"}
 
 
 class Response(io.BytesIO):
@@ -79,7 +80,10 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual("/mcp", state[1]["path"])
                 # Open WebUI fills in each user's ID; the gateway gives each a workspace.
                 self.assertEqual({"X-User-Id": "{{USER_ID}}"}, state[1]["headers"])
+                # Enabled for every Open WebUI user by default.
+                self.assertEqual({"enable": True, "access_grants": [ALL_USERS]}, state[1]["config"])
                 state[1]["config"]["access_grants"] = [{"principal_id": "group-1"}]
+                state[1]["config"]["enable"] = False
                 # An older registration named the shared workspace; an admin added a header.
                 state[1]["headers"] = {"X-Honcho-Workspace-ID": "osr", "x-user-id": "fixed",
                                        "X-Trace": "on"}
@@ -91,11 +95,26 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual("rotated-secret", state[1]["key"])
                 self.assertEqual({"X-Trace": "on", "X-User-Id": "{{USER_ID}}"}, state[1]["headers"])
                 self.assertEqual("My Memory", state[1]["info"]["name"])
-                self.assertEqual([{"principal_id": "group-1"}],
-                                 state[1]["config"]["access_grants"])
+                # The admin's grant stays beside the all-users grant, and it is on again.
+                self.assertEqual({"enable": True, "access_grants": [{"principal_id": "group-1"}, ALL_USERS]},
+                                 state[1]["config"])
                 calls.clear()
                 module.main()
                 self.assertEqual(["GET", "WHOAMI"], calls)
+                # --access=keep leaves an admin's choices alone.
+                state[1]["config"] = {"enable": False, "access_grants": [{"principal_id": "group-1"}]}
+                with patch.object(sys, "argv", [argv[0], "--access=keep", *argv[1:]]):
+                    module.main()
+                self.assertEqual({"enable": False, "access_grants": [{"principal_id": "group-1"}]},
+                                 state[1]["config"])
+                # A new connection registered with it is admin-only.
+                del state[1]
+                with patch.object(sys, "argv", [argv[0], "--access=keep", *argv[1:]]):
+                    module.main()
+                self.assertEqual({"enable": True}, state[1]["config"])
+                with patch.object(sys, "argv", [argv[0], "--access=some", *argv[1:]]), \
+                        self.assertRaises(ValueError):
+                    module.main()
 
     def test_a_key_the_gateway_does_not_accept_for_open_webui_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:

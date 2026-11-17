@@ -45,11 +45,19 @@ for row in rows:
 sys.exit(1)
 ' "$@"
 }
+ensure_team() {
+  if ! mm --json team list | find_field name "$team" id >/dev/null; then
+    mm team create --name "$team" --display-name 'Open Smart Router' >/dev/null
+    mm --json team list | find_field name "$team" id >/dev/null || die "Could not create the team $team."
+  fi
+  mm team users add "$team" "$admin" >/dev/null 2>&1 || true
+}
 # hook_field ID FIELD: FIELD (channel_id, channel_locked) of incoming webhook ID;
 # fails when Mattermost has no such webhook.
 hook_field() { mm --json webhook show "$1" 2>/dev/null | find_field id "$1" "$2" 2>/dev/null; }
 admin=$(<"$etc/admin-user")
 admin_id=$(mm --json user list --all | find_field username "$admin" id) || die "Cannot find the Mattermost administrator $admin."
+ensure_team
 if ! channel_id=$(mm --json channel list "$team" | find_field name "$channel" id); then
   mm channel create --team "$team" --name "$channel" --display-name 'Agent handoffs' >/dev/null
   channel_id=$(mm --json channel list "$team" | find_field name "$channel" id) || die "Could not create $team:$channel."

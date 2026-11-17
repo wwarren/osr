@@ -2998,9 +2998,11 @@ unset _rc
 # A repository from before the services were renamed: services/ollama-router
 # holds the operator's router.ini, the old unit and old code. The tuned
 # router.ini is copied to services/osr-router before seeding (so the default
-# is not seeded over it), installer-owned files are not copied, and every old
-# file is removed with its sha.
+# is not seeded over it). Installer-owned files are seeded first, then every
+# old file is removed with its sha.
 _gitea="$(mktemp -d)"
+printf 'new router code\n' > "${seedtree}/services/osr-router/router.py"
+printf '[Service]\n' > "${seedtree}/services/osr-router/osr-router.service"
 mock_script curl <<EOF
 m=GET; for ((i = 1; i <= \$#; i++)); do [[ \${!i} == -X ]] && { j=\$((i + 1)); m=\${!j}; }; done
 url=\${!#}; path=\${url#*/contents/}
@@ -3023,12 +3025,12 @@ assert_eq "seeding a pre-rename repository succeeds" 0 "$_rc"
 assert_contains "the operator's router.ini is moved" "moved: services/ollama-router/router.ini -> services/osr-router/router.ini" "$out"
 assert_eq "with its content" "# tuned" \
   "$(python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(open(sys.argv[1]))["content"]).decode().strip())' "${_gitea}/post-services_osr-router_router.ini")"
-assert_contains "so the default is not seeded over it" "1 created" "$out"
+assert_contains "only the missing code and env are seeded" "3 created" "$out"
 for _f in router.ini router.py ollama-router.service; do
   assert_eq "old ${_f} removed with its sha" 1 \
     "$(python3 -c 'import json,sys; print(int(bool(json.load(open(sys.argv[1]))["sha"])))' "${_gitea}/delete-services_ollama-router_${_f}" 2>/dev/null)"
 done
-assert_fail "installer-owned code is not copied" test -e "${_gitea}/post-services_osr-router_router.py"
+assert_ok "installer-owned code was seeded before removal" test -e "${_gitea}/post-services_osr-router_router.py"
 # A copy that cannot be made keeps the old file.
 rm -f "${_gitea}"/*
 sed -i 's/POST\\ \*) cat/POST\\ *services\/osr-router\/router.ini) echo nope; echo 500 ;;\n  POST\\ *) cat/' "${MOCK_BIN}/curl"
@@ -3036,6 +3038,13 @@ out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"; _rc=$?
 assert_eq "a failed move fails the seeding" 1 "$_rc"
 assert_contains "and says the old file stays" "left in place" "$out"
 assert_fail "the old router.ini is not removed" test -e "${_gitea}/delete-services_ollama-router_router.ini"
+rm -f "${_gitea}"/*
+sed -i '/POST\\ \*services\/osr-router\/router.ini)/s/router.ini/router.py/' "${MOCK_BIN}/curl"
+out="$(seed_gitea_repo "$seedtree" TOKEN 2>&1)"; _rc=$?
+assert_eq "a failed code seed fails the seeding" 1 "$_rc"
+assert_contains "and says the old code stays" "services/ollama-router/router.py left in place" "$out"
+assert_fail "the old router code is not removed" test -e "${_gitea}/delete-services_ollama-router_router.py"
+rm -f "${seedtree}/services/osr-router/router.py" "${seedtree}/services/osr-router/osr-router.service"
 rm -rf "$_gitea"; unset _gitea _rc _f
 
 # A file whose base64 is over 128 KiB (install/manage-model-servers.sh is) is

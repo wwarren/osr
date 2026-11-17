@@ -4,6 +4,10 @@
 The connection carries Open WebUI's gateway key and X-User-Id: {{USER_ID}},
 which Open WebUI fills in with the user's ID on every request; the Honcho
 gateway gives each user a workspace of their own.
+
+--access=all (the default) enables the connection for every Open WebUI user;
+--access=keep leaves an existing connection's access alone (a new one is
+admin-only until an admin grants it).
 """
 import json
 import os
@@ -27,6 +31,34 @@ USER_HEADER = "X-User-Id"
 USER_TEMPLATE = "{{USER_ID}}"
 # Headers the gateway sets itself; an older registration sent the workspace.
 MANAGED_HEADERS = ("x-user-id", "x-honcho-workspace-id")
+# Open WebUI's grant for every signed-in user (what "Public" saves in its
+# access dialog). Without any grant a connection is admin-only.
+ALL_USERS = {"principal_type": "user", "principal_id": "*", "permission": "read"}
+
+
+def is_all_users(grant):
+    return isinstance(grant, dict) and all(grant.get(key) == value for key, value in ALL_USERS.items())
+
+
+def open_to_all_users(config):
+    """CONFIG enabled, with the all-users grant beside the grants it has."""
+    config = dict(config) if isinstance(config, dict) else {}
+    grants = config.get("access_grants")
+    grants = list(grants) if isinstance(grants, list) else []
+    if not any(is_all_users(grant) for grant in grants):
+        grants.append(dict(ALL_USERS))
+    config["enable"] = True
+    config["access_grants"] = grants
+    return config
+
+
+def access_label(connection):
+    grants = (connection.get("config") or {}).get("access_grants") or []
+    if any(is_all_users(grant) for grant in grants):
+        return "enabled for all users"
+    if grants:
+        return "access limited to the users and groups granted in Open WebUI"
+    return "admin-only"
 
 
 def check_gateway_key(mcp_url, key):
@@ -68,6 +100,12 @@ def is_honcho(item):
 
 def main():
     args = sys.argv[1:]
+    access = "all"
+    for arg in [arg for arg in args if arg.startswith("--access=")]:
+        access = arg.split("=", 1)[1]
+        args.remove(arg)
+    if access not in ("all", "keep"):
+        raise ValueError("--access must be all or keep")
     mode = args[0] if args and args[0] in ("--check", "--snapshot", "--restore") else "register"
     if mode == "--check" and len(args) == 3:
         base, admin_file = args[1:]
@@ -76,7 +114,7 @@ def main():
     elif mode == "register" and len(args) == 4:
         base, admin_file, honcho_file, mcp_url = args
     else:
-        raise ValueError("use --check BASE ADMIN_FILE, --snapshot/--restore BASE ADMIN_FILE FILE, or BASE ADMIN_FILE HONCHO_FILE MCP_URL")
+        raise ValueError("use --check BASE ADMIN_FILE, --snapshot/--restore BASE ADMIN_FILE FILE, or [--access=all|keep] BASE ADMIN_FILE HONCHO_FILE MCP_URL")
     admin = Path(admin_file).read_text(encoding="utf-8").strip()
     if not admin:
         raise ValueError("missing Open WebUI admin token")
@@ -135,15 +173,17 @@ def main():
         updated["info"] = dict(previous.get("info") or connection["info"])
         updated["headers"] = connection_headers(previous.get("headers"))
         connection = updated
+    if access == "all":
+        connection["config"] = open_to_all_users(connection["config"])
     if len(existing) == 1 and existing[0] == connection:
-        print("Honcho MCP is already registered in Open WebUI")
+        print(f"Honcho MCP is already registered in Open WebUI ({access_label(connection)})")
         return
     next_connections = [item for item in connections if not is_honcho(item)]
     next_connections.append(connection)
     if next_connections != connections:
         request(endpoint, admin, json.dumps(
             {"TOOL_SERVER_CONNECTIONS": next_connections}).encode())
-    print("Honcho MCP registered in Open WebUI")
+    print(f"Honcho MCP registered in Open WebUI ({access_label(connection)})")
 
 
 if __name__ == "__main__":

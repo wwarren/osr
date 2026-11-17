@@ -216,9 +216,17 @@ the gateway's key for a workspace is a Honcho JWT for that workspace alone, so
 any other workspace is refused (a tool call's `workspace_id` is replaced by
 the user's own), and Honcho's MCP server binds each session to its user's key.
 A request that names no user is refused; only `GET /osr/v1/whoami` answers it.
-The connection is admin-only until you grant access to users or groups in
-Open WebUI (Admin Settings, External Tools); everyone granted gets a private
-memory.
+The connection is enabled for all Open WebUI users by default: every install
+and reconfigure (and so `tools/upgrade-all.sh`) turns it on and adds Open
+WebUI's all-users grant beside any grants it has, and everyone gets a private
+memory. Users still switch the Honcho Memory tools on in a chat, or an admin
+adds them to a model's default tools. `HONCHO_WEBUI_ACCESS=keep` registers a
+new connection admin-only and leaves an existing one as it is set in Open
+WebUI (Admin Settings, External Tools). The choice is recorded in
+`/etc/honcho-target/webui-access` and reused when the variable is not set, so
+to limit access: change it in Open WebUI, then run
+`HONCHO_WEBUI_ACCESS=keep CT_ID=<id> bash provision-lxc.sh --reconfigure` once
+(`HONCHO_WEBUI_ACCESS=all` returns to the default).
 
 **Agents.** Each agent CT is a client `<agent>-<CT>` (for example
 `hermes-282`) with its own key, issued by the agent's provisioner and pinned to
@@ -354,13 +362,14 @@ whether the secret actually changed:
 Select `honcho` in `open-smart-router-install.sh` with the agents (Honcho is
 always created first). The installer gives it the router's URL and key and
 registers `http://<honcho-ip>:3000/mcp` as an authenticated Streamable HTTP
-tool server in Open WebUI (admin-only until granted; it does not make every
-conversation a memory session). Selected Hermes, OpenClaw and OpenCode get
+tool server in Open WebUI (enabled for all users unless
+`HONCHO_WEBUI_ACCESS=keep`; it does not make every conversation a memory
+session). Selected Hermes, OpenClaw and OpenCode get
 their native Honcho integrations
 ([OpenCode's plugin](../opencode/README.md#honcho-memory)) and DeepSeek Harness
 its MCP connection ([details](../deepseek-harness/README.md#honcho-memory)), each with its own key
-and workspace (its memory of the `user` peer); every Open WebUI user granted
-the tools gets a workspace of their own.
+and workspace (its memory of the `user` peer); every Open WebUI user gets a
+workspace of their own.
 
 It asks for Honcho's CT ID (default: the next free ID not taken by this
 install) and static IP/CIDR (never chosen automatically)

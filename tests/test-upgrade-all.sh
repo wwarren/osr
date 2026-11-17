@@ -160,6 +160,8 @@ case $cmd in
             sed)
                 case "$*" in
                     *service.env*) [[ ! -e $MOCK/$id.port ]] || cat "$MOCK/$id.port" ;;
+                    # Open Terminal's recorded Open WebUI access (all or keep).
+                    *webui-access*) [[ ! -e $MOCK/$id.access ]] || cat "$MOCK/$id.access" ;;
                     *requirements.txt*) [[ ! -e $MOCK/$id.ctpin ]] || cat "$MOCK/$id.ctpin" ;;
                     *DSH_VERSION*) [[ ! -e $MOCK/$id.dsh ]] || cat "$MOCK/$id.dsh" ;;
                     *HERMES_COMMIT*) [[ ! -e $MOCK/$id.hermes-pin-read-fails ]] || exit 1
@@ -180,7 +182,15 @@ case $cmd in
                 [[ ! -e $MOCK/$id.hermes-next ]] || cp "$MOCK/$id.hermes-next" "$MOCK/$id.hermes-commit" ;;
             systemctl) printf 'SYSTEMCTL %s %s\n' "$id" "$*" >> "$MOCK/installs.log" ;;
             /app/openwebui/venv/bin/python) [[ ! -e $MOCK/$id.webui ]] || cat "$MOCK/$id.webui" ;;
-            python3) echo 'mqtts://broker.lan:8883' ;;
+            # Open Terminal's access in Open WebUI: the admin token arrives on stdin.
+            python3)
+                if [[ $* == *--access-only* ]]; then
+                    IFS= read -r token || token=''
+                    printf 'WEBUI_ACCESS %s %s token=%s\n' "$id" "$*" "$token" >> "$MOCK/installs.log"
+                    [[ ! -e $MOCK/access-fails ]] || exit 1
+                    exit 0
+                fi
+                echo 'mqtts://broker.lan:8883' ;;
             test) [[ -e $MOCK/$id.tls ]] ;;
             grep) [[ -e $MOCK/$id.webui-api ]] || exit 1 ;;
             /usr/local/bin/manage-model-servers) printf 'MANAGE %s %s\n' "$id" "$*" >> "$MOCK/installs.log" ;;
@@ -430,6 +440,44 @@ echo 8123 > "$tmp/mock/270.port"
 run_tool '' --yes --only open-terminal
 assert_file_contains 'passes the recorded port' 'OPEN_TERMINAL_PORT=8123 bash /root/open-terminal-deploy/install-target.sh' "$tmp/mock/installs.log"
 assert_eq 'without --upgrade' '' "$(grep -- '--upgrade' "$tmp/mock/installs.log")"
+assert_eq 'no router CT: Open WebUI is not touched' '' "$(grep WEBUI_ACCESS "$tmp/mock/installs.log")"
+
+describe 'Open Terminal is enabled for all Open WebUI users'
+reset_mock
+conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 osr-router open-webui
+conf 270 'ai;ai-tools;osr-target;open-terminal'; state 270 open-terminal
+echo good-token > "$tmp/mock/webui-token"
+OPENWEBUI_ADMIN_TOKEN=good-token run_tool '' --dry-run --only open-terminal
+assert_contains 'the plan says so' 'enable its Open WebUI connection for all users' "$out"
+OPENWEBUI_ADMIN_TOKEN=good-token run_tool '' --yes --only open-terminal
+assert_eq 'the upgrade succeeds' upgraded "$(summary_line open-terminal 270)"
+assert_file_contains 'its connection in the router CT, by ID' \
+    'WEBUI_ACCESS 280 python3 /root/.osr-open-terminal-access.py --access-only --access all --webui-url http://127.0.0.1:8080 --id open-terminal-lxc-270 --admin-token-file /dev/stdin token=good-token' "$tmp/mock/installs.log"
+assert_ok 'after the terminal was upgraded' test "$(grep -n '^INSTALL 270' "$tmp/mock/installs.log" | cut -d: -f1)" -lt "$(grep -n '^WEBUI_ACCESS' "$tmp/mock/installs.log" | cut -d: -f1)"
+assert_ok 'with the repository script' cmp -s "$ROOT/targets/open-terminal/integrate-webui.py" "$tmp/mock/pushed-280-.osr-open-terminal-access.py"
+assert_not_contains 'the token is on no command line' 'good-token' "$(cat "$tmp/mock/pct.log")"
+rm -f "$tmp/mock/installs.log"
+run_tool '' --yes --only open-terminal
+assert_eq 'without a token the terminal is still upgraded' upgraded "$(summary_line open-terminal 270)"
+assert_file_contains 'by its installer' 'INSTALL 270' "$tmp/mock/installs.log"
+assert_eq 'and Open WebUI is left alone' '' "$(grep WEBUI_ACCESS "$tmp/mock/installs.log")"
+assert_contains 'which the plan says' 'its Open WebUI access is not changed: set OPENWEBUI_ADMIN_TOKEN' "$out"
+assert_not_contains 'instead of promising it' 'enable its Open WebUI connection for all users' "$out"
+rm -f "$tmp/mock/installs.log"
+echo keep > "$tmp/mock/270.access"
+OPENWEBUI_ADMIN_TOKEN=good-token run_tool '' --yes --only open-terminal
+assert_eq 'a recorded keep leaves the access alone' '' "$(grep WEBUI_ACCESS "$tmp/mock/installs.log")"
+assert_not_contains 'and the plan does not mention it' 'for all users' "$out"
+OPENWEBUI_ADMIN_TOKEN=good-token OPEN_TERMINAL_WEBUI_ACCESS=all run_tool '' --yes --only open-terminal
+assert_file_contains 'unless all is given for this run' 'WEBUI_ACCESS 280' "$tmp/mock/installs.log"
+rm -f "$tmp/mock/installs.log" "$tmp/mock/270.access"
+OPENWEBUI_ADMIN_TOKEN=good-token OPEN_TERMINAL_WEBUI_ACCESS=keep run_tool '' --yes --only open-terminal
+assert_eq 'keep can be given for a run too' '' "$(grep WEBUI_ACCESS "$tmp/mock/installs.log")"
+touch "$tmp/mock/access-fails"
+OPENWEBUI_ADMIN_TOKEN=good-token run_tool '' --yes --only open-terminal --no-snapshot
+assert_ne 'a refused change is a failure, not silence' upgraded "$(summary_line open-terminal 270)"
+assert_contains 'and is named' 'enabling it for all Open WebUI users failed' "$(cat "$tmp"/logs/*/* 2>/dev/null; echo "$out")"
+rm -f "$tmp/mock/access-fails"
 
 describe 'router, Open WebUI and hcom are found'
 reset_mock

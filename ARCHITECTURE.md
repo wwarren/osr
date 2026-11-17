@@ -880,8 +880,9 @@ runs upstream single-user mode sandboxed to its own home, with private `/tmp`,
 hidden processes and per-workspace memory, task and CPU limits, and idle ones
 are stopped. Agents reach their workspace as MCP tools at the gateway's `/mcp`.
 With the firewall on, port 8000 admits the router and the connected agents.
-The connection is admin-only by default; each user granted access works in
-their own workspace.
+The connection is enabled for all Open WebUI users by default (install and
+`tools/upgrade-all.sh`), each in their own workspace;
+`OPEN_TERMINAL_WEBUI_ACCESS=keep` leaves it admin-only or as set in Open WebUI.
 
 ### 17.1 Hermes Agent (`targets/hermes/`)
 
@@ -951,7 +952,7 @@ Clients reach the API and MCP only through `honcho-gateway` (stdlib Python,
 own account) on the public ports 8000 and 3000; Honcho listens on
 127.0.0.1:8010 and :3010. Like the Open Terminal gateway it gives every client
 its own key (hashes in `clients.json`, managed with `honcho-clients`) and Open
-WebUI (MCP tool server, admin-only until granted) a workspace per user: the
+WebUI (MCP tool server, enabled for all users unless `HONCHO_WEBUI_ACCESS=keep`) a workspace per user: the
 connection sends `X-User-Id: {{USER_ID}}`, Open WebUI fills it in, and the
 gateway forwards with a Honcho JWT for `openwebui-u-<hash of client and user>`
 alone, so Honcho itself refuses every other workspace (it also binds an MCP

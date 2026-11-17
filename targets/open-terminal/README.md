@@ -160,7 +160,10 @@ Terminal is installed in a running CT.
 
 Give them to `provision-lxc.sh` or to `install-target.sh` in the CT. Unset,
 a rerun keeps the values recorded in `/etc/open-terminal/service.env`
-(`tools/upgrade-all.sh` passes only the port).
+(`tools/upgrade-all.sh` passes only the port). After the upgrade it enables
+the terminal's connection in the router's Open WebUI for all users, unless
+keep is recorded; that step needs the Open WebUI admin token and is skipped
+without one.
 
 In the CT:
 
@@ -234,9 +237,16 @@ pct exec <terminal-id> -- journalctl -u open-terminal-gateway -n 100 --no-pager
 ```
 
 Refresh Open WebUI, pick **Open Terminal LXC** in a chat's terminal picker and
-use a model with native function calling. The connection is **admin-only**
-by default; grant users or groups in **Admin Settings → Integrations → Open
-Terminal**, and each of them works in their own workspace. Open WebUI proxies
+use a model with native function calling. The connection is **enabled for all
+Open WebUI users** by default, each in their own workspace: the install,
+`--integrate-only` and `tools/upgrade-all.sh` turn it on and add Open WebUI's
+all-users grant beside any grants it has. `OPEN_TERMINAL_WEBUI_ACCESS=keep`
+registers a new connection admin-only and leaves an existing one as it is set
+in **Admin Settings → Integrations → Open Terminal**. The choice is recorded
+in `/etc/open-terminal/webui-access` and reused when the variable is not set,
+so to limit access: change it in Open WebUI, then run
+`OPEN_TERMINAL_WEBUI_ACCESS=keep CT_ID=<id> ROUTER=<router> bash provision-lxc.sh --integrate-only`
+once (`=all` returns to the default). Open WebUI proxies
 requests, so browsers never reach TCP 8000 and no browser origins are allowed
 (`OPEN_TERMINAL_CORS_ALLOWED_ORIGINS=http://127.0.0.1`; empty would mean `*`).
 With the Proxmox firewall on, the CT admits TCP 8000 only from the router and

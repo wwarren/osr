@@ -68,6 +68,11 @@ settings) is upgraded and Hermes stays at its installed version unless
 Stopped CTs are left alone unless --include-stopped.
 A llama.cpp target installed before the monitor dashboard existed gets it
 (llama-dashboard, TCP 8082); the plan and summary say so.
+Honcho's and Open Terminal's connections in Open WebUI are enabled for all
+users (each user has a memory and a workspace of their own), unless keep was
+recorded for them: HONCHO_WEBUI_ACCESS=keep or OPEN_TERMINAL_WEBUI_ACCESS=keep,
+given to their provisioner or to this run. That needs the Open WebUI admin
+token; without it Open Terminal is still upgraded and its access is left alone.
 
 Before the plan it lists, for every component it will upgrade that comes from
 a public repository, the release pinned here (tested with this repository)
@@ -123,9 +128,12 @@ does not narrow them to one), MQTT_CT_ID
 and MATTERMOST_CT_ID (when not exactly one CT carries that tag),
 OPENWEBUI_ADMIN_TOKEN (otherwise asked once, and checked against Open WebUI,
 when Honcho, or Hermes or OpenClaw with an Open WebUI connection, will be
-reconfigured: with --yes or without stdin at the start of the run, on the
-terminal; with no terminal at all, as under cron, those are not run without
-it), HCOM_EXTRA_CTS (untagged CTs to check for hcom), GITHUB_TOKEN (optional,
+reconfigured, or Open Terminal's connection enabled for all users: with --yes
+or without stdin at the start of the run, on the terminal; with no terminal at
+all, as under cron, those are not run without it, and Open Terminal is
+upgraded without changing its access), HONCHO_WEBUI_ACCESS and
+OPEN_TERMINAL_WEBUI_ACCESS (all or keep; unset, the choice recorded in the CT,
+or all), HCOM_EXTRA_CTS (untagged CTs to check for hcom), GITHUB_TOKEN (optional,
 for GitHub's API rate limit when looking up upstream releases).
 Logs: /var/log/osr-upgrade/<time>/, one file per component plus summary.txt.
 USAGE
@@ -889,6 +897,53 @@ run_guest() {  # run_guest ITEM MODE
     fi
 }
 
+# Open Terminal's connection in Open WebUI is enabled for all users after its
+# upgrade (each works in a workspace of their own), unless keep is recorded in
+# the terminal CT or given as OPEN_TERMINAL_WEBUI_ACCESS.
+OT_ACCESS_PATH=/root/.osr-open-terminal-access.py
+
+# open_terminal_access_mode ID: all or keep.
+open_terminal_access_mode() {
+    local mode=${OPEN_TERMINAL_WEBUI_ACCESS:-}
+    [[ -n $mode ]] || mode=$(pct exec "$1" -- sed -n '1p' /etc/open-terminal/webui-access 2>/dev/null </dev/null | tr -d '\r\n ')
+    if [[ $mode == keep ]]; then echo keep; else echo all; fi
+}
+
+# open_terminal_opens ID: will this run enable that terminal for all users?
+open_terminal_opens() {
+    [[ -n $ROUTER_CT ]] && ct_running "$ROUTER_CT" && [[ $(open_terminal_access_mode "$1") == all ]]
+}
+
+# open_terminal_access ITEM: enable the connection this terminal CT has in the
+# router's Open WebUI for all users. An Open WebUI without that connection (the
+# terminal is registered with another router) is left alone. The token goes
+# to the router CT on stdin, not on a command line or into a file.
+open_terminal_access() {
+    local id=${I_CT[$1]} port rc=0
+    if [[ $(open_terminal_access_mode "$id") == keep ]]; then
+        note "Open Terminal CT $id: Open WebUI access left as it is (keep)."
+        printf 'keep\n' | pct exec "$id" -- sh -c 'umask 022; cat > /etc/open-terminal/webui-access' || true
+        return 0
+    fi
+    if [[ -z $ROUTER_CT ]] || ! ct_running "$ROUTER_CT"; then
+        note "Open Terminal CT $id: no running router CT, so its Open WebUI access was not changed."
+        return 0
+    fi
+    if [[ -z $WEBUI_TOKEN ]]; then
+        note "Open Terminal CT $id: no Open WebUI admin token, so its access was not changed."
+        note "  To enable it for all users: CT_ID=$id ROUTER=$ROUTER_CT bash targets/open-terminal/provision-lxc.sh --integrate-only"
+        return 0
+    fi
+    port=$(pct exec "$ROUTER_CT" -- sed -n 's/^PORT=//p' /app/openwebui/.env 2>/dev/null </dev/null | tail -n 1 | tr -d '\r\n ')
+    [[ $port =~ ^[0-9]{2,5}$ ]] || port=8080
+    pct push "$ROUTER_CT" "$REPO_ROOT/targets/open-terminal/integrate-webui.py" "$OT_ACCESS_PATH" --perms 0700 >/dev/null </dev/null || return 1
+    printf '%s\n' "$WEBUI_TOKEN" | pct exec "$ROUTER_CT" -- python3 "$OT_ACCESS_PATH" --access-only --access all \
+        --webui-url "http://127.0.0.1:$port" --id "open-terminal-lxc-$id" --admin-token-file /dev/stdin || rc=$?
+    pct exec "$ROUTER_CT" -- rm -f -- "$OT_ACCESS_PATH" </dev/null >/dev/null 2>&1 || true
+    (( rc == 0 )) || { note "Open Terminal CT $id was upgraded, but enabling it for all Open WebUI users failed."; return 1; }
+    printf 'all\n' | pct exec "$id" -- sh -c 'umask 022; cat > /etc/open-terminal/webui-access' || true
+}
+
 # Does the router URL this CT recorded point at the router CT found here?
 uses_router_ct() {
     local url host ip
@@ -1042,7 +1097,9 @@ run_item() {  # run_item ITEM MODE
     case $(method_of "${I_TARGET[$1]}") in
         router) run_router ;;
         webui) run_webui "$1" ;;
-        guest) run_guest "$1" "$2" ;;
+        guest)
+            run_guest "$1" "$2" || return
+            if [[ ${I_TARGET[$1]} == open-terminal ]]; then open_terminal_access "$1"; fi ;;
         reconfigure)
             run_reconfigure "$1" "$2" || return
             if hermes_update_wanted "$1"; then update_hermes "$1"; fi ;;
@@ -1064,7 +1121,9 @@ describe_item() {  # what run_item does, for the plan
         guest)
             if [[ $t == open-terminal ]]; then echo -n "push files to /root/${GUEST_DIR[$t]}; rerun install-target.sh with its port"
             else echo -n "push files to /root/${GUEST_DIR[$t]}; install-target.sh --upgrade"; fi
-            if [[ -n ${I_ENV[$i]:-} ]]; then echo " with ${I_ENV[$i]} (latest upstream)"; else echo; fi ;;
+            if [[ -n ${I_ENV[$i]:-} ]]; then echo -n " with ${I_ENV[$i]} (latest upstream)"; fi
+            if [[ $(info_value "$i" access) == all ]]; then echo -n '; enable its Open WebUI connection for all users'; fi
+            echo ;;
         reconfigure)
             if unpinned_service "$t"; then
                 echo "targets/$t/provision-lxc.sh --reconfigure (re-applies its setup; this repository does not pin the $t release, so it stays as it is)"
@@ -1457,6 +1516,15 @@ prepare() {
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" "$(release_pick honcho)" ;;
+            open-terminal)
+                # Its upgrade does not need the token; only its access does.
+                if open_terminal_opens "$id"; then
+                    if [[ -z ${OPENWEBUI_ADMIN_TOKEN:-} ]] && ! $INTERACTIVE && ! { $DRY_RUN && token_tty >/dev/null; }; then
+                        I_NOTE[i]='its Open WebUI access is not changed: set OPENWEBUI_ADMIN_TOKEN to enable it for all users'
+                    else
+                        I_INFO[i]+=' access=all'
+                    fi
+                fi ;;
             llamacpp)
                 if note_llamacpp_dashboard "$i"; then I_NOTE[i]='adds the llama.cpp monitor dashboard (TCP 8082)'; fi ;;
             hermes)
@@ -1512,8 +1580,10 @@ check_webui_token() {
 token_needed() {
     local i
     for i in "${!I_TARGET[@]}"; do
-        case ${I_TARGET[$i]} in honcho|hermes|openclaw|deepseek-harness|opencode) ;; *) continue ;; esac
-        [[ -z ${I_RESULT[$i]} ]] && ct_running "${I_CT[$i]}" && needs_webui_token "$i" && return 0
+        case ${I_TARGET[$i]} in honcho|hermes|openclaw|deepseek-harness|opencode|open-terminal) ;; *) continue ;; esac
+        [[ -z ${I_RESULT[$i]} ]] && ct_running "${I_CT[$i]}" || continue
+        if [[ ${I_TARGET[$i]} == open-terminal ]]; then open_terminal_opens "${I_CT[$i]}" && return 0
+        else needs_webui_token "$i" && return 0; fi
     done
     return 1
 }
@@ -1534,7 +1604,8 @@ read_token() {
     local fd=$1 enter=$2 token tries=0
     note ''
     note 'Honcho, and agents with an Open WebUI connection, register with Open WebUI'
-    note 'again when they are reconfigured, which needs an admin token.'
+    note 'again when they are reconfigured, which needs an admin token. So does'
+    note "enabling Open Terminal's connection for all users (it is upgraded either way)."
     while (( tries < 3 )); do
         printf 'Open WebUI admin API key or session JWT (not shown; Enter: %s): ' "$enter" >&2
         IFS= read -rs -u "$fd" token || token=''

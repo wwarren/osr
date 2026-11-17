@@ -187,7 +187,11 @@ or HONCHO_BUN_BASELINE_SHA256 (CPUs without AVX2). If the router CT has a
 Proxmox firewall file, a rule admitting this CT to the router API is kept in
 it (HONCHO_ROUTER_FIREWALL=false leaves that file alone).
 
-This target registers the MCP server in Open WebUI. --reconfigure updates an
+This target registers the MCP server in Open WebUI, enabled for all of its
+users (each has a memory of their own). HONCHO_WEBUI_ACCESS=keep registers a
+new connection admin-only and leaves an existing one's access as it is set in
+Open WebUI; the choice is recorded in the CT, and a reconfigure (and
+tools/upgrade-all.sh) reuses it when it is not set. --reconfigure updates an
 existing Honcho CT and the registration without deleting its PostgreSQL data;
 every reconfigure dumps the database before migrations and restores it if the
 guest setup fails. A CT using another embedding model cannot switch to the
@@ -228,6 +232,7 @@ ROOTFS_GB=${ROOTFS_GB:-48}
 ONBOOT=${ONBOOT:-1}
 CT_HOSTNAME=${CT_HOSTNAME:-honcho-ai}
 OPENWEBUI_PORT=${OPENWEBUI_PORT:-8080}
+HONCHO_WEBUI_ACCESS=${HONCHO_WEBUI_ACCESS:-}
 # Settings the CT keeps between runs (its settings.env). Forwarded only when
 # set here, before the defaults below fill them in: a plain --reconfigure then
 # keeps the CT's release, model and output mode, and an empty value returns a
@@ -393,6 +398,7 @@ if [[ $mode == reconfigure && -z $IP_CIDR && $dry_run == 0 ]]; then
 fi
 [[ $CT_ID != "$ROUTER_CT_ID" ]] || die 'Honcho and router CT IDs must differ.'
 [[ $OPENWEBUI_PORT =~ ^[0-9]{2,5}$ ]] && (( OPENWEBUI_PORT <= 65535 )) || die 'Invalid OPENWEBUI_PORT.'
+[[ $HONCHO_WEBUI_ACCESS =~ ^(|all|keep)$ ]] || die 'HONCHO_WEBUI_ACCESS must be all or keep.'
 [[ $HONCHO_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid HONCHO_MODEL.'
 [[ -z $HONCHO_STRUCTURED_OUTPUT_MODE || $HONCHO_STRUCTURED_OUTPUT_MODE =~ ^(json_schema|json_object)$ ]] || die 'HONCHO_STRUCTURED_OUTPUT_MODE must be json_schema or json_object.'
 [[ $HONCHO_SKIP_CHAT_PROBE =~ ^(true|false)$ ]] || die 'HONCHO_SKIP_CHAT_PROBE must be true or false.'
@@ -589,6 +595,12 @@ else context_label="$HONCHO_CONTEXT_TOKENS tokens"; fi
 pve_row 'Context window' "$context_label"
 pve_row 'Embedding model' 'Qwen3-Embedding-0.6B (1024 dimensions), llama.cpp on the CT'"'"'s CPU'
 pve_row 'Agents allowed' "${HONCHO_CLIENT_IPS:-none}"
+case $HONCHO_WEBUI_ACCESS in
+  all) access_label='enabled for all users, each with a memory of their own' ;;
+  keep) access_label=$([[ $mode == create ]] && printf 'admin-only until you grant it in Open WebUI' || printf 'left as it is set in Open WebUI') ;;
+  *) access_label=$([[ $mode == create ]] && printf 'enabled for all users, each with a memory of their own' || printf 'the recorded choice (all users when none is recorded)') ;;
+esac
+pve_row 'Open WebUI access' "$access_label"
 [[ $rotate_keys == false ]] || pve_row 'Keys' "replace the JWT secret, the admin key and Open WebUI's key"
 pve_confirm "$( [[ $mode == create ]] && printf 'Create Honcho CT %s?' "$CT_ID" || printf 'Reconfigure Honcho CT %s?' "$CT_ID")"
 if (( dry_run )); then
@@ -599,6 +611,7 @@ if (( dry_run )); then
   printf 'Router IP: %s; chat model: %s; embedding: qwen3-embedding-0.6b (1024 dimensions) in the Honcho CT.\n' \
     "${ROUTER_IP:-detected from router route}" "$HONCHO_MODEL"
   printf 'Agent IPs allowed to Honcho: %s.\n' "${HONCHO_CLIENT_IPS:-none}"
+  printf 'Open WebUI access to the Honcho Memory tools: %s.\n' "$access_label"
   [[ $HONCHO_ROUTER_FIREWALL == false ]] ||
     printf 'Would admit %s to the router API in %s/firewall/%s.fw, if that file exists.\n' "$honcho_ip" "$PVE_ETC" "$ROUTER_CT_ID"
   [[ $rotate_keys == false ]] || printf "Would replace the JWT secret, the admin key and Open WebUI's gateway key.\n"
@@ -612,6 +625,14 @@ fi
 # Checked before anything is created: the run ends by registering MCP.
 for tool in pct pvesh pvesm curl; do command -v "$tool" >/dev/null || die "Missing $tool"; done
 if [[ $mode == reconfigure ]]; then honcho_reconfigure_preflight "$CT_ID"; fi
+# Who may use the connection: the choice recorded by the last run, unless one
+# is given now. A Honcho registered before that record existed was admin-only
+# by default and is enabled for all users.
+if [[ -z $HONCHO_WEBUI_ACCESS && $mode == reconfigure ]]; then
+  HONCHO_WEBUI_ACCESS=$(pct exec "$CT_ID" -- sed -n '1p' /etc/honcho-target/webui-access 2>/dev/null | tr -d '\r\n ' || true)
+  [[ $HONCHO_WEBUI_ACCESS == keep ]] || HONCHO_WEBUI_ACCESS=all
+fi
+HONCHO_WEBUI_ACCESS=${HONCHO_WEBUI_ACCESS:-all}
 if [[ -z ${OPENWEBUI_ADMIN_TOKEN:-} ]]; then
   [[ ${NONINTERACTIVE:-false} != true && -t 0 ]] ||
     die 'Set OPENWEBUI_ADMIN_TOKEN to register Honcho MCP in Open WebUI.'
@@ -748,9 +769,12 @@ pct exec "$ROUTER_CT_ID" -- curl -fsS --max-time 10 "http://${honcho_ip}:3000/he
 pct exec "$CT_ID" -- cat /etc/honcho-target/openwebui-key > "$stage/honcho-api-key"
 [[ -s $stage/honcho-api-key ]] || die 'Honcho did not generate a gateway key for Open WebUI.'
 pct push "$ROUTER_CT_ID" "$stage/honcho-api-key" "$router_stage/honcho-api-key" --perms 0600
-pct exec "$ROUTER_CT_ID" -- python3 "$router_stage/integrate-webui.py" \
+pct exec "$ROUTER_CT_ID" -- python3 "$router_stage/integrate-webui.py" "--access=$HONCHO_WEBUI_ACCESS" \
   "http://127.0.0.1:$OPENWEBUI_PORT" "$router_stage/admin-token" "$router_stage/honcho-api-key" \
   "http://${honcho_ip}:3000"
+# Recorded for later reconfigures (and tools/upgrade-all.sh).
+pct exec "$CT_ID" -- sh -c 'umask 022; printf "%s\n" "$1" > /etc/honcho-target/webui-access' sh "$HONCHO_WEBUI_ACCESS" ||
+  printf 'Could not record HONCHO_WEBUI_ACCESS=%s in CT %s; give it again on the next reconfigure.\n' "$HONCHO_WEBUI_ACCESS" "$CT_ID" >&2
 if [[ $rotate_keys == true ]]; then
   rotation_pending=false
   if ! pct exec "$CT_ID" -- rm -rf -- "$rotation_stage"; then
@@ -760,8 +784,15 @@ if [[ $rotate_keys == true ]]; then
   rotation_staged=false
 fi
 printf 'Honcho API: http://%s:8000; MCP: http://%s:3000/mcp\n' "$honcho_ip" "$honcho_ip"
-printf 'Every Open WebUI user granted the Honcho Memory tools gets a memory of their own\n'
-printf '(Admin Settings > External Tools grants access; pct exec %s -- /usr/local/sbin/honcho-clients workspaces lists them).\n' "$CT_ID"
+if [[ $HONCHO_WEBUI_ACCESS == keep ]]; then
+  printf 'Access to the Honcho Memory tools was left alone (HONCHO_WEBUI_ACCESS=keep): a new connection is admin-only.\n'
+  printf 'Every Open WebUI user granted them gets a memory of their own\n'
+  printf '(Admin Settings > External Tools grants access; pct exec %s -- /usr/local/sbin/honcho-clients workspaces lists them).\n' "$CT_ID"
+else
+  printf 'The Honcho Memory tools are enabled for all Open WebUI users, each with a memory of their own\n'
+  printf '(pct exec %s -- /usr/local/sbin/honcho-clients workspaces lists them). To limit them, change the access in\n' "$CT_ID"
+  printf 'Admin Settings > External Tools, then keep that choice: HONCHO_WEBUI_ACCESS=keep CT_ID=%s bash %s --reconfigure.\n' "$CT_ID" "$0"
+fi
 if [[ $rotate_keys == true ]]; then
   printf 'The JWT secret, the admin key and Open WebUI'"'"'s key changed; the agents keep their own keys.\n'
 fi

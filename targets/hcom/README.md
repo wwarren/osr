@@ -168,9 +168,9 @@ without the flag removes the plugin and moves state back to `osr-hcom`.
 
 The observer provisioner runs
 [`configure-agent-handoffs.sh`](../mattermost/configure-agent-handoffs.sh) in
-the Mattermost CT: local `mmctl` keeps or creates a dedicated channel
-(`HCOM_MATTERMOST_CHANNEL`, default `agent-handoffs`, in `MATTERMOST_TEAM`,
-default `ollama`) and its own incoming webhook in
+the Mattermost CT: local `mmctl` keeps or creates the `MATTERMOST_TEAM` team
+(default `osr`), a dedicated channel (`HCOM_MATTERMOST_CHANNEL`, default
+`agent-handoffs`), and its own incoming webhook in
 `/etc/mattermost-target/agent-handoffs-webhook-url`. The webhook is locked to
 that channel, so a payload, even one sent with a leaked URL, cannot post
 anywhere else; a rerun locks one made by an earlier release in place. It

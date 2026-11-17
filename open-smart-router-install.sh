@@ -3067,13 +3067,12 @@ if remote != local and meta.get("sha"):
 }
 
 # Move a repository's pre-rename service directories (LEGACY_SERVICE_DIRS)
-# through the contents API, before seeding. A file the installer owns is just
-# removed (seeding writes its new copy); any other file, such as the
-# operator's router.ini or monitor.ini, is first copied to the new path unless
-# a copy is already there. An old file is removed only once its content is
-# safe at the new path. Uses $api, $auth and $owner from seed_gitea_repo.
+# through the contents API. Before seeding, move operator-owned files such as
+# router.ini and monitor.ini so their tuned copies win. After seeding, remove
+# installer-owned old paths only when their new copies exist. Uses $api, $auth
+# and $owner from seed_gitea_repo.
 migrate_gitea_service_dirs() {
-  local pair old new resp http body path sha name new_rel payload failed=0
+  local phase="$1" pair old new resp http body path sha name new_rel payload failed=0
   local repo="${api}/repos/${owner}/${GITEA_REPO_NAME}/contents"
   for pair in "${LEGACY_SERVICE_DIRS[@]}"; do
     old="services/${pair%%:*}"; new="services/${pair#*:}"
@@ -3086,7 +3085,16 @@ migrate_gitea_service_dirs() {
       name="${path##*/}"
       [[ "$name" != "${pair%%:*}.service" ]] || name="${pair#*:}.service"
       new_rel="${new}/${name}"
-      if ! is_installer_owned "$new_rel"; then
+      if is_installer_owned "$new_rel"; then
+        [[ "$phase" == after ]] || continue
+        resp="$(gitea_api GET "${repo}/${new_rel}")"
+        http="${resp##*$'\n'}"
+        if [[ "$http" != "200" ]]; then
+          echo "  WARNING: ${new_rel} is not present (HTTP ${http}); ${path} left in place." >&2
+          failed=$((failed + 1)); continue
+        fi
+      else
+        [[ "$phase" == before ]] || continue
         resp="$(gitea_api GET "${repo}/${new_rel}")"
         http="${resp##*$'\n'}"
         if [[ "$http" == "404" ]]; then
@@ -3157,7 +3165,7 @@ seed_gitea_repo() {
 
   # First move what the repo still has under the pre-rename names, so the
   # operator's tuned files are found at the new paths and not seeded over.
-  migrate_gitea_service_dirs || failed=$((failed + 1))
+  migrate_gitea_service_dirs before || failed=$((failed + 1))
 
   # Walk the generated tree deterministically.
   while IFS= read -r rel; do
@@ -3203,6 +3211,8 @@ print(json.dumps({"message": "Seed %s from installer" % sys.argv[1],
       failed=$((failed + 1))
     fi
   done < <(cd "$tree" && find . -type f -printf '%P\n' | sort)
+
+  migrate_gitea_service_dirs after || failed=$((failed + 1))
 
   echo "Repo seeding complete: ${created} created, ${updated} updated, ${skipped} already present, ${failed} failed." >&2
   (( failed == 0 ))
@@ -9214,7 +9224,7 @@ health_url() {
   local port
   case "$1" in
     litellm-proxy) printf '%s\n' "$LITELLM_HEALTH_URL" ;;
-    osr-router) printf '%s/healthz\n' "$ROUTER_URL" ;;
+    osr-router|ollama-router) printf '%s/healthz\n' "$ROUTER_URL" ;;
     open-webui)
       port="$(kv_get "${REPO_DIR}/env/openwebui.env" PORT)"
       printf 'http://127.0.0.1:%s/health\n' "${port:-8080}" ;;
@@ -9266,10 +9276,9 @@ restart_and_check() {
   done
 }
 
-# Once apply-config.sh has installed osr-router and osr-monitor, take out the
-# pre-rename ollama-router and ollama-monitor units (same code, same port):
-# stop, disable and remove each, and move the old StateDirectory to the new
-# name. Prints the new units whose old unit was enabled, to enable in turn.
+# After the new units have passed their health checks, take out the stopped
+# pre-rename units and move their StateDirectory to the new name. Prints the
+# new units whose old unit was enabled, to enable in turn.
 # Never fails: a leftover old unit is reported, not fatal.
 migrate_legacy_units() {
   local pair old new was_enabled
@@ -9379,8 +9388,8 @@ openwebui_restore_db() {
 }
 
 cmd_apply() {
-  local svc snapshot failed webui_from=""
-  local -a affected=()
+  local svc pair old new snapshot failed webui_from=""
+  local -a affected=() legacy_pairs=() legacy_running=() renamed=() rollback=()
   if $DRY_RUN; then echo "  [dry-run] would apply config and restart services"; return 0; fi
   # Checked with -f, not -x: seeding through the Gitea contents API does not
   # preserve the executable bit, and we invoke it via `bash` anyway.
@@ -9400,6 +9409,17 @@ cmd_apply() {
   [[ ! -f "${ROUTER_DIR}/router.ini" ]] ||
     budget_before="$(ROUTER_INI="${ROUTER_DIR}/router.ini" kindi_timeout_seconds 2>/dev/null)" || budget_before=""
   budget_after="$(kindi_timeout_seconds 2>/dev/null)" || budget_after=""
+  # Remember which old services were running before the account migration
+  # stops them. Their units stay in place until the replacements are healthy.
+  for pair in "${LEGACY_UNITS[@]}"; do
+    old="${pair%%=*}"; new="${pair#*=}"
+    [[ -f "${UNIT_DIR}/${old}.service" &&
+       ( -f "${UNIT_DIR}/${new}.service" || -f "${REPO_DIR}/services/${new}/${new}.service" ) ]] || continue
+    legacy_pairs+=("$pair")
+    if systemctl is-active --quiet "${old}.service" 2>/dev/null; then
+      legacy_running+=("$old")
+    fi
+  done
   # Before apply-config.sh, which gives the env files the new account's group.
   if ! migrate_legacy_account; then
     note "Nothing was applied."
@@ -9454,56 +9474,71 @@ cmd_apply() {
     note "           systemctl restart ${SERVICES[*]}"
     return 0
   fi
-  local -a renamed=()
+  for pair in "${legacy_pairs[@]}"; do
+    old="${pair%%=*}"; new="${pair#*=}"
+    systemctl stop "${old}.service" >/dev/null 2>&1 ||
+      note "WARNING: could not stop ${old}.service before starting ${new}.service."
+    affected+=("$new")
+  done
+  mapfile -t affected < <(for svc in "${SERVICES[@]}"; do
+    printf '%s\n' "${affected[@]}" | grep -qx -- "$svc" && echo "$svc"; done)
+  if (( ${#affected[@]} )); then
+    echo "Restarting: ${affected[*]}"
+    if ! failed="$(restart_and_check "${affected[@]}")"; then
+      note "ERROR: ${failed} did not become healthy. Rolling back to the previous files..."
+      note "  (see: journalctl -u ${failed} -n 50)"
+      # Stop the replacements before bringing back the old units on the same
+      # ports. Leave the old unit files and their enabled state in place.
+      for pair in "${legacy_pairs[@]}"; do
+        systemctl stop "${pair#*=}.service" >/dev/null 2>&1 || true
+      done
+      restore_runtime "$snapshot"
+      # A renamed account is not renamed back: point the restored units at it.
+      if $ACCOUNT_RENAMED; then
+        sed -i -e "s/^User=${LEGACY_ACCOUNT}\$/User=${SERVICE_USER}/" -e "s/^Group=${LEGACY_ACCOUNT}\$/Group=${SERVICE_USER}/" \
+          "${UNIT_DIR}"/*.service 2>/dev/null || true
+      fi
+      if [[ -n "$webui_from" ]]; then
+        note "  Reinstalling open-webui ${webui_from} and restoring its database..."
+        systemctl stop open-webui.service 2>/dev/null || true
+        ( umask 022; "${OPENWEBUI_DIR}/venv/bin/pip" install --no-cache-dir "open-webui==${webui_from}" ) >/dev/null 2>&1 || \
+          note "  WARNING: reinstalling open-webui ${webui_from} failed."
+        openwebui_restore_db "$snapshot"
+      fi
+      for svc in "${affected[@]}"; do
+        for pair in "${legacy_pairs[@]}"; do
+          [[ "$svc" != "${pair#*=}" ]] || continue 2
+        done
+        rollback+=("$svc")
+      done
+      rollback+=("${legacy_running[@]}")
+      systemctl daemon-reload 2>/dev/null || true
+      if restart_and_check "${rollback[@]}" >/dev/null; then
+        note "Rolled back; the previous configuration is running again."
+      else
+        note "Rolled back the files, but a service is still unhealthy — check it by hand."
+      fi
+      note "  The LiteLLM venv is not rolled back. The repo still holds the new config;"
+      note "  fix it (or git revert) and run apply again."
+      return 1
+    fi
+  fi
+  # Only now is it safe to disable and remove the old units.
   mapfile -t renamed < <(migrate_legacy_units)
   if (( ${#renamed[@]} )); then
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable "${renamed[@]/%/.service}" >/dev/null 2>&1 ||
       note "WARNING: could not enable ${renamed[*]}; run systemctl enable ${renamed[*]} so they start at boot."
-    affected+=("${renamed[@]}")
-    mapfile -t affected < <(for svc in "${SERVICES[@]}"; do
-      printf '%s\n' "${affected[@]}" | grep -qx -- "$svc" && echo "$svc"; done)
   fi
-  if (( ${#affected[@]} == 0 )); then
-    echo "No service is affected by this change; nothing restarted."
-    secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
-    sync_metrics_key
-    kindi_budget_note "$budget_before" "$budget_after"
-    return 0
-  fi
-  echo "Restarting: ${affected[*]}"
-  if failed="$(restart_and_check "${affected[@]}")"; then
-    secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
-    sync_metrics_key
+  if (( ${#affected[@]} )); then
     echo "Applied; all restarted services are healthy."
-    kindi_budget_note "$budget_before" "$budget_after"
-    return 0
-  fi
-
-  note "ERROR: ${failed} did not become healthy. Rolling back to the previous files..."
-  note "  (see: journalctl -u ${failed} -n 50)"
-  restore_runtime "$snapshot"
-  # A renamed account is not renamed back: point the restored units at it.
-  if $ACCOUNT_RENAMED; then
-    sed -i -e "s/^User=${LEGACY_ACCOUNT}\$/User=${SERVICE_USER}/" -e "s/^Group=${LEGACY_ACCOUNT}\$/Group=${SERVICE_USER}/" \
-      "${UNIT_DIR}"/*.service 2>/dev/null || true
-  fi
-  if [[ -n "$webui_from" ]]; then
-    note "  Reinstalling open-webui ${webui_from} and restoring its database..."
-    systemctl stop open-webui.service 2>/dev/null || true
-    ( umask 022; "${OPENWEBUI_DIR}/venv/bin/pip" install --no-cache-dir "open-webui==${webui_from}" ) >/dev/null 2>&1 || \
-      note "  WARNING: reinstalling open-webui ${webui_from} failed."
-    openwebui_restore_db "$snapshot"
-  fi
-  systemctl daemon-reload 2>/dev/null || true
-  if restart_and_check "${affected[@]}" >/dev/null; then
-    note "Rolled back; the previous configuration is running again."
   else
-    note "Rolled back the files, but a service is still unhealthy — check it by hand."
+    echo "No service is affected by this change; nothing restarted."
   fi
-  note "  The LiteLLM venv is not rolled back. The repo still holds the new config;"
-  note "  fix it (or git revert) and run apply again."
-  return 1
+  secrets_fingerprint > "${ROUTER_DIR}/.secrets.applied"
+  sync_metrics_key
+  kindi_budget_note "$budget_before" "$budget_after"
+  return 0
 }
 
 # Push using the Gitea deploy token from the secrets file.

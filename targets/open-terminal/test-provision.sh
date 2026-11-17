@@ -166,6 +166,9 @@ has '/etc/open-terminal/api-key --perms 0600'
 has 'OPEN_TERMINAL_VERSION=v0.14.0 OPEN_TERMINAL_COMMIT= bash /root/open-terminal-deploy/install-target.sh'
 has 'integrate-webui.py --webui-url http://127.0.0.1:\<router-webui-port\> --terminal-url http://192.0.2.81:8000'
 has '--id open-terminal-lxc-281'
+# Enabled for every Open WebUI user by default, and the choice is recorded.
+has '\<router-stage\>/api-key --access all'
+has '/etc/open-terminal/webui-access sh all'
 has '+ verify Open WebUI install, open-webui.service, /health and /api/version on router CT 280:<router-webui-port> before pct create'
 [[ $output == *'before pct create'*'+ pct create 281'* ]] || { printf 'FAIL WebUI verification does not precede CT creation\n' >&2; exit 1; }
 lacks 'Setup stopped'
@@ -216,7 +219,18 @@ output=$(env -i "PATH=$PATH" CT_ID=281 ROUTER_CT_ID=280 bash "$provision" --dry-
 has '+ pct pull 281 /etc/open-terminal/api-key'
 lacks '+ pct create'
 has '--terminal-url http://\<terminal-eth0-ip\>:8000'
+# A later integration reuses the recorded choice (a dry run cannot read it).
+has "--access \<recorded\,\ or\ all\>"
 passed=$((passed + 1))
+
+output=$(env -i "PATH=$PATH" CT_ID=281 ROUTER_CT_ID=280 OPEN_TERMINAL_WEBUI_ACCESS=all bash "$provision" --dry-run --integrate-only 2>&1) ||
+    { printf 'FAIL integrate-only for all users\n%s\n' "$output" >&2; exit 1; }
+has '\<router-stage\>/api-key --access all'
+passed=$((passed + 1))
+
+plan OPEN_TERMINAL_WEBUI_ACCESS=keep
+has '\<router-stage\>/api-key --access keep'
+has '/etc/open-terminal/webui-access sh keep'
 
 reject 'CT_ID' CT_ID=99
 reject 'Set CT_ID for unattended provisioning' CT_ID=
@@ -239,6 +253,7 @@ reject 'Set GATEWAY for unattended provisioning' GATEWAY=
 reject 'IP_CIDR' IP_CIDR=dhcp
 reject 'GATEWAY' GATEWAY=
 reject 'OPEN_TERMINAL_PORT' OPEN_TERMINAL_PORT=70000
+reject 'OPEN_TERMINAL_WEBUI_ACCESS must be all or keep' OPEN_TERMINAL_WEBUI_ACCESS=admin
 reject 'Set OPEN_TERMINAL_COMMIT' OPEN_TERMINAL_VERSION=v0.15.0
 reject 'OPEN_TERMINAL_COMMIT must be' OPEN_TERMINAL_COMMIT=abc
 reject 'CONNECTION_NAME' CONNECTION_NAME="$(printf 'x%.0s' {1..65})"

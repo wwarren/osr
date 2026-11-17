@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Verify the new mmctl JSON parser and channel separation without a server.
+# Verify the mmctl JSON parser, team migration and channel separation without a server.
 set -Eeuo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-eval "$(python3 "$here/../../tests/lib/extract-functions.py" "$here/configure-agent-handoffs.sh" --only find_field)"
+eval "$(python3 "$here/../../tests/lib/extract-functions.py" "$here/configure-agent-handoffs.sh" --only find_field,ensure_team)"
 [[ $(printf '%s' '[{"id":"one","name":"agent-handoffs"},{"id":"two","name":"health"}]' |
   find_field name agent-handoffs id) == one ]] || exit 1
 [[ $(printf '%s\n' '{"id":"one","channel_id":"target"}' '{"id":"two","channel_id":"other"}' |
@@ -14,12 +14,29 @@ output=$(bash "$here/configure-agent-handoffs.sh" --dry-run)
 if HCOM_MATTERMOST_CHANNEL=osr-monitor bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
 if MATTERMOST_CHANNEL=health HCOM_MATTERMOST_CHANNEL=health bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
 if HCOM_MATTERMOST_CHANNEL='unsafe channel' bash "$here/configure-agent-handoffs.sh" --dry-run 2>/dev/null; then exit 1; fi
+team=osr admin=admin has_osr=0 team_creates=0
+mm() {
+  case "$*" in
+    '--json team list')
+      if (( has_osr )); then
+        printf '%s\n' '[{"id":"old","name":"ollama"},{"id":"new","name":"osr"}]'
+      else
+        printf '%s\n' '[{"id":"old","name":"ollama"}]'
+      fi ;;
+    'team create --name osr --display-name Open Smart Router') has_osr=1; (( team_creates += 1 )) ;;
+    'team users add osr admin') : ;;
+    *) echo "FAIL: unexpected mmctl call: $*" >&2; return 1 ;;
+  esac
+}
+ensure_team
+ensure_team
+[[ $has_osr == 1 && $team_creates == 1 ]] || { echo 'FAIL: osr team was not created exactly once'; exit 1; }
 # Whole runs against a fake mmctl that, like the real one, prints help text for
 # a webhook subcommand it does not have. They need root (EUID check, runuser);
 # unshare -r runs them as an ordinary user.
 if (( EUID != 0 )); then
   echo 'SKIP handoff end-to-end cases (need root; try unshare -r)'
-  echo 'PASS Mattermost handoffs: JSON object/array/NDJSON parsing, separate channel and dry run without secrets'
+  echo 'PASS Mattermost handoffs: JSON parsing, missing team created once, separate channel and dry run without secrets'
   exit 0
 fi
 tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
@@ -36,8 +53,11 @@ cmd = " ".join(args[:2])
 def opt(name): return args[args.index(name) + 1]
 def new_id(): return "%026d" % (len(st["hooks"]) + len(st["channels"]) + 1)
 if cmd == "user list": print(json.dumps(st["users"]))
-elif cmd == "channel list": print(json.dumps(st["channels"]))
-elif cmd == "channel create": st["channels"].append({"id": "c" + new_id()[1:], "name": opt("--name")})
+elif cmd == "team list": print(json.dumps(st["teams"]))
+elif cmd == "team create": st["teams"].append({"id": "t" + new_id()[1:], "name": opt("--name")})
+elif cmd == "team users": pass
+elif cmd == "channel list": print(json.dumps([c for c in st["channels"] if c["team"] == args[2]]))
+elif cmd == "channel create": st["channels"].append({"id": "c" + new_id()[1:], "name": opt("--name"), "team": opt("--team")})
 elif cmd == "channel users": pass
 elif cmd == "webhook show":
     hook = next((h for h in st["hooks"] if h["id"] == args[2]), None)
@@ -56,19 +76,24 @@ PY
 chmod +x "$bin/mmctl" "$bin/runuser"
 health=h0000000000000000000000001
 printf '{"users":[{"id":"u0000000000000000000000001","username":"admin"}],
- "channels":[{"id":"c0000000000000000000000001","name":"osr-monitor"}],
+ "teams":[{"id":"t0000000000000000000000001","name":"ollama"}],
+ "channels":[{"id":"c0000000000000000000000001","name":"ollama-monitor","team":"ollama"}],
  "hooks":[{"id":"%s","channel_id":"c0000000000000000000000001","channel_locked":false}]}' "$health" > "$tmp/mm.json"
 printf 'http://192.0.2.77:8065/hooks/%s\n' "$health" > "$etc/webhook-url"
 run() { env PATH="$bin:$PATH" FAKE_MM="$tmp/mm.json" MM_TARGET_ETC="$etc" MMCTL="$bin/mmctl" bash "$here/configure-agent-handoffs.sh" 2>&1; }
 state() { python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$tmp/mm.json" "$1"; }
 out=$(run) || { echo "FAIL: fresh handoff setup: $out"; exit 1; }
+[[ $(state 'sorted(t["name"] for t in s["teams"])') == "['ollama', 'osr']" &&
+   $(state '[(c["team"], c["name"]) for c in s["channels"] if c["name"] == "agent-handoffs"]') == "[('osr', 'agent-handoffs')]" ]] ||
+  { echo 'FAIL: an existing Mattermost CT did not gain the osr team and its handoff channel'; exit 1; }
 saved=$(<"$etc/agent-handoffs-webhook-url"); hook=${saved##*/}
 [[ $(state "[h for h in s['hooks'] if h['id']=='$hook'][0]['channel_locked']") == True && $out != *"$hook"* ]] ||
   { echo 'FAIL: a new handoff webhook must be locked to its channel and its URL never printed'; exit 1; }
 [[ $(state "[h for h in s['hooks'] if h['id']=='$hook'][0]['channel_id'] != 'c0000000000000000000000001'") == True ]] ||
   { echo 'FAIL: handoffs went to the health channel'; exit 1; }
 out=$(run) || { echo "FAIL: rerun: $out"; exit 1; }
-[[ $(<"$etc/agent-handoffs-webhook-url") == "$saved" && $(state 'len(s["hooks"])') == 2 ]] || { echo 'FAIL: a rerun replaced the handoff webhook'; exit 1; }
+[[ $(<"$etc/agent-handoffs-webhook-url") == "$saved" && $(state 'len(s["hooks"])') == 2 &&
+   $(state 'len(s["teams"])') == 2 ]] || { echo 'FAIL: a rerun replaced the handoff webhook or team'; exit 1; }
 # A webhook from an earlier release, unlocked, is locked in place.
 python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["hooks"][1]["channel_locked"]=False; json.dump(s,open(p,"w"))' "$tmp/mm.json"
 run >/dev/null || { echo 'FAIL: rerun with an unlocked webhook'; exit 1; }
@@ -81,4 +106,4 @@ out=$(run) || { echo "FAIL: setup with a deleted health webhook: $out"; exit 1; 
 # A health webhook (custom channel name) bound to the handoff channel is refused.
 python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["hooks"].append({"id":sys.argv[2],"channel_id":s["hooks"][0]["channel_id"],"channel_locked":False}); json.dump(s,open(p,"w"))' "$tmp/mm.json" "$health"
 if run >/dev/null; then echo 'FAIL: handoffs accepted in the health channel'; exit 1; fi
-echo 'PASS Mattermost handoffs: JSON parsing, separate channel, dry run without secrets, whole runs (locked webhook, kept on rerun, old webhook locked, deleted health webhook)'
+echo 'PASS Mattermost handoffs: JSON parsing, separate channel, dry run without secrets, whole runs (missing team created, locked webhook, kept on rerun, old webhook locked, deleted health webhook)'

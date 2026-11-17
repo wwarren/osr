@@ -38,6 +38,16 @@ assert_fail "json_object or json_schema only" env "${common[@]}" HONCHO_STRUCTUR
 assert_fail "another Bun needs a checksum" env "${common[@]}" HONCHO_BUN_VERSION=1.5.0 bash "$provision" --dry-run
 assert_ok "and runs with the baseline one alone" env "${common[@]}" HONCHO_BUN_VERSION=1.5.0 HONCHO_BUN_BASELINE_SHA256="$(printf 'a%.0s' {1..64})" bash "$provision" --dry-run
 assert_fail "a checksum is 64 hex digits" env "${common[@]}" HONCHO_BUN_SHA256=abc bash "$provision" --dry-run
+assert_contains "Open WebUI's connection is enabled for all users by default" "Open WebUI access to the Honcho Memory tools: enabled for all users" "$(env "${common[@]}" bash "$provision" --dry-run)"
+assert_contains "a reconfigure reuses the recorded choice" "Honcho Memory tools: the recorded choice (all users when none is recorded)" "$(env "${common[@]}" bash "$provision" --dry-run --reconfigure)"
+assert_contains "keep registers a new connection admin-only" "Honcho Memory tools: admin-only until you grant it" "$(env "${common[@]}" HONCHO_WEBUI_ACCESS=keep bash "$provision" --dry-run)"
+assert_contains "and leaves an existing one alone" "Honcho Memory tools: left as it is set in Open WebUI" "$(env "${common[@]}" HONCHO_WEBUI_ACCESS=keep bash "$provision" --dry-run --reconfigure)"
+assert_fail "all or keep only" env "${common[@]}" HONCHO_WEBUI_ACCESS=admin bash "$provision" --dry-run
+assert_ok "the registration gets the choice" grep -q 'integrate-webui.py" "--access=\$HONCHO_WEBUI_ACCESS"' "$provision"
+assert_ok "which is read back from the CT on a reconfigure" grep -q "sed -n '1p' /etc/honcho-target/webui-access" "$provision"
+record_line=$(grep -n '> /etc/honcho-target/webui-access' "$provision" | head -n1 | cut -d: -f1)
+register_line=$(grep -n '"--access=\$HONCHO_WEBUI_ACCESS"' "$provision" | head -n1 | cut -d: -f1)
+assert_ok "and recorded only after Open WebUI accepted it" test "${register_line:-999}" -lt "${record_line:-0}"
 
 describe honcho_reconfigure_preflight
 # shellcheck disable=SC1090

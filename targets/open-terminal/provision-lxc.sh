@@ -15,8 +15,9 @@ Usage: bash provision-lxc.sh [--dry-run] [--integrate-only]
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Open Terminal from
 the open-webui/open-terminal v0.14.0 GitHub tag behind a workspace gateway
 (every Open WebUI user, and every agent CT connected later, gets an isolated
-workspace), and registers an admin-only system terminal in an existing
-open-smart-router Open WebUI. It asks for an
+workspace), and registers a system terminal in an existing open-smart-router
+Open WebUI, enabled for all of its users (OPEN_TERMINAL_WEBUI_ACCESS=keep
+registers it admin-only instead). It asks for an
 Open WebUI admin API key or session JWT unless OPENWEBUI_ADMIN_TOKEN is set.
 
 The router (the LXC or VM running that Open WebUI) is given as ROUTER:
@@ -43,13 +44,19 @@ Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=4096,
           required for a non-default version>, CONNECTION_NAME='Open Terminal LXC',
           OPEN_TERMINAL_IDLE_MINUTES=120, OPEN_TERMINAL_MAX_ACTIVE=8,
           OPEN_TERMINAL_WS_MEMORY=1G, OPEN_TERMINAL_WS_TASKS=512,
-          OPEN_TERMINAL_WS_CPU=100% (see README.md, "Workspaces").
+          OPEN_TERMINAL_WS_CPU=100% (see README.md, "Workspaces"),
+          OPEN_TERMINAL_WEBUI_ACCESS=all|keep (all, the default: the connection
+          is enabled for every Open WebUI user; keep: a new connection is
+          admin-only and an existing one keeps the access set in Open WebUI.
+          The choice is recorded in the terminal CT, and --integrate-only and
+          tools/upgrade-all.sh reuse it when it is not set).
 
 --dry-run prints the command plan without touching Proxmox, logging in to the
 router, or asking for a token.
 --integrate-only registers an already installed terminal CT (CT_ID on this
 host). Its API key (Open WebUI's client key) is read from that CT; no new CT is
-created. Agent CTs connect themselves: OPEN_TERMINAL_URL with their own
+created. Run again later, it also enables the connection for all users unless
+keep was recorded or is given. Agent CTs connect themselves: OPEN_TERMINAL_URL with their own
 provisioner (targets/hermes, openclaw, deepseek-harness).
 USAGE
 }
@@ -282,6 +289,7 @@ OPEN_TERMINAL_PORT=${OPEN_TERMINAL_PORT:-}
 OPEN_TERMINAL_VERSION=${OPEN_TERMINAL_VERSION:-v0.14.0}
 OPEN_TERMINAL_COMMIT=${OPEN_TERMINAL_COMMIT:-}
 CONNECTION_NAME=${CONNECTION_NAME:-Open Terminal LXC}
+OPEN_TERMINAL_WEBUI_ACCESS=${OPEN_TERMINAL_WEBUI_ACCESS:-}
 # Taken out of the environment at once so no child process (pct, ssh) inherits it.
 saved_admin_token=${OPENWEBUI_ADMIN_TOKEN:-}
 unset OPENWEBUI_ADMIN_TOKEN
@@ -368,6 +376,7 @@ for name in CORES MEMORY_MB ROOTFS_GB OPEN_TERMINAL_PORT; do positive "$name" "$
   die 'OPEN_TERMINAL_COMMIT must be a full 40-digit lowercase SHA-1.'
 [[ $OPEN_TERMINAL_VERSION == v0.14.0 || -n $OPEN_TERMINAL_COMMIT ]] ||
   die "Set OPEN_TERMINAL_COMMIT to the reviewed commit of ${OPEN_TERMINAL_VERSION} (tags can be moved upstream)."
+[[ $OPEN_TERMINAL_WEBUI_ACCESS =~ ^(|all|keep)$ ]] || die 'OPEN_TERMINAL_WEBUI_ACCESS must be all or keep.'
 [[ -z $ROUTER_IP ]] || ipv4 "$ROUTER_IP" || die 'ROUTER_IP must be IPv4.'
 [[ -z $NAMESERVER ]] || ipv4 "$NAMESERVER" || die 'NAMESERVER must be IPv4.'
 if [[ -n $OPENWEBUI_PORT ]]; then
@@ -501,6 +510,17 @@ if (( integrate_only )); then
     TERMINAL_IP=$(pct exec "$CT_ID" -- sh -c "ip -4 -o addr show dev eth0 | awk 'NR==1 {split(\$4,a,\"/\"); print a[1]}'")
     ipv4 "$TERMINAL_IP" || die 'Cannot detect terminal CT IPv4 on eth0.'
   fi
+  # Who may use the connection: the choice recorded by the last run, unless
+  # one is given now. A terminal registered before that record existed was
+  # admin-only by default and is enabled for all users.
+  if [[ -z $OPEN_TERMINAL_WEBUI_ACCESS ]]; then
+    if (( dry_run )); then
+      OPEN_TERMINAL_WEBUI_ACCESS='<recorded, or all>'
+    else
+      OPEN_TERMINAL_WEBUI_ACCESS=$(pct exec "$CT_ID" -- sed -n '1p' /etc/open-terminal/webui-access 2>/dev/null | tr -d '\r\n ' || true)
+      [[ $OPEN_TERMINAL_WEBUI_ACCESS == keep ]] || OPEN_TERMINAL_WEBUI_ACCESS=all
+    fi
+  fi
 else
   if (( ! dry_run )); then
     pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null || die "CT ID ${CT_ID} is already used."
@@ -512,6 +532,12 @@ else
   fi
   TERMINAL_IP=${IP_CIDR%%/*}
 fi
+OPEN_TERMINAL_WEBUI_ACCESS=${OPEN_TERMINAL_WEBUI_ACCESS:-all}
+case $OPEN_TERMINAL_WEBUI_ACCESS in
+  all) access_label='enabled for all users, each in a workspace of their own' ;;
+  keep) access_label=$( (( integrate_only )) && printf 'left as it is set in Open WebUI' || printf 'admin-only until you grant it in Open WebUI') ;;
+  *) access_label='the recorded choice (all users when none is recorded)' ;;
+esac
 
 # The firewall admits the address the router actually uses to reach the
 # terminal: correct for a CT, a VM, or a router on another node or subnet.
@@ -529,12 +555,14 @@ pve_summary "Open Terminal: $( (( integrate_only )) && printf 'integrate' || pri
 pve_row 'Router (Open WebUI)' "$router_label, reaches the terminal from $ROUTER_IP"
 if (( integrate_only )); then
   pve_row 'Terminal CT' "$CT_ID at $TERMINAL_IP"
+  pve_row 'Open WebUI access' "$access_label"
   pve_confirm "Register Open Terminal CT $CT_ID in Open WebUI?"
 else
   pve_row 'Terminal CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
   pve_row 'Template' "$TEMPLATE"
   pve_row 'Network' "$IP_CIDR via $GATEWAY on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
   pve_row 'Terminal' "Open Terminal $OPEN_TERMINAL_VERSION on port $OPEN_TERMINAL_PORT"
+  pve_row 'Open WebUI access' "$access_label"
   pve_confirm "Create Open Terminal CT $CT_ID?"
 fi
 
@@ -640,10 +668,17 @@ router_run python3 "$router_stage/integrate-webui.py" \
   --webui-url "http://127.0.0.1:${OPENWEBUI_PORT}" \
   --terminal-url "http://${TERMINAL_IP}:${OPEN_TERMINAL_PORT}" \
   --id "open-terminal-lxc-${CT_ID}" --name "$CONNECTION_NAME" \
-  --admin-token-file "$router_stage/admin-token" --terminal-key-file "$router_stage/api-key"
+  --admin-token-file "$router_stage/admin-token" --terminal-key-file "$router_stage/api-key" \
+  --access "$OPEN_TERMINAL_WEBUI_ACCESS"
+# Recorded for later runs (--integrate-only, tools/upgrade-all.sh).
+run pct exec "$CT_ID" -- sh -c 'umask 022; printf "%s\n" "$1" > /etc/open-terminal/webui-access' sh "$OPEN_TERMINAL_WEBUI_ACCESS"
 (( dry_run )) && router_stage=''
 
 printf 'Open Terminal: http://%s:%s (reachable from %s at %s).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT" "$router_label" "$ROUTER_IP"
 printf 'Select "%s" in Open WebUI chats. Each user gets a workspace of their own in CT %s (/srv/open-terminal/ws/<id>; list them with: pct exec %s -- /usr/local/sbin/open-terminal-clients workspaces).\n' "$CONNECTION_NAME" "$CT_ID" "$CT_ID"
-printf 'Connection is admin-only. Grant groups in Admin Settings > Integrations > Open Terminal; each member works in their own workspace.\n'
+if [[ $OPEN_TERMINAL_WEBUI_ACCESS == keep ]]; then
+  printf 'Access to the connection was left alone (OPEN_TERMINAL_WEBUI_ACCESS=keep): a new connection is admin-only. Grant users or groups in Admin Settings > Integrations > Open Terminal; each works in their own workspace.\n'
+else
+  printf 'The connection is enabled for all Open WebUI users, each in their own workspace. Limit it in Admin Settings > Integrations > Open Terminal, then keep that choice with OPEN_TERMINAL_WEBUI_ACCESS=keep bash %s --integrate-only.\n' "$0"
+fi
 printf 'Agents: rerun their provisioner with OPEN_TERMINAL_URL=http://%s:%s (Hermes, OpenClaw, DeepSeek Harness).\n' "$TERMINAL_IP" "$OPEN_TERMINAL_PORT"

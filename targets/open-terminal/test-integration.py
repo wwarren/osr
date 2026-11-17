@@ -16,6 +16,7 @@ SCRIPT = pathlib.Path(__file__).with_name("integrate-webui.py")
 SPEC = importlib.util.spec_from_file_location("integrate_webui", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+ALL_USERS = {"principal_type": "user", "principal_id": "*", "permission": "read"}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -100,11 +101,11 @@ class IntegrationTests(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def invoke(self):
+    def invoke(self, *extra):
         argv = ["integrate-webui.py", "--webui-url", f"http://127.0.0.1:{self.server.server_port}",
                 "--terminal-url", f"http://127.0.0.1:{self.server.server_port}",
                 "--id", "open-terminal-lxc-281",
-                "--admin-token-file", str(self.admin), "--terminal-key-file", str(self.key)]
+                "--admin-token-file", str(self.admin), "--terminal-key-file", str(self.key), *extra]
         with patch("sys.argv", argv):
             MODULE.main()
 
@@ -114,11 +115,61 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(Handler.connections[0]["id"], "other")
         ours = Handler.connections[1]
         self.assertEqual(ours["key"], "terminal-secret")
-        self.assertEqual(ours["config"], {"access_grants": []})
-        ours["config"]["access_grants"] = [{"principal_type": "group", "principal_id": "trusted", "permission": "read"}]
+        # Enabled for every Open WebUI user by default.
+        self.assertEqual(ours["config"], {"access_grants": [ALL_USERS]})
+        self.assertIs(ours["enabled"], True)
+        self.invoke()
+        self.assertEqual(Handler.connections[1]["config"], {"access_grants": [ALL_USERS]}, "no second grant")
+        trusted = {"principal_type": "group", "principal_id": "trusted", "permission": "read"}
+        Handler.connections[1]["config"] = {"access_grants": [trusted], "chat_uploads": True}
+        Handler.connections[1]["enabled"] = False
         self.invoke()
         self.assertEqual(len(Handler.connections), 2)
-        self.assertEqual(Handler.connections[1]["config"]["access_grants"][0]["principal_id"], "trusted")
+        self.assertEqual(Handler.connections[1]["config"],
+                         {"access_grants": [trusted, ALL_USERS], "chat_uploads": True})
+        self.assertIs(Handler.connections[1]["enabled"], True)
+
+    def test_access_keep_leaves_access_alone(self):
+        self.invoke("--access", "keep")
+        ours = Handler.connections[1]
+        self.assertEqual(ours["config"], {"access_grants": []}, "a new connection is admin-only")
+        trusted = {"principal_type": "group", "principal_id": "trusted", "permission": "read"}
+        ours["config"]["access_grants"] = [trusted]
+        ours["enabled"] = False
+        self.key.write_text("terminal-secret")
+        self.invoke("--access", "keep")
+        self.assertEqual(Handler.connections[1]["config"], {"access_grants": [trusted]})
+        self.assertIs(Handler.connections[1]["enabled"], False)
+
+    def test_an_upgrade_opens_an_admin_only_connection(self):
+        self.invoke("--access", "keep")
+        self.invoke("--access", "all")
+        self.assertEqual(Handler.connections[1]["config"], {"access_grants": [ALL_USERS]})
+
+    def access_only(self, *extra):
+        argv = ["integrate-webui.py", "--access-only",
+                "--webui-url", f"http://127.0.0.1:{self.server.server_port}",
+                "--id", "open-terminal-lxc-281", "--admin-token-file", str(self.admin), *extra]
+        with patch("sys.argv", argv):
+            MODULE.main()
+
+    def test_access_only_opens_a_registered_connection_without_its_key(self):
+        self.invoke("--access", "keep")
+        self.key.unlink()
+        before = dict(Handler.connections[1])
+        self.access_only("--access", "keep")
+        self.assertEqual(Handler.connections[1], before)
+        self.access_only()
+        self.assertEqual(Handler.connections[1], {**before, "config": {"access_grants": [ALL_USERS]}})
+        self.assertEqual(Handler.connections[0]["id"], "other")
+        posts = Handler.posts
+        self.access_only()
+        self.assertEqual(Handler.posts, posts, "nothing to save the second time")
+
+    def test_access_only_leaves_an_open_webui_without_the_connection_alone(self):
+        self.access_only()
+        self.assertEqual([item["id"] for item in Handler.connections], ["other"])
+        self.assertEqual(Handler.posts, 0)
 
     def test_failed_verify_does_not_write(self):
         Handler.verify_ok = False
