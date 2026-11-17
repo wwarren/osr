@@ -311,7 +311,7 @@ true`); a tool request whose candidates all lack tools gets `no-tool-model`
 | **Unknown size** | `unknown_params` (0.3): usable, never preferred |
 | **Embeddings** | Structurally excluded; naming one is a 400 |
 | **Tools** | On a tool request, models known to lack tools are excluded (unless nothing else is left); `+tool_match` for reported support over unknown. Support comes from Ollama's `/api/show` capabilities (also the llama.cpp bridge's `MODEL_CAPABILITIES` and AirLLM), LM Studio's `trained_for_tool_use`, and `tool_kinds` in `router.ini` for the `/v1/models` kinds (all six Strata-style kinds by default; their text models count as capable, image generators not). Shown as `tools` in `/routing/inventory` |
-| **Context length** | Recorded in `/routing/inventory`, not scored: Ollama the smaller of model limit and configured `num_ctx`; the llama.cpp bridge its per-slot context; AirLLM its window; the `/v1/models` kinds `context_length`, `max_model_len`, `context_window` or `meta.n_ctx`. Ollama's `/api/show` answer is cached per model digest for `show_cache_seconds` (3600; 60 s for a server that lists no digest, such as the llama.cpp bridge, whose settings can change unseen), keeping the last good answer. It can overstate served context; the agent and Honcho dispatchers use it (§17.1) |
+| **Context length** | Recorded in `/routing/inventory`, not scored: Ollama the smaller of model limit and configured `num_ctx`; the llama.cpp bridge its per-slot context; AirLLM its window; the `/v1/models` kinds `context_length`, `max_model_len`, `context_window` or `meta.n_ctx`. Ollama's `/api/show` answer is cached per model digest for `show_cache_seconds` (3600; 60 s for a server that lists no digest, such as the llama.cpp bridge, whose settings can change unseen), keeping the last good answer. It can overstate served context; the agent and Honcho dispatchers use it (§17.1). Beside it, `served_context_length` is set only when the value is what the server serves now (LM Studio's loaded instance, a `num_ctx`, the bridge's slot, AirLLM's window, the `/v1/models` kinds), never a model's own limit; `/v1/models` advertises it as `context_length` for a name every server of which reports one |
 | **Load** | `−busy_penalty` (0.03) for each request this router has in flight on the server (counted from sending it until its body is relayed, it fails or the client leaves; what agents or other clients send a server directly is not seen). An equally good idle server therefore wins, and a busy server that leads only by `loaded_bonus` gives way once the lead is within `tie_epsilon` (from its second request with the defaults). `busy_penalty = 0` turns it off |
 | **Tie order** | Candidates within `tie_epsilon` are tried least busy first, then the one the conversation used last (affinity), otherwise in rotation. For a tool request only the same model on several hosts takes part, so an agent loop keeps one model: the one its task has been using, while that is among the tied |
 | **Affinity** | A conversation prefers the server and model that answered it last, for `sticky_seconds` (1800) after that answer, so its prompt cache is reused and its model does not change between equal choices. It only orders tied candidates: a better score or a less busy server still wins, and the conversation then stays with that one. Conversations are told apart by a hash of how they began (through the first assistant reply once there is one, so two that open alike differ from their second turn); at most 4096 are remembered. A named model's hosts are ordered the same way. `sticky_seconds = 0` turns it off |
@@ -893,7 +893,13 @@ pool host (routing `auto` through Hermes would loop back into `auto`). Its API
 server on 8642 calls a local dispatcher on 8765, which uses router inventory
 and ranking as metadata and sends inference directly to a tool-capable server
 with at least the configured context (AirLLM excluded; a named model lacking
-either is refused). Backend and router keys are pushed as private files;
+either is refused). The dispatcher's `/v1/models` gives each model the context
+its servers serve (`served_context_length`; a server that reports none counts
+as 65536, or the model's limit if smaller, or as the pinned number). With
+`HERMES_CONTEXT_LENGTH=auto` Hermes pins no window and takes it from there, so
+it follows, for example, an LM Studio model loaded with 262144 tokens. The
+other agents (OpenClaw, OpenCode, Honcho, DeepSeek Harness) take the same `auto`
+setting, applied each time they are configured. Backend and router keys are pushed as private files;
 `--reconfigure` refreshes them. By default inbound API access is limited to the
 router and egress to the router, registered model hosts, DNS and public
 HTTP(S).
@@ -969,8 +975,10 @@ the agents and passes its URL and CT to them; an agent's later `--reconfigure`
 keeps it (`HONCHO_URL=` turns it off). Inbound is limited to the router and the
 selected agents (an agent's MCP rule carries its own tag), and one tagged rule
 in the router CT's firewall lets Honcho reach the router. `HONCHO_CONTEXT_TOKENS`
-(asked by the installer; 65536 on a first install that omits it) sizes Honcho's
-token budgets via `budgets.py`; `HONCHO_<SETTING>` overrides one. Budgets,
+(asked by the installer; `auto` on a first install that omits it) sizes Honcho's
+token budgets via `budgets.py`: under `auto`, for the window the proxy's
+selected model is served with, read on every run; `HONCHO_<SETTING>` overrides
+one. Budgets,
 release, chat model, output mode and Bun pins persist in the CT
 (`budgets.env`, `settings.env`), so reconfigures never fall back to defaults. A
 rerun sets aside env, keys, units, Bun and `llama-server`, stops Honcho and
@@ -1142,8 +1150,12 @@ dashboard account through FreeLLMAPI's own declarative config file, reads the
 unified key as the image's `node` account and hands it to the router CT on
 stdin. A new release replaces the CT (same ID, MAC, address, firewall file and
 resources; data restored inside the CT) after a `vzdump` backup, and restores
-that backup when `/api/ping` or the unchanged key fails; `tools/upgrade-all.sh`
-takes no snapshot of it for that reason and checks it by `/api/ping`.
+that backup when `/api/ping` or the unchanged key fails. A settings change
+(port, access range, router) restarts the same image and carries the change to
+the firewall rules and the router registration, restoring env file, settings
+record, firewall and startup command on failure. `tools/upgrade-all.sh`
+snapshots it only for a run that keeps its release (`FREELLMAPI_VERSION=keep`,
+so a CT following the pin is not replaced) and checks it by `/api/ping`.
 
 ## 18. Verification and CI
 

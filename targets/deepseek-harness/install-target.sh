@@ -15,7 +15,9 @@ Keys: router-api-key (empty for a keyless OSR), with Honcho honcho-api-key,
   with Open Terminal open-terminal-key (this CT's client key), next to this
   script or already in /etc/deepseek-harness.
 Environment: DSH_ROUTER_URL, DSH_BIND_IP, DSH_MODEL=auto,
-  DSH_CONTEXT_WINDOW=32768, DSH_MAX_TOKENS=8192, DSH_PORT=3080,
+  DSH_CONTEXT_WINDOW=auto (what DSH_MODEL's servers serve, from the router's
+  inventory, read on every run; or a number of tokens), DSH_MAX_TOKENS=8192,
+  DSH_PORT=3080,
   DSH_VERSION=0.2.1-rc.5 (an exact npm release, or latest),
   DSH_HONCHO_MCP_URL (Honcho memory through its MCP server; empty = off),
   DSH_OPEN_TERMINAL_URL (this agent's own Open Terminal workspace, the
@@ -46,7 +48,7 @@ done
 ROUTER_URL=${DSH_ROUTER_URL:-}
 BIND_IP=${DSH_BIND_IP:-}
 MODEL=${DSH_MODEL:-auto}
-CONTEXT_WINDOW=${DSH_CONTEXT_WINDOW:-32768}
+CONTEXT_WINDOW=${DSH_CONTEXT_WINDOW:-auto}
 MAX_TOKENS=${DSH_MAX_TOKENS:-8192}
 PORT=${DSH_PORT:-3080}
 VERSION=${DSH_VERSION:-$DEFAULT_VERSION}
@@ -79,16 +81,19 @@ API_MODEL=deepseek-harness
 
 [[ $ROUTER_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?$ ]] || die 'DSH_ROUTER_URL must be an HTTP(S) origin.'
 [[ $BIND_IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die 'DSH_BIND_IP must be the CT IPv4 address.'
-for value in "$CONTEXT_WINDOW" "$MAX_TOKENS" "$PORT"; do
+[[ $CONTEXT_WINDOW == auto || $CONTEXT_WINDOW =~ ^[1-9][0-9]{0,7}$ ]] ||
+  die 'DSH_CONTEXT_WINDOW must be auto or a positive integer.'
+for value in "$MAX_TOKENS" "$PORT"; do
   [[ $value =~ ^[1-9][0-9]{0,7}$ ]] || die 'Context, max tokens and port must be positive integers.'
 done
-(( MAX_TOKENS < CONTEXT_WINDOW && PORT <= 65535 )) || die 'Invalid context, max tokens or port.'
+(( PORT <= 65535 )) && { [[ $CONTEXT_WINDOW == auto ]] || (( MAX_TOKENS < CONTEXT_WINDOW )); } ||
+  die 'Invalid context, max tokens or port.'
 [[ $VERSION =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?)$ ]] || die 'DSH_VERSION must be latest or an exact npm version.'
 [[ $MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid DSH_MODEL.'
 if [[ -n $HONCHO_MCP_URL ]]; then
   [[ $HONCHO_MCP_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] ||
     die 'DSH_HONCHO_MCP_URL must be an HTTP(S) URL such as http://<honcho-ip>:3000/mcp.'
-  (( CONTEXT_WINDOW >= 32768 )) ||
+  [[ $CONTEXT_WINDOW == auto ]] || (( CONTEXT_WINDOW >= 32768 )) ||
     die 'Honcho memory adds about 40 tool definitions; it needs DSH_CONTEXT_WINDOW of 32768 or more.'
 fi
 [[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] ||
@@ -121,6 +126,9 @@ settings_record() {
   printf 'DSH_ROUTER_URL=%s\nDSH_BIND_IP=%s\nDSH_HONCHO_MCP_URL=%s\n' "$ROUTER_URL" "$BIND_IP" "$HONCHO_MCP_URL"
   printf 'ROUTER_KEY_SHA256=%s\nHONCHO_KEY_SHA256=%s\nFILES_SHA256=%s\n' "$2" "$3" "$4"
   printf 'DSH_OPEN_TERMINAL_URL=%s\nOPEN_TERMINAL_KEY_SHA256=%s\n' "$OPEN_TERMINAL_URL" "${ot_key_sha:-none}"
+  # auto: the window it resolved to, so a server that now serves another one
+  # is a change.
+  [[ $CONTEXT_WINDOW != auto ]] || printf 'DSH_SERVED_CONTEXT=%s\n' "${window:-unknown}"
   printf 'DSH_API=%s\nDSH_API_PORT=%s\nDSH_API_PERMISSIONS=%s\nAPI_KEY_SHA256=%s\n' \
     "$API" "$API_PORT" "$API_PERMISSIONS" "${api_key_sha:-none}"
 }
@@ -265,6 +273,13 @@ router_key_file=$(key_source router-api-key) || die 'Missing router-api-key (an 
 router_key=$(tr -d '\r\n' < "$router_key_file")
 [[ -z $router_key || $router_key =~ ^[A-Za-z0-9._~+/=-]+$ ]] || die 'Router key has unsupported characters.'
 service_router_key=${router_key:-osr-keyless-placeholder}
+# resolve_window: DSH_CONTEXT_WINDOW, or with auto what DSH_MODEL's servers
+# serve, asked of the router's inventory (configure.mjs --print-context).
+resolve_window() {
+  if [[ $CONTEXT_WINDOW != auto ]]; then echo "$CONTEXT_WINDOW"; return 0; fi
+  OSR_API_KEY="$service_router_key" node "$SOURCE_DIR/configure.mjs" --router-url "$ROUTER_URL" \
+    --model "$MODEL" --context-window auto --print-context
+}
 honcho_key='' honcho_key_file=''
 if [[ -n $HONCHO_MCP_URL ]]; then
   honcho_key_file=$(key_source honcho-api-key) || die 'DSH_HONCHO_MCP_URL needs honcho-api-key.'
@@ -290,6 +305,12 @@ if [[ $API == true ]]; then
   [[ ! -s $API_KEY_FILE ]] || api_key_sha=$(key_sha "$(tr -d '\r\n' < "$API_KEY_FILE")")
 fi
 
+# With auto the window is read now, so a changed one is not "nothing to do".
+window=$CONTEXT_WINDOW
+if [[ $CONTEXT_WINDOW == auto ]]; then
+  window=unknown
+  if node_ok; then window=$(resolve_window 2>/dev/null) || window=unknown; fi
+fi
 previous_record=''
 [[ ! -r $ETC_DIR/settings ]] || previous_record=$(< "$ETC_DIR/settings")
 previous_release=$(current_release 2>/dev/null || true)
@@ -473,8 +494,17 @@ done
 [[ -n $HONCHO_MCP_URL ]] || rm -f -- "$ETC_DIR/honcho-api-key"
 [[ -n $OPEN_TERMINAL_URL ]] || rm -f -- "$ETC_DIR/open-terminal-key"
 
+if [[ $CONTEXT_WINDOW == auto ]]; then
+  window=$(resolve_window) || die "Could not read the context $MODEL is served with from the router's inventory (above)."
+  [[ $window =~ ^[1-9][0-9]{0,7}$ ]] || die "The router's inventory gave no usable context window for $MODEL."
+  (( MAX_TOKENS < window )) ||
+    die "$MODEL may be served with only $window tokens of context, not more than DSH_MAX_TOKENS ($MAX_TOKENS). Lower DSH_MAX_TOKENS, choose another DSH_MODEL, or set DSH_CONTEXT_WINDOW."
+  [[ -z $HONCHO_MCP_URL ]] || (( window >= 32768 )) ||
+    die "$MODEL may be served with only $window tokens of context; Honcho memory adds about 40 tool definitions and needs 32768 or more. Choose another DSH_MODEL, or set DSH_CONTEXT_WINDOW."
+  note "Context window: $window tokens, what $MODEL is served with."
+fi
 overlay_tmp=$(mktemp "$ETC_DIR/osr.patch.yml.XXXXXX")
-configure_args=(--router-url "$ROUTER_URL" --model "$MODEL" --context-window "$CONTEXT_WINDOW"
+configure_args=(--router-url "$ROUTER_URL" --model "$MODEL" --context-window "$window"
   --max-tokens "$MAX_TOKENS" --output "$overlay_tmp" --force --instructions "$DSH_HOME_DIR/AGENTS.md")
 [[ -z $HONCHO_MCP_URL ]] || configure_args+=(--honcho-mcp-url "$HONCHO_MCP_URL")
 [[ -z $OPEN_TERMINAL_URL ]] || configure_args+=(--open-terminal-url "$OPEN_TERMINAL_URL")

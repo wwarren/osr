@@ -52,6 +52,17 @@ KINDI_HEALTH_CACHE_SECONDS = 5
 # A direct target: one model server, picked in Hermes as provider custom:<name>
 # and served under /t/<name>/v1. Names come from the router's inventory.
 TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# A context setting of auto (HERMES_CONTEXT_LENGTH, OPENCLAW_CONTEXT_LENGTH,
+# OPENCODE_CONTEXT_LENGTH): the agent sizes each model's window from this
+# dispatcher's /v1/models. A model must serve at least the agent's minimum
+# (DIRECT_AUTO_MIN_CONTEXT, Hermes's 64000 when unset), and a server that does
+# not report what it serves is taken to serve the window every OSR model
+# target defaults to, never more than the model's own reported limit.
+AUTO_MIN_CONTEXT = 64000
+AUTO_ASSUMED_CONTEXT = 65536
+# How old an inventory a direct target's model list may still take served
+# contexts from (Hermes keeps an endpoint's context for as long).
+CACHED_INVENTORY_SECONDS = 300
 
 
 def read_env(path):
@@ -197,13 +208,17 @@ class _SSEDone:
 
 
 class Dispatcher:
-    def __init__(self, router_url, router_key, backend_keys=None, min_context=0, targets=None):
+    def __init__(self, router_url, router_key, backend_keys=None, min_context=0, targets=None,
+                 assumed_context=None):
         self.router_url = router_url.rstrip("/")
         # Direct targets bypass the router entirely: listing and chat go to
         # the one server, with no inventory, ranking or failover.
         self.targets = targets or {}
         # HERMES_CONTEXT_LENGTH: a model reported to serve less is never used.
         self.min_context = min_context
+        # The window counted for a server that does not report what it serves:
+        # the pinned setting itself, or AUTO_ASSUMED_CONTEXT under auto.
+        self.assumed_context = min_context if assumed_context is None else assumed_context
         self.router_key = router_key
         self.backend_keys = backend_keys or {}
         self._inventory = None
@@ -317,6 +332,26 @@ class Dispatcher:
         return (entry.get("tools") is not False
                 and not (isinstance(context, int) and context < self.min_context))
 
+    def served_context(self, entries):
+        """The context a client can count on from these entries (all the
+        replicas a request may land on): the smallest served context. An
+        entry that reports none counts as assumed_context, or as its model's
+        reported limit (context_length) when that is smaller. None when
+        nothing is known. The agents read this from /v1/models, so they follow
+        what the servers serve (an LM Studio model loaded with 262144 tokens,
+        Strata started with 131072)."""
+        def number(value):
+            return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+        values = []
+        for entry in entries:
+            value = number(entry.get("served_context_length"))
+            if value is None:
+                value, limit = number(self.assumed_context), number(entry.get("context_length"))
+                if value and limit:
+                    value = min(value, limit)
+            values.append(value)
+        return min(values) if values and all(values) else None
+
     def _ranked(self, body, unpinned=False):
         inventory = self.inventory()
         chat = [m for m in inventory["models"] if m.get("name") and not m.get("is_embedding")]
@@ -373,12 +408,24 @@ class Dispatcher:
         inventory models, minus models that are never usable (usable() false
         on every server that serves them)."""
         chat = [m for m in self.inventory()["models"] if m.get("name") and not m.get("is_embedding")]
-        names = {m["name"] for m in chat if self.usable(m)}
+        usable = [m for m in chat if self.usable(m)]
+        names = {m["name"] for m in usable}
         unusable = {m["name"] for m in chat} - names
         names.update(self.router_models() - unusable)
         names.discard("auto")
-        return {"object": "list", "data": [{"id": name, "object": "model"}
-                                          for name in ["auto", *sorted(names)]]}
+        # A real model: its own replicas. auto and the tier aliases may land on
+        # any usable model. Other router names (cloud models) are not known.
+        anywhere = self.served_context(usable)
+        data = []
+        for name in ["auto", *sorted(names)]:
+            item = {"id": name, "object": "model"}
+            replicas = [m for m in usable if m["name"] == name]
+            context = (self.served_context(replicas) if replicas
+                       else anywhere if name == "auto" or name in TIER_ALIASES else None)
+            if context:
+                item["context_length"] = context
+            data.append(item)
+        return {"object": "list", "data": data}
 
     def backend_key(self, server):
         kind, _ = server_parts(server)
@@ -396,8 +443,28 @@ class Dispatcher:
         else:
             data = request_json(base + "/v1/models", self.backend_key(server))
             names = [m.get("id") for m in data.get("data") or [] if isinstance(m, dict)]
-        return {"object": "list", "data": [{"id": n, "object": "model", "owned_by": name}
-                                          for n in names if isinstance(n, str) and n]}
+        listed = self._cached_models()
+        result = []
+        for n in names:
+            if not isinstance(n, str) or not n:
+                continue
+            item = {"id": n, "object": "model", "owned_by": name}
+            entries = [m for m in listed if m.get("server") == server and m.get("name") == n]
+            context = self.served_context(entries or [{}])
+            if context:
+                item["context_length"] = context
+            result.append(item)
+        return {"object": "list", "data": result}
+
+    def _cached_models(self):
+        """The models of an inventory fetched for the router-ranked provider
+        in the last CACHED_INVENTORY_SECONDS, or none. A direct target never
+        asks the router, so without a recent one its models count as serving
+        the floor."""
+        with self._lock:
+            data, age = self._inventory, time.monotonic() - self._inventory_time
+        models = data.get("models") if isinstance(data, dict) and age < CACHED_INVENTORY_SECONDS else None
+        return [m for m in models or [] if isinstance(m, dict)]
 
     def router_models(self):
         data = request_json(self.router_url + "/v1/models", self.router_key)
@@ -810,12 +877,18 @@ def main():
     router_url = settings.get("ROUTER_URL", "")
     if not router_url:
         raise SystemExit(f"ROUTER_URL missing from {etc}/settings")
+    value = settings.get(context_setting) or "0"
+    assumed = None
     try:
-        min_context = int(settings.get(context_setting) or 0)
+        if value == "auto":
+            min_context = int(os.environ.get("DIRECT_AUTO_MIN_CONTEXT") or AUTO_MIN_CONTEXT)
+            assumed = AUTO_ASSUMED_CONTEXT
+        else:
+            min_context = int(value)
     except ValueError:
-        raise SystemExit(f"{context_setting} in {etc}/settings is not a number") from None
+        raise SystemExit(f"{context_setting} in {etc}/settings is not a number or auto") from None
     Handler.dispatcher = Dispatcher(router_url, secrets.get("ROUTER_API_KEY", ""), keys, min_context,
-                                    load_targets(etc + "/targets"))
+                                    load_targets(etc + "/targets"), assumed)
     port = int(os.environ.get("HERMES_DIRECT_PORT", "8765"))
     logging.basicConfig(level=logging.INFO)
     DispatchServer(("127.0.0.1", port), Handler).serve_forever()

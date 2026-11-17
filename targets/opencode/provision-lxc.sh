@@ -43,8 +43,9 @@ Required: ROUTER (or the prompt); for a new CT also TEMPLATE (Debian
 Interactive runs list downloaded templates and eligible rootdir storage when
 those values are unset. CT_ID is the OpenCode CT, separate from the existing
 router CT ID or IP address.
-OpenCode: OPENCODE_MODEL=auto, OPENCODE_CONTEXT_LENGTH=65536 (>=32768; the
-          model's host must serve it), OPENCODE_MAX_TOKENS=8192,
+OpenCode: OPENCODE_MODEL=auto, OPENCODE_CONTEXT_LENGTH=auto (each model's window
+          as its server serves it, from the router's discovery, applied on each
+          run; or a number >=32768 the model's host must serve), OPENCODE_MAX_TOKENS=8192,
           OPENCODE_VERSION=2.2.7 (exact @opencode/cli release, or latest),
           OPENCODE_PORT=4096, OPENCODE_FREE_MODELS=false (true also offers
           OpenCode's free cloud models).
@@ -481,7 +482,9 @@ valid_template() { [[ $1 =~ $template_re ]]; }
 valid_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_router() { classify_router "$1" >/dev/null; }
 valid_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
-valid_context() { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 32768 )); }
+valid_context() { [[ $1 == auto ]] || { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 32768 )); }; }
+# context_floor: the least context a model must serve under OPENCODE_CONTEXT_LENGTH.
+context_floor() { if [[ $OPENCODE_CONTEXT_LENGTH == auto ]]; then echo 32768; else echo "$OPENCODE_CONTEXT_LENGTH"; fi; }
 valid_tokens() { [[ $1 =~ ^[1-9][0-9]{2,6}$ ]]; }
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 && $1 != 8765 )); }
 valid_version() { [[ $1 == latest || $1 =~ ^[2-9][0-9]*\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; }
@@ -563,8 +566,10 @@ if [[ $mode != integrate ]]; then
   pve_section 'OpenCode settings'
   pve_note 'OpenCode needs an OSR model that calls tools, with 32768 tokens of context or more.'
   pve_ask OPENCODE_MODEL 'OSR model or tier' "$(recorded_or OPENCODE_MODEL auto)" valid_model
-  pve_ask OPENCODE_CONTEXT_LENGTH 'Context window the model serves (tokens)' "$(recorded_or OPENCODE_CONTEXT_LENGTH 65536)" valid_context \
-    'Use a whole number of tokens, 32768 or more.'
+  pve_note "Context window: auto follows what each model's server serves (Strata started with 131072"
+  pve_note 'tokens gets 131072); a number pins that window for every model.'
+  pve_ask OPENCODE_CONTEXT_LENGTH 'Context window (auto, or tokens)' "$(recorded_or OPENCODE_CONTEXT_LENGTH auto)" valid_context \
+    'Use auto, or a whole number of tokens, 32768 or more.'
   pve_ask OPENCODE_MAX_TOKENS 'Max reply tokens' "$(recorded_or OPENCODE_MAX_TOKENS 8192)" valid_tokens 'Use a whole number of tokens.'
   pve_ask OPENCODE_VERSION 'OpenCode release (exact, or latest)' "$(recorded_or OPENCODE_VERSION "$DEFAULT_OPENCODE_VERSION")" valid_version \
     'Use an exact @opencode/cli release (2.x or newer, e.g. 2.2.7) or latest.'
@@ -643,7 +648,7 @@ if [[ $mode != integrate ]]; then
 fi
 [[ ${OPEN_TERMINAL_URL:-} != none ]] || OPEN_TERMINAL_URL=''
 OPENCODE_MODEL=${OPENCODE_MODEL:-auto}
-OPENCODE_CONTEXT_LENGTH=${OPENCODE_CONTEXT_LENGTH:-65536}
+OPENCODE_CONTEXT_LENGTH=${OPENCODE_CONTEXT_LENGTH:-auto}
 OPENCODE_MAX_TOKENS=${OPENCODE_MAX_TOKENS:-8192}
 OPENCODE_VERSION=${OPENCODE_VERSION:-$DEFAULT_OPENCODE_VERSION}
 OPENCODE_PORT=${OPENCODE_PORT:-$(recorded_or OPENCODE_PORT 4096)}
@@ -695,9 +700,9 @@ if [[ -n $ROUTER_URL ]]; then
 fi
 valid_model "$OPENCODE_MODEL" || die 'Invalid OPENCODE_MODEL.'
 valid_context "$OPENCODE_CONTEXT_LENGTH" ||
-  die 'OPENCODE_CONTEXT_LENGTH must be at least 32768 (OpenCode needs room for its prompt, tools and history).'
-[[ $OPENCODE_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCODE_MAX_TOKENS >= 256 && OPENCODE_MAX_TOKENS * 2 <= OPENCODE_CONTEXT_LENGTH )) ||
-  die 'OPENCODE_MAX_TOKENS must be at least 256 and at most half of OPENCODE_CONTEXT_LENGTH.'
+  die 'OPENCODE_CONTEXT_LENGTH must be auto or at least 32768 (OpenCode needs room for its prompt, tools and history).'
+[[ $OPENCODE_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCODE_MAX_TOKENS >= 256 && OPENCODE_MAX_TOKENS * 2 <= $(context_floor) )) ||
+  die 'OPENCODE_MAX_TOKENS must be at least 256 and at most half of OPENCODE_CONTEXT_LENGTH (of 32768 with auto).'
 valid_version "$OPENCODE_VERSION" || die 'OPENCODE_VERSION must be latest or an exact @opencode/cli release (2.x or newer) such as 2.2.7.'
 if [[ $mode == create ]]; then
   [[ $TEMPLATE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-(12|13)-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] ||

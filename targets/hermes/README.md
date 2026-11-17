@@ -54,9 +54,34 @@ Hermes its own workspace there as MCP server `open_terminal` (see
   `CONTEXT_SIZE` and `tools` in `MODEL_CAPABILITIES`. On older hosts raise
   `OLLAMA_CONTEXT_LENGTH` in `/etc/ollama-target/ollama.env` or llama.cpp's
   `CONTEXT_SIZE`, otherwise Ollama silently drops the start of the prompt (the
-  tool definitions) and llama.cpp rejects it. The router's inventory reports
-  `context_length` but can overstate what a host serves, so
-  `HERMES_CONTEXT_LENGTH` must match the real window.
+  tool definitions) and llama.cpp rejects it.
+
+### Context window: `auto` follows what each server serves
+
+With `HERMES_CONTEXT_LENGTH=auto` (the default for new CTs) Hermes pins no
+window. It reads each model's window from the dispatcher's `/v1/models`, which
+reports, from the router's polled inventory, the context the model's server
+serves right now (`served_context_length`):
+
+| Server | Served context the router sees |
+|---|---|
+| LM Studio | the loaded instance's context length (a model loaded with 262144 tokens gives 262144) |
+| Ollama | a `num_ctx` in the model's Modelfile; without one, nothing (it serves `OLLAMA_CONTEXT_LENGTH`, which Ollama does not report) |
+| llama.cpp bridge, AirLLM | the active per-slot window |
+| Strata, Basalt, Maya, Xolotl, Avalon, Kindi | the window the server reports in `/v1/models` |
+
+A model whose server reports nothing counts as 65536, the window every OSR
+model target defaults to (or the model's own limit, when that is smaller). A
+model reported to serve less than 64000 is not used. `auto` and
+the tier aliases get the smallest window among the models they may land on,
+and a model on several servers the smallest of its replicas. Hermes checks an
+endpoint's window when a session starts and keeps it for about five minutes,
+so a change in LM Studio reaches new sessions within that time.
+
+A number (64000 or more) pins that window for every model instead, as before
+this setting took `auto`; the host must then really serve it. An existing CT
+keeps its recorded number until you reconfigure it with
+`HERMES_CONTEXT_LENGTH=auto`.
 
 ## Provision on the Proxmox host
 
@@ -85,7 +110,7 @@ It then creates the CT and firewall, resolves model-server host names inside
 the CT (with the dispatcher's resolver) and admits every IPv4 address, and
 pushes the installer, dispatcher, units and keys. The guest installer installs
 Hermes as `hermes`; configures provider `custom` (`model.base_url` at the
-dispatcher, `model.default`, `model.context_length`, a placeholder key);
+dispatcher, `model.default`, `model.context_length` unless it is `auto`, a placeholder key);
 starts `hermes-direct.service` and sends one tool-using chat through it;
 generates the API server key (`/etc/hermes-target/api-key`, 0600) and
 `API_SERVER_*` settings; starts `hermes-gateway.service` and waits for
@@ -98,7 +123,7 @@ connection by URL, keeping all others.
 | Setting | Default | Meaning |
 |---|---|---|
 | `HERMES_MODEL` | `auto` | Default model of provider `custom:osr`. `auto` uses `/routing/explain`, prefers loaded models and pins an agent task to one model while a server for it works; if all its servers fail, the router ranks afresh. Name a model for a fixed choice |
-| `HERMES_CONTEXT_LENGTH` | `65536` | Context the host really serves (≥ 64000). The dispatcher never uses a model the inventory reports with less, or without tool support; AirLLM is excluded |
+| `HERMES_CONTEXT_LENGTH` | `auto` | `auto`: each model's window as its server serves it ([above](#context-window-auto-follows-what-each-server-serves)); the floor is 64000. A number (≥ 64000) pins that window for every model. The dispatcher never uses a model the inventory reports with less than the floor, or without tool support; AirLLM is excluded |
 | `HERMES_CHANNEL` | `stable` | Upstream channel (`stable` or `main`) |
 | `HERMES_COMMIT` | — | Pin the checkout; a changed pin applies on the next run (the installer reports the installed commit). Kept by `--reconfigure`; `HERMES_COMMIT=` clears it |
 | `HERMES_INSTALLER_SHA256` | — | Refuse another `install.sh`; every run prints its checksum |
@@ -253,6 +278,7 @@ tool-capable model with enough context.
 | `model server … is unreachable; skipping it` in `journalctl -u hermes-direct` | Not yet admitted (`--reconfigure` after adding a server or changing its DNS), down, or blocked by the model host's firewall |
 | 503 "No available chat model with tool support and at least … tokens of context" | Check `tools` and `context_length` per model in `/routing/inventory`; raise the host's context or add `tools` to llama.cpp's `MODEL_CAPABILITIES` |
 | "Direct model-server chat probe failed" | Check `/routing/inventory`, backend keys and direct access from this CT to the model host |
-| Agent forgets instructions or tools mid-task | The host serves less than `HERMES_CONTEXT_LENGTH`; raise it on the host |
+| Agent forgets instructions or tools mid-task | The host serves less than Hermes assumes: with a pinned `HERMES_CONTEXT_LENGTH`, raise it on the host or use `auto`; with `auto`, check `served_context_length` in `/routing/inventory` |
+| Hermes still uses 65536 after LM Studio was raised | The CT has a pinned number recorded: `provision-lxc.sh --reconfigure` with `HERMES_CONTEXT_LENGTH=auto`. With `auto`, the model must be loaded in LM Studio (a cold one reports no served window) |
 | Open WebUI lists no `hermes-agent` | `systemctl status hermes-gateway` in the CT, then `--integrate-only`; the router needs TCP 8642 through the firewall |
 | Chats are slow to get a title | The Task Model (External) must be a router model, not `hermes-agent` |

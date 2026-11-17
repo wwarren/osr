@@ -49,6 +49,9 @@ refused ROUTER_URL=http://router:8000 HERMES_DASHBOARD=yes
 msg=$(ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=8192 bash "$script" --dry-run 2>&1 || true)
 [[ $msg == *'at least 64000'* ]] || fail "context refusal does not explain the minimum: $msg"
 ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=64000 bash "$script" --dry-run >/dev/null || fail '64000 refused'
+refused ROUTER_URL=http://router:8000 HERMES_CONTEXT_LENGTH=Auto
+msg=$(ROUTER_URL=http://router:8000 bash "$script" --dry-run 2>&1) || fail "auto (the default) refused: $msg"
+[[ $msg == *"context_length=auto, each model's served window"* ]] || fail "dry run does not show auto: $msg"
 pass 'invalid endpoint, model, context below 64K, pins, channel and reserved ports are refused'
 
 # --- helpers in isolation ----------------------------------------------------------
@@ -320,10 +323,14 @@ config=$home/.hermes/config.kv
 [[ $(kv model.provider "$config") == custom:osr && $(kv model.base_url "$config") == http://127.0.0.1:8765/v1 ]] ||
   fail "provider config: $(cat "$config")"
 [[ $(kv providers.osr.api "$config") == http://127.0.0.1:8765/v1 && $(kv providers.osr.api_key "$config") == no-key &&
-   $(kv providers.osr.transport "$config") == chat_completions && $(kv providers.osr.default_model "$config") == auto &&
-   $(kv providers.osr.context_length "$config") == 65536 ]] || fail "named osr provider: $(cat "$config")"
+   $(kv providers.osr.transport "$config") == chat_completions && $(kv providers.osr.default_model "$config") == auto ]] ||
+  fail "named osr provider: $(cat "$config")"
+# HERMES_CONTEXT_LENGTH=auto (the default) pins no window: Hermes reads each
+# model's served context from the dispatcher's /v1/models.
+grep -q 'context_length=' "$config" && fail "auto pinned a context: $(cat "$config")"
+grep -q '^HERMES_CONTEXT_LENGTH=auto$' "$etc/settings" || fail 'auto not recorded'
 [[ $(kv model.api_key "$config") == no-key ]] || fail 'model.api_key is not the local placeholder'
-[[ $(kv model.context_length "$config") == 65536 && $(kv model.default "$config") == auto ]] || fail 'model and context'
+[[ $(kv model.default "$config") == auto ]] || fail 'model default'
 env_file=$home/.hermes/.env
 [[ $(kv ROUTER_API_KEY "$env_file") == "$router_key" ]] || fail 'ROUTER_API_KEY not kept for reruns'
 [[ $(kv API_SERVER_ENABLED "$env_file") == true && $(kv API_SERVER_HOST "$env_file") == 0.0.0.0 ]] || fail 'API server env'
@@ -350,6 +357,14 @@ out=$(guest) || fail "rerun: $out"
 [[ $out == *'nothing to do'* ]] || fail "unchanged rerun did work: $out"
 grep -qE '^(apt-get|upstream-install|systemctl restart)' "$log" && fail 'unchanged rerun touched packages or the unit'
 pass 'an unchanged, healthy installation is left alone'
+
+# 2b. A number pins the window for every provider; auto removes the pin again.
+out=$(guest HERMES_CONTEXT_LENGTH=131072) || fail "pinned context: $out"
+[[ $(kv model.context_length "$config") == 131072 && $(kv providers.osr.context_length "$config") == 131072 ]] ||
+  fail "context not pinned: $(cat "$config")"
+out=$(guest HERMES_CONTEXT_LENGTH=auto) || fail "back to auto: $out"
+grep -q 'context_length=' "$config" && fail "auto kept a pinned context: $(cat "$config")"
+pass 'a numeric HERMES_CONTEXT_LENGTH pins every provider and auto removes the pin'
 
 # 3. The router key was rotated: a new key file is applied.
 old_api_key=$(< "$etc/api-key")
@@ -426,7 +441,7 @@ pass 'a rollback whose previous gateway does not come back either is reported as
 
 # 10. A configuration command fails: the files are restored by the ERR trap.
 reset_tree; push_key
-guest >/dev/null || fail 'setup for the config failure'
+guest HERMES_CONTEXT_LENGTH=65536 >/dev/null || fail 'setup for the config failure'
 prev_config=$(< "$config"); prev_env=$(< "$env_file")
 out=$(guest HERMES_CONTEXT_LENGTH=131072 FAKE_CONFIG_FAIL=model.context_length) && fail "a failed config set was accepted: $out"
 [[ $out == *'running again'* ]] || fail "config rollback message: $out"

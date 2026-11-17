@@ -61,6 +61,7 @@ lacks 'correct horse battery'; has 'me@example.org, the password you gave'
 has 'freellmapi:v0.99.1 (sha256:0000'; lacks 'No digest is pinned'
 has 'nas:vztmpl/freellmapi_v0.99.1.tar'; has 'tag=30'; has '--nameserver 192.0.2.53'; has 'bridge=vmbr1'
 has 'IN ACCEPT -source 198.51.100.0/24 -p tcp -dport 3100'
+has 'PORT=3100'
 has 'pct exec 210 -- /usr/local/bin/manage-model-servers set-freellmapi http://192.0.2.80:3100 --apply (key on stdin)'
 pass 'create: settings are passed through and the password never appears'
 
@@ -107,7 +108,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 commit=$(cat "$here/upstream-commit.txt")
-image_entrypoint='/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
+image_entrypoint='/usr/bin/env PORT=3001 /usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
 # fresh: an empty fake host with a router CT 210 at 192.0.2.10.
 fresh() {
     rm -rf -- "${tmp:?}/host"
@@ -163,6 +164,12 @@ has 'Router CT 210 offers its models as freellmapi/<id>'
 [[ $(grep -c '^pct start 280' "$FAKE/calls") == 2 && $(cat "$FAKE/ct/280/started") == "$default_version" ]] || fail 'one maintenance boot and one server start were expected'
 pass 'create: a running CT with key, account, settings, firewall and the router registration'
 
+fresh; create FREELLMAPI_PORT=3100; ok 'custom port create'; set_data
+[[ $(cat "$FAKE/ct/280/listening") == PORT=3100 && $(setting FREELLMAPI_PORT) == 3100 &&
+   $(cat "$FAKE/router-call") == "set-freellmapi http://192.0.2.80:3100 --apply"$'\n'"$(cat "$data/freeapi.db")"$'\n'"$(cat "$data/freeapi.db")" ]] || fail 'custom port did not reach the server and router'
+pass 'a custom port overrides the image environment and reaches the router'
+fresh; create; ok 'create for reconfigure'; set_data
+
 host CT_ID=280 --reconfigure; ok 'unchanged reconfigure'
 has 'nothing to do'
 [[ $(grep -c '^pct \(stop\|set\|start\|destroy\) 280' "$FAKE/calls") == 5 ]] || fail 'an unchanged CT was touched'
@@ -209,6 +216,28 @@ host CT_ID=280 ROUTER_CT_ID=210 FAKE_KEY_REFUSED=1 --register; bad '--register w
 has 'refused its own unified API key'; [[ ! -e $FAKE/router-call ]] || fail 'a refused key was handed to the router'
 host CT_ID=210 --reconfigure; bad 'another CT'; has 'not a FreeLLMAPI CT'
 pass '--register hands the key over again; a CT of another kind is refused'
+
+# A port move updates the firewall and router. A failed start restores both.
+fresh; create; ok 'create for port changes'; set_data
+printf 'IN ACCEPT -source 203.0.113.10/32 -p tcp -dport 9000 # operator rule\n' >> "$PVE_ETC/firewall/280.fw"
+host CT_ID=280 FREELLMAPI_PORT=3100 --reconfigure; ok 'port change'
+[[ $(cat "$FAKE/ct/280/listening") == PORT=3100 && $(setting FREELLMAPI_PORT) == 3100 &&
+   $(cat "$PVE_ETC/firewall/280.fw") == *'-dport 3100 -log nolog # open-smart-router freellmapi-web'* &&
+   $(cat "$PVE_ETC/firewall/280.fw") == *'operator rule'* &&
+   $(head -n 1 "$FAKE/router-call") == 'set-freellmapi http://192.0.2.80:3100 --apply' ]] || fail 'port change did not update all endpoints'
+host CT_ID=280 FREELLMAPI_ACCESS_CIDR=198.51.100.0/24 --reconfigure; ok 'access change'
+[[ $(cat "$PVE_ETC/firewall/280.fw") == *'IN ACCEPT -source 198.51.100.0/24 -p tcp -dport 3100'* &&
+   $(cat "$PVE_ETC/firewall/280.fw") == *'operator rule'* ]] || fail 'access-only change did not update the firewall'
+before=$(env_file); fw_before=$(cat "$PVE_ETC/firewall/280.fw")
+host CT_ID=280 FREELLMAPI_PORT=3200 FAKE_UNHEALTHY_PORT=3200 --reconfigure; bad 'failed port change'
+[[ $(cat "$FAKE/ct/280/listening") == PORT=3100 && $(setting FREELLMAPI_PORT) == 3100 &&
+   $(env_file) == "$before" && $(cat "$PVE_ETC/firewall/280.fw") == "$fw_before" && -z $(ls -A "$tmp/host/state") ]] || fail 'settings rollback did not restore port and firewall'
+sed -i '/^ROUTER_CT_ID=/d' "$data/osr-target/settings"
+host CT_ID=280 FREELLMAPI_PORT=3200 --reconfigure; ok 'port change with an older settings record'
+[[ $(head -n 1 "$FAKE/router-call") == 'set-freellmapi http://192.0.2.80:3200 --apply' &&
+   $(setting ROUTER_CT_ID) == 210 ]] || fail 'the router was not found from the older firewall rule'
+pass 'port and access changes update all endpoints; a failed restart restores settings'
+fresh; create ROUTER_CT_ID=none; ok 'create for settings'; set_data
 
 # Settings only: an operator's own line and the key stay.
 printf 'HTTPS_PROXY=http://proxy.example:3128\n' >> "$data/osr-target/freellmapi.env"
@@ -304,5 +333,78 @@ host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_DESTROY_FAILS=1 --reconfigure; ba
 [[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(conf) == *"entrypoint: $image_entrypoint"* ]] || fail 'the old CT is gone or down'
 [[ $(calls) != *'pct restore'* && $(cat "$data/freeapi.db") == "$key" ]] || fail 'a restore ran over a CT that still existed'
 pass 'a destroy that fails leaves the old CT running'
+
+
+# Network changes the settings path must carry to the firewall and the router,
+# and their rollbacks.
+fresh; create; ok 'create for review'; set_data
+key=$(cat "$data/freeapi.db")
+host CT_ID=280 FREELLMAPI_PORT=3300 FAKE_ROUTER_REFUSES=1 --reconfigure; bad 'a router that refuses a port change'
+[[ $(cat "$FAKE/ct/280/listening") == PORT=3001 && $(setting FREELLMAPI_PORT) == 3001 &&
+   $(cat "$PVE_ETC/firewall/280.fw") == *'-dport 3001 -log nolog # open-smart-router freellmapi-web'* &&
+   $(cat "$PVE_ETC/firewall/280.fw") != *3300* && -z $(ls -A "$tmp/host/state") ]] || fail 'refused registration did not restore port and firewall'
+pass 'a refused registration rolls the settings and firewall back'
+
+sed -i 's|ip=192.0.2.10/24|ip=192.0.2.11/24|' "$PVE_ETC/lxc/210.conf"
+rm -f "$FAKE/router-call"
+host CT_ID=280 --reconfigure; ok 'router readdressed'
+[[ $(cat "$PVE_ETC/firewall/280.fw") == *'-source 192.0.2.11/32 -p tcp -dport 3001'* &&
+   $(cat "$PVE_ETC/firewall/280.fw") != *192.0.2.10/32* && -s $FAKE/router-call ]] || fail 'a readdressed router was not admitted and given the endpoint'
+pass 'a readdressed router is admitted and registered again'
+
+mkdir -p "$FAKE/ct/211"; : > "$FAKE/ct/211/running"
+printf 'tags: ai\nnet0: name=eth0,bridge=vmbr0,ip=192.0.2.12/24,gw=192.0.2.1\n' > "$PVE_ETC/lxc/211.conf"
+rm -f "$FAKE/router-call"
+host CT_ID=280 ROUTER_CT_ID=211 --reconfigure; ok 'another router'
+[[ $(cat "$PVE_ETC/firewall/280.fw") == *'-source 192.0.2.12/32'* && $(setting ROUTER_CT_ID) == 211 && -s $FAKE/router-call ]] || fail 'switching routers'
+pass 'switching the router CT updates rule, record and registration'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FREELLMAPI_PORT=3400 --reconfigure; ok 'release and port together'
+[[ $(cat "$FAKE/ct/280/image") == v0.99.1 && $(cat "$FAKE/ct/280/listening") == PORT=3400 &&
+   $(cat "$PVE_ETC/firewall/280.fw") == *'-dport 3400 -log nolog # open-smart-router freellmapi-web'* &&
+   $(head -n 1 "$FAKE/router-call") == 'set-freellmapi http://192.0.2.80:3400 --apply' ]] || fail 'release and port change together'
+pass 'a new release with a new port updates firewall and router'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FREELLMAPI_PORT=3400 FAKE_UNHEALTHY=v0.99.2 --reconfigure; bad 'release and port, unhealthy'
+has "is running FreeLLMAPI $default_version again"
+[[ $(cat "$FAKE/ct/280/listening") == PORT=3001 && $(cat "$PVE_ETC/firewall/280.fw") == "$fw_before" ]] || fail 'rollback after release and port change'
+pass 'a failed release with a new port restores the old CT on its old port'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FREELLMAPI_PORT=3400 FAKE_ROUTER_REFUSES=1 --reconfigure; bad 'release and port, router refuses'
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && $(cat "$FAKE/ct/280/listening") == PORT=3001 ]] || fail 'refused registration after replacement was not rolled back'
+pass 'a refused registration after a replacement restores the backup'
+
+
+# keep (tools/upgrade-all.sh keeping a CT's release): no replacement, and the
+# CT still follows the tested release afterwards.
+fresh; create; ok 'create for keep'; set_data
+sed -i 's/^FREELLMAPI_VERSION=.*/FREELLMAPI_VERSION=v0.15.0/' "$data/osr-target/settings"
+: > "$FAKE/calls"
+host CT_ID=280 FREELLMAPI_VERSION=keep --reconfigure; ok 'keep'
+has 'runs v0.15.0 and answers: nothing to do'
+[[ $(calls) != *vzdump* && $(calls) != *'pct destroy'* && $(setting FREELLMAPI_VERSION_SOURCE) == default ]] || fail 'keep replaced the CT or pinned it'
+host CT_ID=280 FREELLMAPI_VERSION=keep FREELLMAPI_RATE_LIMIT_RPM=0 --reconfigure; ok 'keep with a setting'
+[[ $(setting FREELLMAPI_VERSION) == v0.15.0 && $(setting FREELLMAPI_VERSION_SOURCE) == default && $(calls) != *vzdump* ]] || fail 'keep with a setting changed the release or its source'
+: > "$FAKE/calls"
+host CT_ID=280 --reconfigure; ok 'following the tested release again'
+[[ $(calls) == *vzdump* && $(setting FREELLMAPI_VERSION) == "$default_version" ]] || fail 'a kept CT no longer follows the tested release'
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 --reconfigure; ok 'an explicit release'
+host CT_ID=280 FREELLMAPI_VERSION=keep --reconfigure; ok 'keep on an explicit release'
+[[ $(setting FREELLMAPI_VERSION) == v0.99.1 && $(setting FREELLMAPI_VERSION_SOURCE) == explicit ]] || fail 'keep dropped an explicit release'
+host "${common[@]}" FREELLMAPI_VERSION=keep CT_ID=281 IP_CIDR=192.0.2.81/24 ROUTER_CT_ID=none; bad 'keep on create'
+has 'FREELLMAPI_VERSION must be a release tag'
+pass 'keep stays on the CT release and its source; a CT following the pin still follows it later'
+
+# A firewall file sync_firewall cannot rewrite stops the run before the CT is touched.
+fresh; create; ok 'create for [RULES]'; set_data
+sed -i '/^\[RULES\]$/d' "$PVE_ETC/firewall/280.fw"
+: > "$FAKE/calls"
+host CT_ID=280 FREELLMAPI_PORT=3100 --reconfigure; bad 'no [RULES]'
+has 'has no [RULES] section'
+[[ $(calls) != *'pct stop'* && $(cat "$FAKE/ct/280/listening") == PORT=3001 && $(setting FREELLMAPI_PORT) == 3001 ]] || fail 'the CT was touched without a usable firewall file'
+pass 'a firewall file without [RULES] stops the run before the CT is stopped'
 
 printf 'passed %s\n' "$passed"

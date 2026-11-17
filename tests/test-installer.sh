@@ -1420,8 +1420,8 @@ assert_eq "an answer is kept" 32768 "$XOLOTL_CONTEXT"
 assert_contains "each target shows its recommendation" "strata: 131072 tokens recommended (Honcho's full budgets; its 24564 MiB GPU fits about 131072)." "$(cat "$_out")"
 assert_contains "the selected agents' needs are listed" "Hermes needs 64000 tokens or more" "$(cat "$_out")"
 assert_contains "a window too small for Hermes is flagged" "Hermes will not use this server" "$(cat "$_out")"
-assert_eq "Honcho defaults to the smallest window chosen" 32768 "$HONCHO_CONTEXT_TOKENS"
-assert_contains "and says which that is" "the smallest above is 32768" "$(cat "$_out")"
+assert_eq "Honcho defaults to auto (its chat model's served window)" auto "$HONCHO_CONTEXT_TOKENS"
+assert_contains "and names the smallest window, to pin instead" "the smallest above is 32768" "$(cat "$_out")"
 STRATA_CONTEXT=131072; HONCHO_CONTEXT_TOKENS=""; TARGETS="strata honcho"
 prompt_target_contexts > "$_out" 2>&1 <<< $'\n\n'
 assert_eq "a preset is the default" 131072 "$STRATA_CONTEXT"
@@ -1441,10 +1441,14 @@ TARGETS="llamacpp deepseek-harness"; LLAMACPP_GPU_CARD=0000:01:00.0; PARALLEL_SL
 prompt_target_contexts > "$_out" 2>&1 <<< $'\n\n'
 assert_eq "llama.cpp asks per request" 65536 "$LLAMACPP_CONTEXT"
 assert_contains "and says what CONTEXT_SIZE becomes" "CONTEXT_SIZE=131072" "$(cat "$_out")"
-assert_eq "DeepSeek defaults to the smallest window too" 65536 "$DEEPSEEK_HARNESS_CONTEXT_WINDOW"
-TARGETS="honcho"; unset HONCHO_CONTEXT_TOKENS
+assert_eq "DeepSeek defaults to auto too" auto "$DEEPSEEK_HARNESS_CONTEXT_WINDOW"
+TARGETS="honcho deepseek-harness"; unset HONCHO_CONTEXT_TOKENS DEEPSEEK_HARNESS_CONTEXT_WINDOW
+prompt_target_contexts > "$_out" 2>&1 <<< $'49152\n40960\n'
+assert_eq "a number still pins Honcho's window" 49152 "$HONCHO_CONTEXT_TOKENS"
+assert_eq "and DeepSeek's" 40960 "$DEEPSEEK_HARNESS_CONTEXT_WINDOW"
+TARGETS="honcho"; unset HONCHO_CONTEXT_TOKENS DEEPSEEK_HARNESS_CONTEXT_WINDOW
 prompt_target_contexts > "$_out" 2>&1 <<< $'\n'
-assert_eq "without model targets, Honcho defaults to 65536" 65536 "$HONCHO_CONTEXT_TOKENS"
+assert_eq "without model targets, Honcho defaults to auto" auto "$HONCHO_CONTEXT_TOKENS"
 TARGETS="strata"; STRATA_CONTEXT=64k
 assert_fail "an invalid preset with no more input stops the prompts" prompt_target_contexts <<< $'\n'
 unset -f nvidia-smi
@@ -1666,7 +1670,7 @@ mock_reset_log
 run_target_provisioner deepseek-harness
 assert_eq "DeepSeek gets its own CT and router, and the token (its chat endpoint is registered in Open WebUI)" \
   "provision deepseek-harness|921|192.0.2.101/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|
-context-env ||||unset|65536
+context-env ||||unset|auto
 dsh-env openwebui=default" "$(mock_calls)"
 mock_reset_log
 TARGET_WEBUI_READY=false run_target_provisioner deepseek-harness

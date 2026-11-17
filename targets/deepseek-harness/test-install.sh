@@ -60,8 +60,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             return self.send(200, {"data": [{"id": m} for m in ("auto", "code-model", "chat-only")]})
         if self.path == "/routing/inventory":
+            # The served context of code-model, from $fake/served (none when absent).
+            served = int(get("served", "0")) or None
             return self.send(200, {"models": [
-                {"name": "code-model", "tools": True, "context_length": 65536},
+                {"name": "code-model", "tools": True, "context_length": 262144,
+                 "served_context_length": served},
                 {"name": "chat-only", "tools": False, "context_length": 65536}]})
         self.send(404, {})
     def do_POST(self):
@@ -212,6 +215,8 @@ assert_contains "Honcho is planned with its workspace and peers" "its own worksp
 assert_fail "Honcho needs a 32k window" env "${base_env[@]}" DSH_CONTEXT_WINDOW=16384 DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp bash "$script" --dry-run
 assert_fail "a Honcho URL with a query is refused" env "${base_env[@]}" DSH_HONCHO_MCP_URL='http://h:3000/mcp?x=1' bash "$script" --dry-run
 assert_fail "a router URL with a path is refused" env "${base_env[@]}" DSH_ROUTER_URL=http://127.0.0.1:8000/v1 bash "$script" --dry-run
+assert_fail "a context that is neither auto nor a number is refused" env "${base_env[@]}" DSH_CONTEXT_WINDOW=Auto bash "$script" --dry-run
+assert_ok "auto is accepted with Honcho (checked once resolved)" env "${base_env[@]}" DSH_CONTEXT_WINDOW=auto DSH_HONCHO_MCP_URL=http://192.0.2.85:3000/mcp bash "$script" --dry-run
 
 describe install_fresh
 push_deploy
@@ -271,6 +276,36 @@ printf 'wrong\n' > "$deploy/router-api-key"
 run_fails "a wrong router key is refused"
 assert_contains "by the router" "HTTP 401" "$out"
 assert_file_contains "and the working key stays installed" 'OSR_API_KEY=router-secret' "$DSH_ETC_DIR/service.env"
+
+describe install_auto_context
+push_deploy
+printf '131072\n' > "$fake/served"
+assert_ok "auto takes the window code-model is served with" install_run DSH_CONTEXT_WINDOW=auto
+assert_file_contains "into the overlay" 'contextWindow: 131072' "$DSH_ETC_DIR/osr.patch.yml"
+assert_file_contains "and the record keeps auto" 'DSH_CONTEXT_WINDOW=auto' "$DSH_ETC_DIR/settings"
+assert_file_contains "with what it resolved to" 'DSH_SERVED_CONTEXT=131072' "$DSH_ETC_DIR/settings"
+push_deploy
+assert_ok "an unchanged served window" install_run DSH_CONTEXT_WINDOW=auto
+assert_contains "is nothing to do" "nothing to do" "$out"
+printf '262144\n' > "$fake/served"
+push_deploy
+assert_ok "a server that now serves more" install_run DSH_CONTEXT_WINDOW=auto
+assert_not_contains "is a change" "nothing to do" "$out"
+assert_file_contains "taken into the overlay" 'contextWindow: 262144' "$DSH_ETC_DIR/osr.patch.yml"
+rm -f "$fake/served"
+push_deploy
+assert_ok "a server that reports nothing" install_run DSH_CONTEXT_WINDOW=auto
+assert_file_contains "counts as 65536" 'contextWindow: 65536' "$DSH_ETC_DIR/osr.patch.yml"
+printf '8192\n' > "$fake/served"
+push_deploy
+run_fails "a window not above DSH_MAX_TOKENS is refused" DSH_CONTEXT_WINDOW=auto
+assert_contains "with what to change" "Lower DSH_MAX_TOKENS" "$out"
+assert_file_contains "and the last overlay is kept" 'contextWindow: 65536' "$DSH_ETC_DIR/osr.patch.yml"
+rm -f "$fake/served"
+push_deploy
+assert_ok "a number pins the window again" install_run
+assert_file_contains "into the overlay" 'contextWindow: 32768' "$DSH_ETC_DIR/osr.patch.yml"
+assert_ok "and the record has no served window" bash -c "! grep -q DSH_SERVED_CONTEXT '$DSH_ETC_DIR/settings'"
 
 describe install_upgrade_rollback
 push_deploy

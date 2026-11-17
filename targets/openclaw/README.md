@@ -53,9 +53,18 @@ nvm checks Node against nodejs.org's `SHASUMS256.txt`. `node`, `npm` and
 The router, model-host firewall and Open WebUI admin-token requirements are
 [Hermes's](../hermes/README.md#before-you-start) (the token is not needed with
 `OPENWEBUI=false`). Models need tools and enough context: the dispatcher never
-selects one the inventory reports with less than `OPENCLAW_CONTEXT_LENGTH`
-(default 65536, minimum 32768; OpenClaw's own local recipes use 64K) or
-without tool support. Raise the hosts' context as for Hermes.
+selects one the inventory reports with less than 32768 tokens under
+`OPENCLAW_CONTEXT_LENGTH=auto`, or less than a pinned number (OpenClaw's own
+local recipes use 64K), or without tool support.
+
+**`auto` (the default for a new CT)** gives each model the window its server
+serves, as [Hermes's `auto`](../hermes/README.md#context-window-auto-follows-what-each-server-serves)
+does: an LM Studio model loaded with 262144 tokens gets 262144, Strata started
+with 131072 gets 131072, and a server that reports nothing counts as 65536 (or
+the model's limit if smaller). OpenClaw keeps the windows in its own config, so
+they are taken when the CT is installed or reconfigured (`--reconfigure`,
+`tools/upgrade-all.sh`), not live. An existing CT keeps its recorded number
+until reconfigured with `OPENCLAW_CONTEXT_LENGTH=auto`.
 
 ## Provision on the Proxmox host
 
@@ -79,8 +88,9 @@ installer:
 2. Starts `openclaw-direct.service` and sends one tool-using chat through it.
 3. Writes providers from the dispatcher's model lists: `osr` (`auto`, tiers,
    router models) and one per model server, each model with `contextWindow` =
-   `OPENCLAW_CONTEXT_LENGTH`, `maxTokens` = `OPENCLAW_MAX_TOKENS`, tool support
-   and the `max_tokens` field.
+   its served window (`auto`) or `OPENCLAW_CONTEXT_LENGTH`, `maxTokens` =
+   `OPENCLAW_MAX_TOKENS` (at most half the window), tool support and the
+   `max_tokens` field.
 4. Runs `openclaw setup --baseline` on the first run, sets `gateway.mode=local`,
    port, token auth, bind address, chat endpoint, Control UI and
    `agents.defaults.model.primary` (`osr/<OPENCLAW_MODEL>`), then
@@ -99,7 +109,7 @@ the same agent).
 | Setting | Default | Meaning |
 |---|---|---|
 | `OPENCLAW_MODEL` | `auto` | Default model `osr/<this>`: `auto`, a tier or a router model; `auto` ranks and pins tasks as for Hermes |
-| `OPENCLAW_CONTEXT_LENGTH` | `65536` | Context the hosts serve (≥ 32768); every provider model's `contextWindow` |
+| `OPENCLAW_CONTEXT_LENGTH` | `auto` | `auto`: each provider model's `contextWindow` is what its server serves (65536 where unreported); a model must serve 32768. A number (≥ 32768) pins every model's `contextWindow` |
 | `OPENCLAW_MAX_TOKENS` | `8192` | `maxTokens` per model, at most half the context |
 | `OPENCLAW_VERSION` | `latest` | npm dist-tag or exact release (enforced on every run; the installed one is reported) |
 | `OPENCLAW_NODE_VERSION` | `24` | `24`, `26` or exact `24.x.y`/`26.x.y`; below 24.22.1 / 26.12.1 is refused; a change reinstalls OpenClaw |
@@ -221,7 +231,8 @@ previous list. Direct picks skip the tool and context checks.
 | "SHA-256 … not NVM_INSTALLER_SHA256" | The nvm installer changed, or `NVM_VERSION` changed without its hash; check it, then set `NVM_INSTALLER_SHA256` |
 | "below this target's security floor" | Node is below 24.22.1 / 26.12.1: set a newer `OPENCLAW_NODE_VERSION` |
 | `model server … is unreachable; skipping it` in `journalctl -u openclaw-direct` | Not yet admitted (`--reconfigure`), down, or blocked by the model host's firewall |
-| "does not offer OPENCLAW_MODEL" | Every server for it lacks tools or reports less than `OPENCLAW_CONTEXT_LENGTH`; check `/routing/inventory` |
+| "does not offer OPENCLAW_MODEL" | Every server for it lacks tools or reports less than `OPENCLAW_CONTEXT_LENGTH` (32768 with `auto`); check `/routing/inventory` |
+| OpenClaw still uses 65536 after a server was raised | Reconfigure the CT: windows are read at each configuration. With a pinned number, use `OPENCLAW_CONTEXT_LENGTH=auto` |
 | `openclaw-gateway` restarts or exits 78 | Invalid config: `journalctl -u openclaw-gateway`, then `openclaw config validate` as `openclaw` |
 | Open WebUI lists no `openclaw` | `systemctl status openclaw-gateway`, then `--integrate-only`; the router needs the Gateway port |
 | Chats are slow to get a title | The Task Model (External) must be a router model |

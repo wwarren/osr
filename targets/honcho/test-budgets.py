@@ -16,6 +16,20 @@ spec.loader.exec_module(budgets)
 
 
 class DerivedTest(unittest.TestCase):
+    def test_auto_follows_the_served_window(self):
+        self.assertEqual(budgets.effective({"CONTEXT_TOKENS": "auto"}, 32768),
+                         budgets.effective({"CONTEXT_TOKENS": "32768"}))
+        self.assertEqual({}, budgets.effective({"CONTEXT_TOKENS": "auto"}, 262144))
+        # Before the proxy has found the window: the pool default.
+        self.assertEqual(budgets.effective({"CONTEXT_TOKENS": "auto"}),
+                         budgets.effective({"CONTEXT_TOKENS": "65536"}))
+        with self.assertRaisesRegex(budgets.BudgetError, "or auto"):
+            budgets.effective({"CONTEXT_TOKENS": "automatic"})
+        self.assertEqual(budgets.served_window({"HONCHO_SERVED_CONTEXT": "98304"}), 98304)
+        self.assertIsNone(budgets.served_window({}))
+        with self.assertRaisesRegex(budgets.BudgetError, "Choose another HONCHO_MODEL"):
+            budgets.served_window({"HONCHO_SERVED_CONTEXT": "4096"})
+
     def test_a_large_window_keeps_honchos_defaults(self):
         self.assertEqual({}, budgets.effective({"CONTEXT_TOKENS": "131072"}))
         self.assertEqual({}, budgets.effective({}))

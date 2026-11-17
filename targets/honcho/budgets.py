@@ -7,6 +7,9 @@ Reads the HONCHO_* budget variables from the environment. A variable that is
 set wins; one that is set and empty returns that setting to Honcho's default;
 one that is unset keeps the value recorded by the last run (PREVIOUS_RECORD).
 HONCHO_CONTEXT_TOKENS derives starting values for the budgets left unset.
+HONCHO_CONTEXT_TOKENS=auto derives them from HONCHO_SERVED_CONTEXT, the window
+the proxy found the selected model served with (65536 while it is not known
+yet, as for the check made before the proxy runs).
 
 Writes RECORD_OUT (the explicit HONCHO_* values, for the next run) and
 SETTINGS_OUT (Honcho environment lines that differ from its defaults), and
@@ -36,6 +39,9 @@ INTEGERS = {
     "DREAM_INDUCTION_MAX_TOOL_ITERATIONS": (("DREAM_INDUCTION_MAX_TOOL_ITERATIONS",), 1, 50, 10),
 }
 BOOLEANS = {"DREAM_ENABLED": (("DREAM_ENABLED",), "true")}
+# HONCHO_CONTEXT_TOKENS=auto before the served window is known: the window
+# every OSR model target defaults to.
+AUTO_ASSUMED_CONTEXT = 65536
 NAMES = list(INTEGERS) + list(BOOLEANS)
 
 
@@ -74,9 +80,12 @@ def validate(values):
             if value not in ("true", "false"):
                 raise BudgetError(f"HONCHO_{name} must be true or false, not {value!r}.")
             continue
+        if name == "CONTEXT_TOKENS" and value == "auto":
+            continue
         _, low, high, _ = INTEGERS[name]
         if not value.isdigit() or not low <= int(value) <= high:
-            raise BudgetError(f"HONCHO_{name} must be a whole number from {low} to {high}, not {value!r}.")
+            also = " or auto" if name == "CONTEXT_TOKENS" else ""
+            raise BudgetError(f"HONCHO_{name} must be a whole number from {low} to {high}{also}, not {value!r}.")
         numbers[name] = int(value)
     return numbers
 
@@ -106,12 +115,32 @@ def derived(context):
     }
 
 
-def effective(values):
+def served_window(environ):
+    """HONCHO_SERVED_CONTEXT as a number, or None when it is not set."""
+    value = environ.get("HONCHO_SERVED_CONTEXT", "")
+    if not value:
+        return None
+    _, low, high, _ = INTEGERS["CONTEXT_TOKENS"]
+    if not value.isdigit() or not low <= int(value) <= high:
+        raise BudgetError(f"The selected model is served with {value} tokens of context; Honcho needs "
+                          f"{low} to {high}. Choose another HONCHO_MODEL, or set HONCHO_CONTEXT_TOKENS.")
+    return int(value)
+
+
+def context_window(values, served=None):
+    """The window the budgets are sized for, or None for Honcho's own."""
+    if values.get("CONTEXT_TOKENS") == "auto":
+        return served or AUTO_ASSUMED_CONTEXT
+    return int(values["CONTEXT_TOKENS"]) if "CONTEXT_TOKENS" in values else None
+
+
+def effective(values, served=None):
     """(explicit values, Honcho settings that differ from its defaults)."""
     numbers = validate(values)
     budget = {name: spec[3] for name, spec in INTEGERS.items() if spec[3] is not None}
-    if "CONTEXT_TOKENS" in numbers:
-        budget.update(derived(numbers["CONTEXT_TOKENS"]))
+    context = context_window(values, served)
+    if context:
+        budget.update(derived(context))
     budget.update({name: value for name, value in numbers.items() if name != "CONTEXT_TOKENS"})
     largest_summary = max(budget["SUMMARY_MAX_TOKENS_SHORT"], budget["SUMMARY_MAX_TOKENS_LONG"])
     if budget["SUMMARY_MAX_INPUT_TOKENS"] < 2 * largest_summary:
@@ -134,14 +163,18 @@ def effective(values):
 def main(argv):
     previous_path, record_path, settings_path = argv
     values = chosen(os.environ, read_record(previous_path))
-    settings = effective(values)
+    served = served_window(os.environ)
+    settings = effective(values, served)
     with open(record_path, "w", encoding="utf-8") as record:
         record.writelines(f"HONCHO_{name}={values[name]}\n" for name in NAMES if name in values)
     with open(settings_path, "w", encoding="utf-8") as out:
         out.writelines(f"{key}={value}\n" for key, value in settings.items())
-    if settings:
-        context = values.get("CONTEXT_TOKENS")
-        print("Honcho budgets" + (f" for a {context}-token context" if context else "") + ": "
+    if values.get("CONTEXT_TOKENS") == "auto" and served is None:
+        print("Honcho budgets: auto, sized for the selected model's context window once it is known.")
+    elif settings:
+        context = context_window(values, served)
+        how = " (auto)" if values.get("CONTEXT_TOKENS") == "auto" else ""
+        print("Honcho budgets" + (f" for a {context}-token context{how}" if context else "") + ": "
               + ", ".join(f"{key}={value}" for key, value in settings.items()))
     else:
         print("Honcho budgets: Honcho's defaults.")

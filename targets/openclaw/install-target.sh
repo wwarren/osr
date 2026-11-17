@@ -87,7 +87,12 @@ Environment:
                                (default: router-api-key next to this script;
                                absent: keep the key already configured)
   OPENCLAW_MODEL=auto          default model: an ID from the router's /v1/models
-  OPENCLAW_CONTEXT_LENGTH=65536  context the model hosts really serve (>=32768)
+  OPENCLAW_CONTEXT_LENGTH=auto   auto: each model's window as its server serves it,
+                                 from the dispatcher's /v1/models (65536 for a
+                                 server that does not say, or the model's limit
+                                 if smaller; applied on every install and
+                                 --reconfigure). A number (>=32768) pins that
+                                 window for every model; the hosts must serve it
   OPENCLAW_MAX_TOKENS=8192     output tokens per reply OpenClaw may ask for
   OPENCLAW_VERSION=latest      npm version or dist-tag of openclaw
   OPENCLAW_NODE_VERSION=24     Node for nvm: 24 or 26, or an exact 24.x.y/26.x.y
@@ -109,6 +114,16 @@ USAGE
 }
 
 # Install helpers (sourced by test-install.sh) -------------------------------
+
+# context_label: the context setting as a person reads it.
+context_label() {
+  if [[ $OPENCLAW_CONTEXT_LENGTH == auto ]]; then echo "auto, each model's served window"
+  else echo "$OPENCLAW_CONTEXT_LENGTH"; fi
+}
+# context_floor: the least context a model must serve to be used.
+context_floor() {
+  if [[ $OPENCLAW_CONTEXT_LENGTH == auto ]]; then echo "$MIN_CONTEXT"; else echo "$OPENCLAW_CONTEXT_LENGTH"; fi
+}
 
 # settings_record: the settings this installation runs with. Keys are
 # recorded only as hashes, so rotating one is a change.
@@ -258,7 +273,11 @@ print(json.dumps([f"http://{ip}:{port}" for ip in sys.argv[2:]], separators=(","
 providers_json() {
   python3 - "$@" <<'PY'
 import json, os, sys
-context, max_tokens, direct = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].rstrip("/")
+# CONTEXT is a number for every model, or auto: each model's context_length
+# from the dispatcher's /v1/models (what its servers serve), else 65536.
+fixed = None if sys.argv[1] == "auto" else int(sys.argv[1])
+max_tokens, direct = int(sys.argv[2]), sys.argv[3].rstrip("/")
+AUTO_ASSUMED_CONTEXT = 65536
 kindi_targets = set(os.environ.get("KINDI_TARGETS", "").split())
 kindi_client_timeout = int(os.environ.get("KINDI_CLIENT_TIMEOUT_SECONDS", "7200"))
 previous = {}
@@ -279,6 +298,14 @@ for item in sys.argv[5:]:
         listed = json.load(f)
     ids = sorted({m["id"] for m in listed.get("data") or []
                   if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]})
+    served = {m["id"]: m.get("context_length") for m in listed.get("data") or []
+              if isinstance(m, dict) and isinstance(m.get("id"), str)}
+
+    def window(model_id):
+        value = served.get(model_id)
+        if fixed:
+            return fixed
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else AUTO_ASSUMED_CONTEXT
     if name == "osr" and "auto" in ids:
         ids = ["auto"] + [i for i in ids if i != "auto"]
     if not ids:
@@ -287,8 +314,8 @@ for item in sys.argv[5:]:
     # Tool calls are what the agent is for; max_tokens is the field every
     # pool server (Ollama, llama.cpp, vLLM-style) accepts.
     out[name] = {"baseUrl": base, "apiKey": "no-key", "api": "openai-completions",
-                 "models": [{"id": i, "name": i, "input": ["text"], "contextWindow": context,
-                             "maxTokens": max_tokens,
+                 "models": [{"id": i, "name": i, "input": ["text"], "contextWindow": window(i),
+                             "maxTokens": min(max_tokens, window(i) // 2),
                              "compat": {"supportsTools": True, "maxTokensField": "max_tokens"}}
                             for i in ids]}
     if name in kindi_targets or (name == "osr" and kindi_targets):
@@ -328,7 +355,7 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROUTER_URL=${ROUTER_URL:-}
 ROUTER_API_KEY_FILE=${ROUTER_API_KEY_FILE:-$source_dir/router-api-key}
 OPENCLAW_MODEL=${OPENCLAW_MODEL:-auto}
-OPENCLAW_CONTEXT_LENGTH=${OPENCLAW_CONTEXT_LENGTH:-65536}
+OPENCLAW_CONTEXT_LENGTH=${OPENCLAW_CONTEXT_LENGTH:-auto}
 OPENCLAW_MAX_TOKENS=${OPENCLAW_MAX_TOKENS:-8192}
 OPENCLAW_VERSION=${OPENCLAW_VERSION:-latest}
 OPENCLAW_NODE_VERSION=${OPENCLAW_NODE_VERSION:-24}
@@ -389,10 +416,11 @@ HONCHO_URL=${HONCHO_URL%/}
 [[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid OPEN_TERMINAL_URL.'
 OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 [[ $OPENCLAW_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid OPENCLAW_MODEL.'
-[[ $OPENCLAW_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCLAW_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
-  die "OPENCLAW_CONTEXT_LENGTH must be at least $MIN_CONTEXT: OpenClaw's prompt, tools and history need it. The model's host must serve that much too."
-[[ $OPENCLAW_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCLAW_MAX_TOKENS >= 256 && OPENCLAW_MAX_TOKENS * 2 <= OPENCLAW_CONTEXT_LENGTH )) ||
-  die 'OPENCLAW_MAX_TOKENS must be at least 256 and at most half of OPENCLAW_CONTEXT_LENGTH.'
+[[ $OPENCLAW_CONTEXT_LENGTH == auto ]] ||
+  { [[ $OPENCLAW_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCLAW_CONTEXT_LENGTH >= MIN_CONTEXT )); } ||
+  die "OPENCLAW_CONTEXT_LENGTH must be auto or at least $MIN_CONTEXT: OpenClaw's prompt, tools and history need it. The model's host must serve that much too."
+[[ $OPENCLAW_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCLAW_MAX_TOKENS >= 256 && OPENCLAW_MAX_TOKENS * 2 <= $(context_floor) )) ||
+  die "OPENCLAW_MAX_TOKENS must be at least 256 and at most half of OPENCLAW_CONTEXT_LENGTH (of $MIN_CONTEXT with auto)."
 # OpenClaw's whole-request deadline for Kindi: see providers_json.
 KINDI_CLIENT_TIMEOUT_SECONDS=$((KINDI_READ_TIMEOUT_SECONDS * 2 + OPENCLAW_MAX_TOKENS))
 [[ $OPENCLAW_VERSION =~ ^([a-z][a-z0-9-]{0,31}|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]] ||
@@ -434,7 +462,7 @@ if (( dry_run )); then
   [[ $OPENCLAW_SKIP_CHAT_PROBE == true ]] ||
     printf '+ send one chat request offering a tool through the local dispatcher to a model server (model %s)\n' "$OPENCLAW_MODEL"
   printf '+ configure provider osr (baseUrl %s/v1, api openai-completions, apiKey <local placeholder>), model osr/%s, contextWindow %s\n' \
-    "$DIRECT_URL" "$OPENCLAW_MODEL" "$OPENCLAW_CONTEXT_LENGTH"
+    "$DIRECT_URL" "$OPENCLAW_MODEL" "$(context_label)"
   printf '+ configure direct providers <target> (baseUrl %s/t/<target>/v1) for: %s\n' \
     "$DIRECT_URL" "$(target_names "$targets_source" | paste -sd' ' - | sed 's/^$/none/')"
   printf '+ Gateway on port %s, bind %s, token auth (key in %s/api-key and %s)\n' \
@@ -873,7 +901,7 @@ mapfile -t new_providers < <(provider_ids < "$stage/providers.json")
 python3 -c 'import json,sys
 models = json.load(open(sys.argv[1]))["osr"]["models"]
 sys.exit(0 if any(m["id"] == sys.argv[2] for m in models) else 1)' "$stage/providers.json" "$OPENCLAW_MODEL" ||
-  fail "The local dispatcher does not offer OPENCLAW_MODEL '$OPENCLAW_MODEL' (no tool support or less than $OPENCLAW_CONTEXT_LENGTH tokens of context on every server)."
+  fail "The local dispatcher does not offer OPENCLAW_MODEL '$OPENCLAW_MODEL' (no tool support or less than $(context_floor) tokens of context on every server)."
 providers_sha256=$(sha256sum "$stage/providers.json" | cut -d' ' -f1)
 
 # 3. OpenClaw's configuration. The Gateway token lives in OpenClaw's .env
@@ -992,7 +1020,7 @@ trap - ERR
 # The key now lives in the dispatcher's own file.
 rm -f -- "$ROUTER_API_KEY_FILE"
 version=$(installed_openclaw)
-note "OpenClaw $version (Node $(installed_node)) discovers via $ROUTER_URL and calls model servers directly with model osr/$OPENCLAW_MODEL (context $OPENCLAW_CONTEXT_LENGTH)."
+note "OpenClaw $version (Node $(installed_node)) discovers via $ROUTER_URL and calls model servers directly with model osr/$OPENCLAW_MODEL (context $(context_label))."
 exact_version "$OPENCLAW_VERSION" || note "Pin this version with OPENCLAW_VERSION=$version."
 [[ $OPENCLAW_API != true ]] || note "OpenAI-compatible API: http://0.0.0.0:$OPENCLAW_PORT/v1 (model $API_MODEL)."
 if [[ $OPENCLAW_DASHBOARD == true ]]; then

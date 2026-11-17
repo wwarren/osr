@@ -254,7 +254,8 @@ reject 'Set STORAGE for unattended provisioning' STORAGE=
 reject 'Set IP_CIDR for unattended provisioning' IP_CIDR=
 reject 'Set GATEWAY for unattended provisioning' GATEWAY=
 reject 'OpenCode and router CT IDs must differ' CT_ID=280
-reject 'at least 32768' OPENCODE_CONTEXT_LENGTH=16384
+reject 'auto or at least 32768' OPENCODE_CONTEXT_LENGTH=16384
+reject 'auto or at least 32768' OPENCODE_CONTEXT_LENGTH=automatic
 reject 'OPENCODE_MAX_TOKENS must be' OPENCODE_MAX_TOKENS=40000
 reject 'OPENCODE_VERSION must be' 'OPENCODE_VERSION=2.0;x'
 reject 'OPENCODE_VERSION must be' OPENCODE_VERSION=1.18.23
@@ -465,7 +466,7 @@ cmp -s "$fake/pushed-284-direct-dispatch.py" "$here/../hermes/direct-dispatch.py
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 guest_env=$(< "$fake/guest-env")
 for want in ROUTER_URL=http://192.0.2.80:8000 OPENCODE_WEB=true OPENCODE_PORT=4096 KINDI_READ_TIMEOUT_SECONDS=5400 \
-            OPENCODE_MODEL=auto OPENCODE_CONTEXT_LENGTH=65536 OPENCODE_VERSION=2.2.7 HONCHO_URL= OPEN_TERMINAL_URL=; do
+            OPENCODE_MODEL=auto OPENCODE_CONTEXT_LENGTH=auto OPENCODE_VERSION=2.2.7 HONCHO_URL= OPEN_TERMINAL_URL=; do
   [[ " $guest_env " == *" $want "* ]] || fail "guest installer not given $want: $guest_env"
 done
 grep -qx 'IN ACCEPT -source 192.0.2.0/24 -p tcp -dport 4096 -log nolog # open-smart-router opencode-web' "$fwfile" || fail "firewall: $(cat "$fwfile")"

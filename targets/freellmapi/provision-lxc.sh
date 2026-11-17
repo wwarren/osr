@@ -26,7 +26,8 @@ FW_TAG='open-smart-router freellmapi'
 CT_DESCRIPTION='FreeLLMAPI for Open Smart Router'
 GUEST_DATA=/app/server/data
 GUEST_DIR=$GUEST_DATA/osr-target
-IMAGE_ENTRYPOINT_RE='^/usr/local/bin/docker-entrypoint\.sh node server/dist/index\.js$'
+IMAGE_ENTRYPOINT='/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
+IMAGE_ENTRYPOINT_RE='^(/usr/bin/env PORT=[1-9][0-9]{0,4} )?/usr/local/bin/docker-entrypoint\.sh node server/dist/index\.js$'
 MAINTENANCE_ENTRYPOINT='sleep infinity'
 
 usage() {
@@ -52,7 +53,9 @@ Optional: CT_HOSTNAME=freellmapi, BRIDGE=vmbr0, CORES=2, MEMORY_MB=1024,
           SWAP_MB=0, ROOTFS_GB=4 (the image), DATA_GB=2 (database and keys),
           ONBOOT=1, NAMESERVER, VLAN_TAG,
           TEMPLATE_STORAGE=local (a storage for container templates),
-          FREELLMAPI_VERSION=<the tested release tag>,
+          FREELLMAPI_VERSION=<the tested release tag> (with --reconfigure,
+                    keep: stay on the CT's release, as tools/upgrade-all.sh
+                    passes when it keeps it),
           FREELLMAPI_DIGEST=<sha256:... the registry digest of that tag>,
           FREELLMAPI_PORT=3001,
           FREELLMAPI_ACCESS_CIDR=<the CT's network> (who may open the
@@ -117,6 +120,25 @@ firewall_config() {
 # fw_access FILE: the access range in a FreeLLMAPI firewall file.
 fw_access() {
     sed -nE "s/^IN ACCEPT -source ([0-9.]+\/[0-9]+) -p tcp -dport [0-9]+ -log nolog # ${FW_TAG}-web\$/\1/p" "$1" 2>/dev/null | head -n 1
+}
+fw_router_ip() {
+    sed -nE "s/^IN ACCEPT -source ([0-9.]+)\/32 -p tcp -dport [0-9]+ -log nolog # ${FW_TAG}-router\$/\1/p" "$1" 2>/dev/null | head -n 1
+}
+sync_firewall() {
+    if (( dry_run )); then printf '+ update FreeLLMAPI rules in %s\n' "$firewall_file"; return; fi
+    grep -qxF '[RULES]' "$firewall_file" || die "Missing [RULES] in $firewall_file."
+    # Keep operator-added rules and options; replace only rules owned by us.
+    awk -v access="$FREELLMAPI_ACCESS_CIDR" -v port="$FREELLMAPI_PORT" -v router="$router_ip" -v tag="$FW_TAG" '
+        $0 == "[RULES]" {
+            print
+            print "IN ACCEPT -source " access " -p tcp -dport " port " -log nolog # " tag "-web"
+            if (router != "") print "IN ACCEPT -source " router "/32 -p tcp -dport " port " -log nolog # " tag "-router"
+            next
+        }
+        index($0, " # " tag "-web") || index($0, " # " tag "-router") { next }
+        { print }
+    ' "$firewall_file" > "$firewall_file.new"
+    mv -- "$firewall_file.new" "$firewall_file"
 }
 
 # --- The image ---------------------------------------------------------------
@@ -287,6 +309,7 @@ write_settings() {
     printf '%s\n' "FREELLMAPI_VERSION=$FREELLMAPI_VERSION" "FREELLMAPI_VERSION_SOURCE=$version_source" \
         "FREELLMAPI_DIGEST=$image_digest" "FREELLMAPI_COMMIT=$image_revision" "FREELLMAPI_PORT=$FREELLMAPI_PORT" \
         "FREELLMAPI_RATE_LIMIT_RPM=$FREELLMAPI_RATE_LIMIT_RPM" "FREELLMAPI_ADMIN_EMAIL=$FREELLMAPI_ADMIN_EMAIL" \
+        "FREELLMAPI_ACCESS_CIDR=$FREELLMAPI_ACCESS_CIDR" "ROUTER_CT_ID=$ROUTER_CT_ID" \
         "TEMPLATE=$(template_volume "$FREELLMAPI_VERSION")" |
         guest sh -c 'umask 022; cat > "$1.new" && mv "$1.new" "$1"' sh "$GUEST_DIR/settings"
 }
@@ -434,8 +457,9 @@ if [[ $mode != create ]]; then
         # A plan away from Proxmox: the settings stand in for the CT's record.
         ct_ip=${IP_CIDR%/*}
         old_version=${OSR_DRY_RUN_OLD_VERSION:-$DEFAULT_FREELLMAPI_VERSION}
-        old_entrypoint='/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
+        old_entrypoint=$IMAGE_ENTRYPOINT
         FREELLMAPI_PORT=${FREELLMAPI_PORT:-3001}
+        FREELLMAPI_ACCESS_CIDR=${FREELLMAPI_ACCESS_CIDR:-$(network_of "${IP_CIDR:-192.0.2.80/24}")}
         FREELLMAPI_RATE_LIMIT_RPM=${FREELLMAPI_RATE_LIMIT_RPM:-600}
         FREELLMAPI_ADMIN_EMAIL=${FREELLMAPI_ADMIN_EMAIL:-admin@osr.local}
         old_source=default old_digest=''
@@ -457,6 +481,12 @@ if [[ $mode != create ]]; then
         FREELLMAPI_RATE_LIMIT_RPM=${FREELLMAPI_RATE_LIMIT_RPM:-$(recorded FREELLMAPI_RATE_LIMIT_RPM)}
         FREELLMAPI_ADMIN_EMAIL=$(recorded FREELLMAPI_ADMIN_EMAIL)
     fi
+    # keep: the CT's own release, and whether it follows the tested one.
+    if [[ $FREELLMAPI_VERSION == keep ]]; then
+        FREELLMAPI_VERSION=$old_version version_source=${old_source:-default}
+        [[ $version_source == explicit ]] || version_source=default
+        FREELLMAPI_DIGEST=${FREELLMAPI_DIGEST:-$old_digest}
+    fi
     # A release chosen for this CT stays until another one is named; a CT on
     # the tested release follows it.
     if [[ -z $FREELLMAPI_VERSION ]]; then
@@ -470,7 +500,29 @@ if [[ $mode != create ]]; then
     fi
     if [[ -z $FREELLMAPI_ACCESS_CIDR && -r $firewall_file ]]; then FREELLMAPI_ACCESS_CIDR=$(fw_access "$firewall_file"); fi
     if [[ $mode == register ]]; then ask_router
-    else ROUTER_CT_ID=none; fi
+    else
+        [[ -r $firewall_file || $dry_run == 1 ]] || die "Missing firewall file: $firewall_file"
+        # sync_firewall rewrites the rules after the server restarts: a file it
+        # cannot rewrite must stop the run before the CT is touched.
+        [[ $dry_run == 1 ]] || grep -qxF '[RULES]' "$firewall_file" ||
+            die "$firewall_file has no [RULES] section; add it (or restore the file) and run again."
+        if [[ -z $ROUTER_CT_ID && $dry_run == 0 ]]; then
+            ROUTER_CT_ID=$(recorded ROUTER_CT_ID)
+            if [[ -z $ROUTER_CT_ID && -r $firewall_file ]]; then
+                # Older installations did not record the router CT ID.
+                candidate=$(pve_tagged_ct osr-router)
+                if [[ -n $candidate && $(pve_ct_net "$candidate" ip) == "$(fw_router_ip "$firewall_file")" ]]; then ROUTER_CT_ID=$candidate; fi
+                [[ -n $ROUTER_CT_ID || -z $(fw_router_ip "$firewall_file") ]] ||
+                    die "Cannot identify the router CT allowed by $firewall_file; set ROUTER_CT_ID to its ID."
+            fi
+        fi
+        ROUTER_CT_ID=${ROUTER_CT_ID:-none}
+        valid_router_ct "$ROUTER_CT_ID" || die 'ROUTER_CT_ID must be a CT ID or none.'
+        if [[ $ROUTER_CT_ID != none ]]; then
+            router_ip=$(pve_ct_net "$ROUTER_CT_ID" ip)
+            [[ -n $router_ip || $dry_run == 1 ]] || die "Router CT $ROUTER_CT_ID has no static address."
+        fi
+    fi
 fi
 
 valid_version "$FREELLMAPI_VERSION" || die 'FREELLMAPI_VERSION must be a release tag such as v0.16.31.'
@@ -478,6 +530,7 @@ valid_version "$FREELLMAPI_VERSION" || die 'FREELLMAPI_VERSION must be a release
 [[ $FREELLMAPI_VERSION != "$DEFAULT_FREELLMAPI_VERSION" ]] || version_source=default
 valid_optional_digest "$FREELLMAPI_DIGEST" || die 'FREELLMAPI_DIGEST must be sha256: and 64 hex digits.'
 valid_port "$FREELLMAPI_PORT" || die 'FREELLMAPI_PORT must be 1..65535.'
+pve_valid_cidr "$FREELLMAPI_ACCESS_CIDR" || die 'FREELLMAPI_ACCESS_CIDR must be a.b.c.d/nn.'
 [[ $FREELLMAPI_RATE_LIMIT_RPM =~ ^(0|[1-9][0-9]{0,6})$ ]] || die 'FREELLMAPI_RATE_LIMIT_RPM must be a nonnegative integer.'
 [[ $FREELLMAPI_READY_TIMEOUT =~ ^[1-9][0-9]{0,4}$ ]] || die 'FREELLMAPI_READY_TIMEOUT must be a positive number of seconds.'
 valid_storage_id "$TEMPLATE_STORAGE" || die 'TEMPLATE_STORAGE must be a Proxmox storage ID.'
@@ -572,11 +625,13 @@ create_ct() {
     [[ $old_entrypoint =~ $IMAGE_ENTRYPOINT_RE ]] ||
         die "CT $CT_ID did not take the image's entrypoint (found '${old_entrypoint:-none}'). Is $template the FreeLLMAPI image, and this Proxmox VE 9.1 or later?"
 }
+# The OCI image exports PORT=3001; dotenv does not replace an exported value.
+# Set PORT in the server's init environment while retaining the other image env.
+runtime_entrypoint() { printf '/usr/bin/env PORT=%s %s\n' "$FREELLMAPI_PORT" "$IMAGE_ENTRYPOINT"; }
 
 # first_start bootstrap|keep: prepare the data directory while the server is
 # down, then start the image's own entrypoint and wait for it.
 first_start() {
-    local entrypoint=${old_entrypoint:-<the image entrypoint>}
     maintenance_boot
     printf '+ prepare %s in the CT (env file with the encryption key, /app/.env)\n' "$GUEST_DIR"
     (( dry_run )) || guest sh -c "$GUEST_PREPARE" sh "$FREELLMAPI_PORT" "$FREELLMAPI_RATE_LIMIT_RPM" "$1"
@@ -591,7 +646,7 @@ first_start() {
     fi
     [[ ${2:-} != restore ]] || restore_data
     write_settings
-    service_boot "$entrypoint"
+    service_boot "$(runtime_entrypoint)"
     (( dry_run )) && { printf '+ wait up to %ss for http://127.0.0.1:%s/api/ping in the CT\n' "$FREELLMAPI_READY_TIMEOUT" "$FREELLMAPI_PORT"; return 0; }
     wait_healthy || { note "FreeLLMAPI in CT $CT_ID did not answer /api/ping within ${FREELLMAPI_READY_TIMEOUT}s."; return 1; }
 }
@@ -674,6 +729,8 @@ rollback() {
     pct restore "$CT_ID" "$dump" --storage "$ct_storage" ||
         { note "pct restore failed. The backup is kept: $dump (pct restore $CT_ID $dump --storage $ct_storage)"; return 1; }
     pct start "$CT_ID" || { note "The restored CT $CT_ID did not start. The backup is kept: $dump"; return 1; }
+    FREELLMAPI_PORT=$old_port
+    ROUTER_CT_ID=$old_router
     if wait_healthy; then
         note "CT $CT_ID is running FreeLLMAPI $old_version again."
         rm -rf -- "$stage"
@@ -690,9 +747,31 @@ pve_row 'Rate limit' "$FREELLMAPI_RATE_LIMIT_RPM requests per minute per client"
 
 same_release=0
 [[ $old_version != "$FREELLMAPI_VERSION" ]] || same_release=1
+old_port=$FREELLMAPI_PORT old_router=$ROUTER_CT_ID old_router_ip=''
+if (( ! dry_run )); then
+    old_port=$(recorded FREELLMAPI_PORT)
+    old_router=$(recorded ROUTER_CT_ID)
+    old_router=${old_router:-$ROUTER_CT_ID}
+    old_router_ip=$(fw_router_ip "$firewall_file")
+fi
+rollback_settings() {
+    trap - ERR
+    note "Restoring FreeLLMAPI settings in CT $CT_ID."
+    pct stop "$CT_ID" 2>/dev/null || true
+    maintenance_boot || return 1
+    guest tar -C "$GUEST_DATA" -xpf - < "$settings_stage/config.tar" || return 1
+    cp -- "$settings_stage/firewall.fw" "$firewall_file" || return 1
+    FREELLMAPI_PORT=$old_port
+    ROUTER_CT_ID=$old_router
+    service_boot "$old_entrypoint" || return 1
+    wait_healthy || return 1
+    rm -rf -- "$settings_stage"
+}
 if (( same_release && ! dry_run )); then
     same_settings=1
-    [[ $(recorded FREELLMAPI_PORT) == "$FREELLMAPI_PORT" && $(recorded FREELLMAPI_RATE_LIMIT_RPM) == "$FREELLMAPI_RATE_LIMIT_RPM" ]] || same_settings=0
+    [[ $old_port == "$FREELLMAPI_PORT" && $(recorded FREELLMAPI_RATE_LIMIT_RPM) == "$FREELLMAPI_RATE_LIMIT_RPM" &&
+       $(fw_access "$firewall_file") == "$FREELLMAPI_ACCESS_CIDR" && $(fw_router_ip "$firewall_file") == "$router_ip" &&
+       $old_router == "$ROUTER_CT_ID" ]] || same_settings=0
     if (( same_settings )) && guest node -e "$GUEST_PING" "$FREELLMAPI_PORT" 2>/dev/null; then
         pve_ensure_tags "$CT_ID" ai ai-model osr-target freellmapi
         printf 'FreeLLMAPI CT %s runs %s and answers: nothing to do.\n' "$CT_ID" "$FREELLMAPI_VERSION"
@@ -705,10 +784,22 @@ if (( same_release )); then
     pve_confirm "Apply the settings to FreeLLMAPI CT $CT_ID (a short restart)?"
     image_digest=${old_digest:-} image_revision=''
     (( dry_run )) || image_revision=$(recorded FREELLMAPI_COMMIT)
+    if (( ! dry_run )); then
+        install -d -m 0700 "$STATE_DIR"
+        settings_stage=$(mktemp -d "$STATE_DIR/$CT_ID-settings.XXXXXXXX")
+        guest tar -C "$GUEST_DATA" -cf - osr-target/freellmapi.env osr-target/settings > "$settings_stage/config.tar" ||
+            { rm -rf -- "$settings_stage"; die 'Could not back up the FreeLLMAPI settings.'; }
+        cp -- "$firewall_file" "$settings_stage/firewall.fw" || { rm -rf -- "$settings_stage"; die 'Could not back up the FreeLLMAPI firewall.'; }
+    fi
+    trap 'note "Stopped at line $LINENO."; rollback_settings || note "Settings backup kept: $settings_stage"; exit 1' ERR
     run pct stop "$CT_ID"
-    trap 'note "Stopped at line $LINENO."; service_boot "$old_entrypoint" || true; exit 1' ERR
-    first_start keep || { service_boot "$old_entrypoint"; die "FreeLLMAPI in CT $CT_ID did not come back; see pct console $CT_ID."; }
+    if ! first_start keep; then rollback_settings || note "Settings backup kept: $settings_stage"; exit 1; fi
+    sync_firewall
+    if [[ $old_port != "$FREELLMAPI_PORT" || $old_router != "$ROUTER_CT_ID" || $old_router_ip != "$router_ip" ]]; then
+        if ! register_with_router; then rollback_settings || note "Settings backup kept: $settings_stage"; exit 1; fi
+    fi
     trap - ERR
+    (( dry_run )) || rm -rf -- "$settings_stage"
     (( dry_run )) || printf 'FreeLLMAPI CT %s was restarted with its settings.\n' "$CT_ID"
     exit 0
 fi
@@ -754,7 +845,7 @@ else
     install -d -m 0700 "$stage"
     data_tar=$stage/data.tar
     key_before=$(read_key | sha256sum) || die "Could not read the unified API key in CT $CT_ID."
-    firewall=$(cat -- "$firewall_file")
+    cp -- "$firewall_file" "$stage/firewall.fw"
     # From here the old CT is touched: any failure starts it again.
     trap 'note "Stopped at line $LINENO."; pct stop "$CT_ID" 2>/dev/null || true; service_boot "$old_entrypoint" || true; rm -rf -- "$stage"; exit 1' ERR
     pct stop "$CT_ID"
@@ -772,9 +863,10 @@ else
 fi
 create_ct "$(template_volume "$FREELLMAPI_VERSION")" "$net" "$ct_storage:${rootfs_size%G}" "$ct_storage:${data_size%G}" "${keep[@]}"
 if (( dry_run )); then
-    printf '+ write %s again as it was\n' "$firewall_file"
+    sync_firewall
 else
-    printf '%s\n' "$firewall" > "$firewall_file"
+    cp -- "$stage/firewall.fw" "$firewall_file"
+    sync_firewall
 fi
 if ! first_start keep restore; then
     (( dry_run )) || { rollback || true; exit 1; }
@@ -788,6 +880,9 @@ if [[ $key_after != "$key_before" ]] || ! key_works "$(read_key)"; then
     note "Release $FREELLMAPI_VERSION started, but the unified API key is not the one the router has."
     rollback || true
     exit 1
+fi
+if [[ $old_port != "$FREELLMAPI_PORT" || $old_router != "$ROUTER_CT_ID" || $old_router_ip != "$router_ip" ]]; then
+    if ! register_with_router; then rollback || true; exit 1; fi
 fi
 trap - ERR
 rm -rf -- "$stage"

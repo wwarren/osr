@@ -252,7 +252,8 @@ reject 'Set STORAGE for unattended provisioning' STORAGE=
 reject 'Set IP_CIDR for unattended provisioning' IP_CIDR=
 reject 'Set GATEWAY for unattended provisioning' GATEWAY=
 reject 'OpenClaw and router CT IDs must differ' CT_ID=280
-reject 'at least 32768' OPENCLAW_CONTEXT_LENGTH=16384
+reject 'auto or at least 32768' OPENCLAW_CONTEXT_LENGTH=16384
+reject 'auto or at least 32768' OPENCLAW_CONTEXT_LENGTH=automatic
 reject 'OPENCLAW_MAX_TOKENS must be' OPENCLAW_MAX_TOKENS=40000
 reject 'OPENCLAW_VERSION must be' 'OPENCLAW_VERSION=1.0;x'
 reject 'OPENCLAW_NODE_VERSION must be' OPENCLAW_NODE_VERSION=22
@@ -447,7 +448,7 @@ cmp -s "$fake/pushed-283-direct-dispatch.py" "$here/../hermes/direct-dispatch.py
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 guest_env=$(< "$fake/guest-env")
 for want in ROUTER_URL=http://192.0.2.80:8000 OPENCLAW_API=true OPENCLAW_DASHBOARD=true OPENCLAW_PORT=18789 KINDI_READ_TIMEOUT_SECONDS=5400 \
-            OPENCLAW_MODEL=auto OPENCLAW_CONTEXT_LENGTH=65536 OPENCLAW_NODE_VERSION=24 NVM_VERSION=v0.40.4; do
+            OPENCLAW_MODEL=auto OPENCLAW_CONTEXT_LENGTH=auto OPENCLAW_NODE_VERSION=24 NVM_VERSION=v0.40.4; do
   [[ " $guest_env " == *" $want "* ]] || fail "guest installer not given $want: $guest_env"
 done
 [[ $guest_env != *NVM_INSTALLER_SHA256* ]] || fail 'an unset nvm pin must leave the guest default in force'

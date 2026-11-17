@@ -1689,8 +1689,8 @@ freellmapi_host_ready() {
 }
 valid_honcho_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
 # Blank: Honcho's own token budgets (fine for a context window of 128k or more).
-valid_honcho_context_tokens() { [[ -z $1 || ( $1 =~ ^[1-9][0-9]{3,6}$ && $1 -ge 8192 && $1 -le 1048576 ) ]]; }
-valid_dsh_context_tokens() { [[ $1 =~ ^[1-9][0-9]{4,6}$ && $1 -ge 16384 && $1 -le 1048576 ]]; }
+valid_honcho_context_tokens() { [[ -z $1 || $1 == auto || ( $1 =~ ^[1-9][0-9]{3,6}$ && $1 -ge 8192 && $1 -le 1048576 ) ]]; }
+valid_dsh_context_tokens() { [[ $1 == auto || ( $1 =~ ^[1-9][0-9]{4,6}$ && $1 -ge 16384 && $1 -le 1048576 ) ]]; }
 valid_hf_token() { [[ $1 =~ ^hf_[A-Za-z0-9]{30,}$ ]]; }
 
 # host_gpu_cuda_arch: GPU 0's compute capability (86), from the GPU step or,
@@ -2078,16 +2078,18 @@ prompt_target_contexts() {
     if [[ -z $smallest ]] || (( value < smallest )); then smallest=$value; fi
   done
   if [[ " ${TARGETS} " == *" honcho "* ]]; then
-    echo "  honcho: its budgets follow its chat model's context window. Give the window the"
-    echo "    server behind HONCHO_MODEL serves${smallest:+ (the smallest above is ${smallest})}. Blank: Honcho's"
-    echo "    own budgets, which need models that report 131072 tokens or more."
-    prompt_until_valid "    Model context window" HONCHO_CONTEXT_TOKENS \
-      "${HONCHO_CONTEXT_TOKENS-${smallest:-65536}}" valid_honcho_context_tokens || return 1
+    echo "  honcho: its budgets follow its chat model's context window. auto: the window the"
+    echo "    model is served with, read on every run. Or give the window the server behind"
+    echo "    HONCHO_MODEL serves${smallest:+ (the smallest above is ${smallest})}. Blank: Honcho's own"
+    echo "    budgets, which need models that report 131072 tokens or more."
+    prompt_until_valid "    Model context window (auto, tokens or blank)" HONCHO_CONTEXT_TOKENS \
+      "${HONCHO_CONTEXT_TOKENS-auto}" valid_honcho_context_tokens || return 1
   fi
   if [[ " ${TARGETS} " == *" deepseek-harness "* ]]; then
-    echo "  deepseek-harness: the context its OSR model serves${smallest:+ (the smallest above is ${smallest})}."
-    prompt_until_valid "    Served context tokens" DEEPSEEK_HARNESS_CONTEXT_WINDOW \
-      "${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-${smallest:-65536}}" valid_dsh_context_tokens || return 1
+    echo "  deepseek-harness: the context its OSR model serves. auto: read from the router on"
+    echo "    every run; or a number${smallest:+ (the smallest above is ${smallest})}."
+    prompt_until_valid "    Served context tokens (auto, or tokens)" DEEPSEEK_HARNESS_CONTEXT_WINDOW \
+      "${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-auto}" valid_dsh_context_tokens || return 1
   fi
 }
 
@@ -2309,7 +2311,7 @@ run_target_provisioner() {
       if [[ "$name" == honcho ]]; then
         export ROUTER_IP="$router_ip" HONCHO_MODEL="${HONCHO_MODEL:-fast}"
         export HONCHO_CLIENT_IPS="${client_ips:-${HONCHO_CLIENT_IPS:-}}"
-        # Set and empty: Honcho's own budgets (not the first install's 65536).
+        # Set and empty: Honcho's own budgets (not the first install's auto).
         [[ -z ${HONCHO_CONTEXT_TOKENS+set} ]] || export HONCHO_CONTEXT_TOKENS
       fi
       # Only the agents use Honcho, and only once its CT was provisioned.
@@ -2331,7 +2333,7 @@ run_target_provisioner() {
       # without the token installs it without Open WebUI.
       if [[ "$name" == deepseek-harness ]]; then
         export DEEPSEEK_HARNESS_MODEL="${DEEPSEEK_HARNESS_MODEL:-auto}"
-        export DEEPSEEK_HARNESS_CONTEXT_WINDOW="${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-65536}"
+        export DEEPSEEK_HARNESS_CONTEXT_WINDOW="${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-auto}"
         export DSH_ACCESS_CIDR="${DEEPSEEK_HARNESS_ACCESS_CIDR:-${API_ALLOW_CIDR:-$ip}}"
         if [[ ${TARGET_WEBUI_READY:-true} != true || -z "$admin_token" ]]; then
           export OPENWEBUI=false
@@ -4639,6 +4641,12 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
         # None when it reports none. A ceiling, not a guarantee: Ollama, for
         # one, may serve less than the model's own limit unless num_ctx says.
         "context_length": positive_int(raw.get("context_length")),
+        # The context the server is set to serve this model with right now
+        # (tokens): LM Studio's loaded instance, a num_ctx (Ollama Modelfile,
+        # the llama.cpp bridge's slot, AirLLM's window) or a /v1/models
+        # server's own setting. None when only the model's own limit is known.
+        # Clients that size their window from discovery (Hermes) use this.
+        "served_context_length": positive_int(raw.get("served_context_length")),
         # True/False when the server reports residency; None otherwise.
         "loaded": raw.get("loaded"),
         "kind": server_kind(server),
@@ -4650,6 +4658,9 @@ def build_entry(server: str, raw: dict, capabilities=None) -> dict:
 _CAPABILITIES = {}
 # The same key -> context length from the same /api/show answer, or None.
 _CONTEXTS = {}
+# The same key -> that context when it came from a num_ctx (what the server
+# serves), or None when it is only the model's own limit.
+_SERVED_CONTEXTS = {}
 # A digest identifies what was probed: Ollama gives a re-pulled or re-created
 # model a new one, and AirLLM puts its served window into its digest. Such an
 # answer is kept for show_cache_seconds (an hour), so a poll does not ask every
@@ -4673,7 +4684,7 @@ def _forget_show_answers(server: str, current: set) -> None:
     """Drop the cached answers of models a server no longer lists (a removed
     model, or the previous digest of a re-pulled one)."""
     for key in [k for k in _CAPABILITIES if k[0] == server and k not in current]:
-        for cache in (_CAPABILITIES, _CONTEXTS, _SHOW_TIMES):
+        for cache in (_CAPABILITIES, _CONTEXTS, _SERVED_CONTEXTS, _SHOW_TIMES):
             cache.pop(key, None)
 
 
@@ -4702,6 +4713,19 @@ def show_context_length(show: dict):
     return min(values) if values else None
 
 
+def show_served_context(show: dict):
+    """show_context_length when /api/show gives a num_ctx, the window the
+    server really uses (a Modelfile's, the llama.cpp bridge's slot, AirLLM's);
+    None when only the model's own limit is known: Ollama then serves its
+    OLLAMA_CONTEXT_LENGTH default, which /api/show does not report."""
+    parameters = show.get("parameters")
+    if not isinstance(parameters, str) or not any(
+            len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit()
+            for parts in (line.split() for line in parameters.splitlines())):
+        return None
+    return show_context_length(show)
+
+
 def _show_key(server: str, raw: dict) -> tuple:
     name = raw.get("name") or raw.get("model") or ""
     return (server, name, raw.get("digest") or raw.get("modified_at") or "")
@@ -4716,7 +4740,7 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
     if (not force and key in _CAPABILITIES and key in _SHOW_TIMES
             and time.monotonic() - _SHOW_TIMES[key] < _show_ttl(raw)):
         return _CAPABILITIES[key]
-    caps = context = None
+    caps = context = served = None
     try:
         async with (limit or asyncio.Semaphore(1)):
             response = await client.post(f"{server}/api/show", json={"model": name},
@@ -4728,10 +4752,12 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
                 if isinstance(found, list):
                     caps = [str(c) for c in found]
                 context = show_context_length(payload)
+                served = show_served_context(payload)
         # Only a definite answer is cached; a transient failure is retried
         # on the next poll.
         if response.status_code in (200, 400, 404, 405, 501):
             _CONTEXTS[key] = context
+            _SERVED_CONTEXTS[key] = served
             _CAPABILITIES[key] = caps
             _SHOW_TIMES[key] = time.monotonic()
     except (httpx.HTTPError, ValueError, AttributeError):
@@ -4739,15 +4765,22 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
     return _CAPABILITIES.get(key, caps)
 
 
-def lmstudio_context(model: dict):
-    """LM Studio's context for a model: the smallest loaded instance's
-    configured context_length, else max_context_length; None if neither."""
+def lmstudio_loaded_context(model: dict):
+    """The context LM Studio serves a model with: its smallest loaded
+    instance's configured context_length, or None when it is not loaded (a
+    just-in-time load uses LM Studio's load settings, which it does not list)."""
     loaded = []
     for instance in model.get("loaded_instances") or []:
         config = instance.get("config") if isinstance(instance, dict) else None
         if isinstance(config, dict) and positive_int(config.get("context_length")):
             loaded.append(config["context_length"])
-    return min(loaded) if loaded else positive_int(model.get("max_context_length"))
+    return min(loaded) if loaded else None
+
+
+def lmstudio_context(model: dict):
+    """LM Studio's context for a model: the smallest loaded instance's
+    configured context_length, else max_context_length; None if neither."""
+    return lmstudio_loaded_context(model) or positive_int(model.get("max_context_length"))
 
 
 def _lmstudio_v1_models(payload: dict) -> list:
@@ -4776,6 +4809,7 @@ def _lmstudio_v1_models(payload: dict) -> list:
             "tools": True if trained else None,
             "loaded": bool(m.get("loaded_instances")),
             "context_length": lmstudio_context(m),
+            "served_context_length": lmstudio_loaded_context(m),
         })
     return out
 
@@ -4860,17 +4894,22 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
             # and variants stay unknown unless the API or the id gives one.
             if not size:
                 size = MODEL_SIZES.get(str(model["id"]).lower())
+            # Field names used by OpenAI-style servers (vLLM-style
+            # max_model_len included), then the served context that
+            # llama-server and Strata-style servers give as meta.n_ctx
+            # (not n_ctx_train, the model's own limit). None required.
+            context = next(filter(None, (
+                *(positive_int(model.get(k)) for k in
+                  ("context_length", "max_model_len", "context_window")),
+                positive_int(meta.get("n_ctx")))), None)
             raw = {"name": model["id"], "capabilities": caps,
                    "details": {"parameter_size": size},
                    "loaded": state == "loaded" if state is not None else None,
-                   # Field names used by OpenAI-style servers (vLLM-style
-                   # max_model_len included), then the served context that
-                   # llama-server and Strata-style servers give as meta.n_ctx
-                   # (not n_ctx_train, the model's own limit). None required.
-                   "context_length": next(filter(None, (
-                       *(positive_int(model.get(k)) for k in
-                         ("context_length", "max_model_len", "context_window")),
-                       positive_int(meta.get("n_ctx")))), None)}
+                   # These servers report the window they were started
+                   # with (STRATA_CONTEXT, -c, Kindi's fitted context), so
+                   # it is also the served one.
+                   "context_length": context,
+                   "served_context_length": context}
             # An image generator listed beside the chat model (Strata's
             # /v1/images model) outputs no text, so it takes no tools.
             if server_kind(server) in TOOL_KINDS:
@@ -4919,6 +4958,7 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str,
                                       for m in raws])
         for raw in raws:
             raw["context_length"] = _CONTEXTS.get(_show_key(server, raw))
+            raw["served_context_length"] = _SERVED_CONTEXTS.get(_show_key(server, raw))
         _forget_show_answers(server, {_show_key(server, raw) for raw in raws})
     else:
         caps = [None] * len(raws)
@@ -6086,6 +6126,20 @@ async def route_chat_completion(request: Request):
     )
 
 
+def served_contexts(models: list) -> dict:
+    """Model name -> the context every server listing it serves (the smallest),
+    for /v1/models. A name is left out when any of its servers reports only
+    the model's own limit, or nothing: a request may land on that server."""
+    found = {}
+    for entry in models:
+        name, served = entry.get("name"), entry.get("served_context_length")
+        if name in found and found[name] is None:
+            continue
+        found[name] = (None if not served else
+                       min(served, found[name]) if found.get(name) else served)
+    return {name: value for name, value in found.items() if value}
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     """Advertise auto + the tier aliases, then whatever is actually available.
@@ -6125,12 +6179,15 @@ async def list_models(request: Request):
                 data.append({"id": name, "object": "model", "owned_by": "freellmapi"})
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
+        served = served_contexts(INVENTORY["models"])
         for entry in INVENTORY["models"]:
             if entry["is_embedding"] or entry["name"] in seen:
                 continue
             seen.add(entry["name"])
-            data.append({"id": entry["name"], "object": "model",
-                         "owned_by": entry["kind"]})
+            item = {"id": entry["name"], "object": "model", "owned_by": entry["kind"]}
+            if served.get(entry["name"]):
+                item["context_length"] = served[entry["name"]]
+            data.append(item)
         return JSONResponse({"object": "list", "data": data})
 
     # Discovery unavailable: supplement the aliases with LiteLLM's own list so

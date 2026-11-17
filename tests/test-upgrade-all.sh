@@ -901,14 +901,24 @@ assert_eq 'it follows the model servers' 'kindi freellmapi' \
 freellmapi_snapshot_case() {
     # shellcheck disable=SC2034  # read by take_snapshot
     SNAPSHOTS=true REQUIRE_SNAPSHOT=true
-    add_item freellmapi 287
+    add_item freellmapi 287 "${1:-}"
     take_snapshot 0 "$RUN_DIR/log" && echo "SNAP=[$SNAP]"
 }
 reset_mock
+printf 'v0.16.31\n' > "$tmp/mock/287.freellmapi"
 out=$(in_tool freellmapi_snapshot_case 2>&1)
-assert_contains 'no snapshot, even with --require-snapshot (its provisioner backs up and restores)' 'SNAP=[]' "$out"
-assert_contains 'and it says why' "backs the CT up itself" "$out"
-assert_eq 'pct snapshot is not called' '' "$(grep ' snapshot 287' "$tmp/mock/pct.log")"
+assert_contains 'same-release reconfigure has a snapshot' 'SNAP=[osr-upg-' "$out"
+assert_file_contains 'pct snapshot is called' 'snapshot 287 osr-upg-' "$tmp/mock/pct.log"
+touch "$tmp/mock/287.nosnap"
+out=$(in_tool freellmapi_snapshot_case 2>&1)
+assert_not_contains '--require-snapshot refuses a same-release run without a snapshot' 'SNAP=[' "$out"
+rm -f "$tmp/mock/287.nosnap"
+reset_mock
+printf 'v0.16.31\n' > "$tmp/mock/287.freellmapi"
+out=$(in_tool freellmapi_snapshot_case FREELLMAPI_VERSION=v0.99.1 2>&1)
+assert_contains 'replacement uses the provisioner backup' 'SNAP=[]' "$out"
+assert_contains 'and it says why' 'backs the CT up before replacing it' "$out"
+assert_eq 'pct snapshot is not called for replacement' '' "$(grep ' snapshot 287' "$tmp/mock/pct.log")"
 freellmapi_state_case() {
     add_item freellmapi 287
     collect_state 0
@@ -926,6 +936,19 @@ freellmapi_pin_case() {
 }
 assert_contains 'an older release moves to the pin' 'FREELLMAPI_VERSION=v0.16.31' "$(in_tool freellmapi_pin_case v0.15.2)"
 assert_contains 'a newer one stays' 'newer than the pin' "$(in_tool freellmapi_pin_case v0.17.0)"
+assert_not_contains 'and names no release (run_reconfigure passes keep)' 'FREELLMAPI_VERSION=' "$(in_tool freellmapi_pin_case v0.17.0 | cut -d'|' -f1)"
+freellmapi_keep_snapshot_case() {
+    # shellcheck disable=SC2034  # read by take_snapshot and decide_pin
+    SNAPSHOTS=true REQUIRE_SNAPSHOT=true KEEP_PINS=true
+    add_item freellmapi 287
+    decide_pin 0 FREELLMAPI_VERSION v0.15.2 v0.16.31
+    take_snapshot 0 "$RUN_DIR/log" && echo "SNAP=[$SNAP]"
+}
+reset_mock
+printf 'v0.15.2\n' > "$tmp/mock/287.freellmapi"
+out=$(in_tool freellmapi_keep_snapshot_case 2>&1)
+assert_contains 'with --keep-pins an older release is kept and snapshotted (the CT stays)' 'SNAP=[osr-upg-' "$out"
+conf 287 'ai;ai-model;osr-target;freellmapi'; state 287
 echo v0.15.2 > "$tmp/mock/287.freellmapi"
 run_tool '' --dry-run --only freellmapi --pinned
 assert_contains 'the plan runs its provisioner with the pin' \
@@ -956,6 +979,20 @@ assert_contains 'Gitea does not get it' $'GOT \nAFTER' "$out"
 out=$(in_tool reconf_case freellmapi 2>&1)
 assert_contains 'FreeLLMAPI does not get it' $'GOT \nAFTER' "$out"
 assert_eq 'nor a router CT (it registered itself when it was made)' '' "$(grep '^ARGS' <<< "$out" | grep -F ROUTER_CT_ID)"
+# freellmapi_reconf_case INFO: the release words run_reconfigure hands FreeLLMAPI.
+freellmapi_reconf_case() {
+    # shellcheck disable=SC2317  # replaces env for run_reconfigure
+    env() { printf 'ARGS %s\n' "$*"; }
+    add_item freellmapi 287 "$1"
+    ( run_reconfigure 0 unattended )
+}
+out=$(in_tool freellmapi_reconf_case '' 2>&1)
+assert_contains 'a kept release is named as keep, so a CT following the pin is not replaced' 'FREELLMAPI_VERSION=keep' "$out"
+out=$(in_tool freellmapi_reconf_case 'FREELLMAPI_VERSION=v0.99.1' 2>&1)
+assert_contains 'a chosen release is passed as it is' 'FREELLMAPI_VERSION=v0.99.1' "$out"
+assert_not_contains 'and not as keep' 'FREELLMAPI_VERSION=keep' "$out"
+out=$(in_tool reconf_case opencode 2>&1)
+assert_not_contains 'keep is for FreeLLMAPI only' 'FREELLMAPI_VERSION' "$out"
 out=$(in_tool reconf_case opencode 2>&1)
 assert_contains 'OpenCode gets it (its chat endpoint is registered in Open WebUI)' 'GOT secret-token' "$out"
 assert_eq 'not on its command line either' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"

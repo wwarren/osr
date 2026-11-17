@@ -29,10 +29,24 @@ account, in the same workspace and memory.
   a free CT ID and a static IPv4 address with DNS and internet access.
 - The router running as a CT **on the same PVE host** (address and key are read
   with `pct exec`).
-- An OSR model with tool calls that serves the configured context (check
-  `tools` and `context_length` in `/routing/inventory`). DeepSeek's 29 tools
-  take ~6,000 tokens per request in 0.2.1; Honcho's MCP tools add several
-  thousand more.
+- An OSR model with tool calls and enough context (check `tools`,
+  `context_length` and `served_context_length` in `/routing/inventory`).
+  DeepSeek's 29 tools take ~6,000 tokens per request in 0.2.1; Honcho's MCP
+  tools add several thousand more.
+
+**Context window.** With `DSH_CONTEXT_WINDOW=auto` (the default for a new CT)
+the guest reads, on every run, the window `DSH_MODEL` is served with from the
+router's inventory and writes it into DeepSeek's overlay: an LM Studio model
+loaded with 262144 tokens gets 262144, Strata started with 131072 gets 131072.
+A server that reports nothing counts as 65536 (or the model's limit if
+smaller). For an alias (`auto`, a tier) it is the smallest window among the
+tool-capable models the router may send DeepSeek to, so a concrete model gets
+the most. The resolved window is recorded, so a server that now serves another
+window makes the next `--reconfigure` (or `tools/upgrade-all.sh`) rewrite the
+overlay. The run stops, keeping the last overlay, when that window is not above
+`DSH_MAX_TOKENS`, or below 32768 with Honcho. A number pins the window instead.
+An existing CT keeps its recorded number until reconfigured with
+`DSH_CONTEXT_WINDOW=auto`.
 - The router port must accept the CT. When the router has a firewall file, the
   provisioner keeps one rule there (`# osr-deepseek-harness-router`);
   `DSH_ROUTER_FIREWALL=false` leaves it to you.
@@ -68,7 +82,7 @@ is ever deleted.
 | Setting | Default | Meaning |
 |---|---|---|
 | `DSH_MODEL` | `auto` | OSR model ID or tier; a concrete tool-capable model gives steadier sessions |
-| `DSH_CONTEXT_WINDOW` | `32768` (main installer: the smallest model window, else 65536) | Context the model serves; an exact model is checked against every reporting host. At least 32768 with Honcho |
+| `DSH_CONTEXT_WINDOW` | `auto` | `auto`: what the model's servers serve ([above](#requirements)). A number: the context the model serves; an exact model is checked against every reporting host. At least 32768 with Honcho |
 | `DSH_MAX_TOKENS` | `8192` | Max reply tokens, below the context window |
 | `DSH_VERSION` | `0.2.1-rc.5` | Exact npm release or `latest` |
 | `DSH_PORT` | `3080` | Web UI port |
@@ -84,7 +98,7 @@ is ever deleted.
 
 The main installer accepts `DEEPSEEK_HARNESS_*` equivalents (`_MODEL`,
 `_CONTEXT_WINDOW`, `_VERSION`, `_PORT`, `_ACCESS_CIDR`, `_API_PORT`,
-`_API_PERMISSIONS`), prompts for model and context (at least 16384), and uses
+`_API_PERMISSIONS`), prompts for model and context (`auto`, or at least 16384), and uses
 its `API_ALLOW_CIDR` as the Web UI range when none is given. It passes the
 Open WebUI admin key it asks for once; without one DeepSeek is installed with
 `OPENWEBUI=false`.

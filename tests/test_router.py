@@ -1813,6 +1813,71 @@ def test_lmstudio_context_length(router):
     assert entry["context_length"] == 4096
 
 
+def test_lmstudio_served_context_is_the_loaded_instance(router):
+    """Only a loaded instance tells what LM Studio serves; max_context_length
+    is the model's own limit, which a just-in-time load need not use."""
+    v1 = {r["name"]: r for r in router._lmstudio_v1_models({"models": [
+        {"key": "loaded", "type": "llm", "max_context_length": 262144,
+         "loaded_instances": [{"id": "a", "config": {"context_length": 262144}},
+                              {"id": "b", "config": {"context_length": 131072}}]},
+        {"key": "cold", "type": "llm", "max_context_length": 262144, "loaded_instances": []},
+    ]})}
+    assert (v1["loaded"]["context_length"], v1["loaded"]["served_context_length"]) == (131072, 131072)
+    assert (v1["cold"]["context_length"], v1["cold"]["served_context_length"]) == (262144, None)
+    entry = router.build_entry("lmstudio+http://h:1234", v1["loaded"], v1["loaded"]["capabilities"])
+    assert entry["served_context_length"] == 131072
+    v0 = router._lmstudio_v0_models({"data": [{"id": "m", "type": "llm", "max_context_length": 4096}]})
+    assert router.build_entry("lmstudio+http://h:1234", v0[0], [])["served_context_length"] is None
+
+
+def test_show_served_context(router):
+    served = router.show_served_context
+    # The model's own limit alone: Ollama serves its OLLAMA_CONTEXT_LENGTH.
+    assert served({"model_info": {"qwen3.context_length": 40960}}) is None
+    assert served({"model_info": {"llama.context_length": 131072},
+                   "parameters": "stop <eot>\nnum_ctx 65536"}) == 65536
+    # A num_ctx above the model's limit is served at the limit.
+    assert served({"model_info": {"llama.context_length": 32768},
+                   "parameters": "num_ctx 65536"}) == 32768
+    for nothing in ({}, {"parameters": "num_ctx big"}, {"parameters": None}):
+        assert served(nothing) is None
+
+
+def test_discovery_records_served_context(served):
+    router, upstream, client = served
+    router._CAPABILITIES.clear()
+    router._CONTEXTS.clear()
+    router._SERVED_CONTEXTS.clear()
+    upstream.inventory = {HOST_A: tags(("qwen3:14b", "14.8B", "qwen3")),
+                          HOST_B: tags(("bridged", "27B", "qwen3"))}
+    upstream.capabilities.update({"qwen3:14b": ["completion", "tools"], "bridged": ["completion", "tools"]})
+    upstream.show_extra.update({
+        "qwen3:14b": {"model_info": {"qwen3.context_length": 40960}},
+        "bridged": {"model_info": {"qwen3.context_length": 262144}, "parameters": "num_ctx 131072"}})
+    assert client.post("/routing/refresh").status_code == 200
+    inventory = {e["name"]: e for e in client.get("/routing/inventory").json()["models"]}
+    assert (inventory["qwen3:14b"]["context_length"], inventory["qwen3:14b"]["served_context_length"]) == (40960, None)
+    assert (inventory["bridged"]["context_length"], inventory["bridged"]["served_context_length"]) == (131072, 131072)
+    # /v1/models advertises only a served context.
+    listed = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    assert listed["bridged"]["context_length"] == 131072
+    assert "context_length" not in listed["qwen3:14b"]
+    assert "context_length" not in listed["auto"]
+
+
+def test_served_contexts_take_every_replica(router):
+    contexts = router.served_contexts([
+        {"name": "a", "served_context_length": 262144},
+        {"name": "a", "served_context_length": 131072},
+        {"name": "b", "served_context_length": 65536},
+        {"name": "b", "served_context_length": None},   # a replica that may serve less
+        {"name": "c", "served_context_length": None},
+        {"name": "d", "served_context_length": None},
+        {"name": "d", "served_context_length": 65536},
+    ])
+    assert contexts == {"a": 131072}
+
+
 def test_openai_kind_context_length(router):
     import asyncio
 
@@ -1830,6 +1895,8 @@ def test_openai_kind_context_length(router):
     _, entries, error = asyncio.run(fetch())
     assert error is None
     assert {e["name"]: e["context_length"] for e in entries} == {"a": 65536, "b": 32768, "c": None}
+    # These servers report the window they run with: it is the served one.
+    assert {e["name"]: e["served_context_length"] for e in entries} == {"a": 65536, "b": 32768, "c": None}
 
 
 def test_openai_kind_tool_support_is_unknown_without_a_listing(router):

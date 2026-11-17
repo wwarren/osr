@@ -54,6 +54,8 @@ msg=$(env -u ROUTER_URL bash "$deploy_dry/install-target.sh" --dry-run 2>&1 || t
 [[ $msg == *'ROUTER_URL is unset'* && $msg == *'provision-lxc.sh --reconfigure'* ]] || fail "missing router URL gives no recovery path: $msg"
 refused ROUTER_URL=http://router:8000 OPENCODE_MODEL='bad model'
 refused ROUTER_URL=http://router:8000 OPENCODE_CONTEXT_LENGTH=16384
+refused ROUTER_URL=http://router:8000 OPENCODE_CONTEXT_LENGTH=Auto
+refused ROUTER_URL=http://router:8000 OPENCODE_CONTEXT_LENGTH=auto OPENCODE_MAX_TOKENS=20000
 refused ROUTER_URL=http://router:8000 OPENCODE_MAX_TOKENS=64
 refused ROUTER_URL=http://router:8000 OPENCODE_CONTEXT_LENGTH=32768 OPENCODE_MAX_TOKENS=20000
 refused ROUTER_URL=http://router:8000 OPENCODE_VERSION='latest; rm'
@@ -153,6 +155,16 @@ assert p["strata-a"]["settings"]["baseURL"] == "http://127.0.0.1:8765/t/strata-a
 assert p["strata-down"] == {"settings": {"baseURL": "x"}, "models": {"kept": {}}}
 PY
 [[ $(provider_ids <<< "$providers" | paste -sd' ') == 'osr strata-a strata-down' ]] || fail provider_ids
+# CONTEXT auto: each model's context_length from the dispatcher's listing
+# (what its servers serve), 65536 where it gives none; replies at most half.
+printf '{"data":[{"id":"auto","context_length":131072},{"id":"big","context_length":262144},{"id":"quiet"},{"id":"small","context_length":12000}]}' > "$tmp_root/served.json"
+providers=$(providers_json auto 8192 http://127.0.0.1:8765 - "osr=$tmp_root/served.json")
+python3 - "$providers" <<'PY' || fail "providers_json auto: $providers"
+import json, sys
+models = {i: m for i, m in json.loads(sys.argv[1])["osr"]["models"].items()}
+assert {i: (m["limit"]["context"], m["limit"]["output"]) for i, m in models.items()} == {
+    "auto": (131072, 8192), "big": (262144, 8192), "quiet": (65536, 8192), "small": (12000, 6000)}, models
+PY
 printf '{"data":[]}' > "$tmp_root/empty.json"
 [[ $(providers_json 65536 8192 http://127.0.0.1:8765 - "osr=$tmp_root/empty.json") == '{}' ]] || fail 'a provider without models'
 python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert not any("headerTimeout" in v["settings"] for v in p.values())' "$providers" ||
@@ -268,7 +280,8 @@ grep -qx 'User=opencode-direct' "$direct" || fail 'the dispatcher runs as its ow
 grep -qx 'ExecStart=/usr/bin/python3 /usr/local/lib/opencode-direct.py' "$direct" || fail 'dispatcher ExecStart'
 grep -qx 'Environment=DIRECT_ETC=/etc/opencode-target' "$direct" &&
   grep -qx 'Environment=DIRECT_SECRETS_FILE=/etc/opencode-target/router.env' "$direct" &&
-  grep -qx 'Environment=DIRECT_CONTEXT_SETTING=OPENCODE_CONTEXT_LENGTH' "$direct" || fail 'dispatcher files'
+  grep -qx 'Environment=DIRECT_CONTEXT_SETTING=OPENCODE_CONTEXT_LENGTH' "$direct" &&
+  grep -qx 'Environment=DIRECT_AUTO_MIN_CONTEXT=32768' "$direct" || fail 'dispatcher files'
 api_unit=$here/opencode-api.service
 grep -qx 'User=opencode-api' "$api_unit" || fail 'the chat endpoint runs as its own account'
 grep -qx 'ExecStart=/usr/bin/python3 /usr/local/lib/opencode-api.py' "$api_unit" || fail 'chat endpoint ExecStart'
@@ -563,7 +576,7 @@ grep -q 'chown opencode:opencode .*/opencode.json' "$log" || fail 'the agent doe
 [[ -f $units/opencode.service && -f $units/opencode-direct.service && -e $state/active && -e $state/direct-active ]] ||
   fail 'server or dispatcher not started'
 cmp -s "$tmp_root/opencode-direct.py" "$here/../hermes/direct-dispatch.py" || fail "the Hermes target's dispatcher was not installed"
-grep -q '^OPENCODE_CONTEXT_LENGTH=65536$' "$etc/settings" && grep -q '^OPENCODE_RELEASE=2.2.7-linux-x64$' "$etc/settings" ||
+grep -q '^OPENCODE_CONTEXT_LENGTH=auto$' "$etc/settings" && grep -q '^OPENCODE_RELEASE=2.2.7-linux-x64$' "$etc/settings" ||
   fail 'the settings record'
 grep -q '^PROVIDERS_SHA256=pending$' "$etc/settings" && fail 'the final settings record was not written'
 grep -q "$router_key" "$etc/settings" && fail 'the settings record holds the router key'

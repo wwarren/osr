@@ -89,7 +89,7 @@ CT_ID=240 STORAGE=local-lvm IP_CIDR=192.0.2.40/24 GATEWAY=192.0.2.1 \
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `FREELLMAPI_VERSION` | the tested release | Release tag to run; a CT given one stays on it until another is named |
+| `FREELLMAPI_VERSION` | the tested release | Release tag to run; a CT given one stays on it until another is named. With `--reconfigure`, `keep` stays on the CT's release |
 | `FREELLMAPI_DIGEST` | empty | Registry digest the tag must have (`skopeo inspect --format '{{.Digest}}' docker://ghcr.io/tashfeenahmed/freellmapi:<tag>`) |
 | `FREELLMAPI_PORT` | 3001 | Dashboard and API port |
 | `FREELLMAPI_ACCESS_CIDR` | the CT's network | Who may open the dashboard and API (the router is always admitted) |
@@ -159,12 +159,16 @@ CT_ID=<CT> FREELLMAPI_VERSION=v0.17.0 bash targets/freellmapi/provision-lxc.sh -
 ```
 
 - Nothing changed and the server answers: nothing to do.
-- Only settings changed (port, rate limit): the same image restarts with the
-  env file rewritten. Lines you added to the env file, and the key, are kept.
+- Settings changed (port, access range, router, rate limit): the same image restarts
+  with the env file rewritten. The CT startup overrides the image's `PORT`
+  value, the FreeLLMAPI firewall rules follow the selected port and access
+  range, and a port change updates the router endpoint. Operator-added env
+  lines and firewall rules are kept. A failed restart restores the prior env
+  file, settings record, firewall and startup command.
 - Another release: the new image is pulled and checked first. Then the CT is
   stopped and backed up with `vzdump` to `/var/lib/osr-freellmapi/<CT>/`, its
   data directory saved, and the CT destroyed and created again from the new
-  image, with the same ID, address, MAC, firewall file, cores, memory, swap,
+  image, with the same ID, address, MAC, firewall settings, cores, memory, swap,
   start order and DNS, and the data restored. The run succeeds only when
   `/api/ping` answers and the unified key is unchanged and works. Otherwise
   the new CT is removed and the backup restored (`pct restore`), started and
@@ -173,8 +177,12 @@ CT_ID=<CT> FREELLMAPI_VERSION=v0.17.0 bash targets/freellmapi/provision-lxc.sh -
 
 Options set on the CT by hand beyond those listed are not carried over to the
 new CT (the backup has them). `tools/upgrade-all.sh` runs `--reconfigure`,
-offers the newest GitHub release beside the pin, and takes no snapshot of this
-CT (the replacement would remove it; the provisioner's backup replaces it).
+offers the newest GitHub release beside the pin. When it keeps the CT's
+release (same pin, `--keep-pins`, or a release newer than the pin) it passes
+`FREELLMAPI_VERSION=keep`: the CT stays on its release, still following the
+tested one if it did, and is snapshotted when snapshots are enabled. A release
+replacement uses the provisioner's backup because replacing the CT removes its
+snapshots.
 Templates of earlier releases stay in `TEMPLATE_STORAGE` until you delete them.
 
 ## Troubleshooting
@@ -186,7 +194,11 @@ Templates of earlier releases stay in `TEMPLATE_STORAGE` until you delete them.
 - **"runs 'sleep infinity', not the image's entrypoint".** A run was
   interrupted while the data directory was being prepared. Put the entrypoint
   back and start it:
-  `pct set <CT> --entrypoint '/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'; pct start <CT>`.
+  `pct set <CT> --entrypoint '/usr/bin/env PORT=3001 /usr/local/bin/docker-entrypoint.sh node server/dist/index.js'; pct start <CT>`
+  (replace `3001` with the port in `/app/server/data/osr-target/settings`).
+- **"has no [RULES] section".** The run rewrites FreeLLMAPI's rules in the
+  CT's firewall file and stops before touching the CT when it cannot. Put the
+  `[RULES]` line back in `/etc/pve/firewall/<CT>.fw` (or restore the file).
 - **"an earlier replacement ... did not finish".** `/var/lib/osr-freellmapi/<CT>/`
   holds the backup of the CT as it was before. If the CT works, delete the
   directory; if not, `pct destroy <CT>` and

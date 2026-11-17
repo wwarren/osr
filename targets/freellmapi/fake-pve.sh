@@ -22,6 +22,7 @@ set_value() {
 }
 running() { [[ -e $FAKE/ct/$1/running ]]; }
 entrypoint='/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
+runtime_entrypoint_re='^/usr/bin/env PORT=([1-9][0-9]{0,4}) /usr/local/bin/docker-entrypoint\.sh node server/dist/index\.js$'
 
 # server_start ID: what the image's entrypoint does with the data directory.
 server_start() {
@@ -39,11 +40,16 @@ server_start() {
     if grep -q '^FREEAPI_CONFIG_PATH=' "$env" && [[ -s $data/osr-target/bootstrap.json && ! -e $data/account ]]; then
         cp "$data/osr-target/bootstrap.json" "$data/account"
     fi
-    grep '^PORT=' "$env" > "$FAKE/ct/$id/listening"
+    # The OCI image exports PORT=3001. dotenv does not override it with .env.
+    local init_port=3001 init_command
+    init_command=$(value "$id" entrypoint)
+    if [[ $init_command =~ $runtime_entrypoint_re ]]; then init_port=${BASH_REMATCH[1]}; fi
+    printf 'PORT=%s\n' "$init_port" > "$FAKE/ct/$id/listening"
     printf '%s\n' "$version" >> "$FAKE/ct/$id/started"
 }
 # FAKE_UNHEALTHY: releases (space-separated) that start but never answer.
-healthy() { [[ " ${FAKE_UNHEALTHY:-} " != *" $(cat "$FAKE/ct/$1/image") "* && -e $FAKE/ct/$1/listening ]]; }
+healthy() { [[ " ${FAKE_UNHEALTHY:-} " != *" $(cat "$FAKE/ct/$1/image") "* && -e $FAKE/ct/$1/listening &&
+    $(cat "$FAKE/ct/$1/listening") != "PORT=${FAKE_UNHEALTHY_PORT:-<none>}" ]]; }
 
 guest_exec() {
     local id=$1 root js data; shift
@@ -59,7 +65,7 @@ guest_exec() {
         node)
             js=$3
             case $js in
-                *'/api/ping'*) [[ $(value "$id" entrypoint) == "$entrypoint" ]] && healthy "$id" && grep -qx "PORT=$4" "$FAKE/ct/$id/listening" ;;
+                *'/api/ping'*) [[ $(value "$id" entrypoint) =~ $runtime_entrypoint_re ]] && healthy "$id" && grep -qx "PORT=$4" "$FAKE/ct/$id/listening" ;;
                 *'/api/auth/status'*) [[ -e $data/account ]] ;;
                 *'bootstrap.json'*)
                     local email password

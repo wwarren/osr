@@ -37,8 +37,9 @@ Required: ROUTER (or the prompt); for a new CT also TEMPLATE (Debian
 Interactive runs list downloaded templates and eligible rootdir storage when
 those values are unset. CT_ID is the Hermes CT,
 separate from the existing router CT ID or IP address.
-Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=65536 (>=64000; the model's
-          host must serve it), HERMES_CHANNEL=stable, HERMES_COMMIT,
+Hermes:   HERMES_MODEL=auto, HERMES_CONTEXT_LENGTH=auto (each model's window
+          as its server serves it, from the router's discovery; or a number
+          >=64000 that the model's host must serve), HERMES_CHANNEL=stable, HERMES_COMMIT,
           HERMES_INSTALLER_SHA256, HERMES_API_PORT=8642,
           HERMES_API_MODEL_NAME=hermes-agent. --reconfigure and
           --integrate-only keep the recorded channel, pin, API port and model
@@ -505,7 +506,7 @@ valid_template() { [[ $1 =~ $template_re ]]; }
 valid_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_router() { classify_router "$1" >/dev/null; }
 valid_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
-valid_context() { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 64000 )); }
+valid_context() { [[ $1 == auto ]] || { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 64000 )); }; }
 valid_honcho_url() { [[ -z $1 || $1 =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]]; }
 # recorded_or KEY DEFAULT: the CT's recorded KEY (a reconfigure), else DEFAULT.
 hermes_recorded=''
@@ -581,8 +582,10 @@ if [[ $mode != integrate ]]; then
   pve_section 'Hermes settings'
   pve_note 'Hermes needs an OSR model that calls tools, with 64000 tokens of context or more.'
   pve_ask HERMES_MODEL 'OSR model or tier' "$(recorded_or HERMES_MODEL auto)" valid_model
-  pve_ask HERMES_CONTEXT_LENGTH 'Context window the model serves (tokens)' "$(recorded_or HERMES_CONTEXT_LENGTH 65536)" valid_context \
-    'Use a whole number of tokens, 64000 or more.'
+  pve_note "Context window: auto follows what each model's server serves (an LM Studio model loaded"
+  pve_note 'with 262144 tokens gets 262144); a number pins that window for every model.'
+  pve_ask HERMES_CONTEXT_LENGTH 'Context window (auto, or tokens)' "$(recorded_or HERMES_CONTEXT_LENGTH auto)" valid_context \
+    'Use auto, or a whole number of tokens, 64000 or more.'
   pve_ask_yes_no OPENWEBUI 'Offer Hermes in Open WebUI (as hermes-agent)?' "$(recorded_or HERMES_API_SERVER true)"
   pve_ask_yes_no HERMES_DASHBOARD 'Run the Hermes dashboard?' "$(recorded_or HERMES_DASHBOARD true)"
   # Honcho memory: on a reconfigure the recorded one ("none" turns it off); on
@@ -638,7 +641,7 @@ if [[ $mode != integrate ]]; then
 fi
 OPENWEBUI=${OPENWEBUI:-true}
 HERMES_MODEL=${HERMES_MODEL:-auto}
-HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-65536}
+HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-auto}
 HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
 # A reconfigure keeps the recorded channel, pin, API port and model name unless
 # they are given (HERMES_COMMIT= clears the pin). Otherwise a plain
@@ -681,8 +684,8 @@ if [[ -n $ROUTER_URL ]]; then
   ROUTER_URL=${ROUTER_URL%/}
 fi
 [[ $HERMES_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid HERMES_MODEL.'
-[[ $HERMES_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( HERMES_CONTEXT_LENGTH >= 64000 )) ||
-  die 'HERMES_CONTEXT_LENGTH must be at least 64000 (Hermes needs 64K context for tools).'
+valid_context "$HERMES_CONTEXT_LENGTH" ||
+  die 'HERMES_CONTEXT_LENGTH must be auto or at least 64000 (Hermes needs 64K context for tools).'
 [[ $HERMES_CHANNEL =~ ^(stable|main)$ ]] || die 'HERMES_CHANNEL must be stable or main.'
 [[ -z $HERMES_COMMIT || $HERMES_COMMIT =~ ^[0-9a-f]{40}$ ]] || die 'HERMES_COMMIT must be a full 40-digit lowercase SHA-1.'
 [[ -z $HERMES_INSTALLER_SHA256 || $HERMES_INSTALLER_SHA256 =~ ^[0-9a-f]{64}$ ]] ||

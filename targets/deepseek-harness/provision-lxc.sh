@@ -22,7 +22,8 @@ read from /app/router/secrets.env and copied to the new CT as a 0600 file.
 Required: ROUTER_CT_ID; for a new CT also TEMPLATE, STORAGE, IP_CIDR, GATEWAY
   (interactive runs prompt for missing values). A new CT's CT_ID defaults to
   the cluster's next free ID (set it to choose another); --reconfigure asks.
-Settings: DSH_MODEL=auto, DSH_CONTEXT_WINDOW=32768, DSH_MAX_TOKENS=8192,
+Settings: DSH_MODEL=auto, DSH_CONTEXT_WINDOW=auto (what the model's servers
+  serve, from the router's inventory, read on each run; or tokens), DSH_MAX_TOKENS=8192,
   DSH_VERSION=0.2.1-rc.5 (or latest), DSH_PORT=3080,
   DSH_ACCESS_CIDR=<CT subnet>, DSH_ROUTER_FIREWALL=true.
 Honcho memory: HONCHO_URL=http://<honcho-ip>:8000 with HONCHO_CT_ID (or
@@ -196,7 +197,7 @@ DSH_ROUTER_FIREWALL=${DSH_ROUTER_FIREWALL:-true}
 DEFAULT_DSH_VERSION=0.2.1-rc.5
 # DeepSeek settings: DSH_* or the installer's DEEPSEEK_HARNESS_* names. Unset
 # ones keep the CT's recorded value on a reconfigure, else take the default.
-declare -A dsh_default=([MODEL]=auto [CONTEXT_WINDOW]=32768 [MAX_TOKENS]=8192 [VERSION]=$DEFAULT_DSH_VERSION [PORT]=3080)
+declare -A dsh_default=([MODEL]=auto [CONTEXT_WINDOW]=auto [MAX_TOKENS]=8192 [VERSION]=$DEFAULT_DSH_VERSION [PORT]=3080)
 declare -A dsh_given=()
 for name in MODEL CONTEXT_WINDOW MAX_TOKENS VERSION PORT; do
   short=DSH_$name long=DEEPSEEK_HARNESS_$name
@@ -228,6 +229,7 @@ valid_template() { [[ $1 =~ $template_re ]]; }
 valid_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
 valid_tokens() { [[ $1 =~ ^[1-9][0-9]{3,8}$ ]]; }
+valid_window() { [[ $1 == auto ]] || valid_tokens "$1"; }
 valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
 valid_version() { [[ $1 =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?)$ ]]; }
 valid_honcho_url() { [[ -z $1 ]] || honcho_mcp_url "$1" >/dev/null; }
@@ -290,8 +292,10 @@ if [[ $mode != integrate ]]; then
   pve_section 'DeepSeek Harness settings'
   pve_note 'A concrete OSR model that calls tools gives steadier agent sessions than a tier (auto, fast, ...).'
   pve_ask DSH_MODEL 'OSR model or tier' "$(recorded_or DSH_MODEL "${dsh_default[MODEL]}")" valid_model
-  pve_ask DSH_CONTEXT_WINDOW 'Context window the model serves (tokens)' \
-    "$(recorded_or DSH_CONTEXT_WINDOW "${dsh_default[CONTEXT_WINDOW]}")" valid_tokens 'Use a whole number of tokens, 1000 or more.'
+  pve_note "Context window: auto takes what the model's servers serve (an LM Studio model loaded with"
+  pve_note '262144 tokens gets 262144), read again on every reconfigure; a number pins it.'
+  pve_ask DSH_CONTEXT_WINDOW 'Context window (auto, or tokens)' \
+    "$(recorded_or DSH_CONTEXT_WINDOW "${dsh_default[CONTEXT_WINDOW]}")" valid_window 'Use auto, or a whole number of tokens, 1000 or more.'
   pve_ask DSH_MAX_TOKENS 'Max reply tokens' "$(recorded_or DSH_MAX_TOKENS "${dsh_default[MAX_TOKENS]}")" valid_tokens \
     'Use a whole number of tokens, 1000 or more (less than the context window).'
   pve_ask DSH_PORT 'Web UI port' "$(recorded_or DSH_PORT "${dsh_default[PORT]}")" valid_port 'Use a port from 1 to 65535.'
@@ -418,13 +422,16 @@ if [[ $mode == create ]]; then
   valid_cidr "$IP_CIDR" && ipv4 "$GATEWAY" || die 'IP_CIDR and GATEWAY must be valid IPv4 settings.'
 fi
 if [[ $mode != integrate ]]; then
-  for name in DSH_PORT DSH_CONTEXT_WINDOW DSH_MAX_TOKENS; do positive "$name" "${!name}"; done
-  (( DSH_PORT <= 65535 && DSH_MAX_TOKENS < DSH_CONTEXT_WINDOW )) || die 'Invalid port or token capacity (max reply tokens must be below the context window).'
+  for name in DSH_PORT DSH_MAX_TOKENS; do positive "$name" "${!name}"; done
+  [[ $DSH_CONTEXT_WINDOW == auto ]] || positive DSH_CONTEXT_WINDOW "$DSH_CONTEXT_WINDOW"
+  # With auto the guest checks both once the window is known.
+  (( DSH_PORT <= 65535 )) && { [[ $DSH_CONTEXT_WINDOW == auto ]] || (( DSH_MAX_TOKENS < DSH_CONTEXT_WINDOW )); } ||
+    die 'Invalid port or token capacity (max reply tokens must be below the context window).'
   valid_version "$DSH_VERSION" || die 'Invalid DSH_VERSION.'
   valid_model "$DSH_MODEL" || die 'Invalid DSH_MODEL.'
   [[ -z $DSH_ACCESS_CIDR ]] || DSH_ACCESS_CIDR=$(cidr_network "$DSH_ACCESS_CIDR")
   if [[ -n $honcho_mcp ]]; then
-    (( DSH_CONTEXT_WINDOW >= 32768 )) ||
+    [[ $DSH_CONTEXT_WINDOW == auto ]] || (( DSH_CONTEXT_WINDOW >= 32768 )) ||
       die 'Honcho memory adds about 40 tool definitions; set DSH_CONTEXT_WINDOW to 32768 or more.'
   fi
 fi

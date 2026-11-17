@@ -759,6 +759,73 @@ class TestDirect(unittest.TestCase):
         self.assertNotIn("airllm-72b", names)
         self.assertIn("tool-model", names)
 
+    def listed_contexts(self):
+        direct.Handler.dispatcher._inventory = None
+        with urlopen(self.base + "/v1/models", timeout=5) as response:
+            return {m["id"]: m.get("context_length") for m in json.load(response)["data"]}
+
+    def test_model_list_reports_the_served_context(self):
+        # Hermes, without a context_length pin, takes its window from here.
+        direct.Handler.dispatcher.min_context = direct.Handler.dispatcher.assumed_context = 64000
+        models = Router.inventory["models"]
+        models[0]["served_context_length"] = 262144   # LM Studio's loaded instance
+        contexts = self.listed_contexts()
+        self.assertEqual(contexts["tool-model"], 262144)
+        # A server that reports only the model's limit counts as the floor;
+        # auto and a tier alias may land on either model.
+        self.assertEqual((contexts["other-model"], contexts["auto"], contexts["large"]), (64000,) * 3)
+        models[1]["served_context_length"] = 131072
+        contexts = self.listed_contexts()
+        self.assertEqual((contexts["other-model"], contexts["auto"], contexts["fast"]), (131072,) * 3)
+        # A replica that serves less lowers its model's window.
+        Router.inventory["models"].append({"server": models[1]["server"], "name": "tool-model",
+                                           "tools": True, "is_embedding": False,
+                                           "served_context_length": 98304})
+        self.assertEqual(self.listed_contexts()["tool-model"], 98304)
+
+    def test_auto_assumes_the_pool_default_but_never_past_the_model_limit(self):
+        dispatcher = direct.Handler.dispatcher
+        dispatcher.min_context, dispatcher.assumed_context = 32768, 65536
+        models = Router.inventory["models"]
+        models[0].update(context_length=262144)          # a limit only: Ollama without num_ctx
+        models[1].update(context_length=40960)           # a model that cannot hold 65536
+        contexts = self.listed_contexts()
+        self.assertEqual((contexts["tool-model"], contexts["other-model"], contexts["auto"]),
+                         (65536, 40960, 40960))
+        models[0]["served_context_length"] = 131072      # Strata started with --context 131072
+        self.assertEqual(self.listed_contexts()["tool-model"], 131072)
+
+    def test_model_list_reports_nothing_unknown_without_a_floor(self):
+        Router.extra_models = ("openai/gpt-example",)
+        contexts = self.listed_contexts()
+        self.assertEqual(set(contexts.values()), {None})
+        Router.inventory["models"][0]["served_context_length"] = 65536
+        contexts = self.listed_contexts()
+        self.assertEqual((contexts["tool-model"], contexts["auto"], contexts["openai/gpt-example"]),
+                         (65536, None, None))
+
+    def test_main_reads_auto_as_hermes_minimum(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc, home = pathlib.Path(root, "etc"), pathlib.Path(root, "home")
+            etc.mkdir()
+            home.mkdir()
+            (etc / "settings").write_text("ROUTER_URL=http://r:8000\nHERMES_CONTEXT_LENGTH=auto\n")
+            (home / ".env").write_text("ROUTER_API_KEY=k\n")
+            env = {"HERMES_ETC": str(etc), "HERMES_HOME": str(home)}
+            with mock.patch.dict("os.environ", env), \
+                    mock.patch.object(direct, "DispatchServer"), \
+                    mock.patch.object(direct.logging, "basicConfig"):
+                direct.main()
+            self.assertEqual((direct.Handler.dispatcher.min_context,
+                              direct.Handler.dispatcher.assumed_context), (64000, 65536))
+            # OpenClaw and OpenCode take a lower minimum from their unit.
+            with mock.patch.dict("os.environ", dict(env, DIRECT_AUTO_MIN_CONTEXT="32768")), \
+                    mock.patch.object(direct, "DispatchServer"), \
+                    mock.patch.object(direct.logging, "basicConfig"):
+                direct.main()
+            self.assertEqual((direct.Handler.dispatcher.min_context,
+                              direct.Handler.dispatcher.assumed_context), (32768, 65536))
+
     def test_main_reads_the_context_floor_from_the_settings(self):
         with tempfile.TemporaryDirectory() as root:
             etc, home = pathlib.Path(root, "etc"), pathlib.Path(root, "home")
@@ -877,6 +944,24 @@ class TestDirectTargets(unittest.TestCase):
         listed = self.get("/t/strata-a/v1/models")
         self.assertEqual([m["id"] for m in listed["data"]], ["tool-model", "other-model"])
         self.assertEqual(Backend.requests[-1][1:3], ("/v1/models", "Bearer backend-secret"))
+        self.assertEqual(Router.requests, [])
+
+    def test_a_target_listing_takes_contexts_from_a_recent_inventory_only(self):
+        dispatcher = direct.Handler.dispatcher
+        listed = self.get("/t/strata-a/v1/models")
+        # No inventory: every model counts as serving the floor.
+        self.assertEqual({m["id"]: m["context_length"] for m in listed["data"]},
+                         {"tool-model": 65536, "other-model": 65536})
+        dispatcher._inventory = {"models": [
+            {"server": self.strata, "name": "tool-model", "served_context_length": 262144},
+            {"server": self.ollama, "name": "other-model", "served_context_length": 131072}]}
+        dispatcher._inventory_time = direct.time.monotonic()
+        listed = self.get("/t/strata-a/v1/models")
+        self.assertEqual({m["id"]: m["context_length"] for m in listed["data"]},
+                         {"tool-model": 262144, "other-model": 65536})
+        dispatcher._inventory_time -= direct.CACHED_INVENTORY_SECONDS
+        listed = self.get("/t/strata-a/v1/models")
+        self.assertEqual(listed["data"][0]["context_length"], 65536)
         self.assertEqual(Router.requests, [])
 
     def test_an_ollama_target_lists_api_tags_without_a_key(self):

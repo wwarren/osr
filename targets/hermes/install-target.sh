@@ -76,7 +76,13 @@ Environment:
                                (default: router-api-key next to this script;
                                absent: keep the key already configured)
   HERMES_MODEL=auto            a model ID from the router's /v1/models
-  HERMES_CONTEXT_LENGTH=65536  context the model's host really serves (>=64000)
+  HERMES_CONTEXT_LENGTH=auto   auto: Hermes takes each model's window from the
+                               dispatcher's /v1/models, which reports what its
+                               server serves (from the router's discovery; a
+                               server that does not say counts as 65536, or
+                               its model's limit if smaller; a model must
+                               serve 64000). A number (>=64000) pins that
+                               window for every model
   HERMES_CHANNEL=stable        upstream update channel (stable or main)
   HERMES_COMMIT=<sha>          pin the Hermes checkout to this commit
   HERMES_INSTALLER_SHA256      refuse an install.sh with another SHA-256
@@ -99,6 +105,12 @@ USAGE
 }
 
 # Install helpers (sourced by test-install.sh) -------------------------------
+
+# context_label: the context setting as a person reads it.
+context_label() {
+  if [[ $HERMES_CONTEXT_LENGTH == auto ]]; then echo "auto, each model's served window"
+  else echo "$HERMES_CONTEXT_LENGTH"; fi
+}
 
 # settings_record: the settings this installation runs with. The router key
 # is recorded only as a hash, so rotating it is a change.
@@ -222,7 +234,7 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROUTER_URL=${ROUTER_URL:-}
 ROUTER_API_KEY_FILE=${ROUTER_API_KEY_FILE:-$source_dir/router-api-key}
 HERMES_MODEL=${HERMES_MODEL:-auto}
-HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-65536}
+HERMES_CONTEXT_LENGTH=${HERMES_CONTEXT_LENGTH:-auto}
 HERMES_CHANNEL=${HERMES_CHANNEL:-stable}
 HERMES_COMMIT=${HERMES_COMMIT:-}
 HERMES_INSTALLER_SHA256=${HERMES_INSTALLER_SHA256:-}
@@ -280,8 +292,9 @@ fi
 OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 ROUTER_URL=${ROUTER_URL%/}
 [[ $HERMES_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid HERMES_MODEL.'
-[[ $HERMES_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( HERMES_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
-  die "HERMES_CONTEXT_LENGTH must be at least $MIN_CONTEXT: Hermes needs 64K context for agent work with tools. The model's host must serve that much too."
+[[ $HERMES_CONTEXT_LENGTH == auto ]] ||
+  { [[ $HERMES_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( HERMES_CONTEXT_LENGTH >= MIN_CONTEXT )); } ||
+  die "HERMES_CONTEXT_LENGTH must be auto or at least $MIN_CONTEXT: Hermes needs 64K context for agent work with tools. The model's host must serve that much too."
 [[ $HERMES_CHANNEL =~ ^(stable|main)$ ]] || die 'HERMES_CHANNEL must be stable or main.'
 [[ -z $HERMES_COMMIT || $HERMES_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
   die 'HERMES_COMMIT must be a full 40-digit lowercase SHA-1.'
@@ -315,7 +328,7 @@ if (( dry_run )); then
   printf '+ create unprivileged user %s; install Hermes via %s --non-interactive --skip-browser --skip-computer-use --channel %s%s\n' \
     "$HERMES_USER" "$INSTALL_URL" "$HERMES_CHANNEL" "${HERMES_COMMIT:+ --commit $HERMES_COMMIT}"
   printf '+ configure provider=custom:osr (api %s/v1), model=%s, context_length=%s, api_key=<local placeholder>\n' \
-    "$DIRECT_URL" "$HERMES_MODEL" "$HERMES_CONTEXT_LENGTH"
+    "$DIRECT_URL" "$HERMES_MODEL" "$(context_label)"
   printf '+ configure direct providers custom:<target> (api %s/t/<target>/v1) for: %s\n' \
     "$DIRECT_URL" "$(target_names "$targets_source" | paste -sd' ' - | sed 's/^$/none/')"
   printf '+ install %s, start %s, discover models via router and dispatch inference directly\n' \
@@ -674,7 +687,16 @@ trap '[[ $BASHPID == "$$" ]] || exit 1; rollback; exit 1' ERR
 
 run_hermes config set model.base_url "$DIRECT_URL/v1"
 run_hermes config set model.default "$HERMES_MODEL"
-run_hermes config set model.context_length "$HERMES_CONTEXT_LENGTH"
+# auto: no pin, so Hermes reads each model's window from the dispatcher's
+# /v1/models (it checks an endpoint's /models only when nothing is pinned).
+set_context() {
+  if [[ $HERMES_CONTEXT_LENGTH == auto ]]; then
+    run_hermes config unset "$1" >/dev/null 2>&1 || true
+  else
+    run_hermes config set "$1" "$HERMES_CONTEXT_LENGTH"
+  fi
+}
+set_context model.context_length
 # The router key stays in .env for discovery, never in a backend request.
 run_hermes config set model.api_key no-key
 # Named providers, so Hermes's /model switcher can pick them: custom:osr is the
@@ -684,7 +706,7 @@ set_provider() {
   run_hermes config set "providers.$1.api" "$2"
   run_hermes config set "providers.$1.api_key" no-key
   run_hermes config set "providers.$1.transport" chat_completions
-  run_hermes config set "providers.$1.context_length" "$HERMES_CONTEXT_LENGTH"
+  set_context "providers.$1.context_length"
   if [[ $1 == osr && -n $kindi_targets || " $kindi_targets " == *" $1 "* ]]; then
     run_hermes config set "providers.$1.request_timeout_seconds" "$KINDI_CLIENT_TIMEOUT_SECONDS"
     run_hermes config set "providers.$1.stale_timeout_seconds" "$KINDI_CLIENT_TIMEOUT_SECONDS"
@@ -893,6 +915,6 @@ trap - ERR
 # The key now lives in Hermes's own configuration.
 rm -f -- "$ROUTER_API_KEY_FILE"
 commit=$(installed_commit)
-note "Hermes${commit:+ $commit} discovers via $ROUTER_URL and calls model servers directly with model $HERMES_MODEL (context $HERMES_CONTEXT_LENGTH)."
+note "Hermes${commit:+ $commit} discovers via $ROUTER_URL and calls model servers directly with model $HERMES_MODEL (context $(context_label))."
 [[ -n $HERMES_COMMIT || -z $commit ]] || note "Pin this version with HERMES_COMMIT=$commit."
 note "Start a shell with: runuser -u $HERMES_USER -- env HOME=$HERMES_USER_HOME $HERMES_BIN"

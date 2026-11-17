@@ -167,7 +167,10 @@ assert_fail "OPEN_TERMINAL_CT_ID cannot be this CT" env "${common[@]}" OPEN_TERM
 describe dsh_provision_refusals
 assert_fail "an invalid firewall source is refused" env "${common[@]}" DSH_ACCESS_CIDR=bad bash "$provision" --dry-run
 assert_fail "the router CT cannot be reused" env "${common[@]}" CT_ID=250 bash "$provision" --dry-run
-assert_fail "output tokens cannot equal the context" env "${common[@]}" DSH_MAX_TOKENS=32768 bash "$provision" --dry-run
+assert_fail "output tokens cannot equal the context" env "${common[@]}" DSH_CONTEXT_WINDOW=32768 DSH_MAX_TOKENS=32768 bash "$provision" --dry-run
+assert_fail "a context that is neither auto nor a number is refused" env "${common[@]}" DSH_CONTEXT_WINDOW=automatic bash "$provision" --dry-run
+plan=$(env "${common[@]}" bash "$provision" --dry-run 2>&1)
+assert_contains "a new CT follows the served context" 'DSH_CONTEXT_WINDOW=auto' "$plan"
 assert_fail "a moving dist-tag other than latest is refused" env "${common[@]}" DSH_VERSION=next bash "$provision" --dry-run
 assert_fail "a model id with spaces is refused" env "${common[@]}" "DSH_MODEL=a b" bash "$provision" --dry-run
 plan=$(env ROUTER_CT_ID=250 CT_ID=281 bash "$provision" --dry-run --reconfigure 2>&1)

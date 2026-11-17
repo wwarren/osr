@@ -137,10 +137,11 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 # Token budgets for the model's context window (HONCHO_CONTEXT_TOKENS and the
 # HONCHO_<SETTING> overrides; see the README), checked before anything changes.
 # Unset variables keep the last run's values from $etc/budgets.env. A first
-# install with no HONCHO_CONTEXT_TOKENS sizes them for 65536 tokens, the model
-# targets' default context (set it empty for Honcho's own, 128k budgets).
+# install with no HONCHO_CONTEXT_TOKENS uses auto: the budgets follow the window
+# the selected model is served with, read again on every run (set it empty for
+# Honcho's own, 128k budgets). Until the proxy has found it, auto counts 65536.
 if [[ ! -d $opt/.git && ! -e $etc/budgets.env && -z ${HONCHO_CONTEXT_TOKENS+set} ]]; then
-  export HONCHO_CONTEXT_TOKENS=65536
+  export HONCHO_CONTEXT_TOKENS=auto
 fi
 python3 "$deploy/budgets.py" "$etc/budgets.env" "$deploy/budgets.record" "$deploy/budgets.settings" ||
   die 'Invalid Honcho budget settings; nothing was changed.'
@@ -155,11 +156,22 @@ context_tokens=${context_tokens:-131072}
     "$structured_output_mode" "$skip_probe"
   printf 'KINDI_READ_TIMEOUT_SECONDS=%s\n' "$KINDI_READ_TIMEOUT_SECONDS"
 } > "$deploy/proxy.settings"
-selected_model=$(python3 "$deploy/honcho-proxy.py" --probe "$deploy") ||
+probe_out=$(python3 "$deploy/honcho-proxy.py" --probe "$deploy") ||
   die 'Honcho proxy could not validate a direct chat target.'
+selected_model=$(sed -n 1p <<< "$probe_out")
+served_context=$(sed -n 2p <<< "$probe_out")
 [[ $selected_model =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Honcho proxy selected an invalid model name.'
 printf 'RESOLVED_MODEL=%s\n' "$selected_model" >> "$deploy/proxy.settings"
 note "Honcho proxy selected $selected_model from router inventory for $model."
+# auto: size the budgets for the window the selected model is served with.
+# Nothing has changed yet, so a window the budgets cannot fit stops here.
+if [[ $context_tokens == auto ]]; then
+  [[ $served_context =~ ^[1-9][0-9]*$ ]] || die "Honcho proxy found no context window for $selected_model."
+  HONCHO_SERVED_CONTEXT=$served_context \
+    python3 "$deploy/budgets.py" "$etc/budgets.env" "$deploy/budgets.record" "$deploy/budgets.settings" ||
+    die 'Honcho budgets do not fit the selected model'"'"'s context window; nothing was changed.'
+  printf 'RESOLVED_CONTEXT=%s\n' "$served_context" >> "$deploy/proxy.settings"
+fi
 systemctl enable --now postgresql
 db_encoding=$(runuser -u postgres -- psql -Atqc \
   "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='honcho'") ||

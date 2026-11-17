@@ -38,8 +38,9 @@ Required: ROUTER (or the prompt); for a new CT also TEMPLATE (Debian
 Interactive runs list downloaded templates and eligible rootdir storage when
 those values are unset. CT_ID is the OpenClaw CT, separate from the existing
 router CT ID or IP address.
-OpenClaw: OPENCLAW_MODEL=auto, OPENCLAW_CONTEXT_LENGTH=65536 (>=32768; the
-          model's host must serve it), OPENCLAW_MAX_TOKENS=8192,
+OpenClaw: OPENCLAW_MODEL=auto, OPENCLAW_CONTEXT_LENGTH=auto (each model's window
+          as its server serves it, from the router's discovery, applied on each
+          run; or a number >=32768 the model's host must serve), OPENCLAW_MAX_TOKENS=8192,
           OPENCLAW_VERSION=latest (npm version or dist-tag),
           OPENCLAW_NODE_VERSION=24, NVM_VERSION=v0.40.4, NVM_INSTALLER_SHA256,
           OPENCLAW_PORT=18789.
@@ -438,7 +439,9 @@ valid_template() { [[ $1 =~ $template_re ]]; }
 valid_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_router() { classify_router "$1" >/dev/null; }
 valid_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
-valid_context() { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 32768 )); }
+valid_context() { [[ $1 == auto ]] || { [[ $1 =~ ^[1-9][0-9]{4,6}$ ]] && (( $1 >= 32768 )); }; }
+# context_floor: the least context a model must serve under OPENCLAW_CONTEXT_LENGTH.
+context_floor() { if [[ $OPENCLAW_CONTEXT_LENGTH == auto ]]; then echo 32768; else echo "$OPENCLAW_CONTEXT_LENGTH"; fi; }
 valid_tokens() { [[ $1 =~ ^[1-9][0-9]{2,6}$ ]]; }
 valid_honcho_url() { [[ -z $1 || $1 =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]]; }
 # recorded_or KEY DEFAULT: the CT's recorded KEY (a reconfigure), else DEFAULT.
@@ -515,8 +518,10 @@ if [[ $mode != integrate ]]; then
   pve_section 'OpenClaw settings'
   pve_note 'OpenClaw needs an OSR model that calls tools, with 32768 tokens of context or more.'
   pve_ask OPENCLAW_MODEL 'OSR model or tier' "$(recorded_or OPENCLAW_MODEL auto)" valid_model
-  pve_ask OPENCLAW_CONTEXT_LENGTH 'Context window the model serves (tokens)' "$(recorded_or OPENCLAW_CONTEXT_LENGTH 65536)" valid_context \
-    'Use a whole number of tokens, 32768 or more.'
+  pve_note "Context window: auto follows what each model's server serves (Strata started with 131072"
+  pve_note 'tokens gets 131072); a number pins that window for every model.'
+  pve_ask OPENCLAW_CONTEXT_LENGTH 'Context window (auto, or tokens)' "$(recorded_or OPENCLAW_CONTEXT_LENGTH auto)" valid_context \
+    'Use auto, or a whole number of tokens, 32768 or more.'
   pve_ask OPENCLAW_MAX_TOKENS 'Max reply tokens' "$(recorded_or OPENCLAW_MAX_TOKENS 8192)" valid_tokens 'Use a whole number of tokens.'
   pve_ask_yes_no OPENWEBUI 'Offer OpenClaw in Open WebUI (as openclaw)?' "$(recorded_or OPENCLAW_API true)"
   pve_ask_yes_no OPENCLAW_DASHBOARD 'Run the OpenClaw Control UI?' "$(recorded_or OPENCLAW_DASHBOARD true)"
@@ -573,7 +578,7 @@ if [[ $mode != integrate ]]; then
 fi
 OPENWEBUI=${OPENWEBUI:-true}
 OPENCLAW_MODEL=${OPENCLAW_MODEL:-auto}
-OPENCLAW_CONTEXT_LENGTH=${OPENCLAW_CONTEXT_LENGTH:-65536}
+OPENCLAW_CONTEXT_LENGTH=${OPENCLAW_CONTEXT_LENGTH:-auto}
 OPENCLAW_MAX_TOKENS=${OPENCLAW_MAX_TOKENS:-8192}
 OPENCLAW_DASHBOARD=${OPENCLAW_DASHBOARD:-true}
 for name in CORES MEMORY_MB ROOTFS_GB OPENCLAW_PORT; do positive "$name" "${!name}"; done
@@ -606,10 +611,10 @@ if [[ -n $ROUTER_URL ]]; then
   ROUTER_URL=${ROUTER_URL%/}
 fi
 [[ $OPENCLAW_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid OPENCLAW_MODEL.'
-[[ $OPENCLAW_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCLAW_CONTEXT_LENGTH >= 32768 )) ||
-  die 'OPENCLAW_CONTEXT_LENGTH must be at least 32768 (OpenClaw needs room for its prompt, tools and history).'
-[[ $OPENCLAW_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCLAW_MAX_TOKENS >= 256 && OPENCLAW_MAX_TOKENS * 2 <= OPENCLAW_CONTEXT_LENGTH )) ||
-  die 'OPENCLAW_MAX_TOKENS must be at least 256 and at most half of OPENCLAW_CONTEXT_LENGTH.'
+valid_context "$OPENCLAW_CONTEXT_LENGTH" ||
+  die 'OPENCLAW_CONTEXT_LENGTH must be auto or at least 32768 (OpenClaw needs room for its prompt, tools and history).'
+[[ $OPENCLAW_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCLAW_MAX_TOKENS >= 256 && OPENCLAW_MAX_TOKENS * 2 <= $(context_floor) )) ||
+  die 'OPENCLAW_MAX_TOKENS must be at least 256 and at most half of OPENCLAW_CONTEXT_LENGTH (of 32768 with auto).'
 [[ $OPENCLAW_VERSION =~ ^([a-z][a-z0-9-]{0,31}|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]] ||
   die 'OPENCLAW_VERSION must be an npm dist-tag (latest, beta) or an exact version such as 2026.10.9.'
 [[ $OPENCLAW_NODE_VERSION =~ ^(24|26)(\.[0-9]+\.[0-9]+)?$ ]] ||

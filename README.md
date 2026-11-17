@@ -135,8 +135,17 @@ up), the engine (Xolotl's 128k needs 24 GB; Strata, Basalt and Maya keep a small
 KV cache; Ollama and llama.cpp are sized for full-attention models) and the
 agents: Hermes needs 64000+, OpenClaw and OpenCode 32768+, DeepSeek Harness 16384+, and
 Honcho runs its full budgets at 131072. Too-small windows are flagged.
-Honcho's and DeepSeek Harness's windows are asked last, defaulting to the
-smallest chosen. A llama.cpp window is multiplied by `PARALLEL_SLOTS` for
+Honcho's and DeepSeek Harness's windows are asked last, defaulting to `auto`.
+
+**The agents follow what the servers serve.** With `auto` (the default for a
+new agent CT) Hermes, OpenClaw, OpenCode, Honcho and DeepSeek Harness size each
+model's window from what its server reports serving in the router's inventory
+(`served_context_length`): an LM Studio model loaded with 262144 tokens gets
+262144, Strata started with 131072 gets 131072, and a server that reports
+nothing counts as 65536 (or the model's own limit if smaller). Hermes follows
+it live; the others read it each time they are configured (`--reconfigure`,
+`tools/upgrade-all.sh`). A number pins the window instead; an existing agent CT
+keeps its recorded number until reconfigured with `auto`. A llama.cpp window is multiplied by `PARALLEL_SLOTS` for
 `CONTEXT_SIZE`. Presets: `OLLAMA_CONTEXT_LENGTH`, `LLAMACPP_CONTEXT` (or
 `CONTEXT_SIZE`), `STRATA_CONTEXT`, `BASALT_CONTEXT`, `MAYA_CONTEXT`,
 `XOLOTL_CONTEXT`, `AVALON_CONTEXT`, `KINDI_CONTEXT`, `HONCHO_CONTEXT_TOKENS`,
@@ -1063,7 +1072,8 @@ carry their settings forward unless overridden. Interrupting an upgrade
 its next run stops at `/var/lib/<target>-target/rollback-failed` until you have
 inspected the kept snapshot and deleted that file. FreeLLMAPI is replaced by a
 CT made from the new image; it is backed up with `vzdump` first and restored on
-failure, and `tools/upgrade-all.sh` takes no snapshot of it. MQTT and hcom are rerun
+failure, so `tools/upgrade-all.sh` snapshots it only for a run that keeps its
+release (passed as `FREELLMAPI_VERSION=keep`). MQTT and hcom are rerun
 with the same settings (or `--reconfigure`); a failed rollback keeps
 `/etc/mqtt-target/rollback` or `/etc/osr-hcom/rollback` and blocks reruns.
 Rerun hcom everywhere after changing the broker's advertised host or port.

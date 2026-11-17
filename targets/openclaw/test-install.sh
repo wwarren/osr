@@ -49,6 +49,8 @@ msg=$(env -u ROUTER_URL bash "$deploy_dry/install-target.sh" --dry-run 2>&1 || t
 [[ $msg == *'ROUTER_URL is unset'* && $msg == *'provision-lxc.sh --reconfigure'* ]] || fail "missing router URL gives no recovery path: $msg"
 refused ROUTER_URL=http://router:8000 OPENCLAW_MODEL='bad model'
 refused ROUTER_URL=http://router:8000 OPENCLAW_CONTEXT_LENGTH=16384
+refused ROUTER_URL=http://router:8000 OPENCLAW_CONTEXT_LENGTH=Auto
+refused ROUTER_URL=http://router:8000 OPENCLAW_CONTEXT_LENGTH=auto OPENCLAW_MAX_TOKENS=20000
 refused ROUTER_URL=http://router:8000 OPENCLAW_MAX_TOKENS=64
 refused ROUTER_URL=http://router:8000 OPENCLAW_CONTEXT_LENGTH=32768 OPENCLAW_MAX_TOKENS=20000
 refused ROUTER_URL=http://router:8000 OPENCLAW_VERSION='latest; rm'
@@ -119,6 +121,16 @@ assert p["strata-down"] == {"baseUrl": "x", "models": [{"id": "kept"}]}
 PY
 [[ $(provider_ids <<< "$providers" | paste -sd' ') == 'osr strata-a strata-down' ]] || fail provider_ids
 [[ $(provider_entry strata-a <<< "$providers") == *'"baseUrl":"http://127.0.0.1:8765/t/strata-a/v1"'* ]] || fail provider_entry
+# CONTEXT auto: each model's context_length from the dispatcher's listing
+# (what its servers serve), 65536 where it gives none; replies at most half.
+printf '{"data":[{"id":"auto","context_length":131072},{"id":"big","context_length":262144},{"id":"quiet"},{"id":"small","context_length":12000}]}' > "$tmp_root/served.json"
+providers=$(providers_json auto 8192 http://127.0.0.1:8765 - "osr=$tmp_root/served.json")
+python3 - "$providers" <<'PY' || fail "providers_json auto: $providers"
+import json, sys
+models = {m["id"]: m for m in json.loads(sys.argv[1])["osr"]["models"]}
+assert {i: (m["contextWindow"], m["maxTokens"]) for i, m in models.items()} == {
+    "auto": (131072, 8192), "big": (262144, 8192), "quiet": (65536, 8192), "small": (12000, 6000)}, models
+PY
 printf '{"data":[]}' > "$tmp_root/empty.json"
 [[ $(providers_json 65536 8192 http://127.0.0.1:8765 - "osr=$tmp_root/empty.json") == '{}' ]] || fail 'a provider without models'
 python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert not any("timeoutSeconds" in v for v in p.values())' "$providers" ||
@@ -171,7 +183,8 @@ grep -qx 'User=openclaw-direct' "$direct" || fail 'the dispatcher runs as the ag
 grep -qx 'ExecStart=/usr/bin/python3 /usr/local/lib/openclaw-direct.py' "$direct" || fail 'dispatcher ExecStart'
 grep -qx 'Environment=DIRECT_ETC=/etc/openclaw-target' "$direct" &&
   grep -qx 'Environment=DIRECT_SECRETS_FILE=/etc/openclaw-target/router.env' "$direct" &&
-  grep -qx 'Environment=DIRECT_CONTEXT_SETTING=OPENCLAW_CONTEXT_LENGTH' "$direct" || fail 'dispatcher files'
+  grep -qx 'Environment=DIRECT_CONTEXT_SETTING=OPENCLAW_CONTEXT_LENGTH' "$direct" &&
+  grep -qx 'Environment=DIRECT_AUTO_MIN_CONTEXT=32768' "$direct" || fail 'dispatcher files'
 pass "the units run hardened, the dispatcher apart from the agent, and carry no secret"
 
 # Exercise the exact npm command from the generated runtime script without
@@ -500,7 +513,7 @@ grep -q 'chown root:openclaw-direct .*/router.env' "$log" || fail 'the router ke
 [[ -f $tmp_root/openclaw-direct.py ]] && cmp -s "$tmp_root/openclaw-direct.py" "$here/../hermes/direct-dispatch.py" ||
   fail "the Hermes target's dispatcher was not installed"
 grep -q "ROUTER_KEY_SHA256=$(printf '%s' "$router_key" | sha256sum | cut -d' ' -f1)" "$etc/settings" || fail 'settings key hash'
-grep -q '^OPENCLAW_CONTEXT_LENGTH=65536$' "$etc/settings" || fail 'the dispatcher context floor is not in the settings'
+grep -q '^OPENCLAW_CONTEXT_LENGTH=auto$' "$etc/settings" || fail 'auto (the default) is not in the settings'
 grep -q '^PROVIDERS_SHA256=pending$' "$etc/settings" && fail 'the final settings record was not written'
 grep -q "$router_key" "$etc/settings" && fail 'the settings record holds the router key'
 grep '^curl ' "$log" | grep -q "$router_key" && fail 'the router key was passed to curl in argv'
@@ -606,7 +619,7 @@ prev_config=$(< "$config"); prev_env=$(< "$env_file")
 out=$(guest OPENCLAW_CONTEXT_LENGTH=131072 FAKE_CONFIG_FAIL=models.mode) && fail "a failed config set was accepted: $out"
 [[ $out == *'running again'* ]] || fail "config rollback message: $out"
 [[ $(< "$env_file") == "$prev_env" && $(< "$config") == "$prev_config" ]] || fail 'config or .env not restored'
-grep -q '^OPENCLAW_CONTEXT_LENGTH=65536$' "$etc/settings" || fail 'settings not restored'
+grep -q '^OPENCLAW_CONTEXT_LENGTH=auto$' "$etc/settings" || fail 'settings not restored'
 out=$(guest FAKE_VALIDATE_RC=1 OPENCLAW_MAX_TOKENS=4096) && fail 'an invalid config was accepted'
 [[ $(< "$config") == "$prev_config" ]] || fail 'an invalid config was kept'
 pass 'a failing or invalid configuration restores openclaw.json, .env, the settings and the units'

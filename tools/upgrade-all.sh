@@ -833,14 +833,19 @@ verify_item() {
 
 # take_snapshot ITEM LOG: SNAP holds the snapshot's name, or stays empty.
 take_snapshot() {
-    local i=$1 log=$2 id=${I_CT[$1]} name
+    local i=$1 log=$2 id=${I_CT[$1]} name planned current
     SNAP=''
     $SNAPSHOTS || return 0
     if [[ ${I_TARGET[$i]} == freellmapi ]]; then
-        # Its provisioner replaces the CT for a new release (destroying any
-        # snapshot with it) and keeps its own backup for rollback.
-        note "No snapshot of CT $id: FreeLLMAPI's provisioner backs the CT up itself and restores it on failure."
-        return 0
+        # A replacement destroys CT snapshots; its provisioner takes a vzdump.
+        # A same-release reconfigure keeps the CT and must honor --require-snapshot.
+        # No planned release means run_reconfigure passes FREELLMAPI_VERSION=keep.
+        planned=$(info_value "$i" FREELLMAPI_VERSION)
+        current=$(pct exec "$id" -- sed -n 's/^FREELLMAPI_VERSION=//p' /app/server/data/osr-target/settings 2>/dev/null | head -n 1)
+        if [[ -n $planned && -n $current && $planned != "$current" ]]; then
+            note "No snapshot of CT $id: FreeLLMAPI's provisioner backs the CT up before replacing it."
+            return 0
+        fi
     fi
     name="osr-upg-${RUN_STAMP}-$i"
     if pct snapshot "$id" "$name" --description "Before tools/upgrade-all.sh ($REPO_REV)" >> "$log" 2>&1; then
@@ -1031,6 +1036,13 @@ run_reconfigure() {  # run_reconfigure ITEM MODE
     for word in ${I_INFO[$i]}; do
         case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*|FREELLMAPI_VERSION=*) envs+=("$word") ;; esac
     done
+    # FreeLLMAPI's provisioner moves a CT that follows the tested release to it
+    # when no release is named. When this run keeps the CT's release (the same
+    # pin, --keep-pins, or a newer one), it says so, so the CT is not replaced
+    # and the snapshot take_snapshot made for a same-release run stays valid.
+    if [[ $t == freellmapi && -z $(info_value "$i" FREELLMAPI_VERSION) ]]; then
+        envs+=(FREELLMAPI_VERSION=keep)
+    fi
     if [[ $t == mqtt ]]; then
         settings=$(mqtt_env "$id" "$RUN_DIR/mqtt-$id") || return 1
         while IFS= read -r line; do [[ -z $line ]] || envs+=("$line"); done <<< "$settings"

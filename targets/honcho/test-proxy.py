@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Loopback proxy tests with separate fake router and model hosts."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import sys
@@ -42,6 +44,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 server = "strata+" + model_host
                 models = [{"name": "tool-model", "server": server,
                            "tools": state["tools"], "context_length": state["context"],
+                           "served_context_length": state.get("served"),
                            "loaded": True, "is_embedding": False},
                           {"name": "embed-model", "server": server,
                            "is_embedding": True, "loaded": True}]
@@ -165,6 +168,30 @@ class ProxyTest(unittest.TestCase):
         self.router_state["context"] = 65536
         self.router_state["tools"] = False
         with self.assertRaisesRegex(ValueError, "no reachable model that reports tool support"):
+            proxy.probe(str(self.directory))
+
+    def probe_lines(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            proxy.probe(str(self.directory))
+        return out.getvalue().splitlines()
+
+    def test_probe_prints_the_model_and_the_window_it_is_served_with(self):
+        self.write_settings(HONCHO_CONTEXT_TOKENS="auto")
+        self.router_state["context"] = 262144              # a limit only
+        self.assertEqual(self.probe_lines(), ["tool-model", "65536"])
+        self.router_state["served"] = 131072               # Strata started with 131072
+        self.assertEqual(self.probe_lines(), ["tool-model", "131072"])
+        self.router_state.update(context=40960, served=None)  # a model that cannot hold 65536
+        self.assertEqual(self.probe_lines(), ["tool-model", "40960"])
+
+    def test_auto_selects_models_from_32768_tokens(self):
+        self.write_settings(HONCHO_CONTEXT_TOKENS="auto")
+        config = proxy.settings(str(self.directory))
+        dispatcher = proxy.HonchoDispatcher(config, "router-key", {})
+        self.assertEqual((dispatcher.min_context, dispatcher.assumed_context), (32768, 65536))
+        self.router_state["context"] = 16384
+        with self.assertRaisesRegex(ValueError, "at least 32768 context tokens"):
             proxy.probe(str(self.directory))
 
     def test_a_model_that_answers_in_text_gets_a_second_try(self):

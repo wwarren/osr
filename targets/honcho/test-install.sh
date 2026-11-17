@@ -57,7 +57,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "server_status": {server: {"up": True}},
                                    "models": [
                                        {"server": server, "name": "fast-model", "tools": not bool(get("chat-warning")),
-                                        "context_length": 131072, "loaded": True, "is_embedding": False},
+                                        "context_length": 131072, "loaded": True, "is_embedding": False,
+                                        # $fake/served: the context it is served with (none when absent).
+                                        "served_context_length": int(get("served") or 0) or None},
                                        {"server": server, "name": "nomic-embed-text", "loaded": True,
                                         "is_embedding": True}]})
         self.send(404, {})
@@ -363,9 +365,11 @@ assert_not_contains "nothing is dumped on a first install" "pg_dump" "$(calls)"
 assert_ok "the proxy unit is installed" test -f "$tmp/ct/units/honcho-proxy.service"
 assert_contains "the proxy pins the resolved model" 'RESOLVED_MODEL=fast-model' "$(<"$etc/proxy.settings")"
 assert_fail "and nothing is left set aside" test -e "$tmp/ct/state/rollback"
-assert_eq "a first install sizes its budgets for 65536 tokens" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/budgets.env")"
-assert_contains "and says so" "Honcho budgets for a 65536-token context" "$out"
-assert_contains "the proxy asks for that much context" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/proxy.settings")"
+assert_eq "a first install follows the served context (auto)" "HONCHO_CONTEXT_TOKENS=auto" "$(<"$etc/budgets.env")"
+assert_contains "sized once the model is known" "sized for the selected model's context window once it is known" "$out"
+assert_contains "for 65536 where the server reports none" "Honcho budgets for a 65536-token context (auto)" "$out"
+assert_contains "the proxy is told auto" "HONCHO_CONTEXT_TOKENS=auto" "$(<"$etc/proxy.settings")"
+assert_contains "and records the window it found" "RESOLVED_CONTEXT=65536" "$(<"$etc/proxy.settings")"
 admin_key=$(<"$etc/api-key") client_key=$(<"$etc/openwebui-key") clients_json=$(<"$etc/clients.json")
 
 describe honcho_rerun
@@ -377,7 +381,7 @@ assert_contains "even the same commit gets a rollback dump" "pg_dump -Fc honcho"
 assert_eq "the admin key is kept" "$admin_key" "$(<"$etc/api-key")"
 assert_eq "and Open WebUI's key" "$client_key" "$(<"$etc/openwebui-key")"
 assert_eq "and the client list" "$clients_json" "$(<"$etc/clients.json")"
-assert_eq "and the first install's context" "HONCHO_CONTEXT_TOKENS=65536" "$(<"$etc/budgets.env")"
+assert_eq "and the first install's context" "HONCHO_CONTEXT_TOKENS=auto" "$(<"$etc/budgets.env")"
 assert_not_contains "llama.cpp is not built again" "cmake -S" "$(calls)"
 assert_not_contains "nor the model downloaded again" "download" "$(calls)"
 assert_not_contains "and the stored vectors stay" "UPDATE documents" "$(calls)"
@@ -567,6 +571,29 @@ printf 'HONCHO_REF=v3.6.0\nPATH=/nowhere\nHONCHO_ROTATE_KEYS=true\n' > "$etc/set
 out=$(guest) && rc=0 || rc=$?
 assert_eq "unknown names in the record are ignored" 0 "$rc"
 assert_not_contains "it does not rotate the keys" "Rotating the JWT secret" "$out"
+
+describe honcho_auto_context
+printf '98304\n' > "$fake/served"
+out=$(guest HONCHO_CONTEXT_TOKENS=auto) && rc=0 || rc=$?
+assert_eq "auto with a model served with 98304 tokens" 0 "$rc"
+assert_contains "gets budgets for that window" "Honcho budgets for a 98304-token context (auto)" "$out"
+assert_contains "recorded for the proxy" "RESOLVED_CONTEXT=98304" "$(<"$etc/proxy.settings")"
+assert_contains "and in Honcho's environment" "DIALECTIC_MAX_INPUT_TOKENS=86016" "$(<"$etc/honcho.env")"
+printf '131072\n' > "$fake/served"
+out=$(guest) && rc=0 || rc=$?
+assert_eq "a model now served with 131072 tokens" 0 "$rc"
+assert_contains "gets Honcho's own budgets, which fit that window" "Honcho budgets: Honcho's defaults." "$out"
+assert_not_contains "with no override left" "DIALECTIC_MAX_INPUT_TOKENS" "$(<"$etc/honcho.env")"
+printf '4096\n' > "$fake/served"
+before=$(<"$etc/honcho.env")
+out=$(guest) && rc=0 || rc=$?
+assert_ne "a window the budgets cannot fit" 0 "$rc"
+assert_contains "stops with what to change" "Choose another HONCHO_MODEL" "$out"
+assert_eq "before anything changed" "$before" "$(<"$etc/honcho.env")"
+rm -f "$fake/served"
+out=$(guest HONCHO_CONTEXT_TOKENS=) && rc=0 || rc=$?
+assert_eq "back to Honcho's own budgets" 0 "$rc"
+assert_eq "an empty setting returns to Honcho's own budgets" "" "$(<"$etc/budgets.env")"
 
 describe honcho_model_probe
 fresh

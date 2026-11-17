@@ -14,6 +14,8 @@ Group=openclaw-direct
 Environment=DIRECT_ETC=/etc/openclaw-target
 Environment=DIRECT_SECRETS_FILE=/etc/openclaw-target/router.env
 Environment=DIRECT_CONTEXT_SETTING=OPENCLAW_CONTEXT_LENGTH
+# OPENCLAW_CONTEXT_LENGTH=auto: the least context a model must serve to be used.
+Environment=DIRECT_AUTO_MIN_CONTEXT=32768
 EnvironmentFile=-/etc/openclaw-target/settings
 ExecStart=/usr/bin/python3 /usr/local/lib/openclaw-direct.py
 Restart=always

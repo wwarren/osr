@@ -100,7 +100,12 @@ Environment:
                                (default: router-api-key next to this script;
                                absent: keep the key already configured)
   OPENCODE_MODEL=auto          default model: an ID from the router's /v1/models
-  OPENCODE_CONTEXT_LENGTH=65536  context the model hosts really serve (>=32768)
+  OPENCODE_CONTEXT_LENGTH=auto   auto: each model's window as its server serves it,
+                                 from the dispatcher's /v1/models (65536 for a
+                                 server that does not say, or the model's limit
+                                 if smaller; applied on every install and
+                                 --reconfigure). A number (>=32768) pins that
+                                 window for every model; the hosts must serve it
   OPENCODE_MAX_TOKENS=8192     output tokens per reply OpenCode may ask for
   OPENCODE_VERSION=2.2.7       exact @opencode/cli release, or latest
   OPENCODE_PORT=4096           server port (web UI and HTTP API)
@@ -128,6 +133,16 @@ USAGE
 }
 
 # Install helpers (sourced by test-install.sh) -------------------------------
+
+# context_label: the context setting as a person reads it.
+context_label() {
+  if [[ $OPENCODE_CONTEXT_LENGTH == auto ]]; then echo "auto, each model's served window"
+  else echo "$OPENCODE_CONTEXT_LENGTH"; fi
+}
+# context_floor: the least context a model must serve to be used.
+context_floor() {
+  if [[ $OPENCODE_CONTEXT_LENGTH == auto ]]; then echo "$MIN_CONTEXT"; else echo "$OPENCODE_CONTEXT_LENGTH"; fi
+}
 
 # settings_record: the settings this installation runs with. Keys are
 # recorded only as hashes, so rotating one is a change.
@@ -318,7 +333,11 @@ PY
 providers_json() {
   python3 - "$@" <<'PY'
 import json, os, sys
-context, max_tokens, direct = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].rstrip("/")
+# CONTEXT is a number for every model, or auto: each model's context_length
+# from the dispatcher's /v1/models (what its servers serve), else 65536.
+fixed = None if sys.argv[1] == "auto" else int(sys.argv[1])
+max_tokens, direct = int(sys.argv[2]), sys.argv[3].rstrip("/")
+AUTO_ASSUMED_CONTEXT = 65536
 package = os.environ.get("PROVIDER_PACKAGE", "@opencode/ai/providers/openai-compatible")
 kindi_targets = set(os.environ.get("KINDI_TARGETS", "").split())
 kindi_timeout = int(os.environ.get("KINDI_HEADER_TIMEOUT_MS", "7200000"))
@@ -340,6 +359,14 @@ for item in sys.argv[5:]:
         listed = json.load(f)
     ids = sorted({m["id"] for m in listed.get("data") or []
                   if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]})
+    served = {m["id"]: m.get("context_length") for m in listed.get("data") or []
+              if isinstance(m, dict) and isinstance(m.get("id"), str)}
+
+    def window(model_id):
+        value = served.get(model_id)
+        if fixed:
+            return fixed
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else AUTO_ASSUMED_CONTEXT
     if name == "osr" and "auto" in ids:
         ids = ["auto"] + [i for i in ids if i != "auto"]
     if not ids:
@@ -358,7 +385,7 @@ for item in sys.argv[5:]:
         "compatibility": {"maxTokensField": "max_tokens"},
         "models": {i: {"name": i,
                        "capabilities": {"tools": True, "freeform": [], "input": ["text"], "output": ["text"]},
-                       "limit": {"context": context, "output": max_tokens}}
+                       "limit": {"context": window(i), "output": min(max_tokens, window(i) // 2)}}
                    for i in ids},
     }
 print(json.dumps(out, sort_keys=True, separators=(",", ":")))
@@ -510,7 +537,7 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROUTER_URL=${ROUTER_URL:-}
 ROUTER_API_KEY_FILE=${ROUTER_API_KEY_FILE:-$source_dir/router-api-key}
 OPENCODE_MODEL=${OPENCODE_MODEL:-auto}
-OPENCODE_CONTEXT_LENGTH=${OPENCODE_CONTEXT_LENGTH:-65536}
+OPENCODE_CONTEXT_LENGTH=${OPENCODE_CONTEXT_LENGTH:-auto}
 OPENCODE_MAX_TOKENS=${OPENCODE_MAX_TOKENS:-8192}
 OPENCODE_VERSION=${OPENCODE_VERSION:-$DEFAULT_OPENCODE_VERSION}
 OPENCODE_PORT=${OPENCODE_PORT:-4096}
@@ -574,10 +601,11 @@ HONCHO_URL=${HONCHO_URL%/}
 [[ -z $OPEN_TERMINAL_URL || $OPEN_TERMINAL_URL =~ ^https?://[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]{1,5}/?$ ]] || die 'Invalid OPEN_TERMINAL_URL.'
 OPEN_TERMINAL_URL=${OPEN_TERMINAL_URL%/}
 [[ $OPENCODE_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]] || die 'Invalid OPENCODE_MODEL.'
-[[ $OPENCODE_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCODE_CONTEXT_LENGTH >= MIN_CONTEXT )) ||
-  die "OPENCODE_CONTEXT_LENGTH must be at least $MIN_CONTEXT: OpenCode's prompt, tools and history need it. The model's host must serve that much too."
-[[ $OPENCODE_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCODE_MAX_TOKENS >= 256 && OPENCODE_MAX_TOKENS * 2 <= OPENCODE_CONTEXT_LENGTH )) ||
-  die 'OPENCODE_MAX_TOKENS must be at least 256 and at most half of OPENCODE_CONTEXT_LENGTH.'
+[[ $OPENCODE_CONTEXT_LENGTH == auto ]] ||
+  { [[ $OPENCODE_CONTEXT_LENGTH =~ ^[1-9][0-9]{4,6}$ ]] && (( OPENCODE_CONTEXT_LENGTH >= MIN_CONTEXT )); } ||
+  die "OPENCODE_CONTEXT_LENGTH must be auto or at least $MIN_CONTEXT: OpenCode's prompt, tools and history need it. The model's host must serve that much too."
+[[ $OPENCODE_MAX_TOKENS =~ ^[1-9][0-9]{2,6}$ ]] && (( OPENCODE_MAX_TOKENS >= 256 && OPENCODE_MAX_TOKENS * 2 <= $(context_floor) )) ||
+  die "OPENCODE_MAX_TOKENS must be at least 256 and at most half of OPENCODE_CONTEXT_LENGTH (of $MIN_CONTEXT with auto)."
 # OpenCode's wait for response headers from a Kindi server: see providers_json.
 KINDI_HEADER_TIMEOUT_MS=$(( KINDI_READ_TIMEOUT_SECONDS * 2 * 1000 ))
 [[ $OPENCODE_VERSION == latest ]] || exact_version "$OPENCODE_VERSION" ||
@@ -619,7 +647,7 @@ if (( dry_run )); then
   [[ $OPENCODE_SKIP_CHAT_PROBE == true ]] ||
     printf '+ send one chat request offering a tool through the local dispatcher to a model server (model %s)\n' "$OPENCODE_MODEL"
   printf '+ configure provider osr (%s, baseURL %s/v1, apiKey <local placeholder>), model osr/%s, context %s\n' \
-    "$PROVIDER_PACKAGE" "$DIRECT_URL" "$OPENCODE_MODEL" "$OPENCODE_CONTEXT_LENGTH"
+    "$PROVIDER_PACKAGE" "$DIRECT_URL" "$OPENCODE_MODEL" "$(context_label)"
   printf '+ configure direct providers <target> (baseURL %s/t/<target>/v1) for: %s\n' \
     "$DIRECT_URL" "$(target_names "$targets_source" | paste -sd' ' - | sed 's/^$/none/')"
   printf '+ server on %s:%s, Basic auth as opencode (password in %s/password and %s)\n' \
@@ -1101,7 +1129,7 @@ mapfile -t new_providers < <(provider_ids < "$stage/providers.json")
 python3 -c 'import json,sys
 models = json.load(open(sys.argv[1]))["osr"]["models"]
 sys.exit(0 if sys.argv[2] in models else 1)' "$stage/providers.json" "$OPENCODE_MODEL" ||
-  fail "The local dispatcher does not offer OPENCODE_MODEL '$OPENCODE_MODEL' (no tool support or less than $OPENCODE_CONTEXT_LENGTH tokens of context on every server)."
+  fail "The local dispatcher does not offer OPENCODE_MODEL '$OPENCODE_MODEL' (no tool support or less than $(context_floor) tokens of context on every server)."
 providers_sha256=$(sha256sum "$stage/providers.json" | cut -d' ' -f1)
 
 # 3. The release: the unit runs /usr/local/bin/opencode -> current/opencode.
@@ -1216,7 +1244,7 @@ for dir in "$RELEASES"/*/; do
   name=$(basename -- "$dir")
   [[ $name == "$release_name" || $name == "$keep_prev" ]] || rm -rf -- "$dir"
 done
-note "OpenCode $want_version ($release_name) discovers via $ROUTER_URL and calls model servers directly with model osr/$OPENCODE_MODEL (context $OPENCODE_CONTEXT_LENGTH)."
+note "OpenCode $want_version ($release_name) discovers via $ROUTER_URL and calls model servers directly with model osr/$OPENCODE_MODEL (context $(context_label))."
 exact_version "$OPENCODE_VERSION" || note "Pin this release with OPENCODE_VERSION=$want_version."
 if [[ $OPENCODE_WEB == true ]]; then
   note "Web UI: http://$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}'):$OPENCODE_PORT/ (user opencode, password in $OC_ETC/password)."

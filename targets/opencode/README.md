@@ -63,9 +63,18 @@ The router and model-host firewall requirements are
 [Hermes's](../hermes/README.md#before-you-start), including an Open WebUI admin
 API key or session JWT (asked for, or `OPENWEBUI_ADMIN_TOKEN`) unless
 `OPENWEBUI=false`. Models need tools and enough context: the dispatcher never selects
-one the inventory reports with less than `OPENCODE_CONTEXT_LENGTH` (default
-65536, minimum 32768) or without tool support. Raise the hosts' context as for
-Hermes. The router port must admit this CT (`API_ALLOW_CIDR`).
+one the inventory reports with less than 32768 tokens under
+`OPENCODE_CONTEXT_LENGTH=auto`, or less than a pinned number, or without tool
+support. The router port must admit this CT (`API_ALLOW_CIDR`).
+
+**`auto` (the default for a new CT)** gives each model the window its server
+serves, as [Hermes's `auto`](../hermes/README.md#context-window-auto-follows-what-each-server-serves)
+does: an LM Studio model loaded with 262144 tokens gets 262144, Strata started
+with 131072 gets 131072, and a server that reports nothing counts as 65536 (or
+the model's limit if smaller). OpenCode keeps the windows in its own config, so
+they are taken when the CT is installed or reconfigured (`--reconfigure`,
+`tools/upgrade-all.sh`), not live. An existing CT keeps its recorded number
+until reconfigured with `OPENCODE_CONTEXT_LENGTH=auto`.
 
 ## Provision on the Proxmox host
 
@@ -94,8 +103,9 @@ files. The guest installer:
 3. Starts `opencode-direct.service` and sends one tool-using chat through it.
 4. Writes providers from the dispatcher's model lists: `osr` (`auto`, tiers,
    router models) and one per model server, each model with `limit.context` =
-   `OPENCODE_CONTEXT_LENGTH`, `limit.output` = `OPENCODE_MAX_TOKENS`, JSON tool
-   calls, text in and out, and the `max_tokens` field.
+   its served window (`auto`) or `OPENCODE_CONTEXT_LENGTH`, `limit.output` =
+   `OPENCODE_MAX_TOKENS` (at most half the window), JSON tool calls, text in and
+   out, and the `max_tokens` field.
 5. Switches `current` to the release and writes the managed keys of
    `~/.config/opencode/opencode.json` (`model` = `osr/<OPENCODE_MODEL>`,
    `providers`, `update`, the `open-terminal` MCP server and the Honcho
@@ -120,7 +130,7 @@ Open WebUI's is unset or points at an agent.
 | Setting | Default | Meaning |
 |---|---|---|
 | `OPENCODE_MODEL` | `auto` | Default model `osr/<this>`: `auto`, a tier or a router model; `auto` ranks and pins tasks as for Hermes |
-| `OPENCODE_CONTEXT_LENGTH` | `65536` | Context the hosts serve (≥ 32768); every provider model's `limit.context` |
+| `OPENCODE_CONTEXT_LENGTH` | `auto` | `auto`: each provider model's `limit.context` is what its server serves (65536 where unreported); a model must serve 32768. A number (≥ 32768) pins every model's `limit.context` |
 | `OPENCODE_MAX_TOKENS` | `8192` | `limit.output` per model, at most half the context |
 | `OPENCODE_VERSION` | `2.2.7` | Exact `@opencode/cli` release (2.x or newer), or `latest` |
 | `OPENCODE_PORT` | `4096` | Web UI and HTTP API port |
@@ -301,7 +311,8 @@ CT pinned to an older release to this target's pin.
 | "does not match the registry's sha512 integrity" | The download was altered or cut off; nothing was installed. Retry; if it persists, check the CT's proxy or DNS |
 | "is not plain JSON" | `opencode.json` was edited with comments: remove them or move the file aside, then rerun |
 | `model server … is unreachable; skipping it` in `journalctl -u opencode-direct` | Not yet admitted (`--reconfigure`), down, or blocked by the model host's firewall |
-| "does not offer OPENCODE_MODEL" | Every server for it lacks tools or reports less than `OPENCODE_CONTEXT_LENGTH`; check `/routing/inventory` |
+| "does not offer OPENCODE_MODEL" | Every server for it lacks tools or reports less than `OPENCODE_CONTEXT_LENGTH` (32768 with `auto`); check `/routing/inventory` |
+| OpenCode still uses 65536 after a server was raised | Reconfigure the CT: windows are read at each configuration. With a pinned number, use `OPENCODE_CONTEXT_LENGTH=auto` |
 | "did not answer … with default model osr/…" | The server did not start or did not load the config: `journalctl -u opencode` |
 | Open WebUI: "OpenCode's chat endpoint rejected the key" | The CT's `api-key` and the one given differ: rerun `--integrate-only` |
 | Open WebUI: "has no /v1/models: is opencode-api running?" | `OPENWEBUI=false` was set, or the endpoint is down: `journalctl -u opencode-api`, or `--reconfigure` with `OPENWEBUI=true` |

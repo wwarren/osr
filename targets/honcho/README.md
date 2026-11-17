@@ -50,8 +50,9 @@ get both ports (an agent's MCP rule is tagged `# osr-honcho-client-mcp`). See
   100,000). For a smaller window set `HONCHO_CONTEXT_TOKENS` (see
   [Fitting a small context window](#fitting-a-small-context-window));
   otherwise the model server silently truncates. A first install without it
-  uses 65536, the model targets' default. The proxy only picks a model whose
-  reported context is at least `HONCHO_CONTEXT_TOKENS` (131072 when blank).
+  uses `auto` ([below](#auto-budgets-follow-the-served-window)). The proxy
+  only picks a model whose reported context is at least `HONCHO_CONTEXT_TOKENS`
+  (32768 with `auto`, 131072 when blank).
 - **Both reported in the inventory.** Ollama, the llama.cpp bridge (with
   `tools` in `MODEL_CAPABILITIES`), tool-trained LM Studio models, and Strata,
   Basalt, Maya, Xolotl, Avalon and Kindi (`tool_kinds`) report tools and
@@ -60,7 +61,7 @@ get both ports (an agent's MCP rule is tagged `# osr-honcho-client-mcp`). See
   and Maya does not validate it against the schema. Reported context is a
   ceiling: Ollama reports the model limit or a Modelfile `num_ctx`, not a
   server-wide `OLLAMA_CONTEXT_LENGTH`, so make sure the server really serves
-  `HONCHO_CONTEXT_TOKENS`.
+  a pinned `HONCHO_CONTEXT_TOKENS`.
 - **Steady capacity.** The deriver processes every batch of new messages, so
   it competes with interactive chats on the same GPU.
 
@@ -95,11 +96,28 @@ After installing, chat with Hermes or OpenClaw for a few turns and check that
 observations. No errors but nothing stored means the backend ignores the
 schema: switch to `json_object`.
 
+### Auto: budgets follow the served window
+
+With `HONCHO_CONTEXT_TOKENS=auto` (a first install's default) the proxy selects
+a model as usual (tools and at least 32768 reported tokens), then reads the
+window that model is served with from the router's inventory
+(`served_context_length` on every server of it) and the install sizes the
+budgets for that window: an LM Studio model loaded with 262144 tokens, or
+Strata started with 131072, gets Honcho's own budgets; a server that reports
+nothing counts as 65536 (or the model's limit if smaller). It is read again on
+every run, so `--reconfigure` and `tools/upgrade-all.sh` follow a server that
+now serves another window. The run stops before anything changes when the
+budgets cannot fit that window (below 8192, or explicit `HONCHO_<SETTING>`
+overrides too large for it). The window found is recorded as
+`RESOLVED_CONTEXT` in `/etc/honcho-target/proxy.settings`. An existing CT keeps
+its recorded setting until reconfigured with `HONCHO_CONTEXT_TOKENS=auto`.
+
 ### Fitting a small context window
 
-Set `HONCHO_CONTEXT_TOKENS` (8192–1048576) to the window the server gives the
-model, equal to or slightly below `OLLAMA_CONTEXT_LENGTH`. The OSR installer
-asks for it after the model targets and offers the smallest of their windows.
+To pin the window instead, set `HONCHO_CONTEXT_TOKENS` (8192–1048576) to the
+window the server gives the model, equal to or slightly below
+`OLLAMA_CONTEXT_LENGTH`. The OSR installer asks for it after the model targets
+(`auto` by default).
 The install sizes every budget so each request, its answer, the system prompt
 and tool definitions fit. Suggested windows for the models above: 16384 (8
 GB), 24576 (10 GB), 32768 (12–16 GB), 32768–65536 (24 GB).
@@ -136,7 +154,7 @@ Each budget can be overridden (Honcho's setting name with a `HONCHO_` prefix):
 Values are checked before anything changes and kept in
 `/etc/honcho-target/budgets.env`, so a reconfigure that omits a variable keeps
 it; set one empty (`HONCHO_CONTEXT_TOKENS=`) to return to Honcho's default
-(also on a first install, instead of 65536). The install prints the budgets.
+(also on a first install, instead of `auto`). The install prints the budgets.
 
 ## Configuration
 
@@ -402,8 +420,8 @@ which an unattended run takes), static IP/CIDR, the router CT ID and IP, and
 the gateway; no address is inferred. It then reads the router's
 `/routing/inventory` (key from the router CT on curl's stdin; from inside the
 router CT if its firewall turns the host away) and offers the **chat models**
-the proxy can use (tools and at least `HONCHO_CONTEXT_TOKENS`, 65536 on a
-first install), loaded and larger ones first, naming the excluded ones and
+the proxy can use (tools and at least `HONCHO_CONTEXT_TOKENS`, 32768 with
+`auto`), loaded and larger ones first, naming the excluded ones and
 why. Answer with a number, a name or a tier; with no usable model it suggests
 `fast` and warns. Then optional Hermes, OpenClaw and DeepSeek Harness IPs, the
 Debian 13 template and storage menus, and the admin token (no echo). The router

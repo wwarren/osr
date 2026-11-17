@@ -84,7 +84,36 @@ test('rejects missing and overclaimed models', async () => {
   });
 });
 
-const { overlay, parseArgs, withBlock, instructionsBlock } = await import('./configure.mjs');
+const { overlay, parseArgs, withBlock, instructionsBlock, servedContext } = await import('./configure.mjs');
+
+test('auto: the window the model is served with, from the inventory', () => {
+  const inventory = { models: [
+    { name: 'lm', tools: true, context_length: 262144, served_context_length: 262144 },
+    { name: 'strata', tools: true, context_length: 131072, served_context_length: 131072 },
+    { name: 'ollama', tools: true, context_length: 262144 },         // a limit only
+    { name: 'small', tools: true, context_length: 40960 },
+    { name: 'no-tools', tools: false, served_context_length: 2048 },
+    { name: 'embed', is_embedding: true, served_context_length: 512 },
+  ] };
+  assert.equal(servedContext(inventory, 'lm', true), 262144);
+  assert.equal(servedContext(inventory, 'strata', true), 131072);
+  assert.equal(servedContext(inventory, 'ollama', true), 65536);
+  assert.equal(servedContext(inventory, 'small', true), 40960);
+  // An alias may route a tool request to any tool-capable chat model.
+  assert.equal(servedContext(inventory, 'auto', false), 40960);
+  // Two servers of one model: the one that serves less.
+  inventory.models.push({ name: 'lm', tools: true, served_context_length: 98304 });
+  assert.equal(servedContext(inventory, 'lm', true), 98304);
+  assert.equal(servedContext({ models: [] }, 'auto', false), 65536);
+});
+
+test('auto is resolved with --print-context; the overlay takes a number', () => {
+  const base = ['--router-url', 'http://r:1', '--model', 'm'];
+  assert.equal(parseArgs([...base, '--context-window', 'auto', '--print-context']).contextWindow, 'auto');
+  assert.throws(() => parseArgs([...base, '--output', 'x', '--context-window', 'auto']), /--print-context/);
+  assert.throws(() => parseArgs([...base, '--output', 'x', '--context-window', 'big']), /or auto/);
+  assert.throws(() => parseArgs(base), /--output/);
+});
 
 test('Honcho adds one MCP entry whose key comes from the environment', () => {
   const options = parseArgs(['--router-url', 'http://192.0.2.50:8000', '--model', 'code-model', '--output', 'x',

@@ -35,6 +35,8 @@ assert_not_contains "a dry-run create has no such check" "Not checked by a dry r
 assert_contains "and admits Honcho in the router's firewall" "Would admit 192.0.2.85 to the router API in /etc/pve/firewall/280.fw" "$plan"
 assert_not_contains "unless that is turned off" "Would admit" "$(env "${common[@]}" HONCHO_ROUTER_FIREWALL=false bash "$provision" --dry-run)"
 assert_fail "json_object or json_schema only" env "${common[@]}" HONCHO_STRUCTURED_OUTPUT_MODE=xml bash "$provision" --dry-run
+assert_fail "a context that is neither auto, a number nor empty is refused" env "${common[@]}" HONCHO_CONTEXT_TOKENS=automatic bash "$provision" --dry-run
+assert_ok "auto is accepted" env "${common[@]}" HONCHO_CONTEXT_TOKENS=auto bash "$provision" --dry-run
 assert_fail "another Bun needs a checksum" env "${common[@]}" HONCHO_BUN_VERSION=1.5.0 bash "$provision" --dry-run
 assert_ok "and runs with the baseline one alone" env "${common[@]}" HONCHO_BUN_VERSION=1.5.0 HONCHO_BUN_BASELINE_SHA256="$(printf 'a%.0s' {1..64})" bash "$provision" --dry-run
 assert_fail "a checksum is 64 hex digits" env "${common[@]}" HONCHO_BUN_SHA256=abc bash "$provision" --dry-run
@@ -324,8 +326,8 @@ if command -v script >/dev/null; then
   # suggestion). Nothing about embeddings is asked.
   out=$(printf '\n\n' | env "${interactive_env[@]}" STUBS="$stubs" PATH="$PATH" \
     script -qec "bash $provision --dry-run" /dev/null 2>&1 | tr -d '\r') || true
-  assert_contains "the context window is asked first, with the first-install size" "Context window the chat model serves (tokens; none = Honcho's 128k budgets) [65536]" "$out"
-  assert_contains "and reaches the CT" "HONCHO_CONTEXT_TOKENS=65536" "$out"
+  assert_contains "the context window is asked first, with the first-install default" "Context window (auto, tokens, or none) [auto]" "$out"
+  assert_contains "and reaches the CT" "HONCHO_CONTEXT_TOKENS=auto" "$out"
   assert_contains "the router's inventory is read once its address is known" "Reading the models router CT 280 serves" "$out"
   assert_contains "the usable chat model is listed" "1) qwen3:14b  (65536-token context, 14.8B, loaded, on http://192.0.2.90:11434)" "$out"
   assert_contains "the ones the proxy cannot use are named, with the reason" "gemma3:12b (tool support not reported)" "$out"
@@ -385,8 +387,8 @@ assert_not_contains "presets are not asked again" 'Router CT ID' "$out"
 assert_not_contains "nor agents given as empty" 'Agent CT IPs' "$out"
 out=$(PATH="$nostub:$PATH" env "${common[@]}" PVE_INTERACTIVE=true PVE_ACCEPT_DEFAULTS=true PVE_LXC_DIR=$lxc HONCHO_CLIENT_IPS= \
   bash "$provision" --dry-run 2>&1 < /dev/null)
-assert_not_contains "under the OSR installer no default is asked" 'Context window the chat' "$out"
-assert_contains "and the first-install window is used" 'HONCHO_CONTEXT_TOKENS=65536' "$out"
+assert_not_contains "under the OSR installer no default is asked" 'Context window (auto' "$out"
+assert_contains "and the first-install setting is used" 'HONCHO_CONTEXT_TOKENS=auto' "$out"
 # Reconfigure: the CT to change (offered by its tag), then Router.
 printf 'net0: name=eth0,bridge=vmbr0,gw=192.0.2.1,ip=192.0.2.85/24\ntags: osr-target;honcho\n' > "$lxc/285.conf"
 out=$(PATH="$nostub:$PATH" PVE_INTERACTIVE=true PVE_LXC_DIR=$lxc IP_CIDR=192.0.2.85/24 \

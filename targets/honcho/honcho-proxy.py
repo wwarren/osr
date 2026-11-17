@@ -39,11 +39,16 @@ def json_content(content):
     return value if isinstance(value, dict) else None
 
 
+# HONCHO_CONTEXT_TOKENS=auto: the least a model must report to be selected;
+# the budgets then follow the window it is served with.
+AUTO_MIN_CONTEXT = 32768
+
+
 def no_model_error(min_context):
     return ValueError(
         "router inventory has no reachable model that reports tool support and at least "
-        f"{min_context} context tokens. Set HONCHO_CONTEXT_TOKENS to the context window your "
-        "model server gives the model (it is 131072 when unset), or serve a tool-capable model "
+        f"{min_context} context tokens. Set HONCHO_CONTEXT_TOKENS to auto or to the context window "
+        "your model server gives the model (it is 131072 when unset), or serve a tool-capable model "
         "that reports its context (Ollama, the llama.cpp bridge with tools in "
         "MODEL_CAPABILITIES, or LM Studio)")
 
@@ -54,9 +59,10 @@ def settings(directory):
     missing = [name for name in required if not values.get(name)]
     if missing:
         raise ValueError("missing proxy settings: " + ", ".join(missing))
-    values["HONCHO_CONTEXT_TOKENS"] = int(values["HONCHO_CONTEXT_TOKENS"])
-    if values["HONCHO_CONTEXT_TOKENS"] < 8192:
-        raise ValueError("invalid model context")
+    if values["HONCHO_CONTEXT_TOKENS"] != "auto":
+        values["HONCHO_CONTEXT_TOKENS"] = int(values["HONCHO_CONTEXT_TOKENS"])
+        if values["HONCHO_CONTEXT_TOKENS"] < 8192:
+            raise ValueError("invalid model context")
     return values
 
 
@@ -68,8 +74,10 @@ def router_key(directory):
 
 class HonchoDispatcher(direct.Dispatcher):
     def __init__(self, config, key, backend_keys):
+        auto = config["HONCHO_CONTEXT_TOKENS"] == "auto"
         super().__init__(config["ROUTER_URL"], key, backend_keys,
-                         config["HONCHO_CONTEXT_TOKENS"])
+                         AUTO_MIN_CONTEXT if auto else config["HONCHO_CONTEXT_TOKENS"],
+                         assumed_context=direct.AUTO_ASSUMED_CONTEXT if auto else None)
         self.alias = config["HONCHO_MODEL"]
         self.resolved_model = config.get("RESOLVED_MODEL", "")
 
@@ -94,6 +102,13 @@ class HonchoDispatcher(direct.Dispatcher):
                                     if entry["name"].lower() == self.resolved_model.lower())
         matches.pinned = ranked.pinned
         return matches
+
+    def resolved_context(self):
+        """The window the resolved model is served with on every server that
+        may get Honcho's requests (direct.Dispatcher.served_context)."""
+        name = (self.resolved_model or "").lower()
+        return self.served_context([m for m in self.inventory()["models"]
+                                    if m.get("name", "").lower() == name and self.usable(m)])
 
     def model_list(self):
         # Honcho sees one stable chat name. The resolved host and chat model
@@ -167,7 +182,10 @@ def probe(directory):
         dispatcher.resolved_model = candidates[0]["name"]
     else:
         chat_probe(dispatcher, model, config.get("HONCHO_STRUCTURED_OUTPUT_MODE", ""))
+    # Two lines: the model, then the context it is served with (the budgets'
+    # window under HONCHO_CONTEXT_TOKENS=auto).
     print(dispatcher.resolved_model)
+    print(dispatcher.resolved_context() or "")
 
 
 def serve(directory):

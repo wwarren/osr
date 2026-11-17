@@ -18,9 +18,15 @@ const LEGACY_BLOCK_BEGINS = [
 
 function usage() {
   return `Usage: node configure.mjs --router-url URL --model ID --output FILE [options]
+       node configure.mjs --router-url URL --model ID --context-window auto --print-context
 
 Options:
-  --context-window N    Context served by this model (default: 32768)
+  --context-window N    Context served by this model (default: 32768), or auto:
+                        what its servers serve, from the router's inventory
+                        (65536 for a server that does not say, or the model's
+                        limit if smaller; for an alias, the smallest over every
+                        tool-capable model it may route to)
+  --print-context       Print the context window (resolving auto) and exit
   --max-tokens N        Maximum output tokens (default: 8192)
   --api-key-env NAME    Environment variable holding the router key (default: OSR_API_KEY)
   --honcho-mcp-url URL  Honcho MCP endpoint (http(s)://host:port/mcp); adds Honcho memory
@@ -44,6 +50,9 @@ before launching dsh. For a keyless local router, set a nonempty placeholder.\n`
 }
 
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
+// --context-window auto: a server that does not report what it serves is
+// taken to serve the window every OSR model target defaults to.
+export const AUTO_ASSUMED_CONTEXT = 65536;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function parseArgs(argv) {
@@ -67,21 +76,28 @@ export function parseArgs(argv) {
     if (arg === '--force') { options.force = true; continue; }
     if (arg === '--skip-honcho-check') { options.skipHonchoCheck = true; continue; }
     if (arg === '--skip-open-terminal-check') { options.skipOpenTerminalCheck = true; continue; }
+    if (arg === '--print-context') { options.printContext = true; continue; }
     const key = names.get(arg);
     if (!key || i + 1 >= argv.length) throw new Error(`Unknown or incomplete option: ${arg}`);
     options[key] = argv[++i];
     if (key === 'honchoWorkspace') options.honchoWorkspaceGiven = true;
   }
-  for (const key of ['routerUrl', 'model', 'output']) {
+  for (const key of options.printContext ? ['routerUrl', 'model'] : ['routerUrl', 'model', 'output']) {
     if (!options[key]) throw new Error(`Missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`);
   }
   for (const key of ['contextWindow', 'maxTokens']) {
+    if (key === 'contextWindow' && options[key] === 'auto') continue;
     if (!/^[1-9]\d*$/.test(String(options[key])) || !Number.isSafeInteger(Number(options[key]))) {
-      throw new Error(`${key} must be a positive integer`);
+      throw new Error(`${key} must be a positive integer${key === 'contextWindow' ? ' or auto' : ''}`);
     }
     options[key] = Number(options[key]);
   }
-  if (options.maxTokens >= options.contextWindow) throw new Error('max-tokens must be smaller than context-window');
+  if (options.contextWindow === 'auto' && !options.printContext) {
+    throw new Error('Resolve --context-window auto with --print-context first; the overlay takes a number');
+  }
+  if (options.contextWindow !== 'auto' && options.maxTokens >= options.contextWindow) {
+    throw new Error('max-tokens must be smaller than context-window');
+  }
   for (const key of ['apiKeyEnv', 'honchoKeyEnv', 'openTerminalKeyEnv']) {
     if (!ENV_NAME.test(options[key])) throw new Error(`Invalid ${key} name`);
   }
@@ -112,7 +128,7 @@ export function parseArgs(argv) {
     }
     options.openTerminalMcpUrl = `${terminal.origin}/mcp`;
   }
-  options.output = resolve(options.output);
+  if (options.output) options.output = resolve(options.output);
   if (options.instructions) options.instructions = resolve(options.instructions);
   return options;
 }
@@ -140,6 +156,22 @@ export function validateModel(models, inventory, model, contextWindow) {
     throw new Error(`A host serving ${JSON.stringify(model)} reports less than ${contextWindow} context tokens`);
   }
   return entries.length > 0;
+}
+
+// servedContext: the window DeepSeek can count on for MODEL. A real model:
+// the smallest over its servers. An alias (auto, a tier): the smallest over
+// every chat model the router may send a tool request to (tools not known to
+// be missing). Each server counts with what it serves (served_context_length),
+// else AUTO_ASSUMED_CONTEXT or the model's own reported limit if smaller.
+export function servedContext(inventory, model, exact) {
+  const chat = Array.isArray(inventory?.models)
+    ? inventory.models.filter(entry => entry && !entry.is_embedding && entry.tools !== false)
+    : [];
+  const entries = exact ? chat.filter(entry => entry.name === model) : chat;
+  const number = value => (Number.isSafeInteger(value) && value > 0 ? value : null);
+  const windows = entries.map(entry => number(entry.served_context_length) ??
+    Math.min(AUTO_ASSUMED_CONTEXT, number(entry.context_length) ?? AUTO_ASSUMED_CONTEXT));
+  return windows.length ? Math.min(...windows) : AUTO_ASSUMED_CONTEXT;
 }
 
 // Streamable HTTP may return one JSON message or an SSE stream. Read through
@@ -389,6 +421,13 @@ async function main() {
   if (!apiKey) throw new Error(`Set ${options.apiKeyEnv} before configuring DeepSeek`);
   const models = await getJson(`${options.routerUrl}/v1/models`, apiKey);
   const inventory = await getJson(`${options.routerUrl}/routing/inventory`, apiKey);
+  if (options.printContext) {
+    const exact = validateModel(models, inventory, options.model, 0);
+    const window = options.contextWindow === 'auto'
+      ? servedContext(inventory, options.model, exact) : options.contextWindow;
+    process.stdout.write(`${window}\n`);
+    return;
+  }
   const exact = validateModel(models, inventory, options.model, options.contextWindow);
   if (options.honchoMcpUrl) {
     const key = process.env[options.honchoKeyEnv];

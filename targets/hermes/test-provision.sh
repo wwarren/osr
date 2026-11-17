@@ -335,6 +335,7 @@ reject 'Set IP_CIDR for unattended provisioning' IP_CIDR=
 reject 'Set GATEWAY for unattended provisioning' GATEWAY=
 reject 'Hermes and router CT IDs must differ' CT_ID=280
 reject 'at least 64000' HERMES_CONTEXT_LENGTH=32768
+reject 'auto or at least 64000' HERMES_CONTEXT_LENGTH=automatic
 reject 'IP_CIDR' IP_CIDR=192.0.2.999/24
 reject 'EGRESS must be' EGRESS=none
 reject 'HERMES_DASHBOARD must be' HERMES_DASHBOARD=yes
@@ -535,6 +536,7 @@ out=$(real) || fail "full run: $out"
 [[ -z $(secrets_in_argv) ]] || fail "a secret appeared in a command line: $(secrets_in_argv)"
 grep -q 'install-target.sh' "$log" && grep -q 'HERMES_API_SERVER=true' "$log" || fail 'guest installer not run with the API server'
 grep -q 'ROUTER_URL=http://192.0.2.80:8000' "$log" || fail 'ROUTER_URL not derived from the router address'
+grep -q 'HERMES_CONTEXT_LENGTH=auto' "$log" || fail 'a new CT does not follow the served context (auto)'
 grep -q 'KINDI_READ_TIMEOUT_SECONDS=5400' "$log" || fail 'Kindi timeout not read from router.ini'
 fwfile=$fake/pve/firewall/282.fw
 grep -qx 'IN ACCEPT -source 192.0.2.80/32 -p tcp -dport 8642 -log nolog # open-smart-router hermes-api' "$fwfile" || fail "firewall: $(cat "$fwfile")"

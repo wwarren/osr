@@ -14,6 +14,8 @@ Group=opencode-direct
 Environment=DIRECT_ETC=/etc/opencode-target
 Environment=DIRECT_SECRETS_FILE=/etc/opencode-target/router.env
 Environment=DIRECT_CONTEXT_SETTING=OPENCODE_CONTEXT_LENGTH
+# OPENCODE_CONTEXT_LENGTH=auto: the least context a model must serve to be used.
+Environment=DIRECT_AUTO_MIN_CONTEXT=32768
 EnvironmentFile=-/etc/opencode-target/settings
 ExecStart=/usr/bin/python3 /usr/local/lib/opencode-direct.py
 Restart=always

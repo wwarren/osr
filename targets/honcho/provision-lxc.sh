@@ -174,9 +174,11 @@ OpenClaw, DeepSeek Harness, OpenCode) allowed to the API and MCP ports through t
 Proxmox firewall. The router CT is always allowed.
 
 HONCHO_CONTEXT_TOKENS sets Honcho's token budgets for the model's context
-window (at least 8192); HONCHO_<SETTING> overrides one budget (see the
-README). Unset, they keep the CT's last values (a first install sizes them
-for 65536 tokens); set and empty, Honcho's default.
+window: auto (a first install's default) sizes them, on every run, for the
+window the selected model is served with, from the router's inventory; a
+number (at least 8192) pins it; HONCHO_<SETTING> overrides one budget (see
+the README). Unset, they keep the CT's last values; set and empty, Honcho's
+default.
 HONCHO_REF, HONCHO_MODEL, HONCHO_STRUCTURED_OUTPUT_MODE and the HONCHO_BUN_*
 pins are kept the same way: a reconfigure only changes the ones it sets.
 HONCHO_STRUCTURED_OUTPUT_MODE=json_object is for a selected model whose backend
@@ -269,7 +271,7 @@ PVE_ETC=${PVE_ETC:-/etc/pve}
 template_re='^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/debian-13-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$'
 valid_template() { [[ $1 =~ $template_re ]]; }
 valid_storage() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
-valid_context() { [[ -z $1 ]] || { [[ $1 =~ ^[1-9][0-9]{3,6}$ ]] && (( $1 >= 8192 && $1 <= 1048576 )); }; }
+valid_context() { [[ -z $1 || $1 == auto ]] || { [[ $1 =~ ^[1-9][0-9]{3,6}$ ]] && (( $1 >= 8192 && $1 <= 1048576 )); }; }
 valid_agent_ips() { local ip; for ip in $1; do pve_valid_ipv4 "${ip%%/*}" || return 1; done; }
 # recorded_value KEY: KEY from the CT's proxy.settings (a reconfigure), or nothing.
 recorded='' recorded_budgets=''
@@ -318,12 +320,14 @@ pve_note 'Honcho needs a chat model that calls tools and returns structured outp
 # CT's, and keeps it unasked when the CT never recorded one.
 if [[ -z ${HONCHO_CONTEXT_TOKENS+set} ]]; then
   context_default=''
-  if [[ $mode == create ]]; then context_default=65536
+  if [[ $mode == create ]]; then context_default=auto
   else context_default=$(awk -F= '$1 == "HONCHO_CONTEXT_TOKENS" { print $2; exit }' <<< "$recorded_budgets"); fi
   if [[ $mode == create || -n $context_default ]]; then
     HONCHO_CONTEXT_TOKENS=''
-    pve_ask HONCHO_CONTEXT_TOKENS "Context window the chat model serves (tokens; none = Honcho's 128k budgets)" \
-      "$context_default" valid_context 'Use 8192 to 1048576 tokens, or none.'
+    pve_note "Budgets: auto sizes them for the window the chat model is served with (read again on every"
+    pve_note "reconfigure); a number pins the window; none uses Honcho's own 128k budgets."
+    pve_ask HONCHO_CONTEXT_TOKENS "Context window (auto, tokens, or none)" \
+      "$context_default" valid_context 'Use auto, 8192 to 1048576 tokens, or none.'
     if [[ -n $HONCHO_CONTEXT_TOKENS || $interactive == true ]]; then export HONCHO_CONTEXT_TOKENS; else unset HONCHO_CONTEXT_TOKENS; fi
   fi
 fi
@@ -338,7 +342,9 @@ if [[ $interactive == true && -n $inventory_ip && -z $honcho_model_given ]]; the
      python3 "$choices" chat "$inventory_file" 8192 > /dev/null 2>&1; then
     # The proxy's own test: tools reported and this much context (131072 for
     # Honcho's own budgets).
-    min_context=${HONCHO_CONTEXT_TOKENS-65536}
+    # (32768 under auto, whose budgets then follow the served window).
+    min_context=${HONCHO_CONTEXT_TOKENS-auto}
+    [[ $min_context != auto ]] || min_context=32768
     [[ $min_context =~ ^[1-9][0-9]*$ ]] || min_context=131072
     mapfile -t chat_lines < <(python3 "$choices" chat "$inventory_file" "$min_context" 2> "$inventory_file.skipped")
   else
@@ -425,6 +431,8 @@ for name in "${honcho_budget_names[@]}"; do
   [[ -n ${!var+set} ]] || continue
   if [[ $name == DREAM_ENABLED ]]; then
     [[ -z ${!var} || ${!var} =~ ^(true|false)$ ]] || die "$var must be true or false."
+  elif [[ $name == CONTEXT_TOKENS ]]; then
+    valid_context "${!var}" || die "$var must be auto, 8192 to 1048576 tokens, or empty."
   else
     [[ ${!var} =~ ^[0-9]*$ ]] || die "$var must be a whole number of tokens (or characters)."
   fi
@@ -591,6 +599,7 @@ fi
 pve_row 'Chat model' "$HONCHO_MODEL"
 if [[ -z ${HONCHO_CONTEXT_TOKENS+set} ]]; then context_label='kept from the CT'
 elif [[ -z $HONCHO_CONTEXT_TOKENS ]]; then context_label="Honcho's own budgets (128k)"
+elif [[ $HONCHO_CONTEXT_TOKENS == auto ]]; then context_label="auto (the chat model's served window)"
 else context_label="$HONCHO_CONTEXT_TOKENS tokens"; fi
 pve_row 'Context window' "$context_label"
 pve_row 'Embedding model' 'Qwen3-Embedding-0.6B (1024 dimensions), llama.cpp on the CT'"'"'s CPU'
