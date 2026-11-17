@@ -118,7 +118,9 @@ case $cmd in
     snapshot) [[ ! -e $MOCK/$id.nosnap ]] || exit 1 ;;
     delsnapshot|stop|start) : ;;
     rollback) cp "$MOCK/$id.state.orig" "$MOCK/$id.state" ;;
-    push) cat -- "$3" > "$MOCK/pushed-$id-${4##*/}" ;;
+    # Like a pct that reads its stdin: a caller that pipes a secret to a later
+    # pct exec must keep it away from this one.
+    push) cat -- "$3" > "$MOCK/pushed-$id-${4##*/}"; [[ -t 0 ]] || cat > /dev/null ;;
     pull) echo "pulled $3" > "$4" ;;
     exec)
         shift 3
@@ -847,6 +849,14 @@ assert_contains 'keeps an accepted token in OPENWEBUI_ADMIN_TOKEN' 'TOKEN=good-t
 assert_contains 'without exporting it to every child' 'EXPORTED=0' "$out"
 assert_contains 'says Open WebUI accepted it' 'accepted it as an administrator' "$out"
 assert_eq 'never on a pct command line' '' "$(grep -F good-token "$tmp/mock/pct.log")"
+assert_contains 'says it is kept for the whole run' 'Kept for this whole run (10 characters)' "$out"
+out=$(ask_with '\ngood-token\n')
+assert_contains 'one empty line is asked again, not taken for no token' 'Nothing was entered' "$out"
+assert_contains 'and the token typed after it is kept' 'TOKEN=good-token ' "$out"
+out=$(ask_with '\n\ngood-token\n')
+assert_contains 'Enter twice goes on without a token' 'TOKEN= ' "$out"
+out=$(ask_with '  \e[200~good-token\e[201~ \r\n')
+assert_contains 'paste markers, blanks and a carriage return are not part of the token' 'TOKEN=good-token ' "$out"
 out=$(ask_with 'wrong\ngood-token\n')
 assert_contains 'asks again after a refused token' 'Open WebUI refused it' "$out"
 assert_contains 'then keeps the good one' 'TOKEN=good-token ' "$out"
@@ -887,6 +897,7 @@ reconf_case() {
 reset_mock
 out=$(in_tool reconf_case hermes 2>&1)
 assert_contains 'Hermes gets it' 'GOT secret-token' "$out"
+assert_contains 'and the log says it is not asked for it' 'the one this run was given (12 characters); hermes is not asked' "$out"
 assert_eq 'not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"
 assert_contains 'the export ends with the provisioner' 'AFTER 0' "$out"
 out=$(in_tool reconf_case gitea 2>&1)

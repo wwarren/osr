@@ -701,10 +701,12 @@ PROBE
 }
 PROBE_READY=false
 router_probe() {  # router_probe CHECK: stdin goes to the probe (webui-admin reads it)
-    [[ -n $ROUTER_CT ]] && ct_running "$ROUTER_CT" || return 1
+    # Only the probe may read stdin: nothing before it can take the token's
+    # header out of the pipe.
+    [[ -n $ROUTER_CT ]] && ct_running "$ROUTER_CT" </dev/null || return 1
     if ! $PROBE_READY; then
         write_probe "$RUN_DIR/probe.sh"
-        pct push "$ROUTER_CT" "$RUN_DIR/probe.sh" "$PROBE_PATH" --perms 0700 >/dev/null 2>&1 || return 1
+        pct push "$ROUTER_CT" "$RUN_DIR/probe.sh" "$PROBE_PATH" --perms 0700 </dev/null >/dev/null 2>&1 || return 1
         PROBE_READY=true
     fi
     pct exec "$ROUTER_CT" -- sh "$PROBE_PATH" "$1" 2>/dev/null
@@ -999,7 +1001,13 @@ run_reconfigure() {  # run_reconfigure ITEM MODE
     # Through the environment, not env's arguments, which ps would show.
     # run_item runs in its own subshell, so this export ends with it.
     case $t in
-        honcho|hermes|openclaw|deepseek-harness|opencode) [[ -z $WEBUI_TOKEN ]] || export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN ;;
+        honcho|hermes|openclaw|deepseek-harness|opencode)
+            if [[ -n $WEBUI_TOKEN ]]; then
+                export OPENWEBUI_ADMIN_TOKEN=$WEBUI_TOKEN
+                note "Open WebUI admin token: the one this run was given (${#WEBUI_TOKEN} characters); $t is not asked for it."
+            elif needs_webui_token "$i"; then
+                note "This run has no Open WebUI admin token: $t asks for it."
+            fi ;;
     esac
     for word in ${I_INFO[$i]}; do
         case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*) envs+=("$word") ;; esac
@@ -1566,9 +1574,12 @@ prepare() {
 
 # check_webui_token TOKEN: 0 accepted as an admin, 1 refused, 2 cannot tell
 # (no router CT, Open WebUI down): the provisioners then check it themselves.
+WEBUI_CHECK_CODE=''
 check_webui_token() {
     local code
+    WEBUI_CHECK_CODE=''
     code=$(printf 'Authorization: Bearer %s\n' "$1" | router_probe webui-admin) || return 2
+    WEBUI_CHECK_CODE=$code
     case $code in
         200) return 0 ;;
         401|403) return 1 ;;
@@ -1598,31 +1609,62 @@ token_tty() {
     printf '%s\n' "$tty"
 }
 
+# clean_token TEXT: what was typed or pasted, without a terminal's paste
+# markers, carriage returns or the blanks around it.
+clean_token() {
+    local t=$1
+    t=${t//$'\e[200~'/}; t=${t//$'\e[201~'/}; t=${t//$'\r'/}
+    t=${t#"${t%%[![:space:]]*}"}; t=${t%"${t##*[![:space:]]}"}
+    printf '%s' "$t"
+}
+
+# drop_typeahead FD: on a terminal, discard lines typed before the question
+# was shown (an Enter pressed while the plan was built), so that they are not
+# taken for its answer.
+drop_typeahead() {
+    local fd=$1 junk
+    [[ -t $fd ]] || return 0
+    while IFS= read -rs -t 0 -u "$fd" && IFS= read -rs -t 0.1 -u "$fd" junk; do :; done
+}
+
 # read_token FD ENTER_MEANS: ask on FD until the token is accepted, refused
-# three times, or left empty. Sets OPENWEBUI_ADMIN_TOKEN when one is given.
+# three times, or left empty twice in a row (one empty line is asked again:
+# it is too easily a stray Enter). Sets OPENWEBUI_ADMIN_TOKEN and WEBUI_TOKEN
+# when one is given, and says in every case what the run goes on with.
 read_token() {
-    local fd=$1 enter=$2 token tries=0
+    local fd=$1 enter=$2 token='' tries=0 empties=0 kept=''
     note ''
     note 'Honcho, and agents with an Open WebUI connection, register with Open WebUI'
     note 'again when they are reconfigured, which needs an admin token. So does'
     note "enabling Open Terminal's connection for all users (it is upgraded either way)."
     while (( tries < 3 )); do
+        drop_typeahead "$fd"
         printf 'Open WebUI admin API key or session JWT (not shown; Enter: %s): ' "$enter" >&2
-        IFS= read -rs -u "$fd" token || token=''
+        if ! IFS= read -rs -u "$fd" token; then printf '\n' >&2; break; fi
         printf '\n' >&2
-        [[ -n $token ]] || return 0
+        token=$(clean_token "$token")
+        if [[ -z $token ]]; then
+            empties=$((empties + 1))
+            (( empties < 2 )) || break
+            note 'Nothing was entered. Type or paste the key, or press Enter again to go on without it.'
+            continue
+        fi
+        empties=0
         check_webui_token "$token"
         case $? in
-            0) note 'Open WebUI accepted it as an administrator.'; break ;;
-            2) note 'Could not check it against Open WebUI now; each provisioner checks it.'; break ;;
+            0) note 'Open WebUI accepted it as an administrator.'; kept=$token; break ;;
+            2) note 'Could not check it against Open WebUI now; each provisioner checks it.'; kept=$token; break ;;
         esac
-        note 'Open WebUI refused it (not an admin key or JWT, or expired).'
-        token=''
+        note "Open WebUI refused it (HTTP ${WEBUI_CHECK_CODE:-?}: not an admin key or JWT, or expired)."
         tries=$((tries + 1))
     done
-    [[ -n $token ]] || return 0
-    OPENWEBUI_ADMIN_TOKEN=$token  # not exported: see run_reconfigure
-    WEBUI_TOKEN=$token
+    if [[ -z $kept ]]; then
+        (( tries < 3 )) || note 'Refused three times: the run goes on without a token.'
+        return 0
+    fi
+    OPENWEBUI_ADMIN_TOKEN=$kept  # not exported: see run_reconfigure
+    WEBUI_TOKEN=$kept
+    note "Kept for this whole run (${#kept} characters): every component that needs it gets it and none asks again."
 }
 
 # ask_token_unattended: at the start of an unattended run, before the plan.
@@ -2066,6 +2108,8 @@ main() {
     fi
     if $INTERACTIVE && ! ask_yes 'Start the upgrade?' y; then note 'Nothing was changed.'; exit 0; fi
     ask_token
+    # Fixed from here on: nothing in the run can change or drop it.
+    readonly WEBUI_TOKEN
 
     for i in "${!I_TARGET[@]}"; do
         if $ABORTED && [[ -z ${I_RESULT[$i]} ]]; then I_RESULT[i]=not-run; I_NOTE[i]='aborted before this one'; fi
