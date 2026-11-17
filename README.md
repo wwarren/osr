@@ -41,7 +41,8 @@ bash open-smart-router-install.sh
 The installer's menu offers, grouped by purpose: Gitea and Mattermost
 services; Ollama, AirLLM, Kindi, llama.cpp, Strata, Basalt, Maya, Xolotl and
 Avalon model servers; Honcho memory; Hermes, OpenClaw, DeepSeek Harness and
-OpenCode agents; Open Terminal and ComfyUI tools. Enter names or menu numbers
+OpenCode agents; Open Terminal and ComfyUI tools; and the FreeLLMAPI cloud
+gateway (Proxmox VE 9.1 and `skopeo` needed). Enter names or menu numbers
 (comma-separated), or Enter for none. MQTT and hcom are installed afterwards
 ([Agent coordination targets](#agent-coordination-targets)).
 
@@ -304,6 +305,7 @@ Services and companions use separate CTs and stay out of the model pool:
 | [OpenCode](targets/opencode/README.md) | Coding agent with its own web UI on :4096 (password-protected), also offered in Open WebUI as `opencode` through an OpenAI-compatible chat endpoint (:4097); Hermes's dispatcher, needs tools and 32K context. Reconfigure after key rotation or host changes |
 | [Open Terminal](targets/open-terminal/README.md) | Open WebUI terminal connection, enabled for all users with an isolated workspace each (`OPEN_TERMINAL_WEBUI_ACCESS=keep`: admin-only); agents get their own through `OPEN_TERMINAL_URL` (MCP) |
 | [ComfyUI](targets/comfyui/README.md) | Open WebUI image engine on :8188; FLUX.2 Klein 9B needs an accepted Hugging Face license and token |
+| [FreeLLMAPI](targets/freellmapi/README.md) | Free cloud tiers behind one key on :3001, offered as `freellmapi/<id>` and used only when named ([below](#freellmapi-free-cloud-tiers)); its CT is made from the container image (Proxmox VE 9.1) |
 
 Honcho reaches Hermes, OpenClaw and OpenCode through their memory plugins and
 DeepSeek Harness through MCP tools.
@@ -317,7 +319,7 @@ alongside the router; the last tag is the target's directory name under
 | CT | Tags |
 |---|---|
 | Router | `ai`, `ai-tools`, `osr-router`, `openwebui` |
-| Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | `ai`, `ai-model`, `osr-target`, `<target>` |
+| Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI, FreeLLMAPI | `ai`, `ai-model`, `osr-target`, `<target>` |
 | Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, OpenCode, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
 
 `tools/upgrade-all.sh` finds CTs only by these tags (`osr-router`, and
@@ -484,6 +486,27 @@ every regeneration. Get keys and model IDs from the
 [Anthropic Console](https://docs.anthropic.com/en/docs/about-claude/models/overview)
 or [Google AI Studio](https://ai.google.dev/gemini-api/docs/models); these use
 API billing, so check account limits first.
+
+### FreeLLMAPI (free cloud tiers)
+
+The [FreeLLMAPI target](targets/freellmapi/README.md) runs
+[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi), which fronts the free
+tiers of many providers with one key and falls back between them. The router
+lists `freellmapi/auto` and every model it can serve now as
+`freellmapi/<id>` (refreshed every five minutes; `FREELLMAPI_MODELS=auto`
+lists only `freellmapi/auto`), and sends a request naming one straight to
+FreeLLMAPI with its own key (`X-Router-Mode: freellmapi`). Like the cloud
+models these are explicit only: `auto`, the tiers and LiteLLM fallbacks never
+use them, and their prompts leave your network. The provisioner registers the
+endpoint; by hand:
+
+```bash
+manage-model-servers set-freellmapi http://<freellmapi-ct>:3001 --apply   # key from its dashboard, asked twice
+manage-model-servers set-freellmapi --off --apply
+```
+
+`FREELLMAPI_BASE_URL` is in `env/router.env`, the key in `secrets.env`. Without
+both, a `freellmapi/` request gets 404 `freellmapi_not_configured`.
 
 ### Signed-in subscription clients
 
@@ -686,6 +709,7 @@ manage-model-servers set-api-key [key|--generate|--off]
 manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi
 manage-model-servers set-cloud-key <openai|anthropic|gemini> [key|--off]
 manage-model-servers set-cloud-models <openai|anthropic|gemini> <id[,id...]|--off>
+manage-model-servers set-freellmapi <url|--off> [key]      # FreeLLMAPI: freellmapi/<id>, explicit only
 manage-model-servers set-token | set-webhook [url] | test-alert [message]
 manage-model-servers set-webui-version [version|latest] [--apply]
 manage-model-servers apply [--all] | commit [message]
@@ -909,6 +933,7 @@ header file, never on a command line):
 | ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT`; Open Terminal resolves a newer release's Python dependencies with pip when they differ from its lock |
 | Strata, Xolotl, Avalon, Kindi | the tested commit | the tip of `main` | `*_COMMIT` |
 | DeepSeek Harness, OpenCode | the provisioner's default | npm `latest` tag | `DSH_VERSION`, `OPENCODE_VERSION` |
+| FreeLLMAPI | the provisioner's tested release | highest `vX.Y.Z` GitHub release | `FREELLMAPI_VERSION` (its image tag) |
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
 
 Where the upstream release is newer (or a different commit), a run on a
@@ -1036,7 +1061,9 @@ carry their settings forward unless overridden. Interrupting an upgrade
 (Ctrl-C, closed SSH) rolls it back; after a hangup its output is in the CT's
 `/var/log/osr-install-interrupted.log`. If a model target's rollback fails too,
 its next run stops at `/var/lib/<target>-target/rollback-failed` until you have
-inspected the kept snapshot and deleted that file. MQTT and hcom are rerun
+inspected the kept snapshot and deleted that file. FreeLLMAPI is replaced by a
+CT made from the new image; it is backed up with `vzdump` first and restored on
+failure, and `tools/upgrade-all.sh` takes no snapshot of it. MQTT and hcom are rerun
 with the same settings (or `--reconfigure`); a failed rollback keeps
 `/etc/mqtt-target/rollback` or `/etc/osr-hcom/rollback` and blocks reruns.
 Rerun hcom everywhere after changing the broker's advertised host or port.
@@ -1166,5 +1193,5 @@ an `act_runner` with an ubuntu-latest style image whose job containers run as
 root (`--strict` fails on skipped root-only tests). `.github/workflows/tests.yml`
 is the same file for GitHub Actions, where the suites run through `sudo`;
 `tests/test-repo.sh` keeps the two identical. The `strata-upstream`,
-`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream` and
+`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `freellmapi-upstream` and
 `honcho-upstream` jobs also need GitHub (and PyPI) access.

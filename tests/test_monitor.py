@@ -54,6 +54,21 @@ def test_a_shared_host_is_one_check_naming_all_its_tiers(monitor):
     assert "medium, large" in checks[0].label
 
 
+def test_freellmapi_is_watched_only_when_configured(monkeypatch):
+    monkeypatch.delenv("FREELLMAPI_BASE_URL", raising=False)
+    module = load_monitor(monkeypatch)
+    assert "freellmapi" not in {c.key for c in module.build_checks()}
+    module = load_monitor(monkeypatch, FREELLMAPI_BASE_URL="http://10.0.0.60:3001/")
+    check = [c for c in module.build_checks() if c.key == "freellmapi"][0]
+    # Its public ping, without a key and without the model-list requirement.
+    assert check.url == "http://10.0.0.60:3001/api/ping"
+    assert check.headers == {} and check.require_models is False
+    assert "FreeLLMAPI" in check.label
+    # It is not a model server: no tier and no keep-alive plan mention it.
+    assert "http://10.0.0.60:3001" not in module.ollama_hosts()
+    monkeypatch.delenv("FREELLMAPI_BASE_URL")
+
+
 def test_local_services_are_watched(monitor):
     keys = {c.key for c in monitor.build_checks()}
     assert {"litellm-proxy", "osr-router", "open-webui"} <= keys

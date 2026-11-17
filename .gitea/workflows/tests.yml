@@ -3,7 +3,7 @@
 # image. .github/workflows/tests.yml is the same file, for GitHub Actions;
 # tests/test-repo.sh fails when the two differ, so edit both.
 # The "test" job talks to nothing beyond PyPI. The "strata-upstream",
-# "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
+# "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream", "freellmapi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
 # GitHub; they are separate jobs so a GitHub outage cannot hide the results of
 # the main suites.
 name: tests
@@ -210,6 +210,39 @@ jobs:
 
       - name: Pinned upstream check
         run: python targets/kindi/test-pinned-upstream.py "$RUNNER_TEMP/kindi"
+
+  # Checks the FreeLLMAPI release the target pins (DEFAULT_FREELLMAPI_VERSION,
+  # targets/freellmapi/upstream-commit.txt) against its source: the image's
+  # entrypoint, data directory and accounts, the settings and endpoints the
+  # provisioner relies on, and the image workflow. Then builds the server (with
+  # the image's Node major) and runs the provisioner's own guest scripts
+  # against it: env file, first account, health, reading and using the key.
+  freellmapi-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Fetch and build the pinned FreeLLMAPI commit
+        run: |
+          pin=$(cat targets/freellmapi/upstream-commit.txt)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/freellmapi"
+          git -C "$RUNNER_TEMP/freellmapi" fetch -q --depth 1 https://github.com/tashfeenahmed/freellmapi.git "$pin"
+          git -C "$RUNNER_TEMP/freellmapi" checkout -q FETCH_HEAD
+          cd "$RUNNER_TEMP/freellmapi"
+          npm ci
+          npm run build -w server
+
+      - name: Pinned upstream check
+        run: python targets/freellmapi/test-pinned-upstream.py "$RUNNER_TEMP/freellmapi"
 
   # Runs Honcho's own settings loader and request builder, at the release the
   # Honcho target installs, against the honcho.env block it writes: every model

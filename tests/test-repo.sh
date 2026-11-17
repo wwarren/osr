@@ -122,7 +122,13 @@ describe inference_targets
 for dir in "${ROOT}"/targets/*/; do
   name=$(basename "$dir")
   assert_fail "targets/${name} is not a nested git repository" test -e "${dir}.git"
-  assert_ok "targets/${name} has an install-target.sh" test -f "${dir}install-target.sh"
+  # FreeLLMAPI's CT is its container image (a Proxmox OCI-image CT): there is
+  # no guest to install into, so its provisioner does the whole job.
+  if [[ $name == freellmapi ]]; then
+    assert_fail "targets/${name} has no guest installer (the CT is the image)" test -e "${dir}install-target.sh"
+  else
+    assert_ok "targets/${name} has an install-target.sh" test -f "${dir}install-target.sh"
+  fi
   assert_ok "targets/${name} has a provision-lxc.sh" test -f "${dir}provision-lxc.sh"
 done
 dropin="${ROOT}/targets/ollama/ollama-target.conf"
@@ -205,14 +211,16 @@ for dir in "${ROOT}"/targets/*/; do
   case $name in hermes|openclaw|honcho|gitea|mattermost) continue ;; esac
   # Code lines of the target's tests (comments do not count as a test).
   tests_code="cat '${dir}'test-*.sh | grep -vE '^[[:space:]]*#'"
-  if grep -qE -- '--upgrade\)' "${dir}install-target.sh"; then
+  upgrader="${dir}install-target.sh"
+  [[ -f $upgrader ]] || upgrader="${dir}provision-lxc.sh"   # freellmapi: no guest installer
+  if grep -qE -- '--upgrade\)' "$upgrader"; then
     assert_ok "${name}: a test runs --upgrade" bash -c "${tests_code} | grep -q -- '--upgrade'"
   fi
   assert_ok "${name}: a test checks a rollback that succeeds" bash -c "${tests_code} | grep -qE 'running.* again'"
   assert_ok "${name}: a test checks a rollback that fails too" \
     bash -c "${tests_code} | grep -qE 'did not (become healthy|answer|come back) either|failed too'"
   # An upgrade with nothing to change leaves the target alone, and a test says so.
-  assert_ok "${name}: an unchanged upgrade does nothing" grep -q 'nothing to do' "${dir}install-target.sh"
+  assert_ok "${name}: an unchanged upgrade does nothing" grep -q 'nothing to do' "$upgrader"
   assert_ok "${name}: and a test checks it" bash -c "grep -lq 'nothing to do' '${dir}'test-*.sh"
 done
 

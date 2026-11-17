@@ -158,6 +158,12 @@ Commands:
                              when omitted); --off removes its deployments
   set-cloud-models <openai|anthropic|gemini> <model[,model...]|--off>
                              Expose specific provider model IDs through OSR
+  set-freellmapi <url|--off> [key]
+                             Offer a FreeLLMAPI server's models as
+                             freellmapi/<id>, used only when asked for by name
+                             (never by auto or the tiers). <url> is its root
+                             URL, e.g. http://10.0.0.20:3001; its unified API
+                             key goes to secrets.env (prompts when omitted)
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
@@ -540,7 +546,7 @@ resolve_server() {
 secret_keys() {
   local k
   printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS \
-    OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+    OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY FREELLMAPI_API_KEY
   for k in $(server_kinds); do kind_field "$k" key; done
 }
 is_secret_key() {
@@ -887,6 +893,10 @@ cmd_list() {
   # No apostrophe inside the ${...:-default}: bash re-parses that word and a
   # lone quote there opens a quote context, breaking everything after it.
   echo "Keep-alive: ${ka:-<server default (OLLAMA_KEEP_ALIVE on each host)>}"
+  local freellmapi; freellmapi="$(env_get FREELLMAPI_BASE_URL)"
+  if [[ -n "$freellmapi" ]]; then
+    echo "FreeLLMAPI: ${freellmapi} (freellmapi/<id>; only when named, never by auto)"
+  fi
   echo
   # One row per (tier, server) deployment, because each pair can carry its own
   # model — a single MODEL column per tier would hide that.
@@ -1909,6 +1919,19 @@ for rel in ("env/router.env", "env/openwebui.env"):
                 valid = False
             if not valid:
                 err(rel, "SUBSCRIPTION_GATEWAY_BASE_URL needs HTTPS or loopback HTTP root URL")
+        base = entries.get("FREELLMAPI_BASE_URL", "").rstrip("/")
+        if base:
+            try:
+                url = urlsplit(base)
+                valid = url.scheme in ("http", "https") and bool(url.hostname) and \
+                    (url.port is None or url.port > 0) and not (
+                    url.path or url.username or url.password or url.query or url.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                err(rel, "FREELLMAPI_BASE_URL needs a root URL such as http://10.0.0.20:3001")
+        if entries.get("FREELLMAPI_MODELS", "available") not in ("", "available", "auto"):
+            err(rel, "FREELLMAPI_MODELS must be available or auto")
 
 # Python services must at least compile.
 for rel in ("services/osr-router/router.py", "services/osr-monitor/monitor.py"):
@@ -2806,6 +2829,51 @@ cmd_set_cloud_key() {
   CHANGED=true
 }
 
+# FreeLLMAPI (targets/freellmapi): one OpenAI-compatible server in front of
+# free cloud tiers. The router sends it only requests that name
+# freellmapi/<id>; it is not a model server and has no LiteLLM deployment.
+valid_freellmapi_url() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+try:
+    url = urlsplit(sys.argv[1])
+    ok = (url.scheme in ("http", "https") and bool(url.hostname)
+          and (url.port is None or url.port > 0)
+          and not (url.path or url.username or url.password or url.query or url.fragment))
+except ValueError:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+cmd_set_freellmapi() {
+  local url="${1:-}" key="${2:-}" confirm_key=""
+  [[ -n "$url" ]] || die "set-freellmapi: give the server's root URL (http://host:3001) or --off"
+  if [[ "$url" == --off ]]; then
+    env_set FREELLMAPI_BASE_URL ""
+    env_set FREELLMAPI_API_KEY ""
+    echo "FreeLLMAPI is off: freellmapi/ models are no longer offered."
+    CHANGED=true
+    return 0
+  fi
+  url="${url%/}"
+  valid_freellmapi_url "$url" || die "set-freellmapi: '${url}' is not a root URL such as http://10.0.0.20:3001"
+  if [[ -z "$key" ]]; then
+    [[ "$ASSUME_YES" == "true" ]] && die "set-freellmapi: no key given"
+    read -r -s -p "FreeLLMAPI unified API key: " key; echo
+    read -r -s -p "Confirm API key: " confirm_key; echo
+    [[ "$key" == "$confirm_key" ]] || die "API keys did not match"
+  fi
+  [[ "$key" =~ ^freellmapi-[A-Za-z0-9]+$ ]] ||
+    die "set-freellmapi: that is not a FreeLLMAPI unified API key (freellmapi-..., on its dashboard's Keys page)"
+  env_set FREELLMAPI_BASE_URL "$url"
+  env_set FREELLMAPI_API_KEY "$key"
+  echo "FreeLLMAPI at ${url}: its models are offered as freellmapi/<id>; the key is in ${SECRETS_FILE}."
+  echo "They are used only when a request names one. Prompts sent to them leave your network."
+  CHANGED=true
+}
+
 cmd_set_cloud_models() {
   local provider="$1" models="${2:-}" env_key
   cloud_key_name "$provider" >/dev/null || exit 1
@@ -2860,7 +2928,7 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-cloud-key|set-cloud-models|set-webhook|set-webui-version) return 0 ;;
+    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-webhook|set-webui-version) return 0 ;;
     *) [[ -n "$(token_command_kind "$1")" ]] ;;
   esac
 }
@@ -3095,7 +3163,7 @@ while (( $# > 0 )); do
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
       [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-cloud-key" ||
-         "$COMMAND" == "set-cloud-models" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
+         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -3135,6 +3203,7 @@ case "$COMMAND" in
   set-api-key) cmd_set_api_key "${ARGS[0]:-}" ;;
   set-cloud-key) cmd_set_cloud_key "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-cloud-models) cmd_set_cloud_models "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
+  set-freellmapi) cmd_set_freellmapi "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-*-token)
     token_kind="$(token_command_kind "$COMMAND")"
     [[ -n "$token_kind" ]] || die "unknown command '${COMMAND}' (try --help)"
@@ -3160,7 +3229,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-cloud-key|set-*-token)
+  set-api-key|set-cloud-key|set-freellmapi|set-*-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac

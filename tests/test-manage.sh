@@ -2052,6 +2052,49 @@ cmd_set_cloud_models anthropic --off >/dev/null 2>&1
 assert_fail "clearing list removes deployment" grep -q 'model_name: anthropic/claude-other' "$LITELLM_YAML"
 reset_repo
 
+describe valid_freellmapi_url
+assert_ok "http and https root URLs pass" valid_freellmapi_url http://10.0.0.20:3001
+assert_ok "a host name passes" valid_freellmapi_url https://free.example
+assert_fail "a path is refused" valid_freellmapi_url http://10.0.0.20:3001/v1
+assert_fail "credentials are refused" valid_freellmapi_url http://u:p@10.0.0.20:3001
+assert_fail "another scheme is refused" valid_freellmapi_url ftp://10.0.0.20
+assert_fail "a bad port is refused" valid_freellmapi_url http://10.0.0.20:99999
+
+describe cmd_set_freellmapi
+reset_repo
+yaml_before="$(cat "$LITELLM_YAML")"
+cmd_set_freellmapi http://10.0.0.20:3001/ freellmapi-0123abcd >/dev/null 2>&1
+assert_eq "the URL is stored without its slash" http://10.0.0.20:3001 "$(env_get FREELLMAPI_BASE_URL)"
+assert_eq "the key is stored" freellmapi-0123abcd "$(env_get FREELLMAPI_API_KEY)"
+assert_file_contains "the URL is in the committed env file" 'FREELLMAPI_BASE_URL=http://10.0.0.20:3001' "$ENV_FILE"
+assert_fail "the key is not" grep -q freellmapi-0123abcd "$ENV_FILE"
+assert_file_contains "the key is in secrets.env" 'FREELLMAPI_API_KEY=freellmapi-0123abcd' "$SECRETS_FILE"
+assert_eq "LiteLLM gets no deployment for it" "$yaml_before" "$(cat "$LITELLM_YAML")"
+assert_contains "list names it as explicit only" 'FreeLLMAPI: http://10.0.0.20:3001 (freellmapi/<id>; only when named' "$(cmd_list false)"
+assert_eq "the configuration still validates" "" "$(validate_config)"
+assert_fail "unattended, a missing key is refused" cmd_set_freellmapi http://10.0.0.20:3001
+ASSUME_YES=false
+cmd_set_freellmapi http://10.0.0.20:3001 >/dev/null 2>&1 <<< $'freellmapi-fromstdin\nfreellmapi-fromstdin'
+assert_eq "the key is entered twice on stdin" freellmapi-fromstdin "$(env_get FREELLMAPI_API_KEY)"
+assert_fail "differing entries are refused" cmd_set_freellmapi http://10.0.0.20:3001 <<< $'freellmapi-aaaa\nfreellmapi-bbbb'
+ASSUME_YES=true
+cmd_set_freellmapi http://10.0.0.20:3001 freellmapi-0123abcd >/dev/null 2>&1
+assert_fail "another service's key is refused" cmd_set_freellmapi http://10.0.0.20:3001 sk-not-freellmapi
+assert_fail "a URL with a path is refused" cmd_set_freellmapi http://10.0.0.20:3001/v1 freellmapi-0123abcd
+assert_fail "a URL is required" cmd_set_freellmapi ''
+assert_eq "a refused call changes nothing" freellmapi-0123abcd "$(env_get FREELLMAPI_API_KEY)"
+cmd_set_freellmapi --off >/dev/null 2>&1
+assert_eq "--off clears the URL" "" "$(env_get FREELLMAPI_BASE_URL)"
+assert_eq "--off clears the key" "" "$(env_get FREELLMAPI_API_KEY)"
+assert_not_contains "list no longer names it" 'FreeLLMAPI:' "$(cmd_list false)"
+reset_repo
+kv_set "$ENV_FILE" FREELLMAPI_BASE_URL 'http://10.0.0.20:3001/v1'
+assert_contains "validate_config refuses a URL with a path" 'FREELLMAPI_BASE_URL needs a root URL' "$(validate_config)"
+reset_repo
+kv_set "$ENV_FILE" FREELLMAPI_MODELS 'everything'
+assert_contains "validate_config refuses an unknown list mode" 'FREELLMAPI_MODELS must be' "$(validate_config)"
+reset_repo
+
 describe cmd_commit
 reset_repo
 mock_command git 0
@@ -2197,7 +2240,7 @@ assert_ok "returns immediately when the config is local" ensure_config_or_forwar
 
 describe command_writes
 for c in add remove set-tier set-model set-server-model set-keepalive apply commit \
-         set-token set-api-key set-cloud-key set-cloud-models set-lmstudio-token set-strata-token set-webhook set-webui-version; do
+         set-token set-api-key set-cloud-key set-cloud-models set-freellmapi set-lmstudio-token set-strata-token set-webhook set-webui-version; do
   assert_ok "${c} takes the lock" command_writes "$c"
 done
 for c in list status models discover test-alert clear-lock; do

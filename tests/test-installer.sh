@@ -151,7 +151,7 @@ unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL 
 # and restored by re-sourcing the extracted functions at the end.
 _tt="$(mktemp -d)"
 TARGETS_DIR="$_tt/targets"
-for _name in gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui; do
+for _name in gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi; do
   mkdir -p "$TARGETS_DIR/$_name"
   # The fake provisioner records what it was given: settings, flags, and
   # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
@@ -184,6 +184,8 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
 [[ -z ${MEMORY_MB:-} ]] || printf 'memory-env %s\n' "$MEMORY_MB" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != opencode ]] ||
   printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
+[[ $(basename "$(dirname "$0")") != freellmapi ]] ||
+  printf 'freellmapi-env %s|%s|%s\n' "${FREELLMAPI_ADMIN_EMAIL:-}" "${FREELLMAPI_ACCESS_CIDR:-}" "${OPENWEBUI_ADMIN_TOKEN:+token}" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != deepseek-harness ]] ||
   printf 'dsh-env openwebui=%s\n' "${OPENWEBUI:-default}" >> "$MOCK_LOG"
 [[ -z ${KINDI_BACKEND:-}${KINDI_CONTEXT:-} ]] ||
@@ -199,8 +201,8 @@ done
 unset _name
 
 describe target_table
-assert_eq "lists the eighteen targets in menu order" \
-  "gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui" \
+assert_eq "lists the nineteen targets in menu order" \
+  "gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi" \
   "$(target_table | cut -d'|' -f1 | paste -sd' ')"
 
 describe target_field
@@ -211,6 +213,10 @@ assert_eq "and not a model server" "" "$(target_field comfyui entry)"
 assert_eq "OpenClaw is a companion" companion "$(target_field openclaw phase)"
 assert_eq "DeepSeek Harness is a separate companion" companion "$(target_field deepseek-harness phase)"
 assert_eq "and not a model server" "" "$(target_field deepseek-harness entry)"
+assert_eq "FreeLLMAPI is a gateway, not a model server" gateway "$(target_field freellmapi phase)"
+assert_eq "so it has no server entry" "" "$(target_field freellmapi entry)"
+assert_eq "no key for the installer to register (its provisioner hands it over)" "" "$(target_field freellmapi key)"
+assert_eq "and needs no GPU" "" "$(target_field freellmapi gpu)"
 assert_eq "OpenCode is a separate companion" companion "$(target_field opencode phase)"
 assert_eq "not a model server" "" "$(target_field opencode entry)"
 assert_eq "and needs no GPU" "" "$(target_field opencode gpu)"
@@ -643,10 +649,10 @@ assert_fail "OpenCode uses the router's" target_needs_template opencode
 assert_fail "ComfyUI's community script picks its own" target_needs_template comfyui
 
 describe valid_target_selection
-for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "comfyui" "xolotl" "avalon" "kindi" "openclaw" "opencode"; do
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "19" "comfyui" "freellmapi" "xolotl" "avalon" "kindi" "openclaw" "opencode"; do
   assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
 done
-for _sel in 0 19 bogus "ollama,bogus"; do
+for _sel in 0 20 bogus "ollama,bogus"; do
   assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
 done
 unset _sel
@@ -673,7 +679,7 @@ assert_fail "also when the menu would be shown" prompt_target_selection <<< $'\n
 NONINTERACTIVE=true
 NONINTERACTIVE=false; INSTALL_TARGETS=""
 _out="$(mktemp)"
-prompt_target_selection > "$_out" 2>&1 <<< $'19\n6,hermes\n'
+prompt_target_selection > "$_out" 2>&1 <<< $'20\n6,hermes\n'
 assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
 assert_contains "the menu lists the model servers" "10) xolotl" "$(cat "$_out")"
 assert_contains "Avalon among them" "11) avalon" "$(cat "$_out")"
@@ -683,6 +689,8 @@ assert_contains "ComfyUI among them" "18) comfyui" "$(cat "$_out")"
 assert_contains "OpenClaw is grouped with agents" "14) openclaw" "$(cat "$_out")"
 assert_contains "DeepSeek Harness has its own menu choice" "15) deepseek-harness" "$(cat "$_out")"
 assert_contains "OpenCode follows the other agents" "16) opencode" "$(cat "$_out")"
+assert_contains "FreeLLMAPI is last, so earlier numbers stay" "19) freellmapi" "$(cat "$_out")"
+assert_contains "under its own heading" "Cloud gateway (CPU): prompts leave your network; never chosen by auto." "$(cat "$_out")"
 assert_contains "and Open Terminal after them" "17) open-terminal" "$(cat "$_out")"
 assert_contains "memory comes before agents" "Memory infrastructure (CPU)" "$(cat "$_out")"
 assert_contains "the GPU model group is explicit" "Model servers (GPU required by default)" "$(cat "$_out")"
@@ -1041,6 +1049,22 @@ assert_eq "the next target takes its own entered ID" 912 "$STRATA_CT_ID"
 assert_eq "the router's address is refused, the next answer kept" 192.0.2.90/24 "$OLLAMA_IP_CIDR"
 assert_eq "an address already taken is refused" 192.0.2.91/24 "$STRATA_IP_CIDR"
 assert_eq "storage defaults to the router's" router-store "$OLLAMA_STORAGE"
+TARGETS="freellmapi"
+unset FREELLMAPI_CT_ID FREELLMAPI_IP_CIDR FREELLMAPI_STORAGE FREELLMAPI_ADMIN_EMAIL
+mock_command skopeo 0
+mock_command pveversion 0 'pve-manager/9.1.2/0123abcd (running kernel: 6.17.2-1-pve)'
+prompt_target_settings > "$_out" 2>&1 <<< $'925\n192.0.2.95/24\n\nnot-an-address\n\n'
+assert_eq "FreeLLMAPI takes its CT ID and address" "925 192.0.2.95/24" "$FREELLMAPI_CT_ID $FREELLMAPI_IP_CIDR"
+assert_eq "a bad sign-in name is asked again; Enter takes the default" admin@osr.local "$FREELLMAPI_ADMIN_EMAIL"
+assert_contains "it says where prompts go" "third-party free tiers" "$(cat "$_out")"
+assert_contains "and that no password is asked" "password is generated in the CT" "$(cat "$_out")"
+assert_not_contains "no template is asked for a CT made from an image" "Template" "$(cat "$_out")"
+mock_command pveversion 0 'pve-manager/9.0.11/0123abcd (running kernel: 6.14.8-2-pve)'
+unset FREELLMAPI_CT_ID FREELLMAPI_IP_CIDR FREELLMAPI_STORAGE FREELLMAPI_ADMIN_EMAIL
+assert_fail "on Proxmox VE 9.0 the target is refused before anything is built" \
+  prompt_target_settings <<< $'925\n192.0.2.95/24\n\n\n'
+mock_command pveversion 0 'pve-manager/9.1.2/0123abcd (running kernel: 6.17.2-1-pve)'
+TARGETS="ollama strata"
 assert_eq "or takes the answer" gpu-store "$STRATA_STORAGE"
 assert_eq "Strata defaults to the router's selected template location" "$TEMPLATE_REF" "$STRATA_TEMPLATE"
 assert_eq "Ollama is not given one (the community script chooses)" "" "${OLLAMA_TEMPLATE:-}"
@@ -1151,6 +1175,31 @@ assert_fail "empty" valid_honcho_model ""
 assert_fail "a leading dash" valid_honcho_model -fast
 assert_fail "a space" valid_honcho_model "nomic embed"
 
+describe valid_freellmapi_email
+assert_ok "an address" valid_freellmapi_email admin@osr.local
+assert_fail "a bare name" valid_freellmapi_email admin
+assert_fail "a space" valid_freellmapi_email 'a b@osr.local'
+
+describe freellmapi_host_ready
+mock_command skopeo 0
+mock_command pveversion 0 'pve-manager/9.1.2/0123abcd (running kernel: 6.17.2-1-pve)'
+assert_ok "Proxmox VE 9.1 with skopeo" freellmapi_host_ready
+mock_command pveversion 0 'pve-manager/10.0.1/0123abcd (running kernel: 7.0.0-1-pve)'
+assert_ok "a later major release" freellmapi_host_ready
+mock_command pveversion 0 'pve-manager/9.0.11/0123abcd (running kernel: 6.14.8-2-pve)'
+assert_fail "9.0 cannot make a CT from an image" freellmapi_host_ready
+assert_contains "and says what is needed" "needs Proxmox VE 9.1 or later" "$(freellmapi_host_ready 2>&1)"
+mock_command pveversion 1
+assert_fail "an unreadable version is refused" freellmapi_host_ready
+mock_command pveversion 0 'pve-manager/9.1.2/0123abcd (running kernel: 6.17.2-1-pve)'
+rm -f "$MOCK_BIN/skopeo"
+if command -v skopeo >/dev/null 2>&1; then
+  _pass "skopeo is installed on this host (its absence is not testable here)"
+else
+  assert_fail "without skopeo it is refused" freellmapi_host_ready
+  assert_contains "with the package to install" "apt install skopeo" "$(freellmapi_host_ready 2>&1)"
+fi
+
 describe target_menu_group
 assert_eq "services" 'Services (CPU): configuration and alerts; created before OSR.' "$(target_menu_group gitea)"
 assert_eq "CPU model servers" 'Model servers (CPU or optional GPU):' "$(target_menu_group airllm)"
@@ -1163,7 +1212,8 @@ assert_contains "Open Terminal's group" "Open WebUI tools" "$(target_menu_group 
 assert_contains "ComfyUI's group" "Image generation" "$(target_menu_group comfyui)"
 _groups=""
 while IFS='|' read -r _name _; do _groups+="$(target_menu_group "$_name")"$'\n'; done < <(target_table)
-assert_eq "every target has a group, and each group is one run of the menu" 7 \
+assert_contains "FreeLLMAPI's group says where prompts go" "prompts leave your network" "$(target_menu_group freellmapi)"
+assert_eq "every target has a group, and each group is one run of the menu" 8 \
   "$(printf '%s' "$_groups" | uniq | grep -c .)"
 assert_eq "no target falls outside a group" 0 "$(printf '%s' "$_groups" | grep -c '^$')"
 unset _groups _name
@@ -1630,6 +1680,19 @@ run_target_provisioner opencode
 assert_eq "OpenCode gets its own CT and router, its model and web UI range, and the token (Open WebUI)" \
   "provision opencode|922|192.0.2.102/24|192.0.2.1|t-store|vmbr2|local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst|||910|8080|match|
 opencode-env auto|192.0.2.102/24" "$(mock_calls)"
+FREELLMAPI_CT_ID=923; FREELLMAPI_IP_CIDR=192.0.2.103/24; FREELLMAPI_STORAGE=t-store
+mock_reset_log
+run_target_provisioner freellmapi
+assert_eq "FreeLLMAPI gets the router CT to register with, no template and no admin token" \
+  "provision freellmapi|923|192.0.2.103/24|192.0.2.1|t-store|vmbr2||||910||no|
+freellmapi-env admin@osr.local||" "$(mock_calls)"
+mock_reset_log
+FREELLMAPI_ADMIN_EMAIL=me@example.org API_ALLOW_CIDR=192.0.2.0/24 run_target_provisioner freellmapi
+assert_contains "the chosen sign-in name, and the router's API range for its port" "freellmapi-env me@example.org|192.0.2.0/24|" "$(mock_calls)"
+mock_reset_log
+FREELLMAPI_ACCESS_CIDR=198.51.100.0/24 API_ALLOW_CIDR=192.0.2.0/24 run_target_provisioner freellmapi
+assert_contains "its own access range wins" "freellmapi-env admin@osr.local|198.51.100.0/24|" "$(mock_calls)"
+unset FREELLMAPI_ACCESS_CIDR
 mock_reset_log
 OPENCODE_MODEL=fast API_ALLOW_CIDR=192.0.2.0/24 run_target_provisioner opencode
 assert_contains "the chosen model, and the router's API range for the web UI" "opencode-env fast|192.0.2.0/24" "$(mock_calls)"
@@ -1868,6 +1931,18 @@ assert_eq "model targets, their keys, one apply, then the companions" \
   "$(printf '%s\n' 'run ollama' 'template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst' 'run strata' 'key strata' \
      'router /usr/local/bin/manage-model-servers apply' wait token 'run hermes')" "$(mock_calls)"
 assert_contains "the summary lists each target" "strata         CT 912    ok" "$(cat "$_out")"
+TARGETS="hermes freellmapi ollama"; FREELLMAPI_CT_ID=923
+mock_reset_log
+provision_selected_targets > "$_out" 2>&1
+assert_eq "FreeLLMAPI is created with the model targets, before the companions, with no template or key step" \
+  "$(printf '%s\n' 'run freellmapi' 'run ollama' wait token 'run hermes')" "$(mock_calls)"
+assert_contains "and listed in the summary" "freellmapi     CT 923    ok" "$(cat "$_out")"
+mock_reset_log
+FAKE_FAIL=freellmapi provision_selected_targets > "$_out" 2>&1; _rc=$?
+assert_eq "a failed FreeLLMAPI fails the run" 1 "$_rc"
+assert_contains "with its retry command" "targets/freellmapi/provision-lxc.sh" "$(cat "$_out")"
+assert_contains "while the others still run" "run hermes" "$(mock_calls)"
+TARGETS="ollama strata hermes"
 mock_reset_log
 FAKE_APPLY_FAIL=1 provision_selected_targets > "$_out" 2>&1; _rc=$?
 assert_eq "a failed router key apply fails the run" 1 "$_rc"

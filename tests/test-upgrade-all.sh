@@ -51,6 +51,11 @@ done
 describe 'every target has an upgrade method and known services'
 for target in $(tables eval 'printf "%s\n" "${TARGET_ORDER[@]}"') router open-webui hcom; do
     assert_ne "$target has a method" unknown "$(tables method_of "$target")"
+    if [[ $target == freellmapi ]]; then
+        # Its CT is its container image, without systemd: checked over HTTP.
+        assert_eq "$target has no units (its image has no systemd)" '' "$(tables eval "printf '%s' \"\${UNITS[$target]:-}\"")"
+        continue
+    fi
     assert_ne "$target has services to check" '' "$(tables eval "printf '%s' \"\${UNITS[$target]:-}\"")"
 done
 for unit_file in "$ROOT"/targets/*/*.service "$ROOT"/services/*/*.service; do
@@ -166,6 +171,7 @@ case $cmd in
                     *webui-access*) [[ ! -e $MOCK/$id.access ]] || cat "$MOCK/$id.access" ;;
                     *requirements.txt*) [[ ! -e $MOCK/$id.ctpin ]] || cat "$MOCK/$id.ctpin" ;;
                     *DSH_VERSION*) [[ ! -e $MOCK/$id.dsh ]] || cat "$MOCK/$id.dsh" ;;
+                    *FREELLMAPI_VERSION*) [[ ! -e $MOCK/$id.freellmapi ]] || cat "$MOCK/$id.freellmapi" ;;
                     *HERMES_COMMIT*) [[ ! -e $MOCK/$id.hermes-pin-read-fails ]] || exit 1
                                      [[ ! -e $MOCK/$id.hermes-pin ]] || cat "$MOCK/$id.hermes-pin" ;;
                 esac ;;
@@ -194,6 +200,8 @@ case $cmd in
                 fi
                 echo 'mqtts://broker.lan:8883' ;;
             test) [[ -e $MOCK/$id.tls ]] ;;
+            # FreeLLMAPI's /api/ping probe (node in its image): <id>.ping answers.
+            node) [[ $3 == *'/api/ping'* && -e $MOCK/$id.ping ]]; exit ;;
             grep) [[ -e $MOCK/$id.webui-api ]] || exit 1 ;;
             /usr/local/bin/manage-model-servers) printf 'MANAGE %s %s\n' "$id" "$*" >> "$MOCK/installs.log" ;;
             install) : ;;
@@ -883,6 +891,49 @@ rm "$tmp/mock/282.webui-api"
 out=$(ask_with 'typed\n')
 assert_not_contains 'not asked when nothing needs it' 'admin API key or session JWT' "$out"
 
+describe 'FreeLLMAPI'
+assert_eq 'it is upgraded by its provisioner' reconfigure "$(tables method_of freellmapi)"
+assert_eq 'its pin is the provisioner'"'"'s tested release' \
+    "$(sed -n 's/^DEFAULT_FREELLMAPI_VERSION=//p' "$ROOT/targets/freellmapi/provision-lxc.sh")" "$(tables repo_default freellmapi)"
+assert_eq 'and the release this run lists as pinned' "$(tables repo_default freellmapi)" "$(tables pinned_release freellmapi)"
+assert_eq 'it follows the model servers' 'kindi freellmapi' \
+    "$(tables eval 'printf "%s\n" "${TARGET_ORDER[@]}"' | grep -E '^(kindi|freellmapi)$' | paste -sd' ')"
+freellmapi_snapshot_case() {
+    # shellcheck disable=SC2034  # read by take_snapshot
+    SNAPSHOTS=true REQUIRE_SNAPSHOT=true
+    add_item freellmapi 287
+    take_snapshot 0 "$RUN_DIR/log" && echo "SNAP=[$SNAP]"
+}
+reset_mock
+out=$(in_tool freellmapi_snapshot_case 2>&1)
+assert_contains 'no snapshot, even with --require-snapshot (its provisioner backs up and restores)' 'SNAP=[]' "$out"
+assert_contains 'and it says why' "backs the CT up itself" "$out"
+assert_eq 'pct snapshot is not called' '' "$(grep ' snapshot 287' "$tmp/mock/pct.log")"
+freellmapi_state_case() {
+    add_item freellmapi 287
+    collect_state 0
+}
+conf 287 'ai;ai-model;osr-target;freellmapi'; state 287
+touch "$tmp/mock/287.ping"
+assert_contains 'its /api/ping is part of what works' 'http:freellmapi-ping' "$(in_tool freellmapi_state_case)"
+rm "$tmp/mock/287.ping"
+assert_not_contains 'and missing when it does not answer' 'http:freellmapi-ping' "$(in_tool freellmapi_state_case)"
+assert_contains 'which is described' 'FreeLLMAPI no longer answers /api/ping' "$(in_tool describe_missing <<< http:freellmapi-ping)"
+freellmapi_pin_case() {
+    add_item freellmapi 287
+    decide_pin 0 FREELLMAPI_VERSION "$1" v0.16.31
+    echo "${I_INFO[0]}|${I_NOTE[0]}"
+}
+assert_contains 'an older release moves to the pin' 'FREELLMAPI_VERSION=v0.16.31' "$(in_tool freellmapi_pin_case v0.15.2)"
+assert_contains 'a newer one stays' 'newer than the pin' "$(in_tool freellmapi_pin_case v0.17.0)"
+echo v0.15.2 > "$tmp/mock/287.freellmapi"
+run_tool '' --dry-run --only freellmapi --pinned
+assert_contains 'the plan runs its provisioner with the pin' \
+    "FREELLMAPI_VERSION=$(tables repo_default freellmapi) targets/freellmapi/provision-lxc.sh --reconfigure" "$out"
+upstream 'https://api.github.com/repos/tashfeenahmed/freellmapi/releases?per_page=50' '[{"tag_name": "v0.99.1"}]'
+run_tool '' --dry-run --only freellmapi --latest freellmapi
+assert_contains 'or with the latest GitHub release' 'FREELLMAPI_VERSION=v0.99.1 targets/freellmapi/provision-lxc.sh --reconfigure' "$out"
+
 describe 'only the agents that register get the token, through their environment'
 # reconf_case TARGET: what run_reconfigure hands its provisioner.
 reconf_case() {
@@ -902,6 +953,9 @@ assert_eq 'not on its command line' '' "$(grep '^ARGS' <<< "$out" | grep -F secr
 assert_contains 'the export ends with the provisioner' 'AFTER 0' "$out"
 out=$(in_tool reconf_case gitea 2>&1)
 assert_contains 'Gitea does not get it' $'GOT \nAFTER' "$out"
+out=$(in_tool reconf_case freellmapi 2>&1)
+assert_contains 'FreeLLMAPI does not get it' $'GOT \nAFTER' "$out"
+assert_eq 'nor a router CT (it registered itself when it was made)' '' "$(grep '^ARGS' <<< "$out" | grep -F ROUTER_CT_ID)"
 out=$(in_tool reconf_case opencode 2>&1)
 assert_contains 'OpenCode gets it (its chat endpoint is registered in Open WebUI)' 'GOT secret-token' "$out"
 assert_eq 'not on its command line either' '' "$(grep '^ARGS' <<< "$out" | grep -F secret-token)"

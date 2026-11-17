@@ -259,6 +259,120 @@ def test_local_model_with_cloud_prefix_is_not_refused(monkeypatch):
     assert missing.json()["error"]["code"] == "cloud_model_not_configured"
 
 
+FREELLMAPI = "http://10.0.0.60:3001"
+
+
+def freellmapi_upstream(calls, models=None, fail_models=False):
+    """FreeLLMAPI on 10.0.0.60 beside one local Ollama host."""
+    def upstream(request):
+        if request.url.host == "10.0.0.60":
+            calls.append((request.url.path, request.url.query.decode(),
+                          request.headers.get("authorization"),
+                          json.loads(request.content).get("model") if request.content else None))
+            if request.url.path == "/v1/models":
+                if fail_models:
+                    return httpx.Response(503)
+                return httpx.Response(200, json={"object": "list", "data": models or []})
+            if request.url.path == "/v1/chat/completions":
+                return streamed(200, {"model": "llama-3.3-70b"})
+            return httpx.Response(404)
+        return local(request)
+    local = Upstream()
+    local.inventory = {HOST_A: tags(("local:7b", "7B", "llama"))}
+    return upstream
+
+
+FREELLMAPI_LIST = [
+    {"id": "auto", "owned_by": "freellmapi", "available": True},
+    {"id": "fusion", "owned_by": "freellmapi", "available": False},
+    {"id": "llama-3.3-70b", "owned_by": "groq", "available": True},
+    {"id": "bad id\n", "owned_by": "groq", "available": True},
+]
+
+
+def test_freellmapi_models_are_explicit_and_bypass_litellm(monkeypatch):
+    router = load_router(monkeypatch, FREELLMAPI_BASE_URL=FREELLMAPI + "/",
+                         FREELLMAPI_API_KEY="freellmapi-secret", ROUTER_API_KEY="router-key")
+    calls = []
+    router._HTTP["transport"] = httpx.MockTransport(freellmapi_upstream(calls, FREELLMAPI_LIST))
+    auth = {"Authorization": "Bearer router-key"}
+    with TestClient(router.app) as client:
+        listed = [entry for entry in client.get("/v1/models", headers=auth).json()["data"]
+                  if entry["id"].startswith("freellmapi/")]
+        client.get("/v1/models", headers=auth)
+        response = client.post("/v1/chat/completions", headers=auth, json={
+            "model": "freellmapi/llama-3.3-70b", "messages": [{"role": "user", "content": "hi"}]})
+        automatic = client.post("/v1/chat/completions", headers=auth, json={
+            "model": "auto", "messages": [{"role": "user", "content": "hi"}]})
+    # Unavailable and malformed entries are not offered; "auto" always is.
+    assert [entry["id"] for entry in listed] == ["freellmapi/auto", "freellmapi/llama-3.3-70b"]
+    assert {entry["owned_by"] for entry in listed} == {"freellmapi"}
+    # One cached listing for two /v1/models requests, asked for usable models only.
+    assert [call for call in calls if call[0] == "/v1/models"] == [
+        ("/v1/models", "available=true", "Bearer freellmapi-secret", None)]
+    assert response.status_code == 200
+    assert response.headers["x-router-mode"] == "freellmapi"
+    assert response.headers["x-router-model"] == "freellmapi/llama-3.3-70b"
+    # The router's own key replaces the client's, and the prefix is removed.
+    assert calls[-1] == ("/v1/chat/completions", "", "Bearer freellmapi-secret", "llama-3.3-70b")
+    # "auto" stays local: nothing but the one explicit request reached FreeLLMAPI.
+    assert automatic.status_code == 200
+    assert automatic.headers.get("x-router-mode") != "freellmapi"
+    assert len([call for call in calls if call[0] == "/v1/chat/completions"]) == 1
+
+
+def test_freellmapi_auto_list_and_outage(monkeypatch):
+    router = load_router(monkeypatch, FREELLMAPI_BASE_URL=FREELLMAPI,
+                         FREELLMAPI_API_KEY="freellmapi-secret", FREELLMAPI_MODELS="auto")
+    calls = []
+    router._HTTP["transport"] = httpx.MockTransport(freellmapi_upstream(calls, FREELLMAPI_LIST))
+    with TestClient(router.app) as client:
+        ids = [entry["id"] for entry in client.get("/v1/models").json()["data"]]
+    assert "freellmapi/auto" in ids and "freellmapi/llama-3.3-70b" not in ids
+
+    router = load_router(monkeypatch, FREELLMAPI_BASE_URL=FREELLMAPI,
+                         FREELLMAPI_API_KEY="freellmapi-secret")
+    router._HTTP["transport"] = httpx.MockTransport(freellmapi_upstream([], fail_models=True))
+    with TestClient(router.app) as client:
+        ids = [entry["id"] for entry in client.get("/v1/models").json()["data"]]
+    # A FreeLLMAPI outage neither hides its entry nor breaks the local list.
+    assert "freellmapi/auto" in ids and "auto" in ids and "local:7b" in ids
+
+
+def test_freellmapi_requires_url_and_key(monkeypatch):
+    for settings in ({}, {"FREELLMAPI_BASE_URL": FREELLMAPI},
+                     {"FREELLMAPI_API_KEY": "freellmapi-secret"},
+                     {"FREELLMAPI_BASE_URL": FREELLMAPI + "/v1",
+                      "FREELLMAPI_API_KEY": "freellmapi-secret"},
+                     {"FREELLMAPI_BASE_URL": "ftp://10.0.0.60",
+                      "FREELLMAPI_API_KEY": "freellmapi-secret"}):
+        router = load_router(monkeypatch, **settings)
+        calls = []
+        router._HTTP["transport"] = httpx.MockTransport(freellmapi_upstream(calls))
+        with TestClient(router.app) as client:
+            ids = [entry["id"] for entry in client.get("/v1/models").json()["data"]]
+            response = chat(client, model="freellmapi/auto")
+        assert not [name for name in ids if name.startswith("freellmapi/")], settings
+        assert response.status_code == 404, settings
+        assert response.json()["error"]["code"] == "freellmapi_not_configured"
+        assert calls == [], settings
+        for name in ("FREELLMAPI_BASE_URL", "FREELLMAPI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
+
+def test_freellmapi_rejects_malformed_model_names(monkeypatch):
+    router = load_router(monkeypatch, FREELLMAPI_BASE_URL=FREELLMAPI,
+                         FREELLMAPI_API_KEY="freellmapi-secret")
+    calls = []
+    router._HTTP["transport"] = httpx.MockTransport(freellmapi_upstream(calls))
+    with TestClient(router.app) as client:
+        response = chat(client, model="freellmapi/")
+        spaced = chat(client, model="freellmapi/a b")
+    assert response.status_code == 400 and spaced.status_code == 400
+    assert response.json()["error"]["code"] == "freellmapi_model_invalid"
+    assert not [call for call in calls if call[0] == "/v1/chat/completions"]
+
+
 def test_subscription_gateway_preserves_client_login(monkeypatch):
     router = load_router(monkeypatch, ROUTER_API_KEY="router-secret",
                          SUBSCRIPTION_GATEWAY_BASE_URL="http://localhost:5001")

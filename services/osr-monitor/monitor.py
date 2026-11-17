@@ -292,6 +292,13 @@ def build_checks() -> list:
         else:
             checks.append(Check(url, f"{url}{HEALTH_PATH}",
                                 f"Ollama host `{url}` (serving: {served})"))
+    freellmapi = (os.getenv("FREELLMAPI_BASE_URL") or "").strip().rstrip("/")
+    if freellmapi.startswith(("http://", "https://")):
+        # targets/freellmapi: not a model server (the router uses it only for
+        # freellmapi/<id>), but an outage should still be reported. /api/ping
+        # needs no key.
+        checks.append(Check("freellmapi", f"{freellmapi}/api/ping",
+                            f"FreeLLMAPI `{freellmapi}` (freellmapi/ models)"))
     for name, url in local_services().items():
         checks.append(Check(name, url, f"local service `{name}` ({url})"))
     return checks

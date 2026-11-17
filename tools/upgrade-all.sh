@@ -144,7 +144,7 @@ USAGE
 # Upgrade order of the tagged targets: services the others use first, Honcho
 # before the agents that use it, the broker before hcom.
 TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi
-              comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
+              freellmapi comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
 MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
 
 # Services that must be active afterwards if they were active before.
@@ -158,6 +158,8 @@ declare -A UNITS=(
     [ollama]='ollama'
     [strata]='strata' [basalt]='basalt' [maya]='maya' [xolotl]='xolotl' [avalon]='avalon' [kindi]='kindi'
     [comfyui]='comfyui'
+    # FreeLLMAPI's CT is its container image, without systemd: none here. It is
+    # checked by its /api/ping instead (collect_state, http:freellmapi-ping).
     # The workspace gateway; per-user open-terminal-ws@<id> instances start on
     # demand and stop when idle, so neither they nor their ports are checked.
     [open-terminal]='open-terminal-gateway open-terminal-spawner'
@@ -207,7 +209,7 @@ method_of() {
         router) echo router ;;
         open-webui) echo webui ;;
         hcom) echo hcom ;;
-        gitea|mattermost|honcho|hermes|openclaw|deepseek-harness|opencode|mqtt) echo reconfigure ;;
+        gitea|mattermost|honcho|hermes|openclaw|deepseek-harness|opencode|mqtt|freellmapi) echo reconfigure ;;
         *) if [[ -n ${GUEST_DIR[$1]:-} ]]; then echo guest; else echo unknown; fi ;;
     esac
 }
@@ -526,6 +528,12 @@ on_listed_node() {  # on_listed_node ID LIST: is CT ID on a node in LIST (or is 
     return 1
 }
 
+# Run with node in a FreeLLMAPI CT (the image has node, not curl): succeeds
+# when the server on the port in its env file answers /api/ping with
+# {"status": "ok"}, the provisioner's own readiness check.
+FREELLMAPI_HTTP_PROBE='const fs=require("fs");let p="3001";try{const m=/^PORT=([0-9]+)$/m.exec(fs.readFileSync("/app/server/data/osr-target/freellmapi.env","utf8"));if(m)p=m[1]}catch(e){}
+fetch("http://127.0.0.1:"+p+"/api/ping",{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(j=>process.exit(j.status==="ok"?0:1)).catch(()=>process.exit(1))'
+
 # Run in a Hermes CT: prints http:hermes-gateway, http:hermes-direct and
 # http:hermes-dashboard for each of Hermes's HTTP endpoints that answers the
 # way its installer requires (the gateway's /health with "status": "ok" on
@@ -776,6 +784,10 @@ collect_state() {
         mapfile -t ident < <(ct_identity "$id")
         (( ${#ident[@]} == 0 )) || up_servers "${ident[@]}"
     fi
+    # FreeLLMAPI has no units: its server answering /api/ping is the check.
+    if [[ $t == freellmapi ]] && pct exec "$id" -- node -e "$FREELLMAPI_HTTP_PROBE" 2>/dev/null; then
+        echo http:freellmapi-ping
+    fi
     # Hermes's own HTTP checks: an active unit with a listening port can still
     # answer errors (for example after hcom restarts the gateway).
     if [[ $t == hermes || ( $t == hcom && ${agent:-} == hermes ) ]]; then
@@ -794,6 +806,7 @@ describe_missing() {
             http:router-healthz) echo "  - the router's /healthz does not answer 200" ;;
             http:router-models) echo "  - the router's /v1/models does not answer 200" ;;
             http:openwebui-health) echo "  - Open WebUI's /health does not answer 200" ;;
+            http:freellmapi-ping) echo "  - FreeLLMAPI no longer answers /api/ping in its CT" ;;
             http:hermes-gateway) echo "  - Hermes's API server /health (on its API port) no longer answers \"status\": \"ok\"" ;;
             http:hermes-direct) echo "  - Hermes's direct dispatcher (127.0.0.1:8765/healthz) no longer answers" ;;
             http:hermes-dashboard) echo "  - the Hermes dashboard (port 9119, /api/status) no longer answers 200" ;;
@@ -823,6 +836,12 @@ take_snapshot() {
     local i=$1 log=$2 id=${I_CT[$1]} name
     SNAP=''
     $SNAPSHOTS || return 0
+    if [[ ${I_TARGET[$i]} == freellmapi ]]; then
+        # Its provisioner replaces the CT for a new release (destroying any
+        # snapshot with it) and keeps its own backup for rollback.
+        note "No snapshot of CT $id: FreeLLMAPI's provisioner backs the CT up itself and restores it on failure."
+        return 0
+    fi
     name="osr-upg-${RUN_STAMP}-$i"
     if pct snapshot "$id" "$name" --description "Before tools/upgrade-all.sh ($REPO_REV)" >> "$log" 2>&1; then
         SNAP=$name
@@ -1010,7 +1029,7 @@ run_reconfigure() {  # run_reconfigure ITEM MODE
             fi ;;
     esac
     for word in ${I_INFO[$i]}; do
-        case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*) envs+=("$word") ;; esac
+        case $word in DSH_VERSION=*|HONCHO_REF=*|OPENCODE_VERSION=*|FREELLMAPI_VERSION=*) envs+=("$word") ;; esac
     done
     if [[ $t == mqtt ]]; then
         settings=$(mqtt_env "$id" "$RUN_DIR/mqtt-$id") || return 1
@@ -1136,7 +1155,7 @@ describe_item() {  # what run_item does, for the plan
             if unpinned_service "$t"; then
                 echo "targets/$t/provision-lxc.sh --reconfigure (re-applies its setup; this repository does not pin the $t release, so it stays as it is)"
             else
-                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF|OPENCODE_VERSION)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure$([[ $t != hermes ]] || echo "; $(hermes_plan "$i")")"
+                echo "$(grep -oE '(DSH_VERSION|HONCHO_REF|OPENCODE_VERSION|FREELLMAPI_VERSION)=[^ ]*' <<< "${I_INFO[$i]}" | tr '\n' ' ')targets/$t/provision-lxc.sh --reconfigure$([[ $t != hermes ]] || echo "; $(hermes_plan "$i")")"
             fi ;;
         hcom) echo "targets/hcom/provision-lxc.sh as $(info_value "$i" target) (broker CT ${HCOM_MQTT_CT:-?})" ;;
     esac
@@ -1171,8 +1190,9 @@ hermes_outcome() {
 
 # --- Decisions made before anything changes ------------------------------------------
 
-repo_default() {  # repo_default dsh|honcho|opencode
+repo_default() {  # repo_default dsh|honcho|opencode|freellmapi
     case $1 in
+        freellmapi) sed -n 's/^DEFAULT_FREELLMAPI_VERSION=//p' "$REPO_ROOT/targets/freellmapi/provision-lxc.sh" | head -n 1 ;;
         dsh) sed -n 's/^DEFAULT_DSH_VERSION=//p' "$REPO_ROOT/targets/deepseek-harness/provision-lxc.sh" | head -n 1 ;;
         opencode) sed -n 's/^DEFAULT_OPENCODE_VERSION=//p' "$REPO_ROOT/targets/opencode/provision-lxc.sh" | head -n 1 ;;
         honcho) sed -n 's/^HONCHO_REF=\${HONCHO_REF:-\([^}]*\)}$/\1/p' "$REPO_ROOT/targets/honcho/provision-lxc.sh" | head -n 1 ;;
@@ -1209,6 +1229,7 @@ declare -A UPSTREAM=(
     [honcho]='gh-release plastic-labs/honcho'
     [deepseek-harness]='npm @deepseek-ai/dsh'
     [opencode]='npm @opencode/cli'
+    [freellmapi]='gh-release tashfeenahmed/freellmapi'
 )
 # Components that pull from a public repository with no pin here: shown, not asked.
 declare -A UPSTREAM_UNPINNED=(
@@ -1234,7 +1255,7 @@ pinned_release() {
         open-terminal) sed -n 's/^DEFAULT_VERSION=//p' "$f" ;;
         strata) sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$f" ;;
         xolotl|avalon|kindi) cat -- "$REPO_ROOT/targets/$1/upstream-commit.txt" ;;
-        honcho|opencode) repo_default "$1" ;;
+        honcho|opencode|freellmapi) repo_default "$1" ;;
         deepseek-harness) repo_default dsh ;;
     esac 2>/dev/null | head -n 1 | tr -d '\r'
 }
@@ -1521,6 +1542,9 @@ prepare() {
             opencode)
                 recorded=$(pct exec "$id" -- sed -n 's/^OPENCODE_VERSION=//p' /etc/opencode-target/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" OPENCODE_VERSION "$recorded" "$(repo_default opencode)" "$(release_pick opencode)" ;;
+            freellmapi)
+                recorded=$(pct exec "$id" -- sed -n 's/^FREELLMAPI_VERSION=//p' /app/server/data/osr-target/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
+                decide_pin "$i" FREELLMAPI_VERSION "$recorded" "$(repo_default freellmapi)" "$(release_pick freellmapi)" ;;
             honcho)
                 recorded=$(pct exec "$id" -- sed -n 's/^HONCHO_REF=//p' /etc/honcho-target/settings.env 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" HONCHO_REF "$recorded" "$(repo_default honcho)" "$(release_pick honcho)" ;;

@@ -1,0 +1,216 @@
+# FreeLLMAPI gateway
+
+[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi) puts the free tiers
+of many cloud model providers (Google, Groq, OpenRouter, Cerebras, Mistral and
+others) behind one OpenAI-compatible endpoint and one key, and moves on to the
+next provider when one hits its limit. This target runs it in its own CT and
+offers its models through the router as `freellmapi/<id>`.
+
+**Prompts sent to these models leave your network** for whichever provider
+answers, under that provider's terms. OSR therefore treats FreeLLMAPI like its
+[cloud API models](../../README.md#cloud-api-models): a model is used only when
+a request names it. `auto`, the tier aliases and LiteLLM's fallbacks never pick
+one, and FreeLLMAPI is not part of the model pool.
+
+| | |
+|---|---|
+| Release | `v0.16.31` (`DEFAULT_FREELLMAPI_VERSION`), commit in `upstream-commit.txt` |
+| Image | `ghcr.io/tashfeenahmed/freellmapi`, pulled by digest |
+| CT | Unprivileged, made from the image by Proxmox (no Docker or Podman inside), 2 cores, 1 GiB, 4 GiB root + 2 GiB data |
+| Port | 3001: dashboard and API (`/v1/...`) |
+| Tags | `ai`, `ai-model`, `osr-target`, `freellmapi` |
+| Router | `freellmapi/<id>` models, explicit only; `freellmapi/auto` lets FreeLLMAPI choose |
+
+## How the CT is made
+
+FreeLLMAPI is published only as a container image. Proxmox VE 9.1 can make an
+LXC from such an image itself (an "application container", a technology
+preview in 9.1), so there is no container runtime in the CT and no guest
+installer in this directory. `provision-lxc.sh` does the whole job:
+
+1. `skopeo inspect` reads the release's digest and the commit it was built
+   from (the image's `org.opencontainers.image.revision` label). For the tested
+   release that must be the commit in `upstream-commit.txt`; with
+   `FREELLMAPI_DIGEST` the digest must match too. A moved tag is refused before
+   anything changes.
+2. `skopeo copy` stores the image, by digest, as the CT template
+   `<TEMPLATE_STORAGE>:vztmpl/freellmapi_<release>.tar`.
+3. `pct create` makes the CT from it, with a second volume (`mp0`, backed up)
+   at the image's data directory `/app/server/data`. Proxmox takes the image's
+   entrypoint (`docker-entrypoint.sh node server/dist/index.js`) as the CT's
+   init and manages its network.
+4. The CT is started once with an entrypoint that only waits, and the data
+   directory is prepared: `osr-target/freellmapi.env` (root:node 0640) with a
+   new 64-hex-digit `ENCRYPTION_KEY`, the port and the rate limit, linked from
+   `/app/.env`; and the first dashboard account (a bootstrap file FreeLLMAPI
+   reads at its first start, removed once the account exists).
+5. The image's entrypoint is put back and the CT restarted. The run waits for
+   `/api/ping`, checks the account exists, reads the unified API key from the
+   database and checks it opens `/v1/models`.
+6. The endpoint and key go to the router CT: `manage-model-servers
+   set-freellmapi http://<CT>:3001 --apply`, the key on stdin.
+
+The CT's firewall admits the access range (default: the CT's network; from the
+installer, its `API_ALLOW_CIDR`) and the router to port 3001, and nothing else.
+Outbound traffic stays open: FreeLLMAPI calls whichever providers have keys.
+
+## Before you start
+
+- Proxmox VE 9.1 or later, and `skopeo` on the host (`apt install skopeo`;
+  Proxmox uses it to pull images). The host must reach `ghcr.io`.
+- A static address for the CT and a storage for CT templates (`local` by
+  default).
+- Provider API keys: sign up at the providers you want (most free tiers need
+  only an account). Without at least one key, no model answers.
+
+## Provision on the Proxmox host
+
+From the installer, choose `freellmapi` (the last entry). It asks for the CT
+ID, address, storage and the dashboard's sign-in name; the password is
+generated in the CT.
+
+On its own:
+
+```bash
+bash targets/freellmapi/provision-lxc.sh --dry-run   # the plan
+bash targets/freellmapi/provision-lxc.sh
+```
+
+It asks for the CT ID (default: the cluster's next free one), storage,
+address, gateway, the dashboard e-mail and password (Enter: generate one in the
+CT), the access range and the router CT (default: the CT tagged `osr-router`;
+`none` skips the hand-over). Unattended:
+
+```bash
+CT_ID=240 STORAGE=local-lvm IP_CIDR=192.0.2.40/24 GATEWAY=192.0.2.1 \
+  ROUTER_CT_ID=210 PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false \
+  bash targets/freellmapi/provision-lxc.sh
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FREELLMAPI_VERSION` | the tested release | Release tag to run; a CT given one stays on it until another is named |
+| `FREELLMAPI_DIGEST` | empty | Registry digest the tag must have (`skopeo inspect --format '{{.Digest}}' docker://ghcr.io/tashfeenahmed/freellmapi:<tag>`) |
+| `FREELLMAPI_PORT` | 3001 | Dashboard and API port |
+| `FREELLMAPI_ACCESS_CIDR` | the CT's network | Who may open the dashboard and API (the router is always admitted) |
+| `FREELLMAPI_RATE_LIMIT_RPM` | 600 | Requests per minute per client address; the router is one client. `0` turns it off |
+| `FREELLMAPI_ADMIN_EMAIL` | `admin@osr.local` | Dashboard sign-in name |
+| `FREELLMAPI_ADMIN_PASSWORD` | generated | 8 to 128 characters; taken out of the environment at once, passed to the CT on stdin |
+| `TEMPLATE_STORAGE` | `local` | Storage for the image template |
+| `CORES`, `MEMORY_MB`, `SWAP_MB`, `ROOTFS_GB`, `DATA_GB` | 2, 1024, 0, 4, 2 | CT size |
+| `CT_HOSTNAME`, `BRIDGE`, `VLAN_TAG`, `NAMESERVER`, `ONBOOT` | `freellmapi`, `vmbr0`, –, –, 1 | CT network and start |
+| `ROUTER_CT_ID` | the `osr-router` CT | Router to register with, or `none` |
+| `FREELLMAPI_READY_TIMEOUT` | 120 | Seconds to wait for `/api/ping` |
+
+A generated password is kept root-only in the CT:
+
+```bash
+pct exec <CT> -- cat /app/server/data/osr-target/initial-admin-password
+```
+
+Change it in the dashboard, then delete that file.
+
+## Add provider keys
+
+Open `http://<CT address>:3001`, sign in, and add keys on the **Keys** page.
+The dashboard also shows the fallback order, usage per provider and the
+**unified API key** the router uses. If you regenerate that key, hand the new
+one to the router:
+
+```bash
+CT_ID=<CT> bash targets/freellmapi/provision-lxc.sh --register
+```
+
+## Using it through the router
+
+The router lists `freellmapi/auto` and, by default, every model FreeLLMAPI can
+serve now (`freellmapi/<its model id>`), refreshed every five minutes. Open
+WebUI and agents see them in `/v1/models`. A request naming one is sent to
+FreeLLMAPI with the router's key in place of the client's, the prefix removed;
+the response carries `X-Router-Mode: freellmapi`.
+
+```bash
+curl http://<router>:8000/v1/chat/completions -H "Authorization: Bearer $ROUTER_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "freellmapi/auto", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+On the router:
+
+```bash
+manage-model-servers set-freellmapi http://192.0.2.40:3001 --apply   # asks for the key twice
+manage-model-servers set-freellmapi --off --apply
+```
+
+`FREELLMAPI_BASE_URL` (in `env/router.env`, committed) holds the address and
+`FREELLMAPI_API_KEY` (in `secrets.env`) the key. `FREELLMAPI_MODELS=auto` in
+`env/router.env` lists only FreeLLMAPI's own routing entries instead of every
+model. The health monitor watches `/api/ping` and alerts when FreeLLMAPI stops
+answering.
+
+To keep Open WebUI users from reaching these models, restrict them in Open
+WebUI's model settings (Admin Panel → Settings → Models).
+
+## Upgrades
+
+```bash
+CT_ID=<CT> bash targets/freellmapi/provision-lxc.sh --reconfigure            # follow the tested release
+CT_ID=<CT> FREELLMAPI_VERSION=v0.17.0 bash targets/freellmapi/provision-lxc.sh --reconfigure
+```
+
+- Nothing changed and the server answers: nothing to do.
+- Only settings changed (port, rate limit): the same image restarts with the
+  env file rewritten. Lines you added to the env file, and the key, are kept.
+- Another release: the new image is pulled and checked first. Then the CT is
+  stopped and backed up with `vzdump` to `/var/lib/osr-freellmapi/<CT>/`, its
+  data directory saved, and the CT destroyed and created again from the new
+  image, with the same ID, address, MAC, firewall file, cores, memory, swap,
+  start order and DNS, and the data restored. The run succeeds only when
+  `/api/ping` answers and the unified key is unchanged and works. Otherwise
+  the new CT is removed and the backup restored (`pct restore`), started and
+  checked; the backup is deleted afterwards. A failed restore keeps the backup
+  and says how to restore it by hand.
+
+Options set on the CT by hand beyond those listed are not carried over to the
+new CT (the backup has them). `tools/upgrade-all.sh` runs `--reconfigure`,
+offers the newest GitHub release beside the pin, and takes no snapshot of this
+CT (the replacement would remove it; the provisioner's backup replaces it).
+Templates of earlier releases stay in `TEMPLATE_STORAGE` until you delete them.
+
+## Troubleshooting
+
+- **The CT stops right after starting.** The server is the CT's init: when it
+  exits, the CT stops. `pct console <CT>` (or `pct start <CT> --debug`) shows
+  its output. The usual cause is an env file without a valid
+  `ENCRYPTION_KEY`.
+- **"runs 'sleep infinity', not the image's entrypoint".** A run was
+  interrupted while the data directory was being prepared. Put the entrypoint
+  back and start it:
+  `pct set <CT> --entrypoint '/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'; pct start <CT>`.
+- **"an earlier replacement ... did not finish".** `/var/lib/osr-freellmapi/<CT>/`
+  holds the backup of the CT as it was before. If the CT works, delete the
+  directory; if not, `pct destroy <CT>` and
+  `pct restore <CT> /var/lib/osr-freellmapi/<CT>/vzdump-lxc-<CT>-*.tar.zst --storage <storage>`.
+- **Every model fails.** No provider key, or all are rate-limited: see the
+  dashboard's Keys and Analytics pages.
+- **The key is lost.** It is in the database, encrypted with `ENCRYPTION_KEY`.
+  Losing `freellmapi.env` loses the provider keys; the CT's backups (`mp0` is
+  included) have both.
+
+## Verified, and not yet
+
+- `test-provision.sh`: plans and validation, then whole runs against a fake
+  Proxmox (`fake-pve.sh`) that keeps each CT as a directory and runs the
+  provisioner's own guest scripts in it: create, register, settings change,
+  replacement for a new release, every rollback path, and the password and key
+  kept off command lines.
+- `test-pinned-upstream.py` (CI job `freellmapi-upstream`): the pinned commit's
+  Dockerfile, entrypoint, settings, endpoints and image workflow, then the
+  provisioner's guest scripts against the real, built server (account from the
+  bootstrap file, health, reading and using the key, restart).
+- The router's `freellmapi/` path was run against that real server.
+- **Not run on Proxmox.** Watch the first real run: `pct create` from the OCI
+  archive (entrypoint and Debian detection), `pct exec` into an application
+  container, `skopeo` reaching ghcr.io from the host, and a replacement with
+  `vzdump`/`pct restore`. Proxmox marks OCI-image CTs a technology preview in
+  9.1; its behaviour may change in later releases.

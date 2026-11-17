@@ -999,6 +999,10 @@ require_companion_credentials() {
 # front and created after the router. Memory infrastructure follows the model
 # servers, then companions that need the router's Open WebUI come last.
 #
+# A gateway (FreeLLMAPI) is created with the model targets but is no model
+# server: its provisioner registers it with the router as an explicit-only
+# endpoint (manage-model-servers set-freellmapi).
+#
 # One line per target: name|phase|label|router entry (@IP@ and @PORT@ filled
 # in)|key kind (Strata-style servers generate an API key the router needs)|
 # GPU as need:vendors[:generations]: need is required, optional (used when
@@ -1023,7 +1027,8 @@ target_table() {
     'deepseek-harness|companion|DeepSeek Harness: agent Web UI in its own LXC, using OSR models|||' \
     'opencode|companion|OpenCode: coding agent with its own web UI, also offered in Open WebUI as the model opencode|||' \
     'open-terminal|companion|Open Terminal: a private workspace per user, for Open WebUI and the agents|||' \
-    'comfyui|companion|ComfyUI: image generation for Open WebUI (NVIDIA, AMD or Intel Arc GPU when present)|||optional:nvidia,amd,intel'
+    'comfyui|companion|ComfyUI: image generation for Open WebUI (NVIDIA, AMD or Intel Arc GPU when present)|||optional:nvidia,amd,intel' \
+    'freellmapi|gateway|FreeLLMAPI: free cloud tiers behind one key, offered as freellmapi/<id> and used only when named (needs Proxmox VE 9.1)|||'
 }
 # target_field NAME FIELD: one column of the table (phase, label, entry, key, gpu).
 target_field() {
@@ -1547,6 +1552,7 @@ target_menu_group() {
     gitea|mattermost) echo 'Services (CPU): configuration and alerts; created before OSR.' ;;
     ollama|airllm|kindi) echo 'Model servers (CPU or optional GPU):' ;;
     honcho) echo 'Memory infrastructure (CPU): created before agents.' ;;
+    freellmapi) echo 'Cloud gateway (CPU): prompts leave your network; never chosen by auto.' ;;
     *)
       case "$(target_field "$1" phase)" in
         model) echo 'Model servers (GPU required by default):' ;;
@@ -1664,6 +1670,23 @@ show_strata_template_alternatives() {
   done < <(template_storages)
 }
 valid_comfyui_variant() { [[ $1 == klein-4b || $1 == klein-9b ]]; }
+valid_freellmapi_email() { [[ $1 =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; }
+# freellmapi_host_ready: FreeLLMAPI's CT is made from its container image,
+# which needs Proxmox VE 9.1 (OCI images as CT templates) and skopeo. Said
+# when the target is chosen, not after the router is built.
+freellmapi_host_ready() {
+  local version
+  version="$(pveversion 2>/dev/null)" || version=""
+  if [[ ! "$version" =~ ^pve-manager/([0-9]+)\.([0-9]+) ]] ||
+     (( BASH_REMATCH[1] < 9 || ( BASH_REMATCH[1] == 9 && BASH_REMATCH[2] < 1 ) )); then
+    echo "    FreeLLMAPI needs Proxmox VE 9.1 or later (its CT is made from a container image); this host: ${version:-unknown}." >&2
+    return 1
+  fi
+  if ! command -v skopeo >/dev/null 2>&1; then
+    echo "    FreeLLMAPI needs skopeo on this host to pull its image: apt install skopeo" >&2
+    return 1
+  fi
+}
 valid_honcho_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/+-]*$ ]]; }
 # Blank: Honcho's own token budgets (fine for a context window of 128k or more).
 valid_honcho_context_tokens() { [[ -z $1 || ( $1 =~ ^[1-9][0-9]{3,6}$ && $1 -ge 8192 && $1 -le 1048576 ) ]]; }
@@ -1768,6 +1791,14 @@ prompt_target_settings() {
       prompt_until_valid "    Chat model or tier" HONCHO_MODEL "${HONCHO_MODEL:-fast}" valid_honcho_model || return 1
       echo "    Its embedding model needs no answer: Qwen3-Embedding-0.6B runs on llama.cpp in Honcho's CT."
       echo "    Its context window is asked with the model targets' windows, below."
+    fi
+    if [[ $name == freellmapi ]]; then
+      freellmapi_host_ready || return 1
+      echo "    Its models answer from third-party free tiers. OSR offers them as freellmapi/<id>"
+      echo "    and never picks one for auto or a tier. Provider keys are added in its dashboard."
+      prompt_until_valid "    Dashboard e-mail (a sign-in name)" FREELLMAPI_ADMIN_EMAIL \
+        "${FREELLMAPI_ADMIN_EMAIL:-admin@osr.local}" valid_freellmapi_email || return 1
+      echo "    The dashboard password is generated in the CT; the target's summary says how to read it."
     fi
     if [[ $name == deepseek-harness ]]; then
       echo "    DeepSeek runs its own tools; choose an OSR model that supports tool calls."
@@ -2267,6 +2298,12 @@ run_target_provisioner() {
     [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
     # The router's MEMORY is unset above; Strata gets the RAM chosen for its CT.
     [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
+    if [[ "$phase" == gateway ]]; then
+      # FreeLLMAPI hands its endpoint and key to the router CT itself, and
+      # admits the router and the API access range to its one port.
+      export ROUTER_CT_ID="$router_ct" FREELLMAPI_ADMIN_EMAIL="${FREELLMAPI_ADMIN_EMAIL:-admin@osr.local}"
+      [[ -z ${API_ALLOW_CIDR:-} || -n ${FREELLMAPI_ACCESS_CIDR:-} ]] || export FREELLMAPI_ACCESS_CIDR="$API_ALLOW_CIDR"
+    fi
     if [[ "$phase" == companion ]]; then
       export ROUTER_CT_ID="$router_ct" OPENWEBUI_PORT="$webui_port"
       if [[ "$name" == honcho ]]; then
@@ -3676,6 +3713,12 @@ LITELLM_BASE_URL=http://127.0.0.1:4000
 CLOUD_OPENAI_MODELS=
 CLOUD_ANTHROPIC_MODELS=
 CLOUD_GEMINI_MODELS=
+# FreeLLMAPI server (targets/freellmapi), set with manage-model-servers
+# set-freellmapi: its root URL. Its models are offered as freellmapi/<id> and,
+# like the cloud models, never chosen by auto routing. FREELLMAPI_MODELS:
+# available lists every model it can serve now, auto only freellmapi/auto.
+FREELLMAPI_BASE_URL=
+FREELLMAPI_MODELS=available
 # Optional separate LiteLLM gateway for signed-in Codex and Claude Code
 # clients: its root URL (HTTPS, or loopback HTTP).
 SUBSCRIPTION_GATEWAY_BASE_URL=
@@ -4129,6 +4172,76 @@ CLOUD_MODELS = {
     for model in (os.getenv(f"CLOUD_{provider.upper()}_MODELS") or "").split(",")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", model.strip())
 }
+
+# FreeLLMAPI (targets/freellmapi) fronts the free tiers of cloud providers with
+# one OpenAI-compatible endpoint and one key. Like the cloud models above it is
+# an explicit choice: a request must name freellmapi/<id> (freellmapi/auto lets
+# FreeLLMAPI pick), and it is never part of local discovery, "auto", the tier
+# aliases or LiteLLM's fallbacks. Its prompts leave the network.
+FREELLMAPI_PREFIX = "freellmapi/"
+FREELLMAPI_BASE = (os.getenv("FREELLMAPI_BASE_URL") or "").strip().rstrip("/")
+FREELLMAPI_KEY = (os.getenv("FREELLMAPI_API_KEY") or "").strip()
+if FREELLMAPI_BASE:
+    try:
+        _freellmapi_url = urlsplit(FREELLMAPI_BASE)
+        _freellmapi_ok = (_freellmapi_url.scheme in ("http", "https")
+                          and bool(_freellmapi_url.hostname)
+                          and not (_freellmapi_url.username or _freellmapi_url.password
+                                   or _freellmapi_url.path or _freellmapi_url.query
+                                   or _freellmapi_url.fragment))
+        _freellmapi_url.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        _freellmapi_ok = False
+    if not _freellmapi_ok:
+        log.warning("ignoring FREELLMAPI_BASE_URL: use the root URL, e.g. http://10.0.0.20:3001")
+        FREELLMAPI_BASE = ""
+FREELLMAPI_ENABLED = bool(FREELLMAPI_BASE and FREELLMAPI_KEY)
+if FREELLMAPI_BASE and not FREELLMAPI_KEY:
+    log.warning("FREELLMAPI_BASE_URL is set without FREELLMAPI_API_KEY; freellmapi/ models are off")
+# available: list every model FreeLLMAPI can serve now; auto: only its own
+# routing entries (freellmapi/auto and the like).
+FREELLMAPI_MODELS = (os.getenv("FREELLMAPI_MODELS") or "available").strip().lower()
+if FREELLMAPI_MODELS not in ("available", "auto"):
+    log.warning("ignoring FREELLMAPI_MODELS=%r (use available or auto)", FREELLMAPI_MODELS)
+    FREELLMAPI_MODELS = "available"
+FREELLMAPI_REFRESH = 300.0
+_FREELLMAPI_LIST = {"at": 0.0, "ids": ["auto"]}
+_FREELLMAPI_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,199}")
+
+
+def freellmapi_headers() -> dict:
+    return {"Authorization": f"Bearer {FREELLMAPI_KEY}"}
+
+
+async def freellmapi_models() -> list:
+    """Model ids FreeLLMAPI serves now, without the prefix, refreshed at most
+    every FREELLMAPI_REFRESH seconds. "auto" is always first, so the entry
+    stays selectable while FreeLLMAPI is down or has no provider key yet; a
+    failed refresh keeps the previous list."""
+    now = time.monotonic()
+    if _FREELLMAPI_LIST["at"] and now - _FREELLMAPI_LIST["at"] < FREELLMAPI_REFRESH:
+        return _FREELLMAPI_LIST["ids"]
+    _FREELLMAPI_LIST["at"] = now
+    try:
+        response = await http_client().get(
+            f"{FREELLMAPI_BASE}/v1/models", params={"available": "true"},
+            headers=freellmapi_headers(), timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        ids = ["auto"]
+        for entry in (response.json().get("data") or []):
+            name = str(entry.get("id") or "")
+            if not _FREELLMAPI_ID.fullmatch(name) or name in ids:
+                continue
+            if entry.get("available") is False:
+                continue
+            # FreeLLMAPI's own routing entries carry owned_by "freellmapi".
+            if FREELLMAPI_MODELS == "auto" and entry.get("owned_by") != "freellmapi":
+                continue
+            ids.append(name)
+        _FREELLMAPI_LIST["ids"] = ids
+    except Exception as exc:  # noqa: BLE001 - the model list must still be served
+        log.warning("freellmapi: model list unavailable (%s)", exc)
+    return _FREELLMAPI_LIST["ids"]
 
 DISCOVERY_ENABLED = _cfg.getboolean("discovery", "enabled")
 DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
@@ -5874,6 +5987,22 @@ async def route_chat_completion(request: Request):
             json_body=body,
             extra_headers={"X-Router-Mode": "cloud", "X-Router-Model": requested},
         )
+    if requested.startswith(FREELLMAPI_PREFIX):
+        if not FREELLMAPI_ENABLED:
+            return _error(404, f"Model '{requested}' needs FreeLLMAPI, which is not configured "
+                          "(manage-model-servers set-freellmapi).", "freellmapi_not_configured")
+        upstream_model = requested[len(FREELLMAPI_PREFIX):]
+        if not _FREELLMAPI_ID.fullmatch(upstream_model):
+            return _error(400, f"'{requested}' is not a FreeLLMAPI model name.",
+                          "freellmapi_model_invalid")
+        log.info("route explicit freellmapi model=%s", requested)
+        headers = _forward_headers(request, drop_auth=True)
+        headers.update(freellmapi_headers())
+        return await _stream_upstream(
+            "POST", f"{FREELLMAPI_BASE}/v1/chat/completions", headers,
+            json_body=dict(body, model=upstream_model),
+            extra_headers={"X-Router-Mode": "freellmapi", "X-Router-Model": requested},
+        )
     if requested.split("/", 1)[0] in CLOUD_PROVIDERS and "/" in requested \
             and not known_chat_model(requested) and not embedding_only_match(requested):
         # Local servers may use the same prefixes (LM Studio lists
@@ -5987,6 +6116,13 @@ async def list_models(request: Request):
         if name not in seen:
             seen.add(name)
             data.append({"id": name, "object": "model", "owned_by": provider})
+
+    if FREELLMAPI_ENABLED:
+        for name in await freellmapi_models():
+            name = FREELLMAPI_PREFIX + name
+            if name not in seen:
+                seen.add(name)
+                data.append({"id": name, "object": "model", "owned_by": "freellmapi"})
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         for entry in INVENTORY["models"]:
@@ -6331,6 +6467,13 @@ def build_checks() -> list:
         else:
             checks.append(Check(url, f"{url}{HEALTH_PATH}",
                                 f"Ollama host `{url}` (serving: {served})"))
+    freellmapi = (os.getenv("FREELLMAPI_BASE_URL") or "").strip().rstrip("/")
+    if freellmapi.startswith(("http://", "https://")):
+        # targets/freellmapi: not a model server (the router uses it only for
+        # freellmapi/<id>), but an outage should still be reported. /api/ping
+        # needs no key.
+        checks.append(Check("freellmapi", f"{freellmapi}/api/ping",
+                            f"FreeLLMAPI `{freellmapi}` (freellmapi/ models)"))
     for name, url in local_services().items():
         checks.append(Check(name, url, f"local service `{name}` ({url})"))
     return checks
@@ -7233,6 +7376,12 @@ Commands:
                              when omitted); --off removes its deployments
   set-cloud-models <openai|anthropic|gemini> <model[,model...]|--off>
                              Expose specific provider model IDs through OSR
+  set-freellmapi <url|--off> [key]
+                             Offer a FreeLLMAPI server's models as
+                             freellmapi/<id>, used only when asked for by name
+                             (never by auto or the tiers). <url> is its root
+                             URL, e.g. http://10.0.0.20:3001; its unified API
+                             key goes to secrets.env (prompts when omitted)
   set-webui-version [v]      Show, or pin, the Open WebUI version (use 'latest').
                              Checks the version exists and that the venv's
                              Python satisfies its Requires-Python
@@ -7615,7 +7764,7 @@ resolve_server() {
 secret_keys() {
   local k
   printf '%s\n' GITEA_DEPLOY_TOKEN MATTERMOST_WEBHOOK_URL ROUTER_API_KEY OPENAI_API_KEYS \
-    OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+    OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY FREELLMAPI_API_KEY
   for k in $(server_kinds); do kind_field "$k" key; done
 }
 is_secret_key() {
@@ -7962,6 +8111,10 @@ cmd_list() {
   # No apostrophe inside the ${...:-default}: bash re-parses that word and a
   # lone quote there opens a quote context, breaking everything after it.
   echo "Keep-alive: ${ka:-<server default (OLLAMA_KEEP_ALIVE on each host)>}"
+  local freellmapi; freellmapi="$(env_get FREELLMAPI_BASE_URL)"
+  if [[ -n "$freellmapi" ]]; then
+    echo "FreeLLMAPI: ${freellmapi} (freellmapi/<id>; only when named, never by auto)"
+  fi
   echo
   # One row per (tier, server) deployment, because each pair can carry its own
   # model — a single MODEL column per tier would hide that.
@@ -8984,6 +9137,19 @@ for rel in ("env/router.env", "env/openwebui.env"):
                 valid = False
             if not valid:
                 err(rel, "SUBSCRIPTION_GATEWAY_BASE_URL needs HTTPS or loopback HTTP root URL")
+        base = entries.get("FREELLMAPI_BASE_URL", "").rstrip("/")
+        if base:
+            try:
+                url = urlsplit(base)
+                valid = url.scheme in ("http", "https") and bool(url.hostname) and \
+                    (url.port is None or url.port > 0) and not (
+                    url.path or url.username or url.password or url.query or url.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                err(rel, "FREELLMAPI_BASE_URL needs a root URL such as http://10.0.0.20:3001")
+        if entries.get("FREELLMAPI_MODELS", "available") not in ("", "available", "auto"):
+            err(rel, "FREELLMAPI_MODELS must be available or auto")
 
 # Python services must at least compile.
 for rel in ("services/osr-router/router.py", "services/osr-monitor/monitor.py"):
@@ -9881,6 +10047,51 @@ cmd_set_cloud_key() {
   CHANGED=true
 }
 
+# FreeLLMAPI (targets/freellmapi): one OpenAI-compatible server in front of
+# free cloud tiers. The router sends it only requests that name
+# freellmapi/<id>; it is not a model server and has no LiteLLM deployment.
+valid_freellmapi_url() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+try:
+    url = urlsplit(sys.argv[1])
+    ok = (url.scheme in ("http", "https") and bool(url.hostname)
+          and (url.port is None or url.port > 0)
+          and not (url.path or url.username or url.password or url.query or url.fragment))
+except ValueError:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+cmd_set_freellmapi() {
+  local url="${1:-}" key="${2:-}" confirm_key=""
+  [[ -n "$url" ]] || die "set-freellmapi: give the server's root URL (http://host:3001) or --off"
+  if [[ "$url" == --off ]]; then
+    env_set FREELLMAPI_BASE_URL ""
+    env_set FREELLMAPI_API_KEY ""
+    echo "FreeLLMAPI is off: freellmapi/ models are no longer offered."
+    CHANGED=true
+    return 0
+  fi
+  url="${url%/}"
+  valid_freellmapi_url "$url" || die "set-freellmapi: '${url}' is not a root URL such as http://10.0.0.20:3001"
+  if [[ -z "$key" ]]; then
+    [[ "$ASSUME_YES" == "true" ]] && die "set-freellmapi: no key given"
+    read -r -s -p "FreeLLMAPI unified API key: " key; echo
+    read -r -s -p "Confirm API key: " confirm_key; echo
+    [[ "$key" == "$confirm_key" ]] || die "API keys did not match"
+  fi
+  [[ "$key" =~ ^freellmapi-[A-Za-z0-9]+$ ]] ||
+    die "set-freellmapi: that is not a FreeLLMAPI unified API key (freellmapi-..., on its dashboard's Keys page)"
+  env_set FREELLMAPI_BASE_URL "$url"
+  env_set FREELLMAPI_API_KEY "$key"
+  echo "FreeLLMAPI at ${url}: its models are offered as freellmapi/<id>; the key is in ${SECRETS_FILE}."
+  echo "They are used only when a request names one. Prompts sent to them leave your network."
+  CHANGED=true
+}
+
 cmd_set_cloud_models() {
   local provider="$1" models="${2:-}" env_key
   cloud_key_name "$provider" >/dev/null || exit 1
@@ -9935,7 +10146,7 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-cloud-key|set-cloud-models|set-webhook|set-webui-version) return 0 ;;
+    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-webhook|set-webui-version) return 0 ;;
     *) [[ -n "$(token_command_kind "$1")" ]] ;;
   esac
 }
@@ -10170,7 +10381,7 @@ while (( $# > 0 )); do
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
       [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-cloud-key" ||
-         "$COMMAND" == "set-cloud-models" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
+         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -10210,6 +10421,7 @@ case "$COMMAND" in
   set-api-key) cmd_set_api_key "${ARGS[0]:-}" ;;
   set-cloud-key) cmd_set_cloud_key "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-cloud-models) cmd_set_cloud_models "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
+  set-freellmapi) cmd_set_freellmapi "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-*-token)
     token_kind="$(token_command_kind "$COMMAND")"
     [[ -n "$token_kind" ]] || die "unknown command '${COMMAND}' (try --help)"
@@ -10235,7 +10447,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-cloud-key|set-*-token)
+  set-api-key|set-cloud-key|set-freellmapi|set-*-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac

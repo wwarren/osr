@@ -169,8 +169,8 @@ FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | Classify, select, dispatch; a configured cloud ID goes to LiteLLM (§4.2) |
-| `GET /v1/models` | `auto`, tier aliases, configured cloud IDs (`owned_by` = provider), discovered chat models (`owned_by` = kind) |
+| `POST /v1/chat/completions` | Classify, select, dispatch; a configured cloud ID goes to LiteLLM (§4.2), a `freellmapi/<id>` straight to FreeLLMAPI with the router's key (§17.9) |
+| `GET /v1/models` | `auto`, tier aliases, configured cloud IDs (`owned_by` = provider), `freellmapi/<id>` when FreeLLMAPI is set (`owned_by` = `freellmapi`, cached five minutes), discovered chat models (`owned_by` = kind) |
 | `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state, the router's requests in flight per server (`in_flight`) and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll, which also asks every Ollama model for its capabilities again unless `?probe=false` |
 | `POST /routing/explain` | Decision and scored candidates, without executing |
 | `GET /healthz` | Liveness (never needs the key) |
@@ -541,6 +541,7 @@ service account before its venv is built.
 | 4096 / 4097 / 8765 | OpenCode server (web UI, API) / chat endpoint / dispatcher | `0.0.0.0` (loopback with `OPENCODE_WEB=false`) / `0.0.0.0` when Open WebUI is on / `127.0.0.1` | Browsers (Basic auth) → OpenCode, inbound limited by `OPENCODE_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → OpenCode on loopback, inbound from the router only; dispatcher as for Hermes |
 | 8000 / 3000 / 8010, 3010 / 8765, 8766 | Honcho gateway (API / MCP) / Honcho API, MCP / proxy, embeddings | In its CT / in its CT / `127.0.0.1` / `127.0.0.1` | Open WebUI and selected agents → gateway (own keys; a workspace per Open WebUI user) → Honcho; source-restricted firewall |
 | 8188 | ComfyUI | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
+| 3001 | FreeLLMAPI dashboard and API | `0.0.0.0` in its CT | Router and `FREELLMAPI_ACCESS_CIDR` → FreeLLMAPI; FreeLLMAPI → cloud providers (outbound HTTPS) |
 | 3000 / 8065 | Gitea / Mattermost | CT addresses | Configuration repository / alerts and handoffs |
 | 1883, or 8883 for TLS | MQTT broker | `MQTT_BIND_IP` (CT IP; loopback for direct guest installs) | Relays → broker; inbound limited by `MQTT_CLIENT_CIDR` |
 
@@ -552,7 +553,8 @@ firewall sets the input policy to drop). Target CTs are created with
 provisioner); Hermes, OpenClaw and ComfyUI admit only the router's address (ComfyUI also `UI_ALLOW_CIDR`; Hermes's dashboard and
 OpenClaw's Control UI anyone); Honcho admits the router and selected agents;
 DeepSeek Harness `DSH_ACCESS_CIDR` and OpenCode `OPENCODE_ACCESS_CIDR` (and
-each the router to its chat endpoint); model
+each the router to its chat endpoint); FreeLLMAPI the router and
+`FREELLMAPI_ACCESS_CIDR` to its one port; model
 targets leave rules to the operator. Hermes, OpenClaw and OpenCode also restrict egress by default to the router API, the
 registered model servers, Honcho and Open Terminal when set, DNS and internet
 HTTP(S) (§17.1, §17.4, §17.8). Honcho and
@@ -1115,6 +1117,34 @@ them and the previous release. With Honcho the installer adds the official
 its `~/.honcho/config.json`; with Open Terminal a remote MCP server whose key
 OpenCode substitutes from its environment.
 
+### 17.9 FreeLLMAPI (`targets/freellmapi/`)
+
+[FreeLLMAPI](targets/freellmapi/README.md) fronts the free tiers of cloud
+providers with one OpenAI-compatible endpoint and one key. It is a gateway,
+not a pool host: its models leave the network, so like the cloud models (§4.2)
+they are explicit choices. The router lists `freellmapi/auto` and the models
+FreeLLMAPI reports available (`/v1/models?available=true`, cached five minutes;
+a failed refresh keeps the last list) and proxies a request naming one to
+FreeLLMAPI's `/v1/chat/completions`, replacing the client's `Authorization`
+with `FREELLMAPI_API_KEY` and removing the prefix, without LiteLLM. Discovery,
+scoring, `auto`, the tiers and LiteLLM fallbacks never see it. The monitor
+probes its public `/api/ping`. `manage-model-servers set-freellmapi` stores
+`FREELLMAPI_BASE_URL` (committed) and the key (`secrets.env`).
+
+The CT is the published image itself, made by Proxmox VE 9.1's OCI support
+(`pct create` from an OCI archive pulled by digest with `skopeo`; the image's
+entrypoint is the CT's init, no systemd, no container runtime). State lives
+on a second volume at the image's data directory: the SQLite database, the env
+file with `ENCRYPTION_KEY` (which encrypts the stored provider keys) and the
+target's settings record. The provisioner prepares that directory with the
+server down (a temporary `sleep infinity` entrypoint), creates the first
+dashboard account through FreeLLMAPI's own declarative config file, reads the
+unified key as the image's `node` account and hands it to the router CT on
+stdin. A new release replaces the CT (same ID, MAC, address, firewall file and
+resources; data restored inside the CT) after a `vzdump` backup, and restores
+that backup when `/api/ping` or the unchanged key fails; `tools/upgrade-all.sh`
+takes no snapshot of it for that reason and checks it by `/api/ping`.
+
 ## 18. Verification and CI
 
 * `tests/run-tests.sh` runs every shell and pytest suite and every
@@ -1132,7 +1162,7 @@ OpenCode substitutes from its environment.
   Node.js for DeepSeek Harness's `configure.mjs` tests.
   `.github/workflows/tests.yml` is an identical copy for GitHub Actions, where
   the suites run through `sudo`. The `strata-upstream`,
-  `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream` and
+  `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `freellmapi-upstream` and
   `honcho-upstream` jobs each fetch one pinned upstream, kept separate so a
   GitHub outage cannot hide the main results.
 * `tests/test-upgrade-all.sh` keeps `upgrade-all.sh`'s deploy file lists equal

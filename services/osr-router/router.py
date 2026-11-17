@@ -407,6 +407,76 @@ CLOUD_MODELS = {
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", model.strip())
 }
 
+# FreeLLMAPI (targets/freellmapi) fronts the free tiers of cloud providers with
+# one OpenAI-compatible endpoint and one key. Like the cloud models above it is
+# an explicit choice: a request must name freellmapi/<id> (freellmapi/auto lets
+# FreeLLMAPI pick), and it is never part of local discovery, "auto", the tier
+# aliases or LiteLLM's fallbacks. Its prompts leave the network.
+FREELLMAPI_PREFIX = "freellmapi/"
+FREELLMAPI_BASE = (os.getenv("FREELLMAPI_BASE_URL") or "").strip().rstrip("/")
+FREELLMAPI_KEY = (os.getenv("FREELLMAPI_API_KEY") or "").strip()
+if FREELLMAPI_BASE:
+    try:
+        _freellmapi_url = urlsplit(FREELLMAPI_BASE)
+        _freellmapi_ok = (_freellmapi_url.scheme in ("http", "https")
+                          and bool(_freellmapi_url.hostname)
+                          and not (_freellmapi_url.username or _freellmapi_url.password
+                                   or _freellmapi_url.path or _freellmapi_url.query
+                                   or _freellmapi_url.fragment))
+        _freellmapi_url.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        _freellmapi_ok = False
+    if not _freellmapi_ok:
+        log.warning("ignoring FREELLMAPI_BASE_URL: use the root URL, e.g. http://10.0.0.20:3001")
+        FREELLMAPI_BASE = ""
+FREELLMAPI_ENABLED = bool(FREELLMAPI_BASE and FREELLMAPI_KEY)
+if FREELLMAPI_BASE and not FREELLMAPI_KEY:
+    log.warning("FREELLMAPI_BASE_URL is set without FREELLMAPI_API_KEY; freellmapi/ models are off")
+# available: list every model FreeLLMAPI can serve now; auto: only its own
+# routing entries (freellmapi/auto and the like).
+FREELLMAPI_MODELS = (os.getenv("FREELLMAPI_MODELS") or "available").strip().lower()
+if FREELLMAPI_MODELS not in ("available", "auto"):
+    log.warning("ignoring FREELLMAPI_MODELS=%r (use available or auto)", FREELLMAPI_MODELS)
+    FREELLMAPI_MODELS = "available"
+FREELLMAPI_REFRESH = 300.0
+_FREELLMAPI_LIST = {"at": 0.0, "ids": ["auto"]}
+_FREELLMAPI_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,199}")
+
+
+def freellmapi_headers() -> dict:
+    return {"Authorization": f"Bearer {FREELLMAPI_KEY}"}
+
+
+async def freellmapi_models() -> list:
+    """Model ids FreeLLMAPI serves now, without the prefix, refreshed at most
+    every FREELLMAPI_REFRESH seconds. "auto" is always first, so the entry
+    stays selectable while FreeLLMAPI is down or has no provider key yet; a
+    failed refresh keeps the previous list."""
+    now = time.monotonic()
+    if _FREELLMAPI_LIST["at"] and now - _FREELLMAPI_LIST["at"] < FREELLMAPI_REFRESH:
+        return _FREELLMAPI_LIST["ids"]
+    _FREELLMAPI_LIST["at"] = now
+    try:
+        response = await http_client().get(
+            f"{FREELLMAPI_BASE}/v1/models", params={"available": "true"},
+            headers=freellmapi_headers(), timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        ids = ["auto"]
+        for entry in (response.json().get("data") or []):
+            name = str(entry.get("id") or "")
+            if not _FREELLMAPI_ID.fullmatch(name) or name in ids:
+                continue
+            if entry.get("available") is False:
+                continue
+            # FreeLLMAPI's own routing entries carry owned_by "freellmapi".
+            if FREELLMAPI_MODELS == "auto" and entry.get("owned_by") != "freellmapi":
+                continue
+            ids.append(name)
+        _FREELLMAPI_LIST["ids"] = ids
+    except Exception as exc:  # noqa: BLE001 - the model list must still be served
+        log.warning("freellmapi: model list unavailable (%s)", exc)
+    return _FREELLMAPI_LIST["ids"]
+
 DISCOVERY_ENABLED = _cfg.getboolean("discovery", "enabled")
 DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
@@ -2151,6 +2221,22 @@ async def route_chat_completion(request: Request):
             json_body=body,
             extra_headers={"X-Router-Mode": "cloud", "X-Router-Model": requested},
         )
+    if requested.startswith(FREELLMAPI_PREFIX):
+        if not FREELLMAPI_ENABLED:
+            return _error(404, f"Model '{requested}' needs FreeLLMAPI, which is not configured "
+                          "(manage-model-servers set-freellmapi).", "freellmapi_not_configured")
+        upstream_model = requested[len(FREELLMAPI_PREFIX):]
+        if not _FREELLMAPI_ID.fullmatch(upstream_model):
+            return _error(400, f"'{requested}' is not a FreeLLMAPI model name.",
+                          "freellmapi_model_invalid")
+        log.info("route explicit freellmapi model=%s", requested)
+        headers = _forward_headers(request, drop_auth=True)
+        headers.update(freellmapi_headers())
+        return await _stream_upstream(
+            "POST", f"{FREELLMAPI_BASE}/v1/chat/completions", headers,
+            json_body=dict(body, model=upstream_model),
+            extra_headers={"X-Router-Mode": "freellmapi", "X-Router-Model": requested},
+        )
     if requested.split("/", 1)[0] in CLOUD_PROVIDERS and "/" in requested \
             and not known_chat_model(requested) and not embedding_only_match(requested):
         # Local servers may use the same prefixes (LM Studio lists
@@ -2264,6 +2350,13 @@ async def list_models(request: Request):
         if name not in seen:
             seen.add(name)
             data.append({"id": name, "object": "model", "owned_by": provider})
+
+    if FREELLMAPI_ENABLED:
+        for name in await freellmapi_models():
+            name = FREELLMAPI_PREFIX + name
+            if name not in seen:
+                seen.add(name)
+                data.append({"id": name, "object": "model", "owned_by": "freellmapi"})
 
     if DISCOVERY_ENABLED and INVENTORY.get("models"):
         for entry in INVENTORY["models"]:
