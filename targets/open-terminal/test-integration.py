@@ -3,6 +3,7 @@
 Run: python3 targets/open-terminal/test-integration.py (stdlib only).
 """
 import http.server
+import io
 import importlib.util
 import json
 import pathlib
@@ -165,6 +166,19 @@ class IntegrationTests(unittest.TestCase):
         posts = Handler.posts
         self.access_only()
         self.assertEqual(Handler.posts, posts, "nothing to save the second time")
+
+    def test_access_only_reads_the_token_from_its_own_stdin(self):
+        # upgrade-all.sh pipes the token through pct exec. The inherited stdin
+        # is read, never a path: /dev/stdin cannot be opened in an unprivileged CT.
+        self.invoke("--access", "keep")
+        argv = ["integrate-webui.py", "--access-only",
+                "--webui-url", f"http://127.0.0.1:{self.server.server_port}",
+                "--id", "open-terminal-lxc-281", "--admin-token-file", "-"]
+        token = self.admin.read_text()
+        self.admin.unlink()
+        with patch("sys.argv", argv), patch("sys.stdin", io.StringIO(token)):
+            MODULE.main()
+        self.assertEqual(Handler.connections[1]["config"], {"access_grants": [ALL_USERS]})
 
     def test_access_only_leaves_an_open_webui_without_the_connection_alone(self):
         self.access_only()

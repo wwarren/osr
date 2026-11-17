@@ -452,7 +452,7 @@ assert_contains 'the plan says so' 'enable its Open WebUI connection for all use
 OPENWEBUI_ADMIN_TOKEN=good-token run_tool '' --yes --only open-terminal
 assert_eq 'the upgrade succeeds' upgraded "$(summary_line open-terminal 270)"
 assert_file_contains 'its connection in the router CT, by ID' \
-    'WEBUI_ACCESS 280 python3 /root/.osr-open-terminal-access.py --access-only --access all --webui-url http://127.0.0.1:8080 --id open-terminal-lxc-270 --admin-token-file /dev/stdin token=good-token' "$tmp/mock/installs.log"
+    'WEBUI_ACCESS 280 python3 /root/.osr-open-terminal-access.py --access-only --access all --webui-url http://127.0.0.1:8080 --id open-terminal-lxc-270 --admin-token-file - token=good-token' "$tmp/mock/installs.log"
 assert_ok 'after the terminal was upgraded' test "$(grep -n '^INSTALL 270' "$tmp/mock/installs.log" | cut -d: -f1)" -lt "$(grep -n '^WEBUI_ACCESS' "$tmp/mock/installs.log" | cut -d: -f1)"
 assert_ok 'with the repository script' cmp -s "$ROOT/targets/open-terminal/integrate-webui.py" "$tmp/mock/pushed-280-.osr-open-terminal-access.py"
 assert_not_contains 'the token is on no command line' 'good-token' "$(cat "$tmp/mock/pct.log")"

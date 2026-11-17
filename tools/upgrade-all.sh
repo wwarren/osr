@@ -938,7 +938,7 @@ open_terminal_access() {
     [[ $port =~ ^[0-9]{2,5}$ ]] || port=8080
     pct push "$ROUTER_CT" "$REPO_ROOT/targets/open-terminal/integrate-webui.py" "$OT_ACCESS_PATH" --perms 0700 >/dev/null </dev/null || return 1
     printf '%s\n' "$WEBUI_TOKEN" | pct exec "$ROUTER_CT" -- python3 "$OT_ACCESS_PATH" --access-only --access all \
-        --webui-url "http://127.0.0.1:$port" --id "open-terminal-lxc-$id" --admin-token-file /dev/stdin || rc=$?
+        --webui-url "http://127.0.0.1:$port" --id "open-terminal-lxc-$id" --admin-token-file - || rc=$?
     pct exec "$ROUTER_CT" -- rm -f -- "$OT_ACCESS_PATH" </dev/null >/dev/null 2>&1 || true
     (( rc == 0 )) || { note "Open Terminal CT $id was upgraded, but enabling it for all Open WebUI users failed."; return 1; }
     printf 'all\n' | pct exec "$id" -- sh -c 'umask 022; cat > /etc/open-terminal/webui-access' || true

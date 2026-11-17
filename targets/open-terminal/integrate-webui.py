@@ -125,14 +125,20 @@ def main():
     parser.add_argument("--terminal-url")
     parser.add_argument("--id", required=True)
     parser.add_argument("--name", default="Open Terminal LXC")
-    parser.add_argument("--admin-token-file", required=True)
+    parser.add_argument("--admin-token-file", required=True, help="a file, or - for stdin")
     parser.add_argument("--terminal-key-file")
     parser.add_argument("--access", choices=("all", "keep"), default="all",
                         help="all: enable the connection for every Open WebUI user; "
                              "keep: leave an existing connection's access alone (a new one is admin-only)")
     args = parser.parse_args()
 
-    admin_token = pathlib.Path(args.admin_token_file).read_text().strip()
+    # "-" is the token on this process's own stdin. /dev/stdin cannot stand in
+    # for it: opening that path opens the pipe again, which an unprivileged CT
+    # refuses for a pipe that pct exec made on the host (EACCES).
+    if args.admin_token_file == "-":
+        admin_token = sys.stdin.read().strip()
+    else:
+        admin_token = pathlib.Path(args.admin_token_file).read_text().strip()
     if args.access_only:
         if not admin_token:
             raise RuntimeError("The admin token must be nonempty")
