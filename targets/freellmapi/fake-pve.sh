@@ -128,6 +128,11 @@ case $name in
         # <dumpdir>/<name>.tmp, else <tmpdir>/vzdumptmp<pid>_<id>. Every
         # directory above it must let others through.
         tmp_parent=${tmpdir:-$dumpdir}
+        # vzdump makes that directory with mkdir under the caller's umask.
+        (( (8#777 & ~8#$(umask)) & 1 )) || {
+            printf 'INFO: tar: %s/vzdumptmp%s_%s/: Cannot open: Permission denied\n' "$tmp_parent" "$$" "$id" >&2
+            exit 1
+        }
         [[ ! -d $tmp_parent ]] || {
             path=$(cd "$tmp_parent" && pwd)
             while [[ -n $path && $path != / ]]; do

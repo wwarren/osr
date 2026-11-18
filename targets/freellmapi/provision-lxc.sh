@@ -726,7 +726,9 @@ rollback() {
         pct stop "$CT_ID" 2>/dev/null || true
         pct destroy "$CT_ID" || { note "Could not remove the new CT $CT_ID. The backup is kept: $dump"; return 1; }
     fi
-    pct restore "$CT_ID" "$dump" --storage "$ct_storage" ||
+    # pct restore creates /var/lib/lxc/<CT>/rootfs with the caller's umask and
+    # unpacks as the CT's mapped root, like pct create (see create_ct).
+    (umask 022; pct restore "$CT_ID" "$dump" --storage "$ct_storage") ||
         { note "pct restore failed. The backup is kept: $dump (pct restore $CT_ID $dump --storage $ct_storage)"; return 1; }
     pct start "$CT_ID" || { note "The restored CT $CT_ID did not start. The backup is kept: $dump"; return 1; }
     FREELLMAPI_PORT=$old_port
@@ -852,9 +854,10 @@ else
     # For an unprivileged CT, vzdump's tar runs as the CT's mapped root and
     # reads the CT config from vzdump's temporary directory, by default inside
     # the dump directory, which is root-only here (the backup holds the keys).
-    # /var/tmp (vzdump's own fallback) keeps that temporary copy reachable; the
-    # archive is written by root into the root-only directory as before.
-    vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" --tmpdir /var/tmp >&2
+    # /var/tmp (vzdump's own fallback) keeps that temporary copy reachable, and
+    # umask 022 lets vzdump create it reachable: tools/upgrade-all.sh runs with
+    # umask 077. The archive is written by root into the root-only directory.
+    (umask 022; vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" --tmpdir /var/tmp >&2)
     dumps=("$stage"/vzdump-lxc-"$CT_ID"-*.tar.zst)
     [[ ${#dumps[@]} -eq 1 && -s ${dumps[0]} ]] || { note "vzdump left no backup in $stage."; false; }
     dump=${dumps[0]}

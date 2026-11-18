@@ -126,7 +126,8 @@ host() {
     local arg
     for arg in "$@"; do if [[ $arg == --* ]]; then flags+=("$arg"); else vars+=("$arg"); fi; done
     rc=0
-    out=$(env -i "PATH=$tmp/host/bin:$PATH" FAKE="$FAKE" PVE_ETC="$PVE_ETC" OSR_FREELLMAPI_STATE="$tmp/host/state" \
+    # tools/upgrade-all.sh runs provisioners with umask 077.
+    out=$(umask 077; env -i "PATH=$tmp/host/bin:$PATH" FAKE="$FAKE" PVE_ETC="$PVE_ETC" OSR_FREELLMAPI_STATE="$tmp/host/state" \
         BRIDGE=lo FREELLMAPI_READY_TIMEOUT=3 "${vars[@]}" "$bash_bin" "$tool" "${flags[@]}" 2>&1) || rc=$?
 }
 create() { host "${common[@]}" ROUTER_CT_ID=210 "$@"; }
