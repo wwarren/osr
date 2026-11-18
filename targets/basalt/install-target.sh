@@ -447,21 +447,36 @@ wait_ready() {
 }
 
 ensure_service_user() {
-    local node group
+    local node group gid
     getent group "$SERVICE_USER" >/dev/null || groupadd --system "$SERVICE_USER"
     id -u "$SERVICE_USER" >/dev/null 2>&1 ||
         useradd --system --gid "$SERVICE_USER" --home-dir "$BASALT_DATA_DIR" \
             --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    # GPU access: join the group that owns each passed-through node. Root's
-    # group is refused: membership in it would grant far more than the GPU.
+    # Join each node's non-root group. A node may appear as root:root inside
+    # the CT despite the --devN mapping; accept it only if the service account
+    # can already read and write it. Never add the account to group root.
+    # Join video when available so a later corrected gid=44 mapping still works.
     # shellcheck disable=SC2086  # GPU_NODES is a glob list by design
     for node in $GPU_NODES; do
         [[ -e $node ]] || continue
+        gid=$(stat -c %g "$node")
+        if [[ $gid == 0 ]]; then
+            if as_service test -r "$node" && as_service test -w "$node"; then
+                note "WARNING: $node is group root, but $SERVICE_USER can read and write it. Check its actual permissions against the PVE --devN setting; mode 0666 exposes the GPU to all CT users."
+                if getent group video >/dev/null; then
+                    usermod -aG video "$SERVICE_USER"
+                fi
+                continue
+            fi
+            die "$node is group root and $SERVICE_USER cannot read and write it. On the PVE host compare 'pct config <CT_ID>' with the node's actual CT permissions. If its --devN mapping is missing or wrong, set path=$node,gid=44,mode=0660 (44 is video), reboot the CT, and retry; otherwise investigate the device mount and NVIDIA setup."
+        fi
         group=$(stat -c %G "$node")
-        [[ $group != root ]] ||
-            die "$node belongs to group root inside the CT. On the PVE host give the device a non-root group, e.g. pct set <CT_ID> --devN path=$node,gid=44,mode=0660 (44 is \"video\"), restart the CT and run this again."
         usermod -aG "$group" "$SERVICE_USER"
+        as_service test -r "$node" && as_service test -w "$node" ||
+            die "$SERVICE_USER cannot read and write $node after joining group $group (gid $gid); check its CT mode and Proxmox --devN mapping."
     done
+    as_service nvidia-smi -L >/dev/null ||
+        die "$SERVICE_USER cannot use the NVIDIA GPU even though the device nodes are visible; inspect the CT's --devN mappings and permissions."
 }
 
 do_install() {

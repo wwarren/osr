@@ -36,7 +36,7 @@ stub mv 'if [[ ${FAKE_METADATA_FAIL:-0} == 1 && ${*: -1} == */installed-settings
 stub od 'if [[ ${FAKE_KEY_FAIL:-0} == 1 ]]; then printf "partial"; exit 1; fi; exec /usr/bin/od "$@"'
 for command_name in apt-get groupadd useradd usermod chown sleep nvidia-smi g++ make openssl; do stub "$command_name" 'exit 0'; done
 stub dpkg-query 'printf "install ok installed"'
-stub stat 'if [[ $1 == -c && $2 == %G ]]; then echo "${FAKE_GROUP:-video}"; else exec /usr/bin/stat "$@"; fi'
+stub stat 'case $2 in %g) [[ ${FAKE_GROUP:-video} == root ]] && echo 0 || echo 44;; %G) echo "${FAKE_GROUP:-video}";; *) exec /usr/bin/stat "$@";; esac'
 stub systemctl 'case "$1" in is-failed) exit 1;; is-active) exit "${FAKE_INACTIVE:-0}";; esac; exit 0'
 stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
 stub install 'a=(); while (( $# )); do case $1 in -o|-g) shift 2;; *) a+=("$1"); shift;; esac; done; exec /usr/bin/install "${a[@]}"'

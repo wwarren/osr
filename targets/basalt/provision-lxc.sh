@@ -114,8 +114,8 @@ if [[ -z ${GPU_DEVICES:-} ]]; then
     # Optional: only some driver setups create it, and nothing here needs it.
     [[ -c /dev/nvidia-uvm-tools ]] && GPU_DEVICES+=' /dev/nvidia-uvm-tools'
 fi
-# The Basalt service runs as an unprivileged account that joins this group, so
-# the nodes must not be root's group inside the CT.
+# The Basalt service joins this group. The guest installer checks actual node
+# access as that account, including when a node appears as group root.
 GPU_GID=${GPU_GID:-44}
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-auto}
 CUDA_VERSION=${CUDA_VERSION:-13.0}
@@ -308,7 +308,7 @@ run pct exec "$CT_ID" -- env \
 
 printf '\nBasalt target CT %s: API port %s. Read its generated key with:\n' "$CT_ID" "$BASALT_PORT"
 printf '  pct exec %s -- cat /etc/basalt-target/api-key\n' "$CT_ID"
-printf 'Router registration needs Basalt support; the current router does not accept basalt:// addresses.\n'
+printf 'Router registration: set the Basalt key, then add basalt://<CT-address> (see targets/basalt/README.md).\n'
 printf 'Service logs: pct exec %s -- journalctl -u basalt -f\n' "$CT_ID"
 printf 'Upgrade later: push the current install-target.sh, cuda-toolkit.sh and basalt.service to\n'
 printf '  /root/basalt-target-deploy in the CT, then run install-target.sh there with --upgrade.\n'

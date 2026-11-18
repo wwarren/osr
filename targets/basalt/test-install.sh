@@ -18,6 +18,7 @@ trap cleanup EXIT
 source <(sed -n '/^download_model() {/,/^}/p' "$target")
 source <(sed -n '/^generate_run_script() {/,/^}/p' "$target")
 source <(sed -n '/^start_env() {/,/^}/p' "$target")
+source <(sed -n '/^ensure_service_user() {/,/^}/p' "$target")
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 as_service() { "$@"; }
@@ -32,6 +33,37 @@ mkdir -p "$BASALT_DATA_DIR/models" "$tmp/bin"
 BASALT_DIR=$tmp/source
 BASALT_PORT=8080 BASALT_ALIAS=qwen3.8-flash-next BASALT_GPUS=0
 BASALT_CONTEXT=32768 BASALT_ALLOW_NO_KEY=false api_key=secret-for-test
+
+# A root-group device is usable when the service account can open it. Reject
+# an inaccessible node and verify that the service account can use the GPU.
+touch "$tmp/nvidia0"
+gpu_access_case() (
+    local fake_gid=$1 fake_access=$2 fake_smi=$3
+    SERVICE_USER=basalt GPU_NODES="$tmp/nvidia0"
+    getent() { return 0; }
+    id() { return 0; }
+    stat() { [[ $2 == %g ]] && printf '%s\n' "$fake_gid" || printf '%s\n' video; }
+    usermod() { printf 'joined %s\n' "$2"; }
+    as_service() {
+        case $1 in
+            test) [[ $fake_access == yes ]] ;;
+            nvidia-smi) [[ $fake_smi == yes ]] ;;
+            *) return 1 ;;
+        esac
+    }
+    ensure_service_user
+)
+out=$(gpu_access_case 0 yes yes 2>&1) || { echo 'FAIL accessible root-group GPU node was rejected' >&2; exit 1; }
+[[ $out == *'group root'* && $out == *'joined video'* && $out != *'joined root'* ]] ||
+    { printf 'FAIL root-group access decision: %s\n' "$out" >&2; exit 1; }
+out=$(gpu_access_case 0 no yes 2>&1) && { echo 'FAIL inaccessible root-group GPU node was accepted' >&2; exit 1; }
+[[ $out == *'gid=44,mode=0660'* ]] || { printf 'FAIL repair message: %s\n' "$out" >&2; exit 1; }
+out=$(gpu_access_case 44 yes yes 2>&1) || { echo 'FAIL video-group GPU node was rejected' >&2; exit 1; }
+[[ $out == *'joined video'* ]] || { printf 'FAIL video group not joined: %s\n' "$out" >&2; exit 1; }
+out=$(gpu_access_case 44 no yes 2>&1) && { echo 'FAIL inaccessible video-group GPU node was accepted' >&2; exit 1; }
+[[ $out == *'cannot read and write'* ]] || { printf 'FAIL video-group error: %s\n' "$out" >&2; exit 1; }
+out=$(gpu_access_case 44 yes no 2>&1) && { echo 'FAIL service-user nvidia-smi failure was ignored' >&2; exit 1; }
+[[ $out == *'cannot use the NVIDIA GPU'* ]] || { printf 'FAIL GPU probe message: %s\n' "$out" >&2; exit 1; }
 model_path=$BASALT_DATA_DIR/models/$BASALT_MODEL
 run_script=$tmp/run-basalt.sh
 generate_run_script
@@ -73,4 +105,4 @@ fi
     printf 'FAIL unexpected CUDA error: %s\n' "$output" >&2; exit 1;
 }
 
-printf 'Basalt model transfer failure and CUDA package validation passed.\n'
+printf 'Basalt GPU access, model transfer failure and CUDA package validation passed.\n'

@@ -28,6 +28,31 @@ joins; the CT gets unlimited `lxc.prlimit.memlock` and the unit
 work as in the [Strata target](../strata/README.md#gpu-node-shows-group-root)
 (`NVIDIA_DRIVER_VERSION=auto` or an exact version).
 
+### GPU node appears as group root
+
+The guest installer checks whether the `basalt` account can read and write
+each NVIDIA node and run `nvidia-smi`. A node shown as `root:root` is accepted
+with a warning when that access works; the account is never added to group
+`root`. Inspect the host mapping and the node permissions if it fails:
+
+```bash
+pct config <id> | grep -E '^(dev[0-9]+|lxc\.mount\.entry):'
+pct exec <id> -- stat -c '%n gid=%g mode=%a' /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
+pct exec <id> -- runuser -u basalt -- nvidia-smi -L
+```
+
+The default layout is `dev0` for nvidia0, `dev1` for nvidiactl and `dev2`
+for nvidia-uvm. If a `devN` mapping is missing or wrong, correct the matching
+entry to `path=/dev/nvidiaN,gid=44,mode=0660` and reboot the CT. If `pct config`
+already shows that mapping but the CT reports `gid=0,mode=666`, repeating
+`pct set` will not change the effective node; inspect any competing
+`lxc.mount.entry` and the CT device mounts. Mode 0666 exposes the GPU to all
+CT users, so restore the intended mapping after diagnosis.
+
+After a failed first provision, push the current installer into the existing
+CT and run it there. The saved `pending-env` keeps the original model, port
+and other settings; do not rerun `provision-lxc.sh` against that CT.
+
 **CUDA.** The toolkit comes from NVIDIA's apt repository for the CT's
 distribution. Ubuntu 22.04/24.04 and Debian 12 carry the default 13.0;
 **Debian 13 starts at 13.1** and **Ubuntu 26.04 at 13.3**, so set

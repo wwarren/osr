@@ -34,7 +34,7 @@ has 'DRIVER_VERSION='; has 'confirm CT 250 sees host NVIDIA driver'
 has 'bash /root/basalt-target-deploy/install-target.sh'
 has 'BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt'
 has 'BASALT_CONTEXT=65536'
-has 'current router does not accept basalt:// addresses'
+has 'Router registration: set the Basalt key, then add basalt://<CT-address>'
 plan NVIDIA_DRIVER_VERSION=590.48.01
 has 'DRIVER_VERSION=590.48.01'
 reject 'CUDA 13 needs NVIDIA driver 580 or newer' NVIDIA_DRIVER_VERSION=575.64.05
