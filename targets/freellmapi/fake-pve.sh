@@ -83,7 +83,17 @@ guest_exec() {
             script=${script//install -d -o root -g node -m 0750/install -d -m 0750}
             script=$(sed -E 's/^chown (node:node|root:node) /: /' <<< "$script")
             sh -c "$script" "${mapped[@]:3}" ;;
-        sed|test|cat|rm|tar) "${mapped[@]}" ;;
+        tar)
+            # The CT's root cannot read the volume's lost+found (owned by the
+            # host's root): GNU tar fails on it unless it is excluded.
+            # Only an archive of the whole directory (member "data") reaches it.
+            if [[ " ${mapped[*]} " == *' -cf - data ' && " ${mapped[*]} " != *' --exclude=lost+found '* && -d $data/lost+found ]]; then
+                printf 'tar: data/lost+found: Cannot open: Permission denied\n' >&2
+                printf 'tar: Exiting with failure status due to previous errors\n' >&2
+                return 2
+            fi
+            "${mapped[@]}" ;;
+        sed|test|cat|rm) "${mapped[@]}" ;;
         /usr/local/bin/manage-model-servers)
             [[ -z ${FAKE_ROUTER_REFUSES:-} ]] || return 1
             { printf '%s\n' "${*:2}"; cat; } > "$FAKE/router-call" ;;
@@ -154,7 +164,9 @@ case $name in
                 ! exists "$id" || exit 1
                 template=$1; shift
                 [[ $template == *:vztmpl/freellmapi_v*.tar && -f $FAKE/template/cache/${template##*/} ]] || { echo 'no such template' >&2; exit 1; }
-                mkdir -p "$FAKE/ct/$id" "$(fs "$id")/app/server/data"
+                # mp0 is a fresh file system: its root has a lost+found.
+                mkdir -p "$FAKE/ct/$id" "$(fs "$id")/app/server/data/lost+found"
+                chmod 0700 "$(fs "$id")/app/server/data/lost+found"
                 version=${template##*freellmapi_}; printf '%s\n' "${version%.tar}" > "$FAKE/ct/$id/image"
                 {
                     printf 'arch: amd64\n'

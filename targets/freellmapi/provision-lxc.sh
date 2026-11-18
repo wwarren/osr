@@ -710,8 +710,12 @@ stage='' dump='' data_tar=''
 # export_data / restore_data: the data directory as a tar stream, read and
 # written inside the CT so owners need no translation, kept root-only on this
 # host until the new CT has it.
+# The data directory is the root of the mp0 volume, so it holds the file
+# system's lost+found: owned by the host's root, it is "nobody" inside an
+# unprivileged CT and cannot be read there. vzdump leaves it out for the same
+# reason; the new volume has its own.
 export_data() {
-    guest tar -C "${GUEST_DATA%/*}" -cf - "${GUEST_DATA##*/}" > "$data_tar" || return 1
+    guest tar --exclude=lost+found -C "${GUEST_DATA%/*}" -cf - "${GUEST_DATA##*/}" > "$data_tar" || return 1
     tar -tf "$data_tar" | grep -qx "${GUEST_DATA##*/}/osr-target/freellmapi.env"
 }
 restore_data() {
