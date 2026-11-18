@@ -88,6 +88,9 @@ fi
     printf 'FAIL missing .part\n%s\n' "$(cat "$tmp/download.log")" >&2; exit 1;
 }
 [[ ! -e $BASALT_DATA_DIR/models/fixture.basalt ]] || { echo 'FAIL incomplete model promoted' >&2; exit 1; }
+grep -Fq 'Model download failed: https://huggingface.co/example/model/resolve/main/fixture.basalt?download=true' "$tmp/download.log" || {
+    printf 'FAIL missing download URL in error\n%s\n' "$(cat "$tmp/download.log")" >&2; exit 1;
+}
 
 # A stale truncated final file must not be accepted as a valid model either.
 printf 'truncated' > "$BASALT_DATA_DIR/models/fixture.basalt"

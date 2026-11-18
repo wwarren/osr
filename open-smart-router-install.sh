@@ -1603,7 +1603,7 @@ prompt_target_selection() {
     printf '  %d) %-14s %s\n' "$i" "$name" "$label"
     prev_group="$group"
   done < <(target_table)
-  echo "Target-specific settings (GPU_DEVICES, BACKEND, STRATA_MODEL, HERMES_MODEL, OPENCLAW_MODEL, OPENCODE_MODEL, COMFYUI_MODEL_URL, ...) are read"
+  echo "Target-specific settings (GPU_DEVICES, BACKEND, STRATA_MODEL, BASALT_MODEL, HERMES_MODEL, OPENCLAW_MODEL, OPENCODE_MODEL, COMFYUI_MODEL_URL, ...) are read"
   echo "from the environment as each target's README describes."
   prompt_until_valid "Targets to create (numbers or names, comma-separated; none)" \
     INSTALL_TARGETS "${INSTALL_TARGETS:-none}" valid_target_selection || return 1
@@ -2234,6 +2234,7 @@ preset_target_model_servers() {
 # companions (as an environment variable, never an argument).
 run_target_provisioner() {
   local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env cuda_env context_env client_ips="" client
+  local unattended=${NONINTERACTIVE:-false}
   local -a flags=()
   phase="$(target_field "$name" phase)" || return 1
   script="${TARGETS_DIR}/${name}/provision-lxc.sh"
@@ -2277,9 +2278,12 @@ run_target_provisioner() {
       OPENWEBUI_PORT OPENWEBUI_ADMIN_TOKEN TARGET_ADMIN_TOKEN COMFYUI_IMAGE_VARIANT \
       HF_TOKEN TARGET_HF_TOKEN PVE_INTERACTIVE PVE_ROUTER_SUGGESTION
     export CT_ID="$id" IP_CIDR="$ip" GATEWAY="$gateway" STORAGE="$storage" BRIDGE="$bridge"
-    # The installer already asked its questions and showed one summary: the
-    # provisioner takes the defaults for the rest and does not ask to confirm.
+    # Basalt asks for its model pack after the GPU and CT resource plan is
+    # known. Other target defaults were already accepted by this installer.
     export PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false
+    if [[ $name == basalt && $unattended != true && -z ${BASALT_MODEL:-} ]]; then
+      export PVE_ACCEPT_DEFAULTS=false
+    fi
     [[ -z "$nameserver" ]] || export NAMESERVER="$nameserver"
     [[ -z "$template" ]] || export TEMPLATE="$template"
     # GITEA_COMMUNITY_SCRIPT_URL / _SHA256 (and MATTERMOST_*) select and pin a
@@ -2298,8 +2302,11 @@ run_target_provisioner() {
     [[ -z "$context_env" ]] || export "${context_env?}"
     [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
     [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
+    [[ "$name" != basalt || -z ${BASALT_MODEL:-} ]] || export BASALT_MODEL
     # The router's MEMORY is unset above; Strata gets the RAM chosen for its CT.
     [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
+    [[ "$name" != basalt || -z ${BASALT_MEMORY_MB:-} ]] || export MEMORY_MB="$BASALT_MEMORY_MB"
+    [[ "$name" != basalt || -z ${BASALT_ROOTFS_GB:-} ]] || export ROOTFS_GB="$BASALT_ROOTFS_GB"
     if [[ "$phase" == gateway ]]; then
       # FreeLLMAPI hands its endpoint and key to the router CT itself, and
       # admits the router and the API access range to its one port.

@@ -5,6 +5,7 @@ exec </dev/null
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 provision=$here/provision-lxc.sh
 guest=$here/install-target.sh
+source "$here/model-select.sh"
 common=(CT_ID=250 TEMPLATE=local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
         STORAGE=local-lvm IP_CIDR=192.0.2.80/24 GATEWAY=192.0.2.1)
 
@@ -32,7 +33,7 @@ has 'cuda-toolkit.sh'
 has 'nvidia-guest-install.sh lxc'
 has 'DRIVER_VERSION='; has 'confirm CT 250 sees host NVIDIA driver'
 has 'bash /root/basalt-target-deploy/install-target.sh'
-has 'BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt'
+has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ3_XXS.basalt'
 has 'BASALT_CONTEXT=65536'
 has 'Router registration: set the Basalt key, then add basalt://<CT-address>'
 plan NVIDIA_DRIVER_VERSION=590.48.01
@@ -48,6 +49,11 @@ reject 'CT_ID' CT_ID=99
 reject 'BASALT_GPUS' BASALT_GPUS=none
 reject 'BASALT_MODEL' BASALT_MODEL='../wrong.basalt'
 reject 'BASALT_CONTEXT' BASALT_CONTEXT=0
+reject 'Set BASALT_MODEL when BASALT_HF_REPO is a custom repository' BASALT_HF_REPO=https://huggingface.co/example/custom
+plan BASALT_MODEL=UD-IQ2_XS
+has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt'
+plan BASALT_MODEL=custom.basalt
+has 'BASALT_MODEL=custom.basalt'
 reject 'CUDA_VERSION' CUDA_VERSION=12.9
 reject 'cannot be installed in a debian13 CT' TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst
 plan TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst CUDA_VERSION=13.1
@@ -63,6 +69,22 @@ reject 'Duplicate GPU device' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvid
 reject 'does not pass through /dev/nvidia1' BASALT_GPUS=0,1
 plan BASALT_GPUS=0,1 GPU_DEVICES='/dev/nvidia0 /dev/nvidia1 /dev/nvidiactl /dev/nvidia-uvm'
 has 'BASALT_GPUS=0\,1'
+
+# The recommendation uses GPU VRAM, available host RAM and planned CT RAM/disk.
+nvidia-smi() { case $2 in 0) echo 16384 ;; 1) echo 24576 ;; *) return 1 ;; esac; }
+[[ $(basalt_gpu_vram_mib 0,1) == 40960 ]] || { echo 'FAIL selected GPU VRAM total' >&2; exit 1; }
+unset -f nvidia-smi
+[[ $(basalt_model_recommendation 16384 131072 131072 200) == UD-IQ3_XXS ]] || { echo 'FAIL 16 GiB GPU recommendation' >&2; exit 1; }
+[[ $(basalt_model_recommendation 24576 131072 131072 200) == UD-IQ4_XS ]] || { echo 'FAIL 24 GiB GPU recommendation' >&2; exit 1; }
+[[ $(basalt_model_recommendation 32768 131072 131072 200) == UD-Q4_K_XL ]] || { echo 'FAIL 32 GiB GPU recommendation' >&2; exit 1; }
+[[ $(basalt_model_recommendation 16384 59392 65536 120) == UD-IQ2_XS ]] || { echo 'FAIL host RAM recommendation' >&2; exit 1; }
+[[ $(basalt_model_recommendation 16384 131072 131072 100) == UD-IQ1_M ]] || { echo 'FAIL disk recommendation' >&2; exit 1; }
+[[ -z $(basalt_model_recommendation 16384 40000 65536 120) ]] || { echo 'FAIL insufficient host RAM recommendation' >&2; exit 1; }
+
+output=$(printf 'UD-IQ2_XS\n' | env -i "PATH=$PATH" PVE_INTERACTIVE=true "${common[@]}" bash "$provision" --dry-run 2>&1)
+has '== Basalt model =='
+has 'Suggested: UD-IQ3_XXS'
+has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt'
 
 output=$(env -i "PATH=$PATH" bash "$guest" --dry-run 2>&1)
 has 'git fetch --depth 1 https://github.com/jesdga95/basalt.git main into /opt/basalt'
@@ -81,16 +103,24 @@ mkdir -p "$installed/opt/basalt/.git" "$installed/etc/systemd/system" "$installe
 printf 'BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt\nBASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt\nBASALT_ALIAS=qwen3.8-flash-next\nBASALT_GPUS=0\nBASALT_CONTEXT=32768\nBASALT_PORT=8123\nBASALT_ALLOW_NO_KEY=false\nCUDA_VERSION=13.0\n' > "$installed/etc/basalt-target/installed-env"
 rerun_plan() {
     env -i "PATH=$PATH" BASALT_DIR="$installed/opt/basalt" BASALT_ETC_DIR="$installed/etc/basalt-target" \
-        UNIT_DIR="$installed/etc/systemd/system" bash "$guest" --dry-run 2>&1
+        UNIT_DIR="$installed/etc/systemd/system" "$@" bash "$guest" --dry-run 2>&1
 }
 output=$(rerun_plan)
 has 'before anything is stopped'
 has 'systemctl stop basalt.service'
 has 'previous commit locally (no network)'
 
+# A failed first install keeps its old choice in pending-env. An explicit
+# replacement must win when resuming that checkout.
+mv "$installed/etc/basalt-target/installed-env" "$installed/etc/basalt-target/pending-env"
+rm "$installed/etc/systemd/system/basalt.service"
+output=$(rerun_plan BASALT_MODEL=Qwen3.8-FN-UD-IQ3_XXS.basalt)
+has 'download Qwen3.8-FN-UD-IQ3_XXS.basalt'
+lacks 'download Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt'
+
 # Without any settings record the same checkout is refused, not planned with
 # fresh-install defaults.
-rm "$installed/etc/basalt-target/installed-env"
+rm "$installed/etc/basalt-target/pending-env"
 if output=$(rerun_plan); then
     printf 'FAIL a checkout without a settings record was planned\n%s\n' "$output" >&2; exit 1
 fi

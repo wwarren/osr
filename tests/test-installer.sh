@@ -181,6 +181,7 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
 [[ $_ctx == '||||unset|' ]] || printf 'context-env %s\n' "$_ctx" >> "$MOCK_LOG"
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
 [[ -z ${STRATA_MESSAGE_CACHE:-} ]] || printf 'strata-message-cache %s\n' "$STRATA_MESSAGE_CACHE" >> "$MOCK_LOG"
+[[ -z ${BASALT_MODEL:-} ]] || printf 'basalt-model %s\n' "$BASALT_MODEL" >> "$MOCK_LOG"
 [[ -z ${MEMORY_MB:-} ]] || printf 'memory-env %s\n' "$MEMORY_MB" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != opencode ]] ||
   printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
@@ -1609,6 +1610,23 @@ mock_reset_log
 run_target_provisioner strata
 assert_eq "a GPU target gets its template; the router's CORES/ROOTFS_GB and the token do not leak" \
   "provision strata|912|192.0.2.91/24|192.0.2.1|gpu-store|vmbr2|local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst|||||no|" "$(mock_calls)"
+BASALT_CT_ID=924; BASALT_IP_CIDR=192.0.2.104/24; BASALT_STORAGE=gpu-store
+mock_reset_log
+NONINTERACTIVE=false run_target_provisioner basalt
+assert_contains "interactive Basalt keeps its model prompt" "prompt-env false|false|" "$(cat "$MOCK_LOG.prompt")"
+mock_reset_log
+NONINTERACTIVE=true run_target_provisioner basalt
+assert_contains "unattended Basalt takes its resource-based default" "prompt-env true|false|" "$(cat "$MOCK_LOG.prompt")"
+mock_reset_log
+BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt run_target_provisioner basalt
+assert_contains "an explicit Basalt model skips the prompt" "prompt-env true|false|" "$(cat "$MOCK_LOG.prompt")"
+assert_contains "and reaches the target" "basalt-model Qwen3.8-FN-UD-IQ2_XS.basalt" "$(mock_calls)"
+BASALT_MEMORY_MB=65536; BASALT_ROOTFS_GB=120
+mock_reset_log
+run_target_provisioner basalt
+assert_contains "Basalt CT RAM is passed separately from router RAM" "memory-env 65536" "$(mock_calls)"
+assert_contains "Basalt CT disk is passed separately from router disk" "|120|" "$(mock_calls)"
+unset BASALT_CT_ID BASALT_IP_CIDR BASALT_STORAGE BASALT_MEMORY_MB BASALT_ROOTFS_GB
 MAYA_CT_ID=918; MAYA_IP_CIDR=192.0.2.98/24; MAYA_STORAGE=gpu-store
 MAYA_TEMPLATE=local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
 mock_reset_log

@@ -7,9 +7,24 @@ installs host-matched NVIDIA user-space and a CUDA 13 toolkit, builds the
 runs its API as the `basalt` account with a generated key. Register it as
 `basalt://<CT address>` (port 8080).
 
-Defaults: the 81 GiB GSQ-RCO IQ3_S pack, alias `qwen3.8-flash-next`, context
-65536, 8 cores, 128 GiB RAM (floor 64 GiB: the expert arena is pinned host
-RAM), 200 GiB disk. Basalt needs a Blackwell GPU (sm_120: RTX 50 or RTX PRO
+The host installer lists the current Qwen3.8-Flash-Next packs and asks which
+one to install. Its suggested pack uses the selected GPUs' VRAM, available
+host RAM, planned CT RAM and root disk. It allows 16 GiB of RAM beyond the
+pack's expert weights and 30 GiB of disk beyond the pack file, then limits the
+suggestion on smaller GPUs to favor throughput. This is a conservative
+estimate, not a runtime guarantee; any listed pack can be chosen. A preset
+`BASALT_MODEL` (full `.basalt` filename, or a listed suffix) skips the prompt,
+including in unattended runs. Dry runs do not probe host resources and use a
+conservative GPU tier; a standalone guest install still defaults to the
+81.6 GiB UD-IQ3_XXS pack. When launched from the router installer,
+`BASALT_MEMORY_MB` and `BASALT_ROOTFS_GB` set the planned CT sizes used for
+the recommendation; otherwise they are 131072 MiB and 200 GiB.
+Set `BASALT_MODEL` alongside a custom `BASALT_HF_REPO`; the menu describes
+the official repository's packs.
+
+Other defaults: alias `qwen3.8-flash-next`, context 65536, 8 cores, 128 GiB
+RAM (floor 64 GiB: the expert arena is pinned host RAM), 200 GiB disk.
+Basalt needs a Blackwell GPU (sm_120: RTX 50 or RTX PRO
 Blackwell), CUDA 13 and CMake 3.24+ (installed into its venv if the system's
 is older).
 
@@ -52,6 +67,21 @@ CT users, so restore the intended mapping after diagnosis.
 After a failed first provision, push the current installer into the existing
 CT and run it there. The saved `pending-env` keeps the original model, port
 and other settings; do not rerun `provision-lxc.sh` against that CT.
+
+If a download of the former `Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt` default returned
+404, the pack has been removed from the model repository's `main` branch.
+Resume the existing CT with the current pack name explicitly, because its
+`pending-env` retains the previous selection:
+
+```bash
+pct push 164 targets/basalt/install-target.sh /root/basalt-target-deploy/install-target.sh --perms 0755
+pct exec 164 -- env BASALT_MODEL=Qwen3.8-FN-UD-IQ3_XXS.basalt \
+    bash /root/basalt-target-deploy/install-target.sh
+```
+
+Use your CT ID in place of `164`. The previous `.part` file can be left in
+place; the new pack has a different filename. An interrupted download of the
+new pack resumes on the next run.
 
 **CUDA.** The toolkit comes from NVIDIA's apt repository for the CT's
 distribution. Ubuntu 22.04/24.04 and Debian 12 carry the default 13.0;

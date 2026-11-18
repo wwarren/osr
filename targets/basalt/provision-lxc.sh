@@ -11,13 +11,15 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
 
 The installer asks for the CT ID (default: the cluster's next free ID, which
-unattended runs take), IP/CIDR (or dhcp) and a gateway for static IPs. Preset
-CT_ID to choose another ID, and IP_CIDR and GATEWAY for unattended runs.
+unattended runs take), IP/CIDR (or dhcp), a gateway for static IPs, and a
+model pack with a resource-based recommendation. Preset CT_ID to choose
+another ID, and IP_CIDR and GATEWAY for unattended runs.
 
 Creates an unprivileged Proxmox VE 9 LXC, passes an NVIDIA GPU through, clones
 https://github.com/jesdga95/basalt.git inside the CT, installs host-matched
@@ -49,7 +51,7 @@ Optional: CT_HOSTNAME=basalt-target, BRIDGE=vmbr0, CORES=8,
           BASALT_URL=https://github.com/jesdga95/basalt.git,
           BASALT_REF=main, BASALT_COMMIT=<optional full SHA-1 pin>,
           BASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt,
-          BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt,
+          BASALT_MODEL=<pack file; overrides the recommended model>,
           BASALT_ALIAS=qwen3.8-flash-next, BASALT_GPUS=0 (or "0,1"),
           BASALT_CONTEXT=65536, BASALT_PORT=8080, BASALT_READY_TIMEOUT=3600,
           BASALT_ALLOW_NO_KEY=false.
@@ -123,7 +125,7 @@ BASALT_URL=${BASALT_URL:-https://github.com/jesdga95/basalt.git}
 BASALT_REF=${BASALT_REF:-main}
 BASALT_COMMIT=${BASALT_COMMIT:-}
 BASALT_HF_REPO=${BASALT_HF_REPO:-https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt}
-BASALT_MODEL=${BASALT_MODEL:-Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt}
+BASALT_MODEL=${BASALT_MODEL:-}
 BASALT_ALIAS=${BASALT_ALIAS:-qwen3.8-flash-next}
 BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
@@ -166,7 +168,6 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $BASALT_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $BASALT_REF != HEAD && $BASALT_REF != *..* ]] || die 'BASALT_REF must be a branch or tag name.'
 [[ -z $BASALT_COMMIT || $BASALT_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'BASALT_COMMIT must be a full 40-digit SHA-1.'
 [[ $BASALT_HF_REPO =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_HF_REPO (must be an https URL).'
-[[ $BASALT_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $BASALT_MODEL == *.basalt ]] || die 'BASALT_MODEL must be a .basalt file name.'
 [[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
 [[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'BASALT_GPUS must be a GPU list like 0 or 0,1.'
 positive_int BASALT_CONTEXT "$BASALT_CONTEXT"
@@ -209,6 +210,36 @@ for gpu_index in "${gpu_indices[@]}"; do
     [[ -n ${seen_devices[/dev/nvidia$gpu_index]:-} ]] ||
         die "BASALT_GPUS selects GPU $gpu_index, but GPU_DEVICES does not pass through /dev/nvidia$gpu_index."
 done
+
+# --- Questions: Basalt model -------------------------------------------------
+# A dry run uses unknown host resources so its plan is repeatable on laptops
+# and in CI. A real run reads the selected cards and the host's available RAM.
+if [[ -z $BASALT_MODEL ]]; then
+    [[ $BASALT_HF_REPO == https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt ]] ||
+        die 'Set BASALT_MODEL when BASALT_HF_REPO is a custom repository; the model menu lists the official Qwen3.8-Flash-Next packs.'
+    gpu_vram_mib='' host_available_mib=''
+    if (( ! dry_run )); then
+        gpu_vram_mib=$(basalt_gpu_vram_mib "$BASALT_GPUS")
+        host_available_mib=$(basalt_host_available_mib)
+    fi
+    suggested=$(basalt_model_recommendation "$gpu_vram_mib" "$host_available_mib" "$MEMORY_MB" "$ROOTFS_GB")
+    pve_section 'Basalt model'
+    pve_note "Selected GPU VRAM: ${gpu_vram_mib:-unknown} MiB; host available RAM: ${host_available_mib:-unknown} MiB."
+    pve_note "CT: $MEMORY_MB MiB RAM, $ROOTFS_GB GiB disk. Pack sizes from the Basalt model card:"
+    while IFS= read -r row; do pve_note "$row"; done < <(basalt_model_menu)
+    if [[ -n $suggested ]]; then
+        pve_note "Suggested: $suggested (allows 16 GiB RAM and 30 GiB disk beyond the pack's experts/file;"
+        pve_note '  GPU tiers guide performance, and the recommendation is not a runtime guarantee).'
+    else
+        pve_note 'No pack meets the conservative RAM and disk budget. Increase CT resources or'
+        pve_note '  free host RAM; you can still choose a listed pack explicitly.'
+    fi
+    pve_ask BASALT_MODEL 'Model pack suffix' "$suggested" basalt_model_choice 'Choose a listed pack suffix.'
+fi
+if basalt_model_choice "$BASALT_MODEL" && [[ $BASALT_MODEL != *.basalt ]]; then
+    BASALT_MODEL=$(basalt_model_file "$BASALT_MODEL")
+fi
+[[ $BASALT_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $BASALT_MODEL == *.basalt ]] || die 'BASALT_MODEL must be a .basalt file name.'
 
 ostype=debian
 [[ $TEMPLATE == *:vztmpl/ubuntu-* ]] && ostype=ubuntu

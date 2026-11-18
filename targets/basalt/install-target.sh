@@ -84,7 +84,7 @@ environment values override them. A fresh install uses the defaults below.
 Environment:
   BASALT_URL=https://github.com/jesdga95/basalt.git
   BASALT_REF=main, BASALT_COMMIT=<optional full SHA-1 pin>
-  BASALT_MODEL=Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt  (a file in BASALT_HF_REPO)
+  BASALT_MODEL=Qwen3.8-FN-UD-IQ3_XXS.basalt  (a file in BASALT_HF_REPO)
   BASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt
   BASALT_ALIAS=qwen3.8-flash-next   (the served model name)
   BASALT_GPUS=0                     (--gpu list, e.g. 0 or 0,1)
@@ -390,12 +390,15 @@ download_model() {
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BASALT_DATA_DIR/models"
     local url="$BASALT_HF_REPO/resolve/main/$BASALT_MODEL?download=true"
     note "Downloading $BASALT_MODEL to $model_path (this is tens of GiB and can take a long time)..."
-    as_service env "BASALT_MODEL=$BASALT_MODEL" "BASALT_MODEL_URL=$url" "BASALT_MODEL_PATH=$model_path" bash -c '
+    as_service env "BASALT_MODEL=$BASALT_MODEL" "BASALT_HF_REPO=$BASALT_HF_REPO" "BASALT_MODEL_URL=$url" "BASALT_MODEL_PATH=$model_path" bash -c '
         set -euo pipefail
         cd "$(dirname "$BASALT_MODEL_PATH")"
         if [[ ! -f "$BASALT_MODEL" ]]; then
             # Keep a failed or interrupted transfer as .part; never serve it.
-            curl -fL --retry 5 --retry-delay 2 --continue-at - -o "${BASALT_MODEL}.part" "$BASALT_MODEL_URL"
+            if ! curl -fL --retry 5 --retry-delay 2 --continue-at - -o "${BASALT_MODEL}.part" "$BASALT_MODEL_URL"; then
+                echo "Model download failed: $BASALT_MODEL_URL. Check BASALT_MODEL against the files in BASALT_HF_REPO; retry with an explicit BASALT_MODEL if the pack was removed." >&2
+                exit 1
+            fi
             size=$(stat -c %s "${BASALT_MODEL}.part")
             (( size > 1000000000 )) || { echo "model download is only $size bytes" >&2; exit 1; }
             mv -f "${BASALT_MODEL}.part" "$BASALT_MODEL"
@@ -791,7 +794,7 @@ fi
 BASALT_REF=${BASALT_REF:-main}
 BASALT_COMMIT=${BASALT_COMMIT:-}
 BASALT_HF_REPO=${BASALT_HF_REPO:-https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt}
-BASALT_MODEL=${BASALT_MODEL:-Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt}
+BASALT_MODEL=${BASALT_MODEL:-Qwen3.8-FN-UD-IQ3_XXS.basalt}
 BASALT_ALIAS=${BASALT_ALIAS:-qwen3.8-flash-next}
 BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
