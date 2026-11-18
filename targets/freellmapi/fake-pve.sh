@@ -162,8 +162,16 @@ case $name in
             config) exists "$id" || exit 2; cat "$(conf "$id")" ;;
             create)
                 ! exists "$id" || exit 1
+                # FAKE_DUMP_VANISHES: the backup is gone by the time a CT is created.
+                [[ -z ${FAKE_DUMP_VANISHES:-} ]] || rm -f "${OSR_FREELLMAPI_STATE:-/nonexistent}"/*/vzdump-lxc-*.tar.zst
+                # FAKE_CREATE_FAILS: a release whose template pct create refuses.
+                [[ -z ${FAKE_CREATE_FAILS:-} || $1 != *"freellmapi_${FAKE_CREATE_FAILS}.tar" ]] || { echo 'fake: create failed' >&2; exit 1; }
                 template=$1; shift
                 [[ $template == *:vztmpl/freellmapi_v*.tar && -f $FAKE/template/cache/${template##*/} ]] || { echo 'no such template' >&2; exit 1; }
+                # Proxmox opens the OCI archive inside the CT's user namespace,
+                # as its mapped root: the template must be readable by others.
+                (( 8#$(stat -c %a "$FAKE/template/cache/${template##*/}") & 4 )) ||
+                    { echo "fake: unable to open OCI archive ${template##*/}: Permission denied" >&2; exit 1; }
                 # mp0 is a fresh file system: its root has a lost+found.
                 mkdir -p "$FAKE/ct/$id" "$(fs "$id")/app/server/data/lost+found"
                 chmod 0700 "$(fs "$id")/app/server/data/lost+found"

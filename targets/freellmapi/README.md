@@ -172,7 +172,9 @@ CT_ID=<CT> FREELLMAPI_VERSION=v0.17.0 bash targets/freellmapi/provision-lxc.sh -
   start order and DNS, and the data restored. The run succeeds only when
   `/api/ping` answers and the unified key is unchanged and works. Otherwise
   the new CT is removed and the backup restored (`pct restore`), started and
-  checked; the backup is deleted afterwards. A failed restore keeps the backup
+  checked. The backup is then kept in `/var/lib/osr-freellmapi/<CT>.rolled-back-<time>/`
+  (delete it once the CT is fine); it does not block later runs. A rollback never
+  destroys a CT unless its backup file is there. A failed restore keeps the backup
   and says how to restore it by hand.
 
 Options set on the CT by hand beyond those listed are not carried over to the

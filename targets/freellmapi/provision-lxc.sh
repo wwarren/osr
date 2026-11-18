@@ -86,6 +86,11 @@ run() {
     if (( ! dry_run )); then "$@"; fi
 }
 note() { printf '%s\n' "$*" >&2; }
+# set -E hands the ERR trap to every subshell and command substitution. A
+# rollback run there would act on the CT, then the subshell's failure would
+# run it again in the script: so trap actions run only in the script itself,
+# and a subshell that fails just reports it.
+main_shell() { [[ $BASHPID == "$$" ]]; }
 positive_int() { [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer."; }
 valid_storage_id() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_version() { [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
@@ -180,17 +185,22 @@ ensure_template() {
             die "The existing template $volume is not a readable OCI archive. Remove it and run again."
         [[ -z $image_revision || $tmp == "$image_revision" ]] ||
             die "The existing template $volume was built from ${tmp:-(none)}, not $image_revision. Remove it and run again."
+        # pct create reads the image inside the CT's user namespace, as its
+        # mapped root: a template pulled under umask 077 (tools/upgrade-all.sh)
+        # is unreadable there. It is a public image, so it is made readable.
+        chmod 0644 -- "$path" || die "Could not make $volume readable for pct create."
         note "Using the existing template $volume."
         return 0
     fi
     [[ -d ${path%/*} ]] || die "Template directory is missing: ${path%/*}"
     tmp="$path.tmp.$$"
     note "Pulling $ref ($image_digest) to $volume."
-    if ! skopeo copy "docker://$FREELLMAPI_IMAGE_REPO@$image_digest" "oci-archive:$tmp"; then
+    if ! (umask 022; skopeo copy "docker://$FREELLMAPI_IMAGE_REPO@$image_digest" "oci-archive:$tmp"); then
         rm -f -- "$tmp"
         die "Could not pull $ref."
     fi
-    mv -- "$tmp" "$path" || { rm -f -- "$tmp"; die "Could not store $volume."; }
+    # Readable by the CT's mapped root, which unpacks it (see above).
+    chmod 0644 -- "$tmp" && mv -- "$tmp" "$path" || { rm -f -- "$tmp"; die "Could not store $volume."; }
 }
 
 # --- Inside the CT -----------------------------------------------------------
@@ -619,11 +629,14 @@ create_ct() {
     shift 4
     (umask 022; run pct create "$CT_ID" "$template" --unprivileged 1 --rootfs "$rootfs" \
         --mp0 "$data,mp=$GUEST_DATA,backup=1" --net0 "$net" --tags 'ai;ai-model;osr-target;freellmapi' \
-        --description "$CT_DESCRIPTION"$'\n'"OpenAI-compatible API and dashboard on TCP $FREELLMAPI_PORT" "$@")
+        --description "$CT_DESCRIPTION"$'\n'"OpenAI-compatible API and dashboard on TCP $FREELLMAPI_PORT" "$@") ||
+        { note "pct create failed for CT $CT_ID (see its message above)."; return 1; }
     (( dry_run )) && return 0
     old_entrypoint=$(ct_value entrypoint)
-    [[ $old_entrypoint =~ $IMAGE_ENTRYPOINT_RE ]] ||
-        die "CT $CT_ID did not take the image's entrypoint (found '${old_entrypoint:-none}'). Is $template the FreeLLMAPI image, and this Proxmox VE 9.1 or later?"
+    [[ $old_entrypoint =~ $IMAGE_ENTRYPOINT_RE ]] || {
+        note "CT $CT_ID did not take the image's entrypoint (found '${old_entrypoint:-none}'). Is $template the FreeLLMAPI image, and this Proxmox VE 9.1 or later?"
+        return 1
+    }
 }
 # The OCI image exports PORT=3001; dotenv does not replace an exported value.
 # Set PORT in the server's init environment while retaining the other image env.
@@ -664,10 +677,11 @@ if [[ $mode == create ]]; then
     [[ -n $FREELLMAPI_DIGEST ]] || note '  No digest is pinned for this release: the tag is trusted as the registry serves it now.'
     pve_confirm "Create FreeLLMAPI CT $CT_ID?"
     ensure_template "$FREELLMAPI_VERSION" "$FREELLMAPI_DIGEST"
-    trap 'printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
+    trap 'main_shell || exit 1; printf "Provisioning stopped at line %s. CT %s is kept for inspection.\n" "$LINENO" "$CT_ID" >&2' ERR
     extra=(--hostname "$CT_HOSTNAME" --cores "$CORES" --memory "$MEMORY_MB" --swap "$SWAP_MB" --onboot "$ONBOOT")
     [[ -z $NAMESERVER ]] || extra+=(--nameserver "$NAMESERVER")
-    create_ct "$(template_volume "$FREELLMAPI_VERSION")" "$net" "$STORAGE:$ROOTFS_GB" "$STORAGE:$DATA_GB" "${extra[@]}"
+    create_ct "$(template_volume "$FREELLMAPI_VERSION")" "$net" "$STORAGE:$ROOTFS_GB" "$STORAGE:$DATA_GB" "${extra[@]}" ||
+        die "CT $CT_ID was not created as expected; anything created is kept for inspection."
     firewall=$(firewall_config "$FREELLMAPI_ACCESS_CIDR" "$FREELLMAPI_PORT" "$router_ip")
     if (( dry_run )); then
         printf '+ write %s:\n%s\n' "$firewall_file" "$firewall"
@@ -723,9 +737,18 @@ restore_data() {
     guest tar -C "${GUEST_DATA%/*}" -xpf - < "$data_tar"
 }
 # rollback: the CT as the backup has it, started and checked.
+rolled_back=0
 rollback() {
+    main_shell || return 1
     trap - ERR
+    (( ! rolled_back )) || return 1
+    rolled_back=1
     note "Restoring CT $CT_ID from the backup taken before the change."
+    # Nothing is destroyed unless the backup to restore from is there.
+    if [[ -z $dump || ! -s $dump ]]; then
+        note "The backup ${dump:-(none)} is missing: CT $CT_ID is left as it is."
+        return 1
+    fi
     if pct status "$CT_ID" >/dev/null 2>&1; then
         pct stop "$CT_ID" 2>/dev/null || true
         pct destroy "$CT_ID" || { note "Could not remove the new CT $CT_ID. The backup is kept: $dump"; return 1; }
@@ -739,7 +762,13 @@ rollback() {
     ROUTER_CT_ID=$old_router
     if wait_healthy; then
         note "CT $CT_ID is running FreeLLMAPI $old_version again."
-        rm -rf -- "$stage"
+        # The backup is kept: a release that failed is worth a look, and it is
+        # the only copy of the CT as it was. Later runs are not blocked by it.
+        kept="$stage.rolled-back-$(date +%Y%m%d-%H%M%S)"
+        rm -f -- "$data_tar"
+        if mv -- "$stage" "$kept"; then
+            note "The backup is kept in $kept; delete it once CT $CT_ID is fine."
+        fi
     else
         note "The restored CT $CT_ID did not become healthy either. The backup is kept: $dump"
         return 1
@@ -761,6 +790,7 @@ if (( ! dry_run )); then
     old_router_ip=$(fw_router_ip "$firewall_file")
 fi
 rollback_settings() {
+    main_shell || return 1
     trap - ERR
     note "Restoring FreeLLMAPI settings in CT $CT_ID."
     pct stop "$CT_ID" 2>/dev/null || true
@@ -797,7 +827,7 @@ if (( same_release )); then
             { rm -rf -- "$settings_stage"; die 'Could not back up the FreeLLMAPI settings.'; }
         cp -- "$firewall_file" "$settings_stage/firewall.fw" || { rm -rf -- "$settings_stage"; die 'Could not back up the FreeLLMAPI firewall.'; }
     fi
-    trap 'note "Stopped at line $LINENO."; rollback_settings || note "Settings backup kept: $settings_stage"; exit 1' ERR
+    trap 'main_shell || exit 1; note "Stopped at line $LINENO."; rollback_settings || note "Settings backup kept: $settings_stage"; exit 1' ERR
     run pct stop "$CT_ID"
     if ! first_start keep; then rollback_settings || note "Settings backup kept: $settings_stage"; exit 1; fi
     sync_firewall
@@ -853,7 +883,7 @@ else
     key_before=$(read_key | sha256sum) || die "Could not read the unified API key in CT $CT_ID."
     cp -- "$firewall_file" "$stage/firewall.fw"
     # From here the old CT is touched: any failure starts it again.
-    trap 'note "Stopped at line $LINENO."; pct stop "$CT_ID" 2>/dev/null || true; service_boot "$old_entrypoint" || true; rm -rf -- "$stage"; exit 1' ERR
+    trap 'main_shell || exit 1; note "Stopped at line $LINENO."; pct stop "$CT_ID" 2>/dev/null || true; service_boot "$old_entrypoint" || true; rm -rf -- "$stage"; exit 1' ERR
     pct stop "$CT_ID"
     # For an unprivileged CT, vzdump's tar runs as the CT's mapped root and
     # reads the CT config from vzdump's temporary directory, by default inside
@@ -871,9 +901,11 @@ else
     pct set "$CT_ID" --entrypoint "$old_entrypoint"
     pct destroy "$CT_ID"
     # From here the old CT is gone: any failure restores it from the backup.
-    trap 'note "Stopped at line $LINENO."; rollback || true; exit 1' ERR
+    trap 'main_shell || exit 1; note "Stopped at line $LINENO."; rollback || true; exit 1' ERR
 fi
-create_ct "$(template_volume "$FREELLMAPI_VERSION")" "$net" "$ct_storage:${rootfs_size%G}" "$ct_storage:${data_size%G}" "${keep[@]}"
+if ! create_ct "$(template_volume "$FREELLMAPI_VERSION")" "$net" "$ct_storage:${rootfs_size%G}" "$ct_storage:${data_size%G}" "${keep[@]}"; then
+    (( dry_run )) || { rollback || true; exit 1; }
+fi
 if (( dry_run )); then
     sync_firewall
 else

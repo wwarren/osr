@@ -294,7 +294,13 @@ host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_UNHEALTHY=v0.99.2 --reconfigure; 
 has 'did not answer /api/ping'; has "is running FreeLLMAPI $default_version again"
 [[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(cat "$data/freeapi.db") == "$key" && $(env_file) == "$env_before" ]] || fail 'the old CT was not restored'
 [[ $(cat "$PVE_ETC/firewall/280.fw") == "$fw_before" && $(conf) == *'cores: 4'* && $(conf) == *"entrypoint: $image_entrypoint"* ]] || fail 'the restored CT differs'
-[[ $(setting FREELLMAPI_VERSION) == "$default_version" && -z $(ls -A "$tmp/host/state") ]] || fail 'record or leftovers after rollback'
+[[ $(setting FREELLMAPI_VERSION) == "$default_version" && $(ls -A "$tmp/host/state") == 280.rolled-back-* ]] || fail 'record or kept backup after rollback'
+kept=$(echo "$tmp"/host/state/280.rolled-back-*)
+[[ -s $(echo "$kept"/vzdump-lxc-280-*.tar.zst) && ! -e $kept/data.tar && $(stat -c %a "$kept") == 700 ]] || fail 'the kept backup is missing, has the data copy, or is not root-only'
+has "The backup is kept in $kept"
+host CT_ID=280 --reconfigure; ok 'a run after a rollback'
+has 'nothing to do'
+pass 'after a rollback the backup is kept, root-only, and does not block the next run'
 [[ $(calls) == *"pct restore 280 $tmp/host/state/280/vzdump-lxc-280-"*' --storage local-lvm'* ]] || fail 'pct restore was not used'
 pass 'a release that does not become healthy is rolled back from the backup'
 
@@ -400,6 +406,36 @@ host CT_ID=280 FREELLMAPI_VERSION=keep --reconfigure; ok 'keep on an explicit re
 host "${common[@]}" FREELLMAPI_VERSION=keep CT_ID=281 IP_CIDR=192.0.2.81/24 ROUTER_CT_ID=none; bad 'keep on create'
 has 'FREELLMAPI_VERSION must be a release tag'
 pass 'keep stays on the CT release and its source; a CT following the pin still follows it later'
+
+# pct create refusing the new image: one rollback, in the script itself. Under
+# set -E the subshell around pct create inherits the ERR trap; a rollback run
+# there restored the CT and deleted the backup, then the script's own rollback
+# destroyed the restored CT and found no backup (CT 163, 2026-11-17).
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_CREATE_FAILS=v0.99.2 --reconfigure; bad 'pct create refused'
+has 'pct create failed for CT 280'; has "is running FreeLLMAPI $default_version again"
+[[ $(grep -c '^pct restore 280' "$FAKE/calls") == 1 && $(grep -c '^pct destroy 280' "$FAKE/calls") == 1 ]] || fail 'the rollback ran more than once'
+[[ -f $PVE_ETC/lxc/280.conf && -e $FAKE/ct/280/running && $(cat "$FAKE/ct/280/image") == "$default_version" &&
+   $(cat "$data/freeapi.db") == "$key" && $(cat "$PVE_ETC/firewall/280.fw") == "$fw_before" ]] || fail 'the old CT is not back with its data and firewall'
+[[ -s $(echo "$tmp"/host/state/280.rolled-back-*/vzdump-lxc-280-*.tar.zst) ]] || fail 'the backup was not kept'
+pass 'a refused pct create is rolled back once, and the CT and its backup survive'
+
+# A template pulled earlier under umask 077 (root-only) is made readable before
+# pct create, which unpacks it as the CT's mapped root (CT 163, 2026-11-17).
+upgrade_ready
+printf 'revision=%s\n' "$commit" > "$FAKE/template/cache/freellmapi_v0.99.3.tar"; chmod 0600 "$FAKE/template/cache/freellmapi_v0.99.3.tar"
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.3 FAKE_REVISION="$commit" --reconfigure; ok 'an existing root-only template'
+has 'Using the existing template'
+[[ $(stat -c %a "$FAKE/template/cache/freellmapi_v0.99.3.tar") == 644 && $(cat "$FAKE/ct/280/image") == v0.99.3 ]] || fail 'the root-only template was not made readable'
+[[ $(stat -c %a "$FAKE/template/cache/freellmapi_${default_version}.tar") == 644 ]] || fail 'a template pulled under umask 077 is not readable'
+pass 'templates are readable for pct create, whether pulled now or earlier under umask 077'
+
+# A rollback never destroys a CT when its backup is missing.
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_UNHEALTHY=v0.99.2 FAKE_DUMP_VANISHES=1 --reconfigure; bad 'a vanished backup'
+has 'is missing: CT 280 is left as it is'
+[[ -f $PVE_ETC/lxc/280.conf && $(grep -c '^pct destroy 280' "$FAKE/calls") == 1 ]] || fail 'a CT was destroyed without a backup to restore'
+pass 'a rollback without its backup leaves the CT alone'
 
 # A firewall file sync_firewall cannot rewrite stops the run before the CT is touched.
 fresh; create; ok 'create for [RULES]'; set_data
