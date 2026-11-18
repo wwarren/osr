@@ -1925,6 +1925,8 @@ target_context_env() {
 valid_target_context() { [[ $1 =~ ^[1-9][0-9]{3,6}$ ]] && (( $1 >= 4096 && $1 <= 1048576 )); }
 # Avalon's llama-server takes 4096..262144, or auto (from the card's VRAM).
 valid_avalon_context() { [[ $1 == auto ]] || { valid_target_context "$1" && (( $1 <= 262144 )); }; }
+# Basalt's installer takes a context of at most six digits (999999).
+valid_basalt_context() { valid_target_context "$1" && (( $1 <= 999999 )); }
 # avalon_auto_context VRAM_MIB: what AVALON_CONTEXT=auto gives (65536 when the
 # card's memory is not known).
 avalon_auto_context() {
@@ -2065,6 +2067,8 @@ prompt_target_contexts() {
     elif [[ $name == kindi ]]; then
       echo "    auto: Kindi's own size for the card (24576 to 131072), fitted to its free memory."
       prompt_until_valid "    Context window (tokens, or auto)" "$var" "${default:-auto}" valid_kindi_context || return 1
+    elif [[ $name == basalt ]]; then
+      prompt_until_valid "    Context window (tokens, up to 999999)" "$var" "${default:-65536}" valid_basalt_context || return 1
     else
       prompt_until_valid "    Context window (tokens)" "$var" "${default:-65536}" valid_target_context || return 1
     fi
@@ -2303,6 +2307,8 @@ run_target_provisioner() {
     [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
     [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
     [[ "$name" != basalt || -z ${BASALT_MODEL:-} ]] || export BASALT_MODEL
+    [[ "$name" != basalt || -z ${BASALT_KV:-} ]] || export BASALT_KV
+    [[ "$name" != basalt || -z ${BASALT_KV_RESIDENT:-} ]] || export BASALT_KV_RESIDENT
     # The router's MEMORY is unset above; Strata gets the RAM chosen for its CT.
     [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
     [[ "$name" != basalt || -z ${BASALT_MEMORY_MB:-} ]] || export MEMORY_MB="$BASALT_MEMORY_MB"

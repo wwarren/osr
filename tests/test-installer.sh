@@ -182,6 +182,8 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
 [[ -z ${STRATA_MESSAGE_CACHE:-} ]] || printf 'strata-message-cache %s\n' "$STRATA_MESSAGE_CACHE" >> "$MOCK_LOG"
 [[ -z ${BASALT_MODEL:-} ]] || printf 'basalt-model %s\n' "$BASALT_MODEL" >> "$MOCK_LOG"
+[[ -z ${BASALT_KV:-} ]] || printf 'basalt-kv %s\n' "$BASALT_KV" >> "$MOCK_LOG"
+[[ -z ${BASALT_KV_RESIDENT:-} ]] || printf 'basalt-kv-resident %s\n' "$BASALT_KV_RESIDENT" >> "$MOCK_LOG"
 [[ -z ${MEMORY_MB:-} ]] || printf 'memory-env %s\n' "$MEMORY_MB" >> "$MOCK_LOG"
 [[ $(basename "$(dirname "$0")") != opencode ]] ||
   printf 'opencode-env %s|%s\n' "${OPENCODE_MODEL:-}" "${OPENCODE_ACCESS_CIDR:-}" >> "$MOCK_LOG"
@@ -1313,6 +1315,13 @@ assert_ok "256k, its largest" valid_avalon_context 262144
 assert_fail "more than llama-server takes" valid_avalon_context 524288
 assert_fail "too small" valid_avalon_context 2048
 
+describe valid_basalt_context
+assert_ok "64k" valid_basalt_context 65536
+assert_ok "six digits, its largest" valid_basalt_context 999999
+assert_fail "seven digits" valid_basalt_context 1000000
+assert_fail "the generic 1M ceiling" valid_basalt_context 1048576
+assert_fail "too small" valid_basalt_context 2048
+
 describe avalon_auto_context
 assert_eq "256k from 19 GB" 262144 "$(avalon_auto_context 24564)"
 assert_eq "64k below" 65536 "$(avalon_auto_context 16376)"
@@ -1617,10 +1626,24 @@ assert_contains "interactive Basalt keeps its model prompt" "prompt-env false|fa
 mock_reset_log
 NONINTERACTIVE=true run_target_provisioner basalt
 assert_contains "unattended Basalt takes its resource-based default" "prompt-env true|false|" "$(cat "$MOCK_LOG.prompt")"
+# Plain (unexported) shell variables, as a sourced settings file leaves them:
+# a VAR=value prefix on the call would export them by itself and hide a
+# missing export in run_target_provisioner.
 mock_reset_log
-BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt run_target_provisioner basalt
+declare +x BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt
+run_target_provisioner basalt
 assert_contains "an explicit Basalt model skips the prompt" "prompt-env true|false|" "$(cat "$MOCK_LOG.prompt")"
 assert_contains "and reaches the target" "basalt-model Qwen3.8-FN-UD-IQ2_XS.basalt" "$(mock_calls)"
+unset BASALT_MODEL
+mock_reset_log
+declare +x BASALT_KV=int8 BASALT_KV_RESIDENT=32768
+run_target_provisioner basalt
+assert_contains "BASALT_KV reaches the Basalt provisioner" "basalt-kv int8" "$(mock_calls)"
+assert_contains "BASALT_KV_RESIDENT reaches the Basalt provisioner" "basalt-kv-resident 32768" "$(mock_calls)"
+unset BASALT_KV BASALT_KV_RESIDENT
+mock_reset_log
+run_target_provisioner basalt
+assert_not_contains "unset KV settings are not invented" "basalt-kv" "$(mock_calls)"
 BASALT_MEMORY_MB=65536; BASALT_ROOTFS_GB=120
 mock_reset_log
 run_target_provisioner basalt

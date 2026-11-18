@@ -109,9 +109,42 @@ the next run.
 
 Settings: `BASALT_PORT`, `BASALT_MODEL`, `BASALT_HF_REPO`, `BASALT_ALIAS`,
 `BASALT_GPUS` (for `0,1` also add `/dev/nvidia1` to `GPU_DEVICES`),
-`BASALT_CONTEXT`, `CUDA_VERSION`, and `BASALT_ALLOW_NO_KEY=true` for an
-unauthenticated API. `BASALT_URL` and `BASALT_REF` (default `main`) select the
+`BASALT_CONTEXT` (at most 999999), `BASALT_KV`, `BASALT_KV_RESIDENT`,
+`CUDA_VERSION`, and `BASALT_ALLOW_NO_KEY=true` for an unauthenticated API. `BASALT_URL` and `BASALT_REF` (default `main`) select the
 source; pin a tested commit with `BASALT_COMMIT` for production.
+
+To increase the context while keeping 32,768 KV cells on the GPU and streaming
+the rest from pinned CT RAM, set `BASALT_KV=int8` and
+`BASALT_KV_RESIDENT=32768`. The resident count must be at least 20,480 and no
+greater than `BASALT_CONTEXT`. The defaults are `fp16` and `0` (all KV in
+VRAM). Basalt also supports `q4_0` and `k8v4`, but `k8v4` cannot use
+`BASALT_KV_RESIDENT`. These settings are saved across reruns, and an existing
+install with the defaults is not restarted by an installer that adds them.
+
+The pinned RAM copy holds the whole context, not only the cells beyond the
+resident count: about 26 KiB per token for `fp16`, 13.4 KiB for `int8` and
+7.3 KiB for `q4_0` (3.3, 1.7 and 0.9 GiB at 131,072 tokens). It comes out of
+the same CT RAM as the experts. The provisioner sets it aside before
+suggesting a pack, and both the provisioner and `install-target.sh` warn when
+the cache, the pack's routed experts and 16 GiB for the server exceed the CT's
+RAM (and, on the host, its available RAM). The warning does not stop the
+install; raise the CT memory (`pct set <id> --memory <MiB>`), lower the
+context or KV precision, or set `BASALT_KV_RESIDENT=0`.
+
+For an existing CT (replace `164` if yours differs), run from the repository
+clone on the Proxmox host:
+
+```bash
+pct push 164 targets/basalt/install-target.sh /root/basalt-target-deploy/install-target.sh --perms 0755
+pct exec 164 -- env BASALT_CONTEXT=131072 BASALT_KV=int8 BASALT_KV_RESIDENT=32768 \
+    bash /root/basalt-target-deploy/install-target.sh
+```
+
+The installer reuses the other saved settings, updates the launcher, and
+health-checks the restarted service. It may also fetch a newer Basalt commit
+when `BASALT_REF` is unpinned; set `BASALT_COMMIT` to the installed commit to
+keep the engine version. The native context limit of Qwen3.8-Flash-Next is
+262,144 tokens.
 
 ## Router registration
 

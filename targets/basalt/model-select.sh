@@ -85,3 +85,64 @@ basalt_model_recommendation() {
     done < <(basalt_model_rows)
     [[ -z $chosen ]] || printf '%s\n' "$chosen"
 }
+
+# basalt_model_experts_mib MODEL: the routed expert set (MiB) of a listed pack,
+# by suffix or file name; nothing for another model.
+basalt_model_experts_mib() {
+    local suffix file experts
+    while IFS='|' read -r suffix file experts; do
+        if [[ $1 == "$suffix" || $1 == "$(basalt_model_file "$suffix")" ]]; then
+            printf '%s\n' "$(( (experts * 1024 + 9) / 10 ))"
+            return 0
+        fi
+    done < <(basalt_model_rows)
+}
+
+# --- Streamed KV cache RAM ----------------------------------------------------
+# install-target.sh carries identical copies of the functions below, so a run
+# inside the CT warns the same way; test-provision.sh checks that they match.
+# BEGIN shared KV RAM estimate
+# basalt_kv_cell_bytes KV: bytes per context cell in the pinned RAM copy of a
+# streamed cache: 12 QSA layers and the MTP drafter's, each 2 KV heads of 256
+# dims (upstream qsa_real_shapes and kv_block_bytes). k8v4 does not stream.
+basalt_kv_cell_bytes() {
+    case $1 in
+        fp16) echo $((13 * 2048)) ;;
+        int8) echo $((13 * 1056)) ;;
+        q4_0) echo $((13 * 576)) ;;
+        *) echo 0 ;;
+    esac
+}
+
+# basalt_kv_host_mib CONTEXT KV RESIDENT: MiB of RAM Basalt pins for a streamed
+# KV cache, or 0 when the whole cache stays in VRAM. The RAM copy holds every
+# cell of the context, not only those past RESIDENT, in pages of 4 cells.
+basalt_kv_host_mib() {
+    local pages=$(( ($1 + 3) / 4 )) resident_pages=$(( ($3 + 3) / 4 ))
+    if (( $3 <= 0 || resident_pages >= pages )); then echo 0; return 0; fi
+    echo $(( (pages * 4 * $(basalt_kv_cell_bytes "$2") + 1048575) / 1048576 ))
+}
+
+# basalt_gib MIB: MIB as GiB with one decimal.
+basalt_gib() { printf '%d.%d' $(( $1 / 1024 )) $(( $1 % 1024 * 10 / 1024 )); }
+
+# basalt_kv_ram_warning KV_MIB EXPERTS_MIB LIMIT_MIB LIMIT: a warning line when
+# the pinned KV cache, the pack's routed experts (EXPERTS_MIB; empty when not
+# known) and 16 GiB for the server, buffers and checkpoints exceed LIMIT_MIB,
+# described as LIMIT. Nothing when it fits, nothing streams or LIMIT_MIB is not
+# known. The budget is the model recommendation's, so it is conservative:
+# Basalt can keep some experts in VRAM, but the pinned cache cannot move.
+basalt_kv_ram_warning() {
+    local kv=$1 experts=$2 limit=$3 what=$4 need with
+    [[ $kv =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ ]] && (( kv > 0 )) || return 0
+    need=$(( kv + ${experts:-0} + 16384 ))
+    (( need > limit )) || return 0
+    if [[ -n $experts ]]; then
+        with="the pack's $(basalt_gib "$experts") GiB of routed experts and 16 GiB for the server"
+    else
+        with="16 GiB for the server (and the routed experts of this pack, whose size is not known)"
+    fi
+    printf 'Warning: the streamed KV cache pins about %s GiB of RAM; with %s that is about %s GiB, more than %s (%s GiB). Basalt may fail to pin the cache or start with fewer experts in RAM. Add RAM, lower BASALT_CONTEXT, choose a smaller BASALT_KV (int8 is half of fp16, q4_0 half of int8), or set BASALT_KV_RESIDENT=0 to keep the cache in VRAM.\n' \
+        "$(basalt_gib "$kv")" "$with" "$(basalt_gib "$need")" "$what" "$(basalt_gib "$limit")"
+}
+# END shared KV RAM estimate

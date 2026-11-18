@@ -88,7 +88,9 @@ Environment:
   BASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt
   BASALT_ALIAS=qwen3.8-flash-next   (the served model name)
   BASALT_GPUS=0                     (--gpu list, e.g. 0 or 0,1)
-  BASALT_CONTEXT=65536              (maximum context tokens)
+  BASALT_CONTEXT=65536              (maximum context tokens, up to 999999)
+  BASALT_KV=fp16                    (fp16, int8, q4_0 or k8v4)
+  BASALT_KV_RESIDENT=0              (KV cells kept in VRAM; 0 disables RAM streaming)
   BASALT_PORT=8080
   BASALT_READY_TIMEOUT=3600         (seconds; the model load is long)
   BASALT_ALLOW_NO_KEY=false         (true: accept an unauthenticated API)
@@ -108,6 +110,8 @@ generate_run_script() {
                     --max-context "$BASALT_CONTEXT" )
     if [[ -n $BASALT_ALIAS ]]; then args+=( --alias "$BASALT_ALIAS" ); fi
     args+=( --gpu "$BASALT_GPUS" )
+    [[ $BASALT_KV == fp16 ]] || args+=( --kv "$BASALT_KV" )
+    (( BASALT_KV_RESIDENT == 0 )) || args+=( --kv-resident "$BASALT_KV_RESIDENT" )
     if [[ $BASALT_ALLOW_NO_KEY != true ]]; then args+=( --api-key "$api_key" ); fi
     local part
     {
@@ -138,13 +142,18 @@ settings_fingerprint() {
     printf 'model=%s\nhf_repo=%s\nalias=%s\ngpus=%s\ncontext=%s\nport=%s\ndata_dir=%s\ncuda_version=%s\nallow_no_key=%s\nkey_sha256=%s\n' \
         "$BASALT_MODEL" "$BASALT_HF_REPO" "$BASALT_ALIAS" "$BASALT_GPUS" \
         "$BASALT_CONTEXT" "$BASALT_PORT" "$BASALT_DATA_DIR" "$CUDA_VERSION" "$BASALT_ALLOW_NO_KEY" "$key_hash"
+    # Only non-default KV settings add a line: an install from before they
+    # existed ran fp16 with all KV in VRAM and keeps its fingerprint, so an
+    # unchanged rerun stays a no-op instead of rebuilding and reloading.
+    if [[ $BASALT_KV != fp16 ]]; then printf 'kv=%s\n' "$BASALT_KV"; fi
+    if [[ $BASALT_KV_RESIDENT != 0 ]]; then printf 'kv_resident=%s\n' "$BASALT_KV_RESIDENT"; fi
 }
 
 # The settings that decide how Basalt is built and launched. save_settings
 # records them after every successful install or upgrade, so a failed upgrade
 # can roll back to what last worked rather than relaunching with the settings
 # that failed (including another model).
-SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
+SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_KV BASALT_KV_RESIDENT BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
@@ -152,7 +161,14 @@ validate_settings() {
     [[ $BASALT_HF_REPO =~ ^https://[A-Za-z0-9._/-]+$ ]] || die 'Invalid BASALT_HF_REPO (must be an https URL).'
     [[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
     [[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'Invalid BASALT_GPUS (e.g. 0 or 0,1).'
-    [[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid BASALT_CONTEXT.'
+    [[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,5}$ ]] || die 'Invalid BASALT_CONTEXT (1 to 999999 tokens).'
+    [[ $BASALT_KV =~ ^(fp16|int8|q4_0|k8v4)$ ]] || die 'Invalid BASALT_KV (fp16, int8, q4_0 or k8v4).'
+    [[ $BASALT_KV_RESIDENT =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'Invalid BASALT_KV_RESIDENT.'
+    if (( BASALT_KV_RESIDENT > 0 )); then
+        (( BASALT_KV_RESIDENT >= 20480 && BASALT_KV_RESIDENT <= BASALT_CONTEXT )) ||
+            die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than BASALT_CONTEXT.'
+        [[ $BASALT_KV != k8v4 ]] || die 'BASALT_KV=k8v4 cannot be combined with BASALT_KV_RESIDENT.'
+    fi
     [[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'Invalid BASALT_PORT.'
     [[ $BASALT_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'BASALT_ALLOW_NO_KEY must be true or false.'
     [[ $CUDA_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || die 'Invalid CUDA_VERSION.'
@@ -177,6 +193,10 @@ load_settings() {
         [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
         found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
     done < "$file"
+    # Existing installations predate these settings; preserve their original
+    # fp16, all-VRAM behavior when reading either saved record format.
+    [[ -v found[BASALT_KV] ]] || found[BASALT_KV]=fp16
+    [[ -v found[BASALT_KV_RESIDENT] ]] || found[BASALT_KV_RESIDENT]=0
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -196,6 +216,8 @@ fingerprint_env() {
         -e 's/^alias=/BASALT_ALIAS=/p' \
         -e 's/^gpus=/BASALT_GPUS=/p' \
         -e 's/^context=/BASALT_CONTEXT=/p' \
+        -e 's/^kv=/BASALT_KV=/p' \
+        -e 's/^kv_resident=/BASALT_KV_RESIDENT=/p' \
         -e 's/^port=/BASALT_PORT=/p' \
         -e 's/^cuda_version=/CUDA_VERSION=/p' \
         -e 's/^allow_no_key=/BASALT_ALLOW_NO_KEY=/p' "$1"
@@ -244,6 +266,106 @@ saved_settings() {
         fi
     fi
     for key in "${!overrides[@]}"; do printf -v "$key" '%s' "${overrides[$key]}"; done
+}
+
+# --- Streamed KV cache RAM (the same estimate as model-select.sh) --------------
+# This script runs alone inside the CT, so it carries its own copy of the
+# host's estimate; test-provision.sh checks that the copies match.
+# BEGIN shared KV RAM estimate
+# basalt_kv_cell_bytes KV: bytes per context cell in the pinned RAM copy of a
+# streamed cache: 12 QSA layers and the MTP drafter's, each 2 KV heads of 256
+# dims (upstream qsa_real_shapes and kv_block_bytes). k8v4 does not stream.
+basalt_kv_cell_bytes() {
+    case $1 in
+        fp16) echo $((13 * 2048)) ;;
+        int8) echo $((13 * 1056)) ;;
+        q4_0) echo $((13 * 576)) ;;
+        *) echo 0 ;;
+    esac
+}
+
+# basalt_kv_host_mib CONTEXT KV RESIDENT: MiB of RAM Basalt pins for a streamed
+# KV cache, or 0 when the whole cache stays in VRAM. The RAM copy holds every
+# cell of the context, not only those past RESIDENT, in pages of 4 cells.
+basalt_kv_host_mib() {
+    local pages=$(( ($1 + 3) / 4 )) resident_pages=$(( ($3 + 3) / 4 ))
+    if (( $3 <= 0 || resident_pages >= pages )); then echo 0; return 0; fi
+    echo $(( (pages * 4 * $(basalt_kv_cell_bytes "$2") + 1048575) / 1048576 ))
+}
+
+# basalt_gib MIB: MIB as GiB with one decimal.
+basalt_gib() { printf '%d.%d' $(( $1 / 1024 )) $(( $1 % 1024 * 10 / 1024 )); }
+
+# basalt_kv_ram_warning KV_MIB EXPERTS_MIB LIMIT_MIB LIMIT: a warning line when
+# the pinned KV cache, the pack's routed experts (EXPERTS_MIB; empty when not
+# known) and 16 GiB for the server, buffers and checkpoints exceed LIMIT_MIB,
+# described as LIMIT. Nothing when it fits, nothing streams or LIMIT_MIB is not
+# known. The budget is the model recommendation's, so it is conservative:
+# Basalt can keep some experts in VRAM, but the pinned cache cannot move.
+basalt_kv_ram_warning() {
+    local kv=$1 experts=$2 limit=$3 what=$4 need with
+    [[ $kv =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ ]] && (( kv > 0 )) || return 0
+    need=$(( kv + ${experts:-0} + 16384 ))
+    (( need > limit )) || return 0
+    if [[ -n $experts ]]; then
+        with="the pack's $(basalt_gib "$experts") GiB of routed experts and 16 GiB for the server"
+    else
+        with="16 GiB for the server (and the routed experts of this pack, whose size is not known)"
+    fi
+    printf 'Warning: the streamed KV cache pins about %s GiB of RAM; with %s that is about %s GiB, more than %s (%s GiB). Basalt may fail to pin the cache or start with fewer experts in RAM. Add RAM, lower BASALT_CONTEXT, choose a smaller BASALT_KV (int8 is half of fp16, q4_0 half of int8), or set BASALT_KV_RESIDENT=0 to keep the cache in VRAM.\n' \
+        "$(basalt_gib "$kv")" "$with" "$(basalt_gib "$need")" "$what" "$(basalt_gib "$limit")"
+}
+# END shared KV RAM estimate
+
+# basalt_pack_experts_mib FILE: the routed expert set (MiB) of an official
+# Qwen3.8-Flash-Next pack (model-select.sh's table); nothing for another file.
+basalt_pack_experts_mib() {
+    local tenths
+    case $1 in
+        Qwen3.8-FN-UD-IQ1_S.basalt) tenths=311 ;;
+        Qwen3.8-FN-UD-IQ1_M.basalt) tenths=324 ;;
+        Qwen3.8-FN-UD-IQ2_XS.basalt) tenths=394 ;;
+        Qwen3.8-FN-UD-IQ3_XXS.basalt) tenths=468 ;;
+        Qwen3.8-FN-UD-IQ4_XS.basalt) tenths=562 ;;
+        Qwen3.8-FN-NVFP4-DQ6_K.basalt) tenths=633 ;;
+        Qwen3.8-FN-NVFP4-DQ8.basalt) tenths=633 ;;
+        Qwen3.8-FN-UD-Q4_K_XL.basalt) tenths=717 ;;
+        Qwen3.8-FN-UD-Q5_K_XL.basalt) tenths=916 ;;
+        Qwen3.8-FN-UD-Q6_K_XL.basalt) tenths=1017 ;;
+        Qwen3.8-FN-Q8_0.basalt) tenths=1195 ;;
+        *) return 0 ;;
+    esac
+    printf '%s\n' "$(( (tenths * 1024 + 9) / 10 ))"
+}
+
+# ct_memory_mib: this CT's memory limit in MiB (LXCFS shows it as MemTotal; a
+# numeric cgroup memory.max that is lower wins), or nothing when unreadable.
+ct_memory_mib() {
+    local mib='' max=''
+    if [[ -r /proc/meminfo ]]; then
+        mib=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' /proc/meminfo)
+    fi
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then max=$(< /sys/fs/cgroup/memory.max); fi
+    if [[ $max =~ ^[0-9]+$ ]] && { [[ ! $mib =~ ^[0-9]+$ ]] || (( max / 1048576 < mib )); }; then
+        mib=$(( max / 1048576 ))
+    fi
+    [[ ! $mib =~ ^[0-9]+$ ]] || printf '%s\n' "$mib"
+}
+
+# kv_ram_check: with KV streaming, report the RAM the cache pins and warn when
+# this CT cannot also hold the pack's experts. A warning only: the estimate is
+# conservative, and the CT's memory can be raised with pct set --memory.
+kv_ram_check() {
+    local kv_mib limit
+    kv_mib=$(basalt_kv_host_mib "$BASALT_CONTEXT" "$BASALT_KV" "$BASALT_KV_RESIDENT")
+    (( kv_mib > 0 )) || return 0
+    note "KV streaming: $BASALT_KV_RESIDENT of $BASALT_CONTEXT cells stay in VRAM; the whole $BASALT_KV cache takes about $(basalt_gib "$kv_mib") GiB of pinned RAM."
+    limit=$(ct_memory_mib)
+    if [[ -z $limit ]]; then
+        note 'Warning: could not read this CT'"'"'s memory limit, so the RAM for the streamed KV cache was not checked.'
+        return 0
+    fi
+    basalt_kv_ram_warning "$kv_mib" "$(basalt_pack_experts_mib "$BASALT_MODEL")" "$limit" "this CT's memory" >&2
 }
 
 # End install helpers. ----------------------------------------------------------
@@ -612,8 +734,10 @@ do_upgrade() {
     target=$(fetch_target) ||
         die "Could not fetch $BASALT_URL ${BASALT_COMMIT:-$BASALT_REF}; Basalt was not stopped or changed."
     if [[ $previous == "$target" ]] && nothing_to_do; then
-        # A matching legacy fingerprint is sufficient to migrate its records.
-        if [[ ! -f $BASALT_ETC_DIR/installed-env ]]; then
+        # A matching legacy fingerprint is sufficient to migrate its records,
+        # including a record from before the KV settings existed.
+        if [[ ! -f $BASALT_ETC_DIR/installed-env ]] ||
+                ! grep -q '^BASALT_KV_RESIDENT=' "$BASALT_ETC_DIR/installed-env"; then
             save_settings
         fi
         note 'Basalt is up to date and healthy; nothing to do.'
@@ -798,6 +922,8 @@ BASALT_MODEL=${BASALT_MODEL:-Qwen3.8-FN-UD-IQ3_XXS.basalt}
 BASALT_ALIAS=${BASALT_ALIAS:-qwen3.8-flash-next}
 BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
+BASALT_KV=${BASALT_KV:-fp16}
+BASALT_KV_RESIDENT=${BASALT_KV_RESIDENT:-0}
 BASALT_PORT=${BASALT_PORT:-8080}
 BASALT_READY_TIMEOUT=${BASALT_READY_TIMEOUT:-3600}
 BASALT_ALLOW_NO_KEY=${BASALT_ALLOW_NO_KEY:-false}
@@ -811,6 +937,7 @@ for path_var in BASALT_DIR BASALT_DATA_DIR BASALT_ETC_DIR BASALT_STATE_DIR UNIT_
     [[ ${!path_var} =~ ^/[A-Za-z0-9._/-]+$ && ${!path_var} != *..* ]] || die "Invalid $path_var."
 done
 [[ $SERVICE_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid SERVICE_USER.'
+kv_ram_check
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -r $source_dir/basalt.service ]] || die "Missing $source_dir/basalt.service"

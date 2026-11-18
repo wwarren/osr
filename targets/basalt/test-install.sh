@@ -19,6 +19,10 @@ source <(sed -n '/^download_model() {/,/^}/p' "$target")
 source <(sed -n '/^generate_run_script() {/,/^}/p' "$target")
 source <(sed -n '/^start_env() {/,/^}/p' "$target")
 source <(sed -n '/^ensure_service_user() {/,/^}/p' "$target")
+for helper in basalt_kv_cell_bytes basalt_kv_host_mib basalt_gib basalt_kv_ram_warning basalt_pack_experts_mib kv_ram_check; do
+    source <(sed -n "/^$helper() {/,/^}/p" "$target")
+    declare -F "$helper" >/dev/null || { echo "FAIL $helper not found in install-target.sh" >&2; exit 1; }
+done
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 as_service() { "$@"; }
@@ -32,7 +36,7 @@ dry_run=0
 mkdir -p "$BASALT_DATA_DIR/models" "$tmp/bin"
 BASALT_DIR=$tmp/source
 BASALT_PORT=8080 BASALT_ALIAS=qwen3.8-flash-next BASALT_GPUS=0
-BASALT_CONTEXT=32768 BASALT_ALLOW_NO_KEY=false api_key=secret-for-test
+BASALT_CONTEXT=32768 BASALT_KV=fp16 BASALT_KV_RESIDENT=0 BASALT_ALLOW_NO_KEY=false api_key=secret-for-test
 
 # A root-group device is usable when the service account can open it. Reject
 # an inaccessible node and verify that the service account can use the GPU.
@@ -69,7 +73,12 @@ run_script=$tmp/run-basalt.sh
 generate_run_script
 sh -n "$run_script"
 grep -q -- '--max-context 32768' "$run_script"
+! grep -q -- '--kv ' "$run_script"
+! grep -q -- '--kv-resident' "$run_script"
 grep -q -- '--api-key secret-for-test' "$run_script"
+BASALT_KV=int8 BASALT_KV_RESIDENT=32768
+generate_run_script
+grep -q -- '--kv int8 --kv-resident 32768' "$run_script"
 if [[ $(uname -s) == Linux ]]; then
     [[ $(stat -c %a "$run_script") == 700 ]] || { echo 'FAIL launcher permissions' >&2; exit 1; }
 fi
@@ -108,4 +117,28 @@ fi
     printf 'FAIL unexpected CUDA error: %s\n' "$output" >&2; exit 1;
 }
 
-printf 'Basalt GPU access, model transfer failure and CUDA package validation passed.\n'
+# The streamed KV cache's RAM: reported with streaming, silent without it,
+# and a warning when the CT cannot also hold the pack's experts.
+kv_case() (
+    BASALT_CONTEXT=$1 BASALT_KV=$2 BASALT_KV_RESIDENT=$3 BASALT_MODEL=$4 fake_ct_mib=$5
+    ct_memory_mib() { [[ -z $fake_ct_mib ]] || printf '%s\n' "$fake_ct_mib"; }
+    kv_ram_check
+)
+out=$(kv_case 131072 int8 0 Qwen3.8-FN-UD-IQ3_XXS.basalt 65536 2>&1)
+[[ -z $out ]] || { printf 'FAIL KV check without streaming: %s\n' "$out" >&2; exit 1; }
+out=$(kv_case 131072 int8 131072 Qwen3.8-FN-UD-IQ3_XXS.basalt 65536 2>&1)
+[[ -z $out ]] || { printf 'FAIL KV check with every cell resident: %s\n' "$out" >&2; exit 1; }
+out=$(kv_case 131072 int8 32768 Qwen3.8-FN-UD-IQ3_XXS.basalt 131072 2>&1)
+[[ $out == *'about 1.6 GiB of pinned RAM'* && $out != *Warning* ]] ||
+    { printf 'FAIL KV streaming report in a large CT: %s\n' "$out" >&2; exit 1; }
+out=$(kv_case 131072 int8 32768 Qwen3.8-FN-UD-IQ3_XXS.basalt 65536 2>&1)
+[[ $out == *'Warning: the streamed KV cache pins about 1.6 GiB'* && $out == *'46.8 GiB of routed experts'* &&
+   $out == *"more than this CT's memory (64.0 GiB)"* ]] ||
+    { printf 'FAIL KV RAM warning in a small CT: %s\n' "$out" >&2; exit 1; }
+out=$(kv_case 262144 fp16 32768 custom.basalt 20480 2>&1)
+[[ $out == *'Warning:'* && $out == *'whose size is not known'* ]] ||
+    { printf 'FAIL KV RAM warning for a custom pack: %s\n' "$out" >&2; exit 1; }
+out=$(kv_case 131072 int8 32768 Qwen3.8-FN-UD-IQ3_XXS.basalt '' 2>&1)
+[[ $out == *'was not checked'* ]] || { printf 'FAIL unreadable CT memory: %s\n' "$out" >&2; exit 1; }
+
+printf 'Basalt GPU access, KV cache RAM, model transfer failure and CUDA package validation passed.\n'

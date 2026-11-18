@@ -53,7 +53,8 @@ Optional: CT_HOSTNAME=basalt-target, BRIDGE=vmbr0, CORES=8,
           BASALT_HF_REPO=https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt,
           BASALT_MODEL=<pack file; overrides the recommended model>,
           BASALT_ALIAS=qwen3.8-flash-next, BASALT_GPUS=0 (or "0,1"),
-          BASALT_CONTEXT=65536, BASALT_PORT=8080, BASALT_READY_TIMEOUT=3600,
+          BASALT_CONTEXT=65536, BASALT_KV=fp16, BASALT_KV_RESIDENT=0,
+          BASALT_PORT=8080, BASALT_READY_TIMEOUT=3600,
           BASALT_ALLOW_NO_KEY=false.
 
 With no BASALT_COMMIT, installation fetches the latest commit on BASALT_REF
@@ -129,6 +130,8 @@ BASALT_MODEL=${BASALT_MODEL:-}
 BASALT_ALIAS=${BASALT_ALIAS:-qwen3.8-flash-next}
 BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
+BASALT_KV=${BASALT_KV:-fp16}
+BASALT_KV_RESIDENT=${BASALT_KV_RESIDENT:-0}
 BASALT_PORT=${BASALT_PORT:-8080}
 BASALT_READY_TIMEOUT=${BASALT_READY_TIMEOUT:-3600}
 BASALT_ALLOW_NO_KEY=${BASALT_ALLOW_NO_KEY:-false}
@@ -171,7 +174,18 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
 [[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'BASALT_GPUS must be a GPU list like 0 or 0,1.'
 positive_int BASALT_CONTEXT "$BASALT_CONTEXT"
+[[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,5}$ ]] || die 'BASALT_CONTEXT must be at most 999999 tokens (six digits).'
+[[ $BASALT_KV =~ ^(fp16|int8|q4_0|k8v4)$ ]] || die 'BASALT_KV must be fp16, int8, q4_0 or k8v4.'
+[[ $BASALT_KV_RESIDENT =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'BASALT_KV_RESIDENT must be zero or a positive number of cells.'
+if (( BASALT_KV_RESIDENT > 0 )); then
+    (( BASALT_KV_RESIDENT >= 20480 && BASALT_KV_RESIDENT <= BASALT_CONTEXT )) ||
+        die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than BASALT_CONTEXT.'
+    [[ $BASALT_KV != k8v4 ]] || die 'BASALT_KV=k8v4 cannot be combined with BASALT_KV_RESIDENT.'
+fi
 [[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'BASALT_PORT must be 1..65535.'
+# Pinned RAM for a streamed KV cache (0 when it all stays in VRAM): the model
+# suggestion sets it aside, and the plan warns when the CT or host lacks it.
+kv_host_mib=$(basalt_kv_host_mib "$BASALT_CONTEXT" "$BASALT_KV" "$BASALT_KV_RESIDENT")
 [[ $BASALT_READY_TIMEOUT =~ ^[1-9][0-9]{0,6}$ ]] || die 'BASALT_READY_TIMEOUT must be a positive number of seconds.'
 [[ $BASALT_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'BASALT_ALLOW_NO_KEY must be true or false.'
 
@@ -214,18 +228,23 @@ done
 # --- Questions: Basalt model -------------------------------------------------
 # A dry run uses unknown host resources so its plan is repeatable on laptops
 # and in CI. A real run reads the selected cards and the host's available RAM.
+host_available_mib=''
+(( dry_run )) || host_available_mib=$(basalt_host_available_mib)
 if [[ -z $BASALT_MODEL ]]; then
     [[ $BASALT_HF_REPO == https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt ]] ||
         die 'Set BASALT_MODEL when BASALT_HF_REPO is a custom repository; the model menu lists the official Qwen3.8-Flash-Next packs.'
-    gpu_vram_mib='' host_available_mib=''
-    if (( ! dry_run )); then
-        gpu_vram_mib=$(basalt_gpu_vram_mib "$BASALT_GPUS")
-        host_available_mib=$(basalt_host_available_mib)
-    fi
-    suggested=$(basalt_model_recommendation "$gpu_vram_mib" "$host_available_mib" "$MEMORY_MB" "$ROOTFS_GB")
+    gpu_vram_mib=''
+    (( dry_run )) || gpu_vram_mib=$(basalt_gpu_vram_mib "$BASALT_GPUS")
+    # The pinned KV cache comes out of the same RAM as the experts.
+    pack_host_mib=$host_available_mib
+    [[ ! $pack_host_mib =~ ^[0-9]+$ ]] || pack_host_mib=$(( pack_host_mib - kv_host_mib ))
+    suggested=$(basalt_model_recommendation "$gpu_vram_mib" "$pack_host_mib" "$(( MEMORY_MB - kv_host_mib ))" "$ROOTFS_GB")
     pve_section 'Basalt model'
     pve_note "Selected GPU VRAM: ${gpu_vram_mib:-unknown} MiB; host available RAM: ${host_available_mib:-unknown} MiB."
     pve_note "CT: $MEMORY_MB MiB RAM, $ROOTFS_GB GiB disk. Pack sizes from the Basalt model card:"
+    if (( kv_host_mib > 0 )); then
+        pve_note "Streamed KV cache: about $(basalt_gib "$kv_host_mib") GiB of pinned RAM, set aside before the suggestion."
+    fi
     while IFS= read -r row; do pve_note "$row"; done < <(basalt_model_menu)
     if [[ -n $suggested ]]; then
         pve_note "Suggested: $suggested (allows 16 GiB RAM and 30 GiB disk beyond the pack's experts/file;"
@@ -287,7 +306,13 @@ pve_summary "Basalt: create"
 pve_row 'Basalt CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Model' "${BASALT_MODEL} (context ${BASALT_CONTEXT}, port ${BASALT_PORT})"
+pve_row 'Model' "${BASALT_MODEL} (context ${BASALT_CONTEXT}, KV ${BASALT_KV}, resident ${BASALT_KV_RESIDENT}, port ${BASALT_PORT})"
+if (( kv_host_mib > 0 )); then
+    pve_row 'KV streaming' "$BASALT_KV_RESIDENT of $BASALT_CONTEXT cells in VRAM; about $(basalt_gib "$kv_host_mib") GiB pinned RAM"
+    kv_experts_mib=$(basalt_model_experts_mib "$BASALT_MODEL")
+    basalt_kv_ram_warning "$kv_host_mib" "$kv_experts_mib" "$MEMORY_MB" "the CT's RAM (MEMORY_MB)" >&2
+    basalt_kv_ram_warning "$kv_host_mib" "$kv_experts_mib" "$host_available_mib" "the host's available RAM" >&2
+fi
 pve_confirm "Create Basalt CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Basalt pins tens of GiB of expert memory. systemd's LimitMEMLOCK must be
@@ -332,7 +357,8 @@ nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/basalt-target-d
 run pct exec "$CT_ID" -- env \
     "BASALT_URL=$BASALT_URL" "BASALT_REF=$BASALT_REF" "BASALT_COMMIT=$BASALT_COMMIT" \
     "BASALT_HF_REPO=$BASALT_HF_REPO" "BASALT_MODEL=$BASALT_MODEL" "BASALT_ALIAS=$BASALT_ALIAS" \
-    "BASALT_GPUS=$BASALT_GPUS" "BASALT_CONTEXT=$BASALT_CONTEXT" "BASALT_PORT=$BASALT_PORT" \
+    "BASALT_GPUS=$BASALT_GPUS" "BASALT_CONTEXT=$BASALT_CONTEXT" \
+    "BASALT_KV=$BASALT_KV" "BASALT_KV_RESIDENT=$BASALT_KV_RESIDENT" "BASALT_PORT=$BASALT_PORT" \
     "BASALT_READY_TIMEOUT=$BASALT_READY_TIMEOUT" "BASALT_ALLOW_NO_KEY=$BASALT_ALLOW_NO_KEY" \
     "CUDA_VERSION=$CUDA_VERSION" \
     bash /root/basalt-target-deploy/install-target.sh

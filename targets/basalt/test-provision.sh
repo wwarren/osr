@@ -35,6 +35,8 @@ has 'DRIVER_VERSION='; has 'confirm CT 250 sees host NVIDIA driver'
 has 'bash /root/basalt-target-deploy/install-target.sh'
 has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ3_XXS.basalt'
 has 'BASALT_CONTEXT=65536'
+has 'BASALT_KV=fp16'
+has 'BASALT_KV_RESIDENT=0'
 has 'Router registration: set the Basalt key, then add basalt://<CT-address>'
 plan NVIDIA_DRIVER_VERSION=590.48.01
 has 'DRIVER_VERSION=590.48.01'
@@ -49,6 +51,27 @@ reject 'CT_ID' CT_ID=99
 reject 'BASALT_GPUS' BASALT_GPUS=none
 reject 'BASALT_MODEL' BASALT_MODEL='../wrong.basalt'
 reject 'BASALT_CONTEXT' BASALT_CONTEXT=0
+reject 'at most 999999 tokens' BASALT_CONTEXT=1000000
+plan BASALT_MODEL=UD-IQ3_XXS BASALT_CONTEXT=999999
+has 'BASALT_CONTEXT=999999'
+reject 'BASALT_KV' BASALT_KV=bad
+reject 'BASALT_KV_RESIDENT' BASALT_KV_RESIDENT=1000
+reject 'cannot be combined' BASALT_KV=k8v4 BASALT_KV_RESIDENT=32768
+plan BASALT_CONTEXT=131072 BASALT_KV=int8 BASALT_KV_RESIDENT=32768
+has 'BASALT_KV=int8'
+has 'BASALT_KV_RESIDENT=32768'
+has 'KV streaming'
+has 'about 1.6 GiB pinned RAM'
+lacks 'Warning: the streamed KV cache'
+# The CT at its 64 GiB floor cannot hold the UD-IQ3_XXS experts, 16 GiB and
+# the pinned cache: a warning, not a refusal.
+plan BASALT_MODEL=UD-IQ3_XXS MEMORY_MB=65536 BASALT_CONTEXT=131072 BASALT_KV=int8 BASALT_KV_RESIDENT=32768
+has "Warning: the streamed KV cache pins about 1.6 GiB of RAM; with the pack's 46.8 GiB of routed experts"
+has "more than the CT's RAM (MEMORY_MB) (64.0 GiB)"
+has 'pct create'
+plan BASALT_MODEL=UD-IQ3_XXS MEMORY_MB=65536
+lacks 'KV streaming'
+lacks 'Warning: the streamed KV cache'
 reject 'Set BASALT_MODEL when BASALT_HF_REPO is a custom repository' BASALT_HF_REPO=https://huggingface.co/example/custom
 plan BASALT_MODEL=UD-IQ2_XS
 has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt'
@@ -84,6 +107,37 @@ unset -f nvidia-smi
 output=$(printf 'UD-IQ2_XS\n' | env -i "PATH=$PATH" PVE_INTERACTIVE=true "${common[@]}" bash "$provision" --dry-run 2>&1)
 has '== Basalt model =='
 has 'Suggested: UD-IQ3_XXS'
+has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt'
+
+# The CT installer carries the host's KV RAM estimate; the copies must match,
+# and so must its expert table.
+shared_block() { sed -n '/^# BEGIN shared KV RAM estimate$/,/^# END shared KV RAM estimate$/p' "$1"; }
+[[ -n $(shared_block "$here/model-select.sh") && $(shared_block "$here/model-select.sh") == "$(shared_block "$guest")" ]] ||
+    { echo 'FAIL the KV RAM estimate in install-target.sh differs from model-select.sh' >&2; exit 1; }
+source <(sed -n '/^basalt_pack_experts_mib() {/,/^}/p' "$guest")
+while IFS='|' read -r suffix _ _; do
+    [[ $(basalt_pack_experts_mib "$(basalt_model_file "$suffix")") == "$(basalt_model_experts_mib "$suffix")" ]] ||
+        { echo "FAIL install-target.sh expert size for $suffix" >&2; exit 1; }
+done < <(basalt_model_rows)
+[[ -z $(basalt_pack_experts_mib custom.basalt) ]] || { echo 'FAIL expert size for a custom pack' >&2; exit 1; }
+# Bytes per cell from upstream's geometry (Basalt's docs: int8 1,056 per layer).
+[[ $(basalt_kv_host_mib 131072 int8 32768) == 1716 ]] || { echo 'FAIL int8 KV RAM' >&2; exit 1; }
+[[ $(basalt_kv_host_mib 131072 fp16 32768) == 3328 ]] || { echo 'FAIL fp16 KV RAM' >&2; exit 1; }
+[[ $(basalt_kv_host_mib 131072 q4_0 32768) == 936 ]] || { echo 'FAIL q4_0 KV RAM' >&2; exit 1; }
+[[ $(basalt_kv_host_mib 131072 int8 0) == 0 && $(basalt_kv_host_mib 131072 int8 131072) == 0 ]] ||
+    { echo 'FAIL KV RAM without streaming' >&2; exit 1; }
+[[ -z $(basalt_kv_ram_warning 1716 47923 131072 x) && -n $(basalt_kv_ram_warning 1716 47923 65536 x) ]] ||
+    { echo 'FAIL KV RAM warning threshold' >&2; exit 1; }
+[[ -z $(basalt_kv_ram_warning 1716 47923 '' x) ]] || { echo 'FAIL KV RAM warning with an unknown limit' >&2; exit 1; }
+
+# The model suggestion sets the pinned cache aside: 6.5 GiB of fp16 KV leaves a
+# 64 GiB CT room for UD-IQ2_XS rather than UD-IQ3_XXS.
+output=$(printf '\n' | env -i "PATH=$PATH" PVE_INTERACTIVE=true "${common[@]}" MEMORY_MB=65536 ROOTFS_GB=120 bash "$provision" --dry-run 2>&1)
+has 'Suggested: UD-IQ3_XXS'
+output=$(printf '\n' | env -i "PATH=$PATH" PVE_INTERACTIVE=true "${common[@]}" MEMORY_MB=65536 ROOTFS_GB=120 \
+    BASALT_CONTEXT=262144 BASALT_KV=fp16 BASALT_KV_RESIDENT=32768 bash "$provision" --dry-run 2>&1)
+has 'Streamed KV cache: about 6.5 GiB of pinned RAM'
+has 'Suggested: UD-IQ2_XS'
 has 'BASALT_MODEL=Qwen3.8-FN-UD-IQ2_XS.basalt'
 
 output=$(env -i "PATH=$PATH" bash "$guest" --dry-run 2>&1)
@@ -135,7 +189,17 @@ grep -q '^CapabilityBoundingSet=$' "$unit"
 grep -q '^PrivateDevices=false$' "$unit"
 grep -q '^LimitMEMLOCK=infinity$' "$unit"
 
+# The CT installer: six-digit context, and a KV streaming report on a rerun
+# that turns it on (its warning depends on this machine's memory).
+if output=$(env -i "PATH=$PATH" BASALT_CONTEXT=1000000 bash "$guest" --dry-run 2>&1); then
+    printf 'FAIL the guest accepted a seven-digit context\n%s\n' "$output" >&2; exit 1
+fi
+has '1 to 999999 tokens'
+output=$(env -i "PATH=$PATH" BASALT_CONTEXT=131072 BASALT_KV=int8 BASALT_KV_RESIDENT=32768 bash "$guest" --dry-run 2>&1)
+has 'KV streaming: 32768 of 131072 cells stay in VRAM; the whole int8 cache takes about 1.6 GiB of pinned RAM.'
+
 bash -n "$provision"
 bash -n "$guest"
+bash -n "$here/model-select.sh"
 bash -n "$here/cuda-toolkit.sh"
 printf 'Basalt dry-run plans, validation and shell syntax passed. No CT was created.\n'

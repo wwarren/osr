@@ -124,6 +124,21 @@ grep -q -- "$key" "$etc/installed-env" && fail 'the key is in the settings recor
 grep -q -- "$key" "$tmp_root/out" && fail 'the key was printed'
 pass 'a fresh install records its settings, without the key'
 
+# A CT installed before the KV options existed has no KV keys in either
+# record. Its next run must keep the old fp16, all-VRAM behavior, backfill the
+# new settings instead of rejecting the record, and leave the service running:
+# default KV settings add nothing to the fingerprint.
+grep -Eq '^kv(_resident)?=' "$etc/installed-settings" && fail 'default KV settings were written to the fingerprint'
+sed -i '/^BASALT_KV=/d; /^BASALT_KV_RESIDENT=/d' "$etc/installed-env"
+sed -i '/^kv=/d; /^kv_resident=/d' "$etc/installed-settings"
+: > "$log"
+BASALT_COMMIT=$good run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'legacy KV settings migration'; }
+contains 'nothing to do' "$tmp_root/out"
+grep -q 'systemctl stop' "$log" && fail 'a legacy record without KV settings restarted the service'
+contains 'BASALT_KV=fp16' "$etc/installed-env"
+contains 'BASALT_KV_RESIDENT=0' "$etc/installed-env"
+pass 'an older settings record retains the original KV defaults without a restart'
+
 : > "$log"
 BASALT_COMMIT=$good run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'no-op rerun'; }
 contains 'nothing to do' "$tmp_root/out"
@@ -248,9 +263,12 @@ saved_upgrade() {
         "$@" bash "$target" --upgrade
 }
 reset_tree
-BASALT_PORT=8123 BASALT_MODEL=new.basalt BASALT_CONTEXT=65536 BASALT_ALIAS=custom CUDA_VERSION=13.1 run_target > "$tmp_root/out" 2>&1 ||
+BASALT_PORT=8123 BASALT_MODEL=new.basalt BASALT_CONTEXT=65536 BASALT_KV=int8 BASALT_KV_RESIDENT=32768 BASALT_ALIAS=custom CUDA_VERSION=13.1 run_target > "$tmp_root/out" 2>&1 ||
     { cat "$tmp_root/out"; fail 'custom install before saved-settings upgrade'; }
 record=$tree/etc/basalt-target/installed-env
+contains 'BASALT_KV=int8' "$record"
+contains 'BASALT_KV_RESIDENT=32768' "$record"
+contains '--kv int8 --kv-resident 32768' "$launcher"
 cp "$record" "$tmp_root/custom-settings"
 : > "$log"
 saved_upgrade > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'bare upgrade with saved settings'; }
