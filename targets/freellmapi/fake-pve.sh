@@ -110,10 +110,36 @@ case $name in
         esac ;;
     vzdump)
         id=$1; shift
-        [[ "$*" == "--mode stop --compress zstd --dumpdir "* && -z ${FAKE_VZDUMP_FAILS:-} ]] || exit 1
+        dumpdir='' tmpdir=''
+        while (( $# )); do
+            case $1 in
+                --mode) [[ $2 == stop ]] || exit 1 ;;
+                --compress) [[ $2 == zstd ]] || exit 1 ;;
+                --dumpdir) dumpdir=$2 ;;
+                --tmpdir) tmpdir=$2 ;;
+                *) exit 1 ;;
+            esac
+            shift 2
+        done
+        [[ -n $dumpdir && -z ${FAKE_VZDUMP_FAILS:-} ]] || exit 1
         ! running "$id" || exit 1
+        # The real vzdump runs tar for an unprivileged CT as its mapped root,
+        # reading the CT config from the temporary directory: by default
+        # <dumpdir>/<name>.tmp, else <tmpdir>/vzdumptmp<pid>_<id>. Every
+        # directory above it must let others through.
+        tmp_parent=${tmpdir:-$dumpdir}
+        [[ ! -d $tmp_parent ]] || {
+            path=$(cd "$tmp_parent" && pwd)
+            while [[ -n $path && $path != / ]]; do
+                (( 8#$(stat -c %a "$path") & 1 )) || {
+                    printf 'INFO: tar: %s/vzdump-lxc-%s.tmp: Cannot open: Permission denied\n' "$dumpdir" "$id" >&2
+                    exit 1
+                }
+                path=${path%/*}
+            done
+        }
         cp "$(conf "$id")" "$FAKE/ct/$id/conf.saved"; cp "$PVE_ETC/firewall/$id.fw" "$FAKE/ct/$id/fw.saved"
-        tar -C "$FAKE/ct" -cf "$6/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id" ;;
+        tar -C "$FAKE/ct" -cf "$dumpdir/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id" ;;
     pct)
         command=$1 id=${2:-}; shift 2 || true
         case $command in

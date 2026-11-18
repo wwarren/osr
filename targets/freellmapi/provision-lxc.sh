@@ -834,7 +834,7 @@ pve_confirm "Replace FreeLLMAPI CT $CT_ID with release $FREELLMAPI_VERSION (it i
 ensure_template "$FREELLMAPI_VERSION" "$FREELLMAPI_DIGEST"
 if (( dry_run )); then
     stage="$STATE_DIR/$CT_ID" dump="$stage/vzdump-lxc-$CT_ID-<time>.tar.zst" data_tar="$stage/data.tar"
-    printf '+ vzdump %s --mode stop --compress zstd --dumpdir %s (the whole CT, for rollback)\n' "$CT_ID" "$stage"
+    printf '+ vzdump %s --mode stop --compress zstd --dumpdir %s --tmpdir /var/tmp (the whole CT, for rollback)\n' "$CT_ID" "$stage"
     printf '+ start the old CT without the server and save its data directory to %s\n' "$data_tar"
     run pct destroy "$CT_ID"
 else
@@ -849,7 +849,12 @@ else
     # From here the old CT is touched: any failure starts it again.
     trap 'note "Stopped at line $LINENO."; pct stop "$CT_ID" 2>/dev/null || true; service_boot "$old_entrypoint" || true; rm -rf -- "$stage"; exit 1' ERR
     pct stop "$CT_ID"
-    vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" >&2
+    # For an unprivileged CT, vzdump's tar runs as the CT's mapped root and
+    # reads the CT config from vzdump's temporary directory, by default inside
+    # the dump directory, which is root-only here (the backup holds the keys).
+    # /var/tmp (vzdump's own fallback) keeps that temporary copy reachable; the
+    # archive is written by root into the root-only directory as before.
+    vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" --tmpdir /var/tmp >&2
     dumps=("$stage"/vzdump-lxc-"$CT_ID"-*.tar.zst)
     [[ ${#dumps[@]} -eq 1 && -s ${dumps[0]} ]] || { note "vzdump left no backup in $stage."; false; }
     dump=${dumps[0]}

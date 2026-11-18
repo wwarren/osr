@@ -82,7 +82,7 @@ refuse 'Set IP_CIDR for unattended provisioning' IP_CIDR=
 pass 'create: bad settings are refused before anything is planned'
 
 plan --reconfigure FREELLMAPI_VERSION=v0.99.1 OSR_DRY_RUN_OLD_VERSION=v0.16.31
-has 'v0.16.31 -> v0.99.1'; has 'vzdump 280 --mode stop --compress zstd --dumpdir /var/lib/osr-freellmapi/280'
+has 'v0.16.31 -> v0.99.1'; has 'vzdump 280 --mode stop --compress zstd --dumpdir /var/lib/osr-freellmapi/280 --tmpdir /var/tmp'
 has '+ pct destroy 280'; has '+ pct create 280 local:vztmpl/freellmapi_v0.99.1.tar'
 has 'restore the data directory into the new CT'; has 'pct restore 280 '
 has 'are not carried over'
@@ -279,6 +279,8 @@ host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 --reconfigure; ok 'an upgrade'
     fail "order: $(grep -o '^\(skopeo copy\|pct stop\|vzdump\|pct destroy\|pct create\)' "$FAKE/calls" | paste -sd'|')"
 has 'now runs v0.99.1'; lacks "$key"
 [[ $(env_file) != *FREEAPI_CONFIG_PATH* && ! -e $data/osr-target/bootstrap.json ]] || fail 'the upgrade wrote a bootstrap file'
+[[ $(calls) == *'vzdump 280 --mode stop --compress zstd --dumpdir '*' --tmpdir /var/tmp'* ]] || fail 'vzdump was not given a temporary directory the CT root can reach'
+[[ $(stat -c %a "$tmp/host/state") == 700 ]] || fail 'the backup directory is no longer root-only'
 pass '--reconfigure to a new release: image pulled first, backup, new CT, same data, key, options and rules'
 
 : > "$FAKE/calls"
