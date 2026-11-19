@@ -282,6 +282,19 @@ kgpu -- --vendors nvidia --for Strata
 has 'An NVIDIA GPU is needed for Strata'
 pass 'a working AMD card (amdgpu, render node, /dev/kfd) is reported with its LLVM target; vendors go in the order given; NVIDIA-only targets refuse it'
 
+# Vulkan only needs the render node. ROCm callers retain the default /dev/kfd
+# requirement, while a render-only caller can use the already bound card.
+reset_kernel "$tmp/lspci-amd-bound" "$tmp/lspci-amd-bound" 0000:03:00.0
+mkdir -p "$sys/bus/pci/devices/0000:03:00.0/drm/renderD128" "$dev/dri"
+touch "$dev/dri/renderD128"
+kgpu -- --vendors amd --need optional
+[[ $(field GPU_STATE) == declined ]] || fail "AMD without KFD passed the default readiness check: $output"
+kgpu -- --vendors amd --need optional --amd-render-only
+[[ $rc == 0 && $(field GPU_STATE) == ready && $(field GPU_RENDER_NODE) == /dev/dri/renderD128 ]] ||
+    fail "render-only AMD GPU was not ready: $output"
+[[ ! -s $log ]] || fail "a render-only ready AMD card was touched: $(cat "$log")"
+pass 'AMD render-only readiness accepts a Vulkan card without KFD; the default still requires KFD'
+
 reset_kernel "$amd" "$tmp/lspci-amd-bound" 0000:03:00.0
 kgpu -- "${all[@]}" --dry-run
 [[ $rc == 0 && $(field GPU_STATE) == planned && $(field GPU_GENERATION) == rdna3 && $(field GPU_VENDOR) == amd ]] || fail "amd plan: $output"

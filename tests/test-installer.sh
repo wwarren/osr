@@ -476,6 +476,19 @@ assert_not_contains "and no --card" "--card" "$(cat "$MOCK_LOG")"
 assert_contains "NVIDIA is reported" "NVIDIA GPU ready: rtx50 (compute capability 120)" "$(cat "$MOCK_BIN/out")"
 assert_eq "its compute capability is kept" 120 "$HOST_GPU_CUDA_ARCH"
 assert_eq "and its minor" 1 "$(target_gpu_result basalt minor)"
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rtx50\nGPU_CUDA_ARCH=120\nGPU_VENDOR=nvidia\nGPU_NVIDIA_MINOR=\nGPU_PCI=0000:02:00.0'
+assert_fail "a selected NVIDIA card without a minor stops before provisioning" \
+  run_host_gpu_tool optional nvidia 0000:02:00.0 colibri
+assert_contains "the missing minor is explained" "has no /dev/nvidia minor" \
+  "$(run_host_gpu_tool optional nvidia 0000:02:00.0 colibri 2>&1)"
+mock_reset_log
+export FAKE_GPU_OUT=$'GPU_STATE=ready\nGPU_GENERATION=rdna3\nGPU_VENDOR=amd\nGPU_RENDER_NODE=/dev/dri/renderD128'
+run_host_gpu_tool optional amd 0000:03:00.0 "colibri llamacpp" >/dev/null 2>&1
+assert_contains "Vulkan-only targets accept an AMD render node without KFD" \
+  "gpu-tool --need optional --vendors amd --for colibri llamacpp --card 0000:03:00.0 --amd-render-only" "$(cat "$MOCK_LOG")"
+mock_reset_log
+run_host_gpu_tool optional amd 0000:03:00.0 "colibri ollama" >/dev/null 2>&1
+assert_not_contains "a shared ROCm target still needs KFD" "--amd-render-only" "$(cat "$MOCK_LOG")"
 export FAKE_GPU_OUT=GPU_STATE=absent
 assert_contains "no GPU: the targets go on without" "No GPU (absent): ollama will run without one." "$(run_host_gpu_tool optional nvidia "" ollama 2>&1)"
 export FAKE_GPU_RC=2
@@ -631,13 +644,16 @@ GPU_RESULT_KINDI="absent||||"
 assert_eq "Kindi without a GPU: its CPU engine" KINDI_BACKEND=cpu "$(target_gpu_env kindi)"
 GPU_RESULT_COLIBRI="ready|nvidia||2|0000:02:00.0"
 assert_eq "Colibri on an NVIDIA card: CUDA with its /dev/nvidia<minor>" \
-  $'COLIBRI_BACKEND=cuda\nGPU_DEVICES=/dev/nvidia2 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' "$(target_gpu_env colibri)"
+  $'GPU_CARD=0000:02:00.0\nCOLIBRI_BACKEND=cuda\nGPU_DEVICES=/dev/nvidia2 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' "$(target_gpu_env colibri)"
+GPU_RESULT_COLIBRI="ready|nvidia|||0000:02:00.0"
+assert_eq "Colibri keeps the selected card when its NVIDIA minor is unavailable" \
+  $'GPU_CARD=0000:02:00.0\nCOLIBRI_BACKEND=cuda' "$(target_gpu_env colibri)"
 GPU_RESULT_COLIBRI="ready|amd|/dev/dri/renderD128||0000:03:00.0"
 assert_eq "Colibri on an AMD card: Vulkan with the card's render node" \
-  $'COLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD128' "$(target_gpu_env colibri)"
+  $'GPU_CARD=0000:03:00.0\nCOLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD128' "$(target_gpu_env colibri)"
 GPU_RESULT_COLIBRI="ready|intel|/dev/dri/renderD129||0000:04:00.0"
 assert_eq "Colibri on an Intel Arc card: Vulkan too" \
-  $'COLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD129' "$(target_gpu_env colibri)"
+  $'GPU_CARD=0000:04:00.0\nCOLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD129' "$(target_gpu_env colibri)"
 assert_eq "a preset COLIBRI_BACKEND and GPU_DEVICES are kept" "" \
   "$(COLIBRI_BACKEND=vulkan GPU_DEVICES=/dev/dri/renderD130 target_gpu_env colibri)"
 GPU_RESULT_COLIBRI="declined||||"

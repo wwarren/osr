@@ -54,13 +54,23 @@ STORAGE=local-lvm IP_CIDR=192.0.2.51/24 GATEWAY=192.0.2.1 \
 bash targets/colibri/provision-lxc.sh --dry-run     # then without --dry-run
 ```
 
-`GPU_DEVICES` is empty by default (the CPU). For CUDA pass
-`'/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'` (plus `/dev/nvidia-uvm-tools`
-when the host has it); the CT then gets NVIDIA user space matching the host's
-driver (580 series or newer). For Vulkan pass the card's render node, e.g.
-`/dev/dri/renderD128`. Both are mapped with `gid=44` (video), which the
-`colibri` account joins. `COLIBRI_BACKEND=cuda` or `vulkan` without its device
-is refused. A host without the GPU's driver: `bash tools/setup-host-gpu.sh`.
+With `GPU_DEVICES` empty (the default) the provisioner finds the host's GPU the
+way the OSR installer does: `tools/setup-host-gpu.sh` checks the driver for an
+NVIDIA, AMD Radeon RX 7000/9000 or Intel Arc card and, if it is missing, offers
+to install it (on a terminal; unattended, `INSTALL_HOST_DRIVER=yes` and
+`GPU_GENERATION=<gen>`). It may ask for a reboot, after which you run the
+provisioner again. An NVIDIA card gives `COLIBRI_BACKEND=cuda`, its
+`/dev/nvidia<minor>`, control and UVM nodes, and NVIDIA user space in the CT
+matching the host's driver (580 series or newer); an AMD or Intel card gives
+`COLIBRI_BACKEND=vulkan` and its render node. With no usable card the CT runs
+on the CPU, and the provisioner says so. `GPU_CARD=<PCI address>` picks the
+card on a host with several; `COLIBRI_BACKEND=cpu` skips the search;
+`COLIBRI_BACKEND=cuda` or `vulkan` stops unless that vendor's GPU is ready.
+
+Or name the devices: `GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm'`
+(plus `/dev/nvidia-uvm-tools` when the host has it) for CUDA, or the card's
+render node, e.g. `/dev/dri/renderD128`, for Vulkan. Both are mapped with
+`gid=44` (video), which the `colibri` account joins.
 
 Then on OSR:
 

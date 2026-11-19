@@ -31,10 +31,15 @@ CT; to resume or upgrade an existing Colibri CT, run its guest install-target.sh
 Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
           (8192 or more), SWAP_MB=0, ROOTFS_GB=160 (40 or more), ONBOOT=1,
           NAMESERVER, VLAN_TAG, SSH_PUBLIC_KEY=<readable file>,
-          GPU_DEVICES= (empty: the CPU. For CUDA '/dev/nvidia0 /dev/nvidiactl
+          GPU_DEVICES= (empty: the host's GPU is found with
+                      tools/setup-host-gpu.sh, which checks its driver and offers
+                      to install one; no usable GPU gives the CPU. Or name the
+                      devices: for CUDA '/dev/nvidia0 /dev/nvidiactl
                       /dev/nvidia-uvm', plus /dev/nvidia-uvm-tools when the host
                       has it; for Vulkan on AMD Radeon or Intel Arc the card's
                       render node, e.g. /dev/dri/renderD128),
+          GPU_CARD=<PCI address> (with GPU_DEVICES empty: the card to use when
+                      the host has several, as setup-host-gpu.sh --list prints it),
           GPU_GID=44 (the CT group given the GPU nodes; 44 is "video"),
           NVIDIA_DRIVER_VERSION=auto (loaded host driver; or an exact-version check),
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
@@ -45,8 +50,9 @@ Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
                     500 GB+, so the operator copies one in later and restarts
                     the service; see README.md. It must be an absolute path
                     without ".." inside the CT's data directory),
-          COLIBRI_BACKEND=auto (auto|cpu|vulkan|cuda; auto follows GPU_DEVICES:
-                    cuda for NVIDIA nodes, vulkan for a render node, else cpu),
+          COLIBRI_BACKEND=auto (auto|cpu|vulkan|cuda; auto: cuda for an NVIDIA
+                    GPU, vulkan for an AMD Radeon or Intel Arc one, else cpu;
+                    cpu never looks for a GPU),
           COLIBRI_HOST=0.0.0.0, COLIBRI_PORT=8080,
           COLIBRI_ALLOWED_HOST=* (comma-separated Host headers the server's
                     DNS-rebinding guard accepts besides loopback; * because
@@ -54,8 +60,8 @@ Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
                     know. The API key is required either way),
           COLIBRI_READY_TIMEOUT=900.
 
-GPU passthrough is optional: with GPU_DEVICES empty (the default) the CT gets
-no device line and Colibri runs on its CPU backend.
+GPU passthrough is optional: a host without a usable GPU (or COLIBRI_BACKEND=cpu)
+gets a CT with no device line, and Colibri runs on its CPU backend.
 Explicit COLIBRI_REF or an empty COLIBRI_COMMIT follows a branch tip (main if no
 ref is set).
 
@@ -194,6 +200,104 @@ done
 NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../tools/install-nvidia-driver.sh}
 [[ -r $NVIDIA_GUEST_INSTALLER ]] || die "Missing NVIDIA LXC user-space helper: $NVIDIA_GUEST_INSTALLER"
 
+# Check the CT and its host prerequisites before the GPU helper can change the
+# host driver. In particular, an occupied CT ID or missing storage must not
+# leave a driver installed for a CT that cannot be created.
+if (( ! dry_run )); then
+    [[ $EUID -eq 0 ]] || die 'Run as root on the PVE host.'
+    for command_name in pveversion pct pvesh pvesm; do
+        command -v "$command_name" >/dev/null || die "Missing PVE command: $command_name"
+    done
+    [[ $(pveversion) == pve-manager/9.* ]] || die 'This script targets Proxmox VE 9.x.'
+    [[ -d /etc/pve/nodes ]] || die '/etc/pve is unavailable.'
+    if ! pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null; then
+        if pct status "$CT_ID" >/dev/null 2>&1; then
+            die "CT $CT_ID already exists. This script only creates new Colibri CTs; resume or upgrade it with: pct exec $CT_ID -- bash /root/colibri-target-deploy/install-target.sh"
+        fi
+        die "CT ID $CT_ID is unavailable in this cluster."
+    fi
+    [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge interface is missing: $BRIDGE"
+    template_path=$(pvesm path "$TEMPLATE")
+    [[ -f $template_path && -r $template_path ]] || die "Template is not readable: $TEMPLATE"
+    storage_ready=0
+    while read -r storage_name _ status _; do
+        [[ $storage_name == "$STORAGE" && $status == active ]] && storage_ready=1
+    done < <(pvesm status --content rootdir 2>/dev/null || true)
+    (( storage_ready )) || die "Storage is not active or does not support rootdir: $STORAGE"
+fi
+
+# --- The host's GPU ------------------------------------------------------------
+# With no GPU_DEVICES, find the GPU the way the OSR installer does: the host
+# tool checks (and with consent installs) the driver for the vendors this
+# backend can use and reports the card: its /dev/nvidia<minor> for CUDA, its
+# render node for Vulkan. auto takes any of them and runs on the CPU without
+# one; an explicit cuda or vulkan needs its GPU. HOST_GPU_TOOL is for tests.
+HOST_GPU_TOOL=${HOST_GPU_TOOL:-${source_dir%/*/*}/tools/setup-host-gpu.sh}
+GPU_CARD=${GPU_CARD:-}
+[[ -z $GPU_CARD || $GPU_CARD =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] ||
+    die 'GPU_CARD must be a PCI address such as 0000:03:00.0.'
+gpu_detected=''
+gpu_minor_pending=''
+if [[ -z $GPU_DEVICES && $COLIBRI_BACKEND != cpu ]]; then
+    case $COLIBRI_BACKEND in
+        cuda) gpu_need=required gpu_vendors=nvidia ;;
+        vulkan) gpu_need=required gpu_vendors=amd,intel ;;
+        *) gpu_need=optional gpu_vendors=nvidia,amd,intel ;;
+    esac
+    [[ -r $HOST_GPU_TOOL ]] || die "Missing the host GPU tool: $HOST_GPU_TOOL"
+    gpu_args=(--need "$gpu_need" --vendors "$gpu_vendors" --for Colibri)
+    [[ $COLIBRI_BACKEND == cuda ]] || gpu_args+=(--amd-render-only)
+    [[ -z $GPU_CARD ]] || gpu_args+=(--card "$GPU_CARD")
+    (( ! dry_run )) || gpu_args+=(--dry-run)
+    printf '\n== GPU on this host (%s) ==\n' "$gpu_vendors" >&2
+    gpu_rc=0
+    gpu_out=$(bash "$HOST_GPU_TOOL" "${gpu_args[@]}") || gpu_rc=$?
+    case $gpu_rc in
+        0) ;;
+        2) die "Reboot this host, then run this again: the GPU driver is set up but needs a reboot to use the card. Nothing was created." ;;
+        *) die "The host's GPU is not ready for COLIBRI_BACKEND=$COLIBRI_BACKEND (see above). Fix it with: bash $HOST_GPU_TOOL, or set COLIBRI_BACKEND=cpu. Nothing was created." ;;
+    esac
+    gpu_state=$(sed -n 's/^GPU_STATE=//p' <<< "$gpu_out")
+    gpu_vendor=$(sed -n 's/^GPU_VENDOR=//p' <<< "$gpu_out")
+    gpu_render=$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$gpu_out")
+    gpu_minor=$(sed -n 's/^GPU_NVIDIA_MINOR=//p' <<< "$gpu_out")
+    gpu_pci=$(sed -n 's/^GPU_PCI=//p' <<< "$gpu_out")
+    case $gpu_state:$gpu_vendor in
+        ready:nvidia|planned:nvidia)
+            [[ -z $gpu_minor || $gpu_minor =~ ^[0-9]+$ ]] || die "The host GPU tool reported an invalid NVIDIA minor: $gpu_minor"
+            # A ready card must name its own minor, or another card would be
+            # mapped. A planned one (a dry run before the driver is installed)
+            # has none yet: the plan shows /dev/nvidia0 and says so, and a real
+            # run installs the driver first and maps the card's own minor.
+            [[ $gpu_state != ready || -z $GPU_CARD || -n $gpu_minor ]] ||
+                die "The host GPU tool could not identify /dev/nvidia<minor> for GPU_CARD=$GPU_CARD; refusing to map a different NVIDIA card."
+            if [[ $gpu_state == planned && -n $GPU_CARD && -z $gpu_minor ]]; then
+                gpu_minor_pending=" (dry run: the NVIDIA driver is not installed yet, so this card's /dev/nvidia<minor> is unknown; /dev/nvidia0 stands in for it, and a real run maps the card's own minor)"
+                printf 'Note: GPU_CARD=%s%s.\n' "$GPU_CARD" "$gpu_minor_pending" >&2
+            fi
+            GPU_DEVICES="/dev/nvidia${gpu_minor:-0} /dev/nvidiactl /dev/nvidia-uvm"
+            # Optional: only some driver setups create it, and nothing here needs it.
+            if [[ -c /dev/nvidia-uvm-tools ]]; then GPU_DEVICES+=' /dev/nvidia-uvm-tools'; fi
+            [[ $COLIBRI_BACKEND != auto ]] || COLIBRI_BACKEND=cuda ;;
+        ready:amd|ready:intel|planned:amd|planned:intel)
+            if [[ $gpu_render =~ ^/dev/dri/renderD[0-9]+$ ]]; then
+                GPU_DEVICES=$gpu_render
+                [[ $COLIBRI_BACKEND != auto ]] || COLIBRI_BACKEND=vulkan
+            elif [[ $gpu_state == ready ]]; then
+                die "The host GPU tool found the $gpu_vendor GPU${gpu_pci:+ at $gpu_pci} but no render node for it; check its driver with: bash $HOST_GPU_TOOL"
+            fi ;;
+    esac
+    if [[ -n $GPU_DEVICES ]]; then
+        gpu_detected="$gpu_vendor${gpu_pci:+ at $gpu_pci}"
+        printf 'Colibri uses the %s GPU%s (%s): %s\n' "$gpu_vendor" "${gpu_pci:+ at $gpu_pci}" "$gpu_state" "$GPU_DEVICES" >&2
+    elif [[ $COLIBRI_BACKEND == auto ]]; then
+        printf 'Note: no usable GPU on this host (%s); Colibri runs on the CPU. To use one, set up its driver with bash %s and run this again.\n' \
+            "${gpu_state:-unknown}" "$HOST_GPU_TOOL" >&2
+    else
+        die "No ${gpu_vendors//,/ or } GPU is ready on this host for COLIBRI_BACKEND=$COLIBRI_BACKEND (${gpu_state:-unknown}); run bash $HOST_GPU_TOOL, or set COLIBRI_BACKEND=cpu."
+    fi
+fi
+
 read -r -a devices <<< "$GPU_DEVICES"
 declare -A seen_devices=()
 have_gpu=0; have_ctl=0; have_uvm=0; have_nvidia=0; have_dri=0
@@ -229,6 +333,7 @@ fi
 gpu_label='none (CPU)'
 (( ! have_nvidia )) || gpu_label="NVIDIA (CUDA): ${devices[*]}"
 (( ! have_dri )) || gpu_label="render node (Vulkan): ${devices[*]}"
+[[ -z $gpu_detected ]] || gpu_label+=" (found on this host: $gpu_detected)$gpu_minor_pending"
 
 # --- Colibri settings --------------------------------------------------------
 # Nothing to ask: the model is never chosen or fetched here (models run from
@@ -250,30 +355,10 @@ create=(pct create "$CT_ID" "$TEMPLATE" --hostname "$CT_HOSTNAME" --ostype "$ost
 for i in "${!devices[@]}"; do create+=("--dev$i" "path=${devices[$i]},gid=$GPU_GID,mode=0660"); done
 
 if (( ! dry_run )); then
-    [[ $EUID -eq 0 ]] || die 'Run as root on the PVE host.'
-    for command_name in pveversion pct pvesh pvesm; do
-        command -v "$command_name" >/dev/null || die "Missing PVE command: $command_name"
-    done
     # nvidia-smi is only needed when the CT is handed NVIDIA devices.
     if (( have_nvidia )); then
         command -v nvidia-smi >/dev/null || die "Missing PVE/driver command: nvidia-smi.$gpu_hint"
     fi
-    [[ $(pveversion) == pve-manager/9.* ]] || die 'This script targets Proxmox VE 9.x.'
-    [[ -d /etc/pve/nodes ]] || die '/etc/pve is unavailable.'
-    if ! pvesh get /cluster/nextid --vmid "$CT_ID" >/dev/null; then
-        if pct status "$CT_ID" >/dev/null 2>&1; then
-            die "CT $CT_ID already exists. This script only creates new Colibri CTs; resume or upgrade it with: pct exec $CT_ID -- bash /root/colibri-target-deploy/install-target.sh"
-        fi
-        die "CT ID $CT_ID is unavailable in this cluster."
-    fi
-    [[ -d /sys/class/net/$BRIDGE ]] || die "Bridge interface is missing: $BRIDGE"
-    template_path=$(pvesm path "$TEMPLATE")
-    [[ -f $template_path && -r $template_path ]] || die "Template is not readable: $TEMPLATE"
-    storage_ready=0
-    while read -r storage_name _ status _; do
-        [[ $storage_name == "$STORAGE" && $status == active ]] && storage_ready=1
-    done < <(pvesm status --content rootdir 2>/dev/null || true)
-    (( storage_ready )) || die "Storage is not active or does not support rootdir: $STORAGE"
     if (( have_nvidia )); then
         host_driver=$(nvidia_lxc_host_version) || die 'Cannot determine the loaded NVIDIA driver version on this Proxmox host.'
         [[ $NVIDIA_DRIVER_VERSION == auto || $host_driver == "$NVIDIA_DRIVER_VERSION" ]] ||

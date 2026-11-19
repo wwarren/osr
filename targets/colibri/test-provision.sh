@@ -17,6 +17,26 @@ cat > "$fake/bin/nvidia-smi" <<'SMI'
 printf '00000000:01:00.0, %s\n' "${FAKE_VRAM_MIB:-16311}"
 SMI
 chmod +x "$fake/bin/nvidia-smi"
+# tools/setup-host-gpu.sh as the provisioner calls it with no GPU_DEVICES: it
+# logs its arguments and reports the host FAKE_GPU names (absent, nvidia, amd,
+# declined, reboot), failing as the real tool does when --need required finds
+# no GPU.
+cat > "$fake/setup-host-gpu.sh" <<'TOOL'
+printf '%s\n' "$*" > "$FAKE_GPU_LOG"
+need=optional; card=''
+while (( $# )); do case $1 in --need) need=$2; shift ;; --card) card=$2; shift ;; esac; shift; done
+case ${FAKE_GPU:-absent} in
+    nvidia) printf 'GPU_STATE=ready\nGPU_VENDOR=nvidia\nGPU_CUDA_ARCH=120\nGPU_PCI=%s\nGPU_NVIDIA_MINOR=%s\n' "${card:-0000:01:00.0}" "${FAKE_GPU_MINOR-0}" ;;
+    # A dry run on a host without the NVIDIA driver: planned, and no minor yet.
+    nvidia-planned) printf 'GPU_STATE=planned\nGPU_GENERATION=rtx50\nGPU_VENDOR=nvidia\nGPU_PCI=%s\nGPU_NVIDIA_MINOR=\n' "${card:-}" ;;
+    amd) printf 'GPU_STATE=ready\nGPU_VENDOR=amd\nGPU_RENDER_NODE=/dev/dri/renderD129\nGPU_PCI=0000:03:00.0\nGPU_NVIDIA_MINOR=\n' ;;
+    reboot) echo 'reboot needed' >&2; exit 2 ;;
+    *)
+        if [[ $need == required ]]; then echo 'Error: no GPU on this host' >&2; exit 1; fi
+        printf 'GPU_STATE=%s\nGPU_VENDOR=\n' "${FAKE_GPU:-absent}" ;;
+esac
+TOOL
+gpu_log=$fake/gpu-tool.log
 
 pin=$(sed -n 's/^COLIBRI_DEFAULT_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "$here/install-target.sh")
 [[ $pin =~ ^[0-9a-f]{40}$ ]] || { echo 'FAIL missing Colibri test pin' >&2; exit 1; }
@@ -30,14 +50,18 @@ passed=0
 has()   { [[ $output == *"$1"* ]] || { printf 'FAIL missing %s\n%s\n' "$1" "$output" >&2; exit 1; }; }
 lacks() { [[ $output != *"$1"* ]] || { printf 'FAIL unexpected %s\n%s\n' "$1" "$output" >&2; exit 1; }; }
 plan() {
-    output=$(env -i "PATH=$fake/bin:$PATH" "${common[@]}" "$@" "NVIDIA_PROC=$fake/none" \
+    : > "$gpu_log"
+    output=$(env -i "PATH=$fake/bin:$PATH" "HOST_GPU_TOOL=$fake/setup-host-gpu.sh" "FAKE_GPU_LOG=$gpu_log" \
+        "${common[@]}" "$@" "NVIDIA_PROC=$fake/none" \
         bash "$provision" --dry-run 2>&1) || {
         printf 'FAIL plan\n%s\n' "$output" >&2; exit 1; }
     passed=$((passed + 1))
 }
 reject() {
     local reason=$1; shift
-    if output=$(env -i "PATH=$fake/bin:$PATH" "${common[@]}" "$@" "NVIDIA_PROC=$fake/none" \
+    : > "$gpu_log"
+    if output=$(env -i "PATH=$fake/bin:$PATH" "HOST_GPU_TOOL=$fake/setup-host-gpu.sh" "FAKE_GPU_LOG=$gpu_log" \
+        "${common[@]}" "$@" "NVIDIA_PROC=$fake/none" \
         bash "$provision" --dry-run 2>&1); then
         printf 'FAIL accepted invalid setting\n%s\n' "$output" >&2; exit 1
     fi
@@ -86,14 +110,60 @@ has 'path=/dev/nvidia0\,gid=1000\,mode=0660'
 plan GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools'
 has '--dev3 path=/dev/nvidia-uvm-tools'
 
-# With no devices it is a CPU-only CT: no --devN line, no driver install, and
-# nvidia-smi is not required at all.
+# Named devices are used as given: the host GPU tool is not asked.
+[[ ! -s $gpu_log ]] || { printf 'FAIL the host GPU tool ran although GPU_DEVICES was given: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+
+# --- No GPU_DEVICES: the host's GPU is found ----------------------------------
+# The host tool checks (and with consent sets up) the driver for any vendor
+# Colibri can use; an NVIDIA GPU gives CUDA with that card's nodes and the
+# guest's NVIDIA user-space.
+plan GPU_DEVICES= FAKE_GPU=nvidia
+grep -qx -- '--need optional --vendors nvidia,amd,intel --for Colibri --amd-render-only --dry-run' "$gpu_log" ||
+    { printf 'FAIL host GPU tool called as: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+has '--dev0 path=/dev/nvidia0\,gid=44\,mode=0660'; has 'path=/dev/nvidiactl'; has 'path=/dev/nvidia-uvm\,'
+has 'COLIBRI_BACKEND=cuda'; has 'nvidia-guest-install.sh lxc'; has 'DRIVER_VERSION='
+has 'found on this host: nvidia at 0000:01:00.0'
+# The card's own minor, e.g. a second GPU, and GPU_CARD picks the card.
+plan GPU_DEVICES= FAKE_GPU=nvidia FAKE_GPU_MINOR=1 GPU_CARD=0000:02:00.0
+grep -q -- '--card 0000:02:00.0' "$gpu_log" || { printf 'FAIL GPU_CARD did not reach the host GPU tool: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+has '--dev0 path=/dev/nvidia1\,gid=44'; has 'nvidia at 0000:02:00.0'
+reject 'could not identify /dev/nvidia<minor> for GPU_CARD=0000:02:00.0' \
+    GPU_DEVICES= FAKE_GPU=nvidia FAKE_GPU_MINOR= GPU_CARD=0000:02:00.0
+# Before the driver is installed a dry run cannot know the card's minor: it
+# still plans, and says that a real run maps the card's own minor.
+plan GPU_DEVICES= FAKE_GPU=nvidia-planned GPU_CARD=0000:02:00.0
+has 'COLIBRI_BACKEND=cuda'; has 'path=/dev/nvidiactl'
+has "Note: GPU_CARD=0000:02:00.0 (dry run: the NVIDIA driver is not installed yet, so this card's /dev/nvidia<minor> is unknown"
+has 'a real run maps the card'"'"'s own minor)'
+# Without GPU_CARD the planned GPU is the driver's GPU 0, so nothing is pending.
+plan GPU_DEVICES= FAKE_GPU=nvidia-planned
+has 'path=/dev/nvidia0'; lacks 'is unknown'
+reject 'GPU_CARD must be a PCI address' GPU_DEVICES= GPU_CARD=gpu0
+# An AMD Radeon or Intel Arc GPU gives Vulkan with its render node, no NVIDIA user-space.
+plan GPU_DEVICES= FAKE_GPU=amd
+has '--dev0 path=/dev/dri/renderD129\,gid=44\,mode=0660'; has 'COLIBRI_BACKEND=vulkan'
+lacks 'DRIVER_VERSION='; lacks 'nvidia-guest-install.sh lxc'
+# No usable GPU (none on the bus, or its driver setup declined): the CPU, said so.
 plan GPU_DEVICES=
 lacks 'path=/dev/nvidia'; lacks 'DRIVER_VERSION='
-has 'COLIBRI_BACKEND=auto'
-plan COLIBRI_BACKEND=cpu GPU_DEVICES=
+has 'COLIBRI_BACKEND=auto'; has 'no usable GPU on this host (absent); Colibri runs on the CPU'
+plan GPU_DEVICES= FAKE_GPU=declined
+has 'no usable GPU on this host (declined)'; lacks 'path=/dev/'
+# A driver that needs a reboot stops before anything is created.
+reject 'Reboot this host, then run this again' GPU_DEVICES= FAKE_GPU=reboot
+# cpu never looks for a GPU.
+plan COLIBRI_BACKEND=cpu GPU_DEVICES= FAKE_GPU=nvidia
+[[ ! -s $gpu_log ]] || { printf 'FAIL COLIBRI_BACKEND=cpu ran the host GPU tool\n' >&2; exit 1; }
 has 'COLIBRI_BACKEND=cpu'; lacks 'path=/dev/nvidia'
 has 'none (CPU)'
+# An explicit backend asks only for its vendors, and needs its GPU.
+plan COLIBRI_BACKEND=cuda GPU_DEVICES= FAKE_GPU=nvidia
+grep -q -- '--need required --vendors nvidia ' "$gpu_log" || { printf 'FAIL cuda asked: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+has 'path=/dev/nvidia0'; has 'COLIBRI_BACKEND=cuda'
+plan COLIBRI_BACKEND=vulkan GPU_DEVICES= FAKE_GPU=amd
+grep -q -- '--need required --vendors amd,intel ' "$gpu_log" || { printf 'FAIL vulkan asked: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+grep -q -- '--amd-render-only' "$gpu_log" || { printf 'FAIL vulkan did not allow render-only AMD: %s\n' "$(cat "$gpu_log")" >&2; exit 1; }
+has 'path=/dev/dri/renderD129'
 reject 'must include /dev/nvidiaN' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl'
 reject 'Duplicate GPU device' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia0'
 # Vulkan on AMD Radeon or Intel Arc: the card's render node, at the same gid,
@@ -107,9 +177,9 @@ has 'path=/dev/dri/renderD129'; has 'COLIBRI_BACKEND=auto'
 reject 'mixes NVIDIA nodes and a render node' GPU_DEVICES='/dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/dri/renderD128'
 reject 'takes NVIDIA nodes (/dev/nvidia*) or a render node' GPU_DEVICES=/dev/dri/card0
 # An explicit GPU backend needs its device, or the CT would quietly run on the CPU.
-reject 'COLIBRI_BACKEND=cuda needs the NVIDIA nodes' COLIBRI_BACKEND=cuda GPU_DEVICES=
-reject 'COLIBRI_BACKEND=vulkan needs the card' COLIBRI_BACKEND=vulkan GPU_DEVICES=
-reject 'COLIBRI_BACKEND=vulkan needs the card' COLIBRI_BACKEND=vulkan
+reject "The host's GPU is not ready for COLIBRI_BACKEND=cuda" COLIBRI_BACKEND=cuda GPU_DEVICES=
+reject "The host's GPU is not ready for COLIBRI_BACKEND=vulkan" COLIBRI_BACKEND=vulkan GPU_DEVICES=
+reject 'COLIBRI_BACKEND=vulkan needs the card' COLIBRI_BACKEND=vulkan GPU_DEVICES=/dev/nvidia0\ /dev/nvidiactl\ /dev/nvidia-uvm
 
 # --- Colibri settings ---------------------------------------------------------
 plan COLIBRI_BACKEND=cuda

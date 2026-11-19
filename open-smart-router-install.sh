@@ -1303,12 +1303,19 @@ target_gpu_result() {
 # tools/setup-host-gpu.sh for the targets that share a card (CARD) or, without
 # a card, the vendors; their results go to GPU_RESULT_<PREFIX>.
 run_host_gpu_tool() {
-  local need="$1" vendors="$2" card="$3" targets="$4" tool out rc=0 state vendor gen render name
+  local need="$1" vendors="$2" card="$3" targets="$4" tool out rc=0 state vendor gen render minor name render_only=1
   shift 4
+  local -a gpu_args=("$@")
+  if [[ ",$vendors," == *,amd,* ]]; then
+    for name in $targets; do
+      case "$name" in colibri|llamacpp) ;; *) render_only=0; break ;; esac
+    done
+    (( ! render_only )) || gpu_args+=(--amd-render-only)
+  fi
   tool="$(host_gpu_tool)" || return 1
   echo
   echo "--- GPU${card:+ ${card}} for: ${targets} ---"
-  out="$(bash "$tool" --need "$need" --vendors "$vendors" --for "$targets" ${card:+--card "$card"} "$@")" || rc=$?
+  out="$(bash "$tool" --need "$need" --vendors "$vendors" --for "$targets" ${card:+--card "$card"} "${gpu_args[@]}")" || rc=$?
   case "$rc" in
     0) ;;
     2)
@@ -1324,9 +1331,14 @@ run_host_gpu_tool() {
   vendor="$(sed -n 's/^GPU_VENDOR=//p' <<< "$out")"
   gen="$(sed -n 's/^GPU_GENERATION=//p' <<< "$out")"
   render="$(sed -n 's/^GPU_RENDER_NODE=//p' <<< "$out")"
+  minor="$(sed -n 's/^GPU_NVIDIA_MINOR=//p' <<< "$out")"
+  if [[ $state == ready && $vendor == nvidia && -n $card && ! $minor =~ ^[0-9]+$ ]]; then
+    echo "The NVIDIA GPU at $card has no /dev/nvidia minor in the host GPU report; fix its driver before provisioning ${targets}." >&2
+    return 1
+  fi
   for name in $targets; do
     printf -v "GPU_RESULT_$(target_var_prefix "$name")" '%s|%s|%s|%s|%s' "$state" "$vendor" "$render" \
-      "$(sed -n 's/^GPU_NVIDIA_MINOR=//p' <<< "$out")" "$(sed -n 's/^GPU_PCI=//p' <<< "$out")"
+      "$minor" "$(sed -n 's/^GPU_PCI=//p' <<< "$out")"
   done
   if [[ "$state" != ready ]]; then
     echo "No GPU (${state}): ${targets} will run without one."
@@ -1509,6 +1521,9 @@ target_gpu_env() {
         [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=cpu"
         return 0
       fi
+      # Keep the selected PCI address even if the host could not resolve its
+      # NVIDIA minor. The provisioner must fail rather than choose GPU 0.
+      if [[ -z "${GPU_DEVICES:-}" && -n "$pci" ]]; then echo "GPU_CARD=${pci}"; fi
       case "$vendor" in
         nvidia)
           [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=cuda"

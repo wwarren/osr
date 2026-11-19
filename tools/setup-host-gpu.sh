@@ -9,6 +9,7 @@ usage() {
 Usage: bash tools/setup-host-gpu.sh [--dry-run] [--need required|optional]
                                     [--vendors nvidia[,amd][,intel]] [--for "<targets>"]
                                     [--allow <gen>[,<gen>...]:<target>]... [--card <pci address>]
+                                    [--amd-render-only]
        bash tools/setup-host-gpu.sh --list [--vendors nvidia[,amd][,intel]]
 
 Makes sure the host has a working driver for the GPU the targets will use. When
@@ -51,6 +52,9 @@ needs a reboot to pick up new firmware, reboot and run this again.
                   prints it): it must be one of the vendors, and it is the card
                   that is checked, set up and reported. Its generation comes
                   from its PCI ID when that is known, so it is not asked.
+--amd-render-only accept an AMD card with its render node but without /dev/kfd;
+                  for Vulkan targets that do not use ROCm. The default still
+                  requires /dev/kfd for AMD targets that need it.
 --list            print the cards of the vendors, one GPU_CARD=<address>|<vendor>|
                   <generation>|<driver in use>|<name> line each, and exit; nothing
                   is checked or changed. NVIDIA cards outside rtx20-rtx50 have an
@@ -262,7 +266,9 @@ card_usable() {
     [[ -n $gen ]] || return 1
     driver=$(card_driver "$1" || true)
     case $(generation_field "$gen" vendor) in
-        amd) [[ $driver == amdgpu && -e $DEV_ROOT/kfd ]] || return 1 ;;
+        amd)
+            [[ $driver == amdgpu ]] || return 1
+            (( amd_render_only )) || [[ -e $DEV_ROOT/kfd ]] || return 1 ;;
         intel) [[ $driver == i915 || $driver == xe ]] || return 1 ;;
         *) return 1 ;;
     esac
@@ -464,7 +470,7 @@ ready_vendor() {
                 [[ -n $line && $(card_vendor "$line") == "$1" ]] || continue
                 card_usable "$line" || continue
                 GPU_GENERATION=$(card_generation "$line")
-                note "$(vendor_name "$1") GPU ready: ${line#* } ($(card_render_node "$line")$( [[ $1 != amd ]] || printf ', %s' "$DEV_ROOT/kfd"))."
+                note "$(vendor_name "$1") GPU ready: ${line#* } ($(card_render_node "$line")$( [[ $1 != amd || ! -e $DEV_ROOT/kfd ]] || printf ', %s' "$DEV_ROOT/kfd"))."
                 check_allowed "$GPU_GENERATION"
                 report_card ready "$line"
                 return 0
@@ -567,7 +573,7 @@ setup_kernel_driver() {
             GPU_GENERATION=$(card_generation "$line")
             check_allowed "$GPU_GENERATION"
         fi
-        note "$module is loaded: ${line#* } ($(card_render_node "$line")$( [[ $vendor != amd ]] || printf ', %s' "$DEV_ROOT/kfd"))."
+        note "$module is loaded: ${line#* } ($(card_render_node "$line")$( [[ $vendor != amd || ! -e $DEV_ROOT/kfd ]] || printf ', %s' "$DEV_ROOT/kfd"))."
         report_card ready "$line"
         return 0
     done <<< "$gpus"
@@ -575,7 +581,7 @@ setup_kernel_driver() {
         note "$module could not take the card without a restart (new firmware, or the card failed to start at boot). Reboot this host, then run this again (GPU_GENERATION=$GPU_GENERATION); nothing else was changed."
         exit 2
     fi
-    die "$module is loaded but the card has no render node$( [[ $vendor != amd ]] || printf ' or no %s' "$DEV_ROOT/kfd"). See dmesg | grep -i $module."
+    die "$module is loaded but the card has no render node$( [[ $vendor != amd || $amd_render_only == 1 ]] || printf ' or no %s' "$DEV_ROOT/kfd"). See dmesg | grep -i $module."
 }
 
 main() {
@@ -651,6 +657,7 @@ main() {
 
 dry_run=0
 list_only=0
+amd_render_only=0
 card_filter=''
 need=required
 for_targets=''
@@ -667,6 +674,7 @@ while (( $# )); do
         --for) for_targets=${2:-}; shift ;;
         --card) card_filter=$(normalize_pci_address "${2:-}") || die '--card takes a PCI address such as 0000:03:00.0.'; shift ;;
         --list) list_only=1 ;;
+        --amd-render-only) amd_render_only=1 ;;
         --allow)
             [[ ${2:-} =~ ^([a-z0-9-]+(,[a-z0-9-]+)*):[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]] ||
                 die '--allow takes <gen>[,<gen>...]:<target>, e.g. rtx50:Basalt.'
