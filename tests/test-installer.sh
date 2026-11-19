@@ -195,6 +195,8 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
   printf 'kindi-env %s|%s|%s\n' "${KINDI_BACKEND:-}" "${GPU_DEVICES:-}" "${KINDI_CONTEXT:-}" >> "$MOCK_LOG"
 [[ -z ${COLIBRI_BACKEND:-} ]] ||
   printf 'colibri-env %s|%s\n' "${COLIBRI_BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
+[[ -z ${COLIBRI_MODEL_ID:-} ]] ||
+  printf 'colibri-model %s\n' "$COLIBRI_MODEL_ID" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
   printf 'cuda-env %s|%s|%s|%s\n' "${CUDA_VERSION:-}" "${MAYA_CUDA_VERSION:-}" "${XOLOTL_CUDA_VERSION:-}" "${AVALON_CUDA_VERSION:-}" >> "$MOCK_LOG"
 if [[ -n ${HF_TOKEN:-} ]]; then
@@ -448,6 +450,23 @@ assert_contains "or the CPU" "3) none: run on the CPU" "$(cat "$_out")"
 assert_not_contains "only NVIDIA cards are offered to it" "Radeon RX 7900 XTX] (rdna3, driver amdgpu)"$'\n'"    3)" "$(sed -n '/kindi use/,$p' "$_out")"
 _gpu_reset
 rm -f "$_out"; TARGETS=""
+
+describe prompt_colibri_model
+cp "$HERE/../targets/colibri/model-select.sh" "$TARGETS_DIR/colibri/model-select.sh"
+TARGETS=colibri COLIBRI_MEMORY_MB=12288 GPU_RESULT_COLIBRI='ready|nvidia||0|0000:01:00.0'
+COLIBRI_MODEL_ID=''
+_out="$(mktemp)"
+prompt_colibri_model > "$_out" 2>&1 <<< 'y'
+assert_eq "GPU and 12 GiB suggest the general model" qwen36-35b "$COLIBRI_MODEL_ID"
+assert_contains "the download size and destination are shown" '23.1 GB' "$(cat "$_out")"
+COLIBRI_MODEL_ID=''; GPU_RESULT_COLIBRI='declined||||'
+prompt_colibri_model > "$_out" 2>&1 <<< 'y'
+assert_eq "CPU and 12 GiB suggest the coding model" qwen3-coder-30b "$COLIBRI_MODEL_ID"
+COLIBRI_MODEL_ID=''; NONINTERACTIVE=true
+prompt_colibri_model </dev/null >/dev/null 2>&1
+assert_eq "unattended setup does not download" '' "$COLIBRI_MODEL_ID"
+NONINTERACTIVE=false; TARGETS=''; unset COLIBRI_MEMORY_MB COLIBRI_MODEL_ID GPU_RESULT_COLIBRI
+rm -f "$_out"
 
 describe target_gpu_result
 GPU_RESULT_OLLAMA="ready|amd|/dev/dri/renderD128||0000:03:00.0"
@@ -1746,18 +1765,24 @@ unset KINDI_CT_ID KINDI_IP_CIDR KINDI_STORAGE KINDI_TEMPLATE KINDI_CONTEXT GPU_R
 COLIBRI_CT_ID=924; COLIBRI_IP_CIDR=192.0.2.104/24; COLIBRI_STORAGE=gpu-store
 COLIBRI_TEMPLATE=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
 COLIBRI_MEMORY_MB=98304; COLIBRI_ROOTFS_GB=600
+COLIBRI_MODEL_ID=qwen36-35b
 GPU_RESULT_COLIBRI="ready|amd|/dev/dri/renderD128||0000:03:00.0"
 mock_reset_log
 run_target_provisioner colibri
 assert_contains "Colibri gets its AMD card's render node and Vulkan" "colibri-env vulkan|/dev/dri/renderD128" "$(mock_calls)"
 assert_contains "and the RAM chosen for it" "memory-env 98304" "$(mock_calls)"
 assert_contains "and the disk" "|600|" "$(mock_calls)"
+assert_contains "and the chosen model" 'colibri-model qwen36-35b' "$(mock_calls)"
 assert_not_contains "and no CUDA version of the template's repository" "cuda-env" "$(mock_calls)"
 GPU_RESULT_COLIBRI="declined||||"
 mock_reset_log
 run_target_provisioner colibri
 assert_contains "Colibri given no card runs on the CPU" "colibri-env cpu|" "$(mock_calls)"
-unset COLIBRI_CT_ID COLIBRI_IP_CIDR COLIBRI_STORAGE COLIBRI_TEMPLATE COLIBRI_MEMORY_MB COLIBRI_ROOTFS_GB GPU_RESULT_COLIBRI
+COLIBRI_MODEL_ID=''
+mock_reset_log
+run_target_provisioner colibri
+assert_contains "a declined download reaches it as none, so it is not suggested again" 'colibri-model none' "$(mock_calls)"
+unset COLIBRI_CT_ID COLIBRI_IP_CIDR COLIBRI_STORAGE COLIBRI_TEMPLATE COLIBRI_MEMORY_MB COLIBRI_ROOTFS_GB COLIBRI_MODEL_ID GPU_RESULT_COLIBRI
 mock_reset_log
 run_target_provisioner llamacpp
 assert_contains "llama.cpp without a model only gets its CT" "|no|" "$(mock_calls)"

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Plans only: no Proxmox, GPU, download, or root privileges are required.
 #
-# Colibri differs from the other model targets in two ways this file is built
-# around: GPU passthrough is optional (it runs on the CPU), and no model is ever
-# fetched, so the service is expected to come up parked.
+# GPU passthrough and model download are both optional. Dry runs never fetch a
+# model or create a CT; without an explicit model choice, the service parks.
 set -Eeuo pipefail
 exec </dev/null
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -84,14 +83,16 @@ lacks 'gid=0\,'
 has 'bash /root/colibri-target-deploy/install-target.sh'
 has '/root/colibri-target-deploy/install-target.sh --perms 0755'
 has '/root/colibri-target-deploy/colibri.service --perms 0644'
+has '/root/colibri-target-deploy/model-select.sh --perms 0644'
 lacks 'git clone'
 # Settings the guest installer is launched with.
 has "COLIBRI_COMMIT=$pin"; has 'COLIBRI_REF=main'
 has 'COLIBRI_BACKEND=auto'; has 'COLIBRI_HOST=0.0.0.0'; has 'COLIBRI_PORT=8080'
 has 'COLIBRI_READY_TIMEOUT=900'
-# Nothing is asked and nothing is downloaded: the model is left to the operator.
+# An unattended run without an explicit model remains parked.
 has '/var/lib/colibri/model, created empty (parked until a model is copied in; none is downloaded)'
 has 'COLIBRI_MODEL_DIR=/var/lib/colibri/model'
+has 'COLIBRI_MODEL_ID='
 lacks '== Colibri settings =='
 # The closing lines name the router's colibri kind and its token command.
 has 'manage-model-servers set-colibri-token'; has 'add colibri://<CT address>:8080'
@@ -187,6 +188,24 @@ has 'COLIBRI_BACKEND=cuda'
 plan COLIBRI_MODEL_DIR=/var/lib/colibri/models/qwen
 has 'COLIBRI_MODEL_DIR=/var/lib/colibri/models/qwen'
 has '/var/lib/colibri/models/qwen, created empty'
+source "$here/model-select.sh"
+[[ $(colibri_model_recommend 8192 cpu) == qwen3-coder-30b ]] || { echo 'FAIL 8 GiB recommendation' >&2; exit 1; }
+[[ $(colibri_model_recommend 12288 cpu) == qwen3-coder-30b ]] || { echo 'FAIL CPU recommendation' >&2; exit 1; }
+[[ $(colibri_model_recommend 12288 cuda) == qwen36-35b ]] || { echo 'FAIL GPU recommendation' >&2; exit 1; }
+[[ $(colibri_model_recommend 65536 cpu) == qwen36-35b ]] || { echo 'FAIL 64 GiB recommendation' >&2; exit 1; }
+plan COLIBRI_MODEL_ID=qwen36-35b
+has 'Qwen3.6-35B-A3B (23.1 GB) from Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64'
+has 'COLIBRI_MODEL_ID=qwen36-35b'
+plan COLIBRI_MODEL_ID=qwen3-coder-30b MEMORY_MB=8192 GPU_DEVICES=
+has 'Qwen3-Coder-30B-A3B (19.4 GB)'
+reject 'needs at least 10240 MiB' COLIBRI_MODEL_ID=qwen36-35b MEMORY_MB=8192
+# Unattended with no ID: a suggestion and how to opt in, nothing downloaded.
+plan
+has 'Colibri suggestion for 65536 MiB RAM'; has 'set COLIBRI_MODEL_ID=qwen36-35b to download it'
+# none is the OSR installer's answer already given: nothing suggested again.
+plan COLIBRI_MODEL_ID=none
+lacks 'Colibri suggestion'; has 'COLIBRI_MODEL_ID= '; has 'none is downloaded'
+reject 'COLIBRI_MODEL_ID must be' COLIBRI_MODEL_ID=unknown
 plan COLIBRI_HOST=127.0.0.1 COLIBRI_ALLOWED_HOST=colibri.internal,192.0.2.80 COLIBRI_PORT=11434
 has 'COLIBRI_HOST=127.0.0.1'; has 'COLIBRI_ALLOWED_HOST=colibri.internal\,192.0.2.80'
 has 'COLIBRI_PORT=11434'; has 'host 127.0.0.1, port 11434'
@@ -235,6 +254,12 @@ has 'serve the model in /var/lib/colibri/model (parked while it is empty)'
 has '--model /var/lib/colibri/model'
 lacks 'setup.sh --help'                       # colibri has no such option audit
 lacks 'sudo'
+passed=$((passed + 1))
+
+output=$(env -i "PATH=$PATH" COLIBRI_MODEL_ID=qwen36-35b bash "$guest" --dry-run 2>&1) || {
+    printf 'FAIL guest model dry run\n%s\n' "$output" >&2; exit 1; }
+has 'download Qwen3.6-35B-A3B (23.1 GB)'
+has 'Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64'
 passed=$((passed + 1))
 
 # An explicit allowlist is kept, one --allowed-host per entry.

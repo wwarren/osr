@@ -1207,6 +1207,22 @@ valid_gpu_choice() {
   [[ " ${GPU_CHOICE_ADDRESSES:-} " == *" ${value} "* ]]
 }
 
+# Prompt for a Colibri model only after the GPU step has resolved the backend.
+prompt_colibri_model() {
+  [[ " ${TARGETS:-} " == *' colibri '* ]] || return 0
+  local helper="${TARGETS_DIR}/colibri/model-select.sh" backend=cpu vendor
+  [[ -r $helper ]] || { echo "Missing $helper." >&2; return 1; }
+  # shellcheck source=targets/colibri/model-select.sh
+  source "$helper"
+  vendor="$(target_gpu_result colibri vendor)"
+  case $vendor in nvidia) backend=cuda ;; amd|intel) backend=vulkan ;; esac
+  if [[ ${COLIBRI_BACKEND:-} == cpu ]]; then backend=cpu; fi
+  local interactive=true
+  [[ ${NONINTERACTIVE:-false} != true ]] || interactive=false
+  colibri_choose_model "${COLIBRI_MEMORY_MB:-65536}" "$backend" \
+    "${COLIBRI_MODEL_DIR:-/var/lib/colibri/model}" "$interactive"
+}
+
 # prompt_target_gpus: for each selected target that runs on AMD Radeon or Intel
 # Arc (Ollama, llama.cpp, ComfyUI), and for Kindi, ask which of the host's GPUs it gets; the
 # answer is <PREFIX>_GPU_CARD (a PCI address, or none: the CPU). Targets that
@@ -1924,10 +1940,10 @@ prompt_target_settings() {
     fi
     if [[ $name == colibri ]]; then
       host_mib="$(host_memory_mib)"
-      echo "    No model is downloaded: Colibri starts parked until you place one (its README says how)."
+      echo "    After GPU selection, you can choose whether to download a suggested Colibri model."
       echo "    It keeps a model's always-used weights in RAM and streams the experts from disk,"
       echo "    so size both for the model you will run: Qwen3.6-35B-A3B is a 23 GB download and"
-      echo "    runs in 16 GB of RAM; GLM-5.2 takes 429 GB of disk. More RAM keeps more experts resident."
+      echo "    needs at least 10 GB RAM (20 GB preferred); GLM-5.2 takes 429 GB of disk."
       [[ -z $host_mib ]] || echo "    This host has ${host_mib} MiB; leave some for Proxmox."
       prompt_until_valid "    RAM (MiB, 8192 or more)" COLIBRI_MEMORY_MB "${COLIBRI_MEMORY_MB:-65536}" \
         valid_colibri_memory_mb || return 1
@@ -2315,6 +2331,7 @@ preset_target_model_servers() {
 # companions (as an environment variable, never an argument).
 run_target_provisioner() {
   local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env cuda_env context_env client_ips="" client
+  local colibri_model_id="${COLIBRI_MODEL_ID:-}"
   local unattended=${NONINTERACTIVE:-false}
   local -a flags=()
   phase="$(target_field "$name" phase)" || return 1
@@ -2357,7 +2374,7 @@ run_target_provisioner() {
       CORES MEMORY MEMORY_MB SWAP SWAP_MB ROOTFS_GB ONBOOT TEMPLATE FIREWALL NONINTERACTIVE \
       ROUTER ROUTER_CT_ID ROUTER_SSH_HOST ROUTER_IP ROUTER_URL ROUTER_API_KEY \
       OPENWEBUI_PORT OPENWEBUI_ADMIN_TOKEN TARGET_ADMIN_TOKEN COMFYUI_IMAGE_VARIANT \
-      HF_TOKEN TARGET_HF_TOKEN PVE_INTERACTIVE PVE_ROUTER_SUGGESTION
+      HF_TOKEN TARGET_HF_TOKEN PVE_INTERACTIVE PVE_ROUTER_SUGGESTION COLIBRI_MODEL_ID
     export CT_ID="$id" IP_CIDR="$ip" GATEWAY="$gateway" STORAGE="$storage" BRIDGE="$bridge"
     # Basalt asks for its model pack after the GPU and CT resource plan is
     # known. Other target defaults were already accepted by this installer.
@@ -2386,6 +2403,9 @@ run_target_provisioner() {
     [[ "$name" != basalt || -z ${BASALT_MODEL:-} ]] || export BASALT_MODEL
     [[ "$name" != basalt || -z ${BASALT_KV:-} ]] || export BASALT_KV
     [[ "$name" != basalt || -z ${BASALT_KV_RESIDENT:-} ]] || export BASALT_KV_RESIDENT
+    # Answered here already: none (declined or unattended) keeps the
+    # provisioner from suggesting the model a second time.
+    [[ "$name" != colibri ]] || export COLIBRI_MODEL_ID="${colibri_model_id:-none}"
     # The router's MEMORY is unset above; Strata gets the RAM chosen for its CT.
     [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
     [[ "$name" != basalt || -z ${BASALT_MEMORY_MB:-} ]] || export MEMORY_MB="$BASALT_MEMORY_MB"
@@ -3690,6 +3710,7 @@ prompt_target_contexts || exit 1
 prompt_strata_kv_cache || exit 1
 prompt_strata_message_cache || exit 1
 prepare_host_gpu || exit 1
+prompt_colibri_model || exit 1
 # Root SSH between the cluster's nodes, for later upgrades from any node.
 prepare_cluster_ssh || exit 1
 # Gitea and Mattermost, if selected, are created now: the prompts below take

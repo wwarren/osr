@@ -18,8 +18,9 @@ Defaults: port **8080**, 8 cores (`CORES`), 64 GiB RAM (`MEMORY_MB`, at least
 8192), 160 GiB disk (`ROOTFS_GB`, at least 40), backend `auto`, model directory
 `/var/lib/colibri/model`.
 
-**No model is downloaded.** The service starts *parked* until you copy one in;
-see [Placing a model](#placing-a-model).
+Setup suggests a model after GPU and RAM selection and asks before downloading
+it. Press Enter to skip; the service starts *parked* until you copy one in.
+See [Placing a model](#placing-a-model).
 
 ## With the OSR installer
 
@@ -35,13 +36,22 @@ servers. For it the installer asks:
   Debian 12, Ubuntu 24.04 or 22.04.
 - **RAM** (`COLIBRI_MEMORY_MB`, default 65536, at least 8192) and **disk**
   (`COLIBRI_ROOTFS_GB`, default 160, at least 40). Size both for the model you
-  will place: Qwen3.6-35B-A3B is a 23 GB download and runs in 16 GB of RAM;
-  GLM-5.2 needs 429 GB of disk. More RAM keeps more experts resident.
+  will place: Qwen3.6-35B-A3B is a 23 GB download, needs at least 10 GB RAM
+  (20 GB preferred). GLM-5.2 needs 429 GB of disk. More RAM keeps more experts
+  resident.
+- **Model download**: suggests Qwen3.6-35B-A3B (23.1 GB) when RAM is at
+  least 20 GiB on CPU or 10 GiB with a GPU; otherwise suggests
+  Qwen3-Coder-30B-A3B (19.4 GB). These are the two text models in the
+  [tested Colibri catalog](https://github.com/JustVugg/colibri/blob/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/c/setup_catalog.py)
+  that run from RAM. A download starts only after answering yes. For unattended
+  setup, set `COLIBRI_MODEL_ID=qwen36-35b` or `qwen3-coder-30b` to opt in;
+  leave it unset or set it to `none` to skip. See
+  [Downloading a catalog model](#downloading-a-catalog-model).
 
 It adds the CT to the router's server list up front, then, once the CT is
 built, reads `/etc/colibri-target/api-key` and gives it to the router with
-`set-colibri-token`. Until a model is placed, the router and the monitor see
-the server as down.
+`set-colibri-token`. If the download was skipped, the router and monitor see
+the parked server as down until a model is placed.
 
 ## Standalone
 
@@ -53,6 +63,11 @@ CT_ID=251 TEMPLATE=local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
 STORAGE=local-lvm IP_CIDR=192.0.2.51/24 GATEWAY=192.0.2.1 \
 bash targets/colibri/provision-lxc.sh --dry-run     # then without --dry-run
 ```
+
+The standalone provisioner asks the same download question after detecting the
+GPU. To opt in without a prompt, set `COLIBRI_MODEL_ID=qwen36-35b` or
+`COLIBRI_MODEL_ID=qwen3-coder-30b`; unattended without it, nothing is
+downloaded and the provisioner says which ID it would suggest.
 
 With `GPU_DEVICES` empty (the default) the provisioner finds the host's GPU the
 way the OSR installer does: `tools/setup-host-gpu.sh` checks the driver for an
@@ -147,6 +162,39 @@ capabilities. The router sizes the ids colibri announces without a size
 (`qwen3.6-colibri`, `glm-5.2-colibri`, ...) from `[model_sizes]` and does not
 offer an image or decision model (Qwen-Image, Laya, GLiNER) for chat.
 
+## Downloading a catalog model
+
+`COLIBRI_MODEL_ID` names one of the two models in `model-select.sh`, each
+pinned to a Hugging Face commit:
+
+| ID | Model | Download | RAM at least | Repository @ commit |
+|---|---|---|---|---|
+| `qwen36-35b` | Qwen3.6-35B-A3B | 23.1 GB | 10 GiB (20 preferred) | `Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64` @ `c619aa59` |
+| `qwen3-coder-30b` | Qwen3-Coder-30B-A3B | 19.4 GB | 8 GiB (18 preferred) | `Justvugg/Qwen3-Coder-30B-A3B-colibri-int4` @ `d839110a` |
+
+The guest installer downloads it only when the model directory holds no model,
+on the first install or any later run:
+
+```bash
+pct exec <CT_ID> -- env COLIBRI_MODEL_ID=qwen36-35b bash /root/colibri-target-deploy/install-target.sh
+```
+
+- colibri's own downloader (`setup_download.py`, installed with colibri) does
+  the transfer as the `colibri` account. It uses Python's standard library
+  only, so nothing is installed from PyPI. It checks every file against the
+  commit's SHA-256 listing.
+- It stops before fetching anything when the model's filesystem lacks the
+  remaining download plus 1 GiB.
+- Files land in an ID- and revision-specific folder under
+  `/var/lib/colibri/model/.colibri-staging`, on the model's own filesystem even
+  when that is a separate mount. A publication marker keeps the launcher parked
+  until all verified files have moved into place. Staging from another model
+  is never published with the selected one.
+- An interrupted download or publication is resumed by the same command.
+- On an installed CT, the run then restarts the service; nothing is rebuilt.
+- `COLIBRI_MODEL_ID` is not recorded as a setting, so later runs and upgrades
+  never download anything unless asked.
+
 ## Placing a model
 
 A parked service logs one line (`journalctl -u colibri`) and stays inactive:
@@ -185,6 +233,7 @@ On the CPU a large model answers slowly; raise the router's
 ```bash
 pct push <id> targets/colibri/install-target.sh /root/colibri-target-deploy/install-target.sh --perms 0755
 pct push <id> targets/colibri/colibri.service /root/colibri-target-deploy/colibri.service --perms 0644
+pct push <id> targets/colibri/model-select.sh /root/colibri-target-deploy/model-select.sh --perms 0644
 pct exec <id> -- bash /root/colibri-target-deploy/install-target.sh --upgrade
 ```
 
@@ -213,7 +262,7 @@ fetched, moved or rewritten.
 | `/etc/colibri-target/secrets.env` | `COLI_API_KEY` (0600) |
 | `/etc/colibri-target/api-key` | the key (0600), read by the OSR installer |
 | `/etc/colibri-target/installed-env`, `installed-settings` | the last good settings and their fingerprint |
-| `/root/colibri-target-deploy/` | the pushed installer and unit |
+| `/root/colibri-target-deploy/` | the pushed installer, model catalog and unit |
 
 The CT's firewall flag is on with no rules: restrict port 8080 to the router
 and intended clients.

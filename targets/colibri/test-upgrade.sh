@@ -35,7 +35,7 @@ trap cleanup EXIT
 
 # The installer runs from a copy, so a case can ship a changed unit.
 deploy=$tmp_root/deploy; mkdir -p "$deploy"
-cp "$script_dir/install-target.sh" "$script_dir/colibri.service" "$deploy/"
+cp "$script_dir/install-target.sh" "$script_dir/colibri.service" "$script_dir/model-select.sh" "$deploy/"
 target=$deploy/install-target.sh
 log=$tmp_root/calls.log
 
@@ -50,6 +50,12 @@ stub getent 'exit 2'
 # below can look for it without a real CSPRNG call.
 stub openssl 'case "$1 $2" in "rand -hex") printf "%s\n" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";; *) exit 0;; esac'
 stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
+# Fail after moving one published entry, simulating interruption during the
+# non-atomic sequence of same-filesystem renames.
+stub mv 'if [[ ${FAKE_PARTIAL_PUBLISH:-0} == 1 && ${1:-} == -t && ${2:-} == "$FAKE_MODEL_DIR" ]]; then
+    /usr/bin/mv -t "$2" -- "$4"; exit 17
+fi
+exec /usr/bin/mv "$@"'
 # is-failed exits 1 = "not failed"; is-active prints what wait_ready reads
 # (inactive is the parked no-model state). With FAKE_RESTART_HEALS=FILE a
 # restart creates FILE, after which the service is active and healthy: a
@@ -109,8 +115,63 @@ mkdir -p "\$FAKE_COLIBRI_DIR/bin" "\$FAKE_COLIBRI_DIR/libexec/colibri"
 printf '#!/bin/sh\necho coli %s\\n' "\$head" > "\$FAKE_COLIBRI_DIR/bin/coli"
 chmod 0755 "\$FAKE_COLIBRI_DIR/bin/coli"
 printf 'engine built from %s\\n' "\$head" > "\$FAKE_COLIBRI_DIR/libexec/colibri/engine"
+cp "$tmp_root/setup_download.py" "\$FAKE_COLIBRI_DIR/libexec/colibri/setup_download.py"
 STUB
 chmod +x "$bin/make"
+# colibri's downloader as make install puts it in libexec, with the functions
+# install-target.sh calls. FAKE_DL: ok (writes a complete model folder), fail
+# (a transfer error), huge (more than the disk holds). It logs each call.
+cat > "$tmp_root/setup_download.py" <<'PYSTUB'
+import json
+import os
+
+
+class DownloadError(RuntimeError):
+    pass
+
+
+def _log(text):
+    with open(os.environ["FAKE_DL_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+
+
+def hf_token():
+    return None
+
+
+def list_repo_files(repo, revision="main", **_):
+    _log(f"list {repo}@{revision}")
+    size = 1 << 60 if os.environ.get("FAKE_DL") == "huge" else 4
+    return [{"path": "config.json", "size": 2, "sha256": None, "git_oid": "x"},
+            {"path": "model-00000.safetensors", "size": size, "sha256": "y", "git_oid": None}]
+
+
+def bytes_present(model_dir, files, extra_dirs=()):
+    return 0
+
+
+def download_repo(repo, revision, model_dir, files, *, token=None, progress=None, **_):
+    _log(f"download {repo}@{revision} -> {model_dir}")
+    if os.environ.get("FAKE_DL") == "fail":
+        raise DownloadError("connection reset")
+    for spec in files:
+        with open(os.path.join(model_dir, spec["path"]), "w", encoding="utf-8") as handle:
+            handle.write("x" * min(spec["size"], 8))
+    with open(os.path.join(model_dir, ".colibri-download.json"), "w", encoding="utf-8") as handle:
+        json.dump({"repo": repo, "revision": revision, "complete": True, "files": files}, handle)
+    if progress:
+        progress({"file": "", "file_done": 1, "file_total": 1, "done": 1, "total": 1})
+    return {"files": len(files), "bytes": 1}
+
+
+def is_complete(model_dir, extra_dirs=()):
+    try:
+        with open(os.path.join(model_dir, ".colibri-download.json"), encoding="utf-8") as handle:
+            return json.load(handle).get("complete") is True
+    except OSError:
+        return False
+PYSTUB
+dl_log=$tmp_root/download.log
 
 tree=$tmp_root/tree
 reset_tree() {
@@ -133,7 +194,8 @@ rt() {
         UNIT_DIR="$tree/etc/systemd/system" COLIBRI_READY_TIMEOUT=2 \
         GPU_NODES= DRI_NODES= COLIBRI_ICD_DIRS="$tmp_root/no-icd" COLIBRI_BACKEND=cpu \
         COLIBRI_NVCC="$tmp_root/cuda/bin/nvcc" \
-        FAKE_COLIBRI_DIR="$tree/opt/colibri" \
+        FAKE_COLIBRI_DIR="$tree/opt/colibri" FAKE_DL_LOG="$dl_log" \
+        FAKE_MODEL_DIR="$tree/var/lib/colibri/model" \
         "${extra[@]+"${extra[@]}"}" bash "$target" "$@"
 }
 # The commit already installed: how a rerun of an unchanged pin arrives.
@@ -334,5 +396,118 @@ grep -q "^make .* CUDA=1 CUDA_HOME=$tmp_root/cuda" "$log" || fail "the rebuild w
 contains 'built_backend=cuda' "$etc/installed-settings"
 contains '--auto-tier --gpu auto' "$launcher"
 pass 'a GPU passed in later makes the next run rebuild for it'
+
+# --- an explicit model download ------------------------------------------------
+# COLIBRI_MODEL_ID downloads the pinned commit with colibri's own downloader,
+# as the service account, into the model directory's staging folder, and
+# publishes it only when complete.
+modeldir=$tree/var/lib/colibri/model
+qwen_stage=$modeldir/.colibri-staging/qwen36-35b-c619aa594ad1e70af82168fb6b4878427896e21c
+coder_stage=$modeldir/.colibri-staging/qwen3-coder-30b-d839110a17d31b4e6fa9f3d973b751f779b6b9c6
+reset_tree; : > "$dl_log"
+rt COLIBRI_MODEL_ID=qwen3-coder-30b COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a first install with a model download'; }
+grep -qx 'list Justvugg/Qwen3-Coder-30B-A3B-colibri-int4@d839110a17d31b4e6fa9f3d973b751f779b6b9c6' "$dl_log" ||
+    fail "the download was not of the pinned commit: $(cat "$dl_log")"
+contains "download Justvugg/Qwen3-Coder-30B-A3B-colibri-int4@d839110a17d31b4e6fa9f3d973b751f779b6b9c6 -> $coder_stage" "$dl_log"
+contains "Published Qwen3-Coder-30B-A3B in $modeldir" "$tmp_root/out"
+[[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors ]] || fail 'the model was not published in the model directory'
+[[ ! -e $modeldir/.colibri-staging ]] || fail 'the staging folder was left behind'
+grep -q 'runuser -u colibri' "$log" || fail 'the download did not run as the service account'
+grep -qE 'pip|venv|huggingface_hub' "$log" && fail "the download installed Python packages: $(grep -E 'pip|venv' "$log")"
+contains 'COLIBRI_MODEL_DIR=' "$etc/installed-env"
+grep -q 'COLIBRI_MODEL_ID' "$etc/installed-env" && fail 'COLIBRI_MODEL_ID was recorded as a setting'
+pass 'COLIBRI_MODEL_ID downloads the pinned commit as the service account and publishes it whole'
+
+# A model already there is never replaced.
+: > "$dl_log"
+rt COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'a rerun over a model'; }
+contains 'downloads nothing' "$tmp_root/out"
+[[ ! -s $dl_log ]] || fail "a model in place was downloaded over: $(cat "$dl_log")"
+pass 'a model already in place is never downloaded over'
+
+# On an installed, parked CT the same ID downloads, and the restart path
+# serves it: nothing is rebuilt.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install'; }
+: > "$log"; rm -f -- "$tmp_root/healed"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
+    COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a download on an installed CT'; }
+contains 'list Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c' "$dl_log"
+contains 'Published Qwen3.6-35B-A3B' "$tmp_root/out"
+contains 'is back after a restart' "$tmp_root/out"
+grep -q '^make ' "$log" && fail 'a download on an installed CT rebuilt the engines'
+pass 'a download asked for on an installed CT is served after a restart, without a rebuild'
+
+# A failed or partial download publishes nothing, and the launcher still parks:
+# the staging folder is not a model.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install'; }
+: > "$log"
+if rt FAKE_DL=fail COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1; then
+    fail 'a failed download reported success'
+fi
+contains 'Model download failed: connection reset' "$tmp_root/out"
+contains 'nothing was published. Rerun with COLIBRI_MODEL_ID=qwen36-35b to resume it' "$tmp_root/out"
+[[ -d $qwen_stage ]] || fail 'the partial download was not kept for a resume'
+[[ ! -e $modeldir/config.json ]] || fail 'a failed download published files'
+grep -qE 'systemctl (stop|restart)|^make ' "$log" && fail "a failed download touched the service: $(cat "$log")"
+: > "$qwen_stage/config.json"
+sh "$launcher" | grep -q 'is empty' || fail 'the launcher took a partial download for a model'
+pass 'a failed download publishes nothing, keeps its staging folder to resume, and the launcher still parks'
+
+# Switching IDs after a failed transfer must leave the first model's partial
+# files in its own stage, never in the live model directory.
+: > "$qwen_stage/old-model.part"
+: > "$log"; rm -f -- "$tmp_root/healed"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
+    COLIBRI_MODEL_ID=qwen3-coder-30b "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'switching models after a failed download'; }
+[[ -f $qwen_stage/old-model.part ]] || fail 'the previous model stage was changed'
+[[ ! -e $modeldir/old-model.part ]] || fail 'a stale partial file was published with another model'
+[[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors ]] ||
+    fail 'the newly selected model was not published'
+pass 'switching models keeps the old staging files out of the live model'
+
+# A crash during publication leaves a marker that parks the launcher. The next
+# run restores moved entries to stage, verifies them, and finishes publication.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install before interrupted publication'; }
+: > "$log"
+if rt FAKE_PARTIAL_PUBLISH=1 COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1; then
+    fail 'an interrupted publication reported success'
+fi
+[[ -f $modeldir/.colibri-publishing ]] || fail 'the interrupted publication lost its marker'
+[[ -d $qwen_stage ]] || fail 'the interrupted publication lost its stage'
+[[ -n $(find "$modeldir" -mindepth 1 -maxdepth 1 ! -name .colibri-staging ! -name .colibri-publishing -print -quit) ]] ||
+    fail 'the interruption did not move a model entry'
+sh "$launcher" | grep -q 'is empty' || fail 'the launcher served a partially published model'
+grep -qE 'systemctl (stop|restart)|^make ' "$log" && fail 'an interrupted publication touched the service'
+: > "$log"; rm -f -- "$tmp_root/healed"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
+    COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'resuming an interrupted publication'; }
+contains 'Recovered an interrupted model publication' "$tmp_root/out"
+[[ ! -e $modeldir/.colibri-publishing && ! -e $qwen_stage ]] ||
+    fail 'the publication marker or stage remained after recovery'
+[[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors ]] ||
+    fail 'recovery did not publish the whole model'
+grep -q '^make ' "$log" && fail 'recovering publication rebuilt the engines'
+pass 'interrupted publication stays parked and resumes to a complete live model'
+
+# Too little disk stops before anything is fetched.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install before the disk check'; }
+if rt FAKE_DL=huge COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1; then
+    fail 'a download larger than the disk reported success'
+fi
+contains 'Not enough disk for the model' "$tmp_root/out"
+grep -q '^download ' "$dl_log" && fail 'a download started without the disk for it'
+pass 'a download larger than the free disk stops before fetching anything'
 
 printf '%s Colibri upgrade cases passed. No system files, packages or services were touched.\n' "$passed"

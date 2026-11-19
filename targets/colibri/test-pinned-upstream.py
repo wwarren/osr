@@ -126,6 +126,30 @@ def main():
     check('return ["image_generation"]' in server and 'return ["systemone", "decision"]' in server
           and 'return ["chat", "systemone"]' in server, "the capabilities /v1/models lists changed")
 
+    # model-select.sh's two downloads are colibri's catalog entries (repo,
+    # size, RAM minimum), and its downloader has what install-target.sh calls.
+    catalog = show("c/setup_catalog.py")
+    select = (HERE / "model-select.sh").read_text(encoding="utf-8")
+    for block in re.findall(r"\n        ([a-z0-9-]+)\)\n(.*?);;", select, re.S):
+        model_id, body = block
+        fields = dict(re.findall(r"COLIBRI_MODEL_([A-Z_]+)=(\S+)", body))
+        entry = re.search(rf'id="{re.escape(model_id)}".*?repo="([^"]+)", disk_gb=([0-9.]+).*?ram_min_gb=([0-9.]+)',
+                          catalog, re.S)
+        check(entry, f"{model_id} is not in colibri's catalog")
+        cat_repo, disk_gb, ram_min_gb = entry.groups()
+        check(fields.get("REPO") == cat_repo, f"{model_id}: repo {fields.get('REPO')} != catalog {cat_repo}")
+        check(fields.get("GB") == disk_gb, f"{model_id}: size {fields.get('GB')} != catalog {disk_gb}")
+        check(int(fields["MIN_MIB"]) >= float(ram_min_gb) * 1e9 / 2**20 - 1,
+              f"{model_id}: RAM minimum {fields['MIN_MIB']} MiB is below the catalog's {ram_min_gb} GB")
+        check(re.fullmatch(r"[0-9a-f]{40}", fields.get("REVISION", "")), f"{model_id}: no pinned revision")
+    check(select.count("COLIBRI_MODEL_REVISION=") == 2, "model-select.sh should pin both models")
+    downloader = show("c/setup_download.py")
+    for signature in ("def hf_token():", "def list_repo_files(repo, revision=",
+                      "def bytes_present(model_dir, files", "def download_repo(repo, revision, model_dir, files, *, token=None, progress=None",
+                      "def is_complete(model_dir", "class DownloadError("):
+        check(signature in downloader, f"setup_download.py lacks: {signature}")
+    check("setup_download.py" in install, "make install no longer installs setup_download.py")
+
     # The ids router.ini sizes (and the two the router keeps from tools) exist.
     registry = show("c/family_registry.py")
     announced = set(re.findall(r'model_id="([a-z0-9.\-]+)"', registry))
@@ -136,6 +160,7 @@ def main():
     for name in sized + ["inkling-colibri", "olmoe-colibri"]:
         check(name in announced, f"router.ini's {name} is not an id colibri announces")
     print(f"PASS colibri {expected}: build layout, serve flags, key, Host guard, GPU run flags, "
+          f"the two catalog downloads and their downloader, "
           f"/v1/models and {len(sized)} sized ids match the target")
 
 

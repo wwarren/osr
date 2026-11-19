@@ -5,6 +5,7 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -15,9 +16,10 @@ CT_ID to choose another ID, and IP_CIDR and GATEWAY for unattended runs.
 
 Creates an unprivileged Proxmox VE 9 LXC, clones https://github.com/JustVugg/colibri
 inside the CT, builds its engine with make, and starts its OpenAI-compatible API
-as a systemd service. A random API key is generated inside the CT. No model is
-downloaded: models are far too large to fetch unattended, so the service comes up
-parked until an operator places one (see README.md). --dry-run validates settings
+as a systemd service. A random API key is generated inside the CT. After GPU
+selection it suggests a supported model for the target's RAM and asks before
+downloading. Unattended runs skip the download unless COLIBRI_MODEL_ID is set;
+without a model the service parks (see README.md). --dry-run validates settings
 and prints the PVE command plan.
 
 Required: TEMPLATE (downloaded Ubuntu 22.04/24.04 or
@@ -45,11 +47,10 @@ Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
           COLIBRI_COMMIT=0a5504a1dc64f86fcd0fe7db298b0448c730e7e6 (tested default),
           COLIBRI_REF=<branch or tag> (explicitly follow it when no commit is set),
-          COLIBRI_MODEL_DIR=/var/lib/colibri/model (created empty: a model is
-                    NEVER downloaded here. Colibri models run from ~18 GB to
-                    500 GB+, so the operator copies one in later and restarts
-                    the service; see README.md. It must be an absolute path
-                    without ".." inside the CT's data directory),
+          COLIBRI_MODEL_DIR=/var/lib/colibri/model (model destination; absolute
+                    path without ".." inside the CT's data directory),
+          COLIBRI_MODEL_ID= (empty: prompt interactively or skip unattended;
+                    qwen36-35b or qwen3-coder-30b: download that model),
           COLIBRI_BACKEND=auto (auto|cpu|vulkan|cuda; auto: cuda for an NVIDIA
                     GPU, vulkan for an AMD Radeon or Intel Arc one, else cpu;
                     cpu never looks for a GPU),
@@ -136,11 +137,9 @@ else
     COLIBRI_COMMIT=${COLIBRI_COMMIT:-}
 fi
 COLIBRI_REF=${COLIBRI_REF:-main}
-# Colibri serves a model directory, and models run from ~18 GB to 500 GB+, so the
-# installer never picks or fetches one: the guest creates COLIBRI_MODEL_DIR
-# (default /var/lib/colibri/model) empty, and the service comes up parked until
-# an operator copies a model into it. See README.md.
+# A model is downloaded only after an interactive yes or an explicit model ID.
 COLIBRI_MODEL_DIR=${COLIBRI_MODEL_DIR:-/var/lib/colibri/model}
+COLIBRI_MODEL_ID=${COLIBRI_MODEL_ID:-}
 COLIBRI_BACKEND=${COLIBRI_BACKEND:-auto}
 COLIBRI_HOST=${COLIBRI_HOST:-0.0.0.0}
 COLIBRI_PORT=${COLIBRI_PORT:-8080}
@@ -194,7 +193,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Where to send a host without a GPU driver (the router installer runs it too).
 gpu_hint=" Without a driver for that GPU on this host, run: bash ${source_dir%/*/*}/tools/setup-host-gpu.sh"
-for file in install-target.sh colibri.service; do
+for file in install-target.sh colibri.service model-select.sh; do
     [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
 NVIDIA_GUEST_INSTALLER=${NVIDIA_GUEST_INSTALLER:-$source_dir/../../tools/install-nvidia-driver.sh}
@@ -335,11 +334,14 @@ gpu_label='none (CPU)'
 (( ! have_dri )) || gpu_label="render node (Vulkan): ${devices[*]}"
 [[ -z $gpu_detected ]] || gpu_label+=" (found on this host: $gpu_detected)$gpu_minor_pending"
 
-# --- Colibri settings --------------------------------------------------------
-# Nothing to ask: the model is never chosen or fetched here (models run from
-# ~18 GB to 500 GB+, so the service comes up parked until an operator places
-# one), the backend resolves itself in the guest, and the server binds 0.0.0.0
-# on COLIBRI_PORT. See the CT summary below and README.md.
+# Ask after device selection so the suggestion reflects the actual CT backend.
+model_backend=cpu
+if (( have_nvidia )); then model_backend=cuda
+elif (( have_dri )); then model_backend=vulkan
+fi
+colibri_choose_model "$MEMORY_MB" "$model_backend" "$COLIBRI_MODEL_DIR" "$(if pve_asks && (( ! dry_run )); then echo true; else echo false; fi)" ||
+    die 'Could not choose a Colibri model.'
+[[ -z $COLIBRI_MODEL_ID || -n $COLIBRI_MODEL_DIR ]] || die 'COLIBRI_MODEL_DIR is required when downloading a model.'
 
 ostype=debian
 [[ $TEMPLATE == *:vztmpl/ubuntu-* ]] && ostype=ubuntu
@@ -377,7 +379,12 @@ pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
 pve_row 'GPU' "$gpu_label"
 pve_row 'Server' "backend $COLIBRI_BACKEND, host $COLIBRI_HOST, port $COLIBRI_PORT"
-pve_row 'Model' "$COLIBRI_MODEL_DIR, created empty (parked until a model is copied in; none is downloaded)"
+if [[ -n $COLIBRI_MODEL_ID ]]; then
+    colibri_model_details "$COLIBRI_MODEL_ID"
+    pve_row 'Model' "$COLIBRI_MODEL_NAME ($COLIBRI_MODEL_GB GB) from $COLIBRI_MODEL_REPO into $COLIBRI_MODEL_DIR"
+else
+    pve_row 'Model' "$COLIBRI_MODEL_DIR, created empty (parked until a model is copied in; none is downloaded)"
+fi
 pve_confirm "Create Colibri CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Colibri pins tens of GiB of model memory. systemd's LimitMEMLOCK must be
@@ -423,6 +430,7 @@ fi
 run pct exec "$CT_ID" -- install -d -m 0700 /root/colibri-target-deploy
 run pct push "$CT_ID" "$source_dir/install-target.sh" /root/colibri-target-deploy/install-target.sh --perms 0755
 run pct push "$CT_ID" "$source_dir/colibri.service" /root/colibri-target-deploy/colibri.service --perms 0644
+run pct push "$CT_ID" "$source_dir/model-select.sh" /root/colibri-target-deploy/model-select.sh --perms 0644
 run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/colibri-target-deploy/nvidia-guest-install.sh --perms 0755
 # Only an NVIDIA CT needs the NVIDIA user-space in the guest; a CPU-only or
 # Vulkan CT must not be told to install that driver (Mesa's Vulkan driver is
@@ -431,7 +439,7 @@ if (( have_nvidia )); then
     nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/colibri-target-deploy/nvidia-guest-install.sh
 fi
 run pct exec "$CT_ID" -- env "COLIBRI_REF=$COLIBRI_REF" "COLIBRI_COMMIT=$COLIBRI_COMMIT" \
-    "COLIBRI_MODEL_DIR=$COLIBRI_MODEL_DIR" "COLIBRI_BACKEND=$COLIBRI_BACKEND" \
+    "COLIBRI_MODEL_DIR=$COLIBRI_MODEL_DIR" "COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID" "COLIBRI_BACKEND=$COLIBRI_BACKEND" \
     "COLIBRI_HOST=$COLIBRI_HOST" "COLIBRI_PORT=$COLIBRI_PORT" \
     "COLIBRI_ALLOWED_HOST=$COLIBRI_ALLOWED_HOST" \
     "COLIBRI_READY_TIMEOUT=$COLIBRI_READY_TIMEOUT" \
@@ -442,7 +450,15 @@ printf '  pct exec %s -- cat /etc/colibri-target/api-key\n' "$CT_ID"
 printf 'Then on OSR: manage-model-servers set-colibri-token (paste it), and\n'
 printf '  manage-model-servers add colibri://<CT address>:%s --tier <tier> --apply\n' "$COLIBRI_PORT"
 printf '(the OSR installer does both for a CT it creates).\n'
-printf 'No model is downloaded: the service is parked until one is placed (README.md).\n'
+if [[ -n $COLIBRI_MODEL_ID ]]; then
+    if (( dry_run )); then
+        printf 'Selected model: %s (%s GB), to be downloaded into %s.\n' "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_DIR"
+    else
+        printf 'Selected model: %s (%s GB), downloaded into %s.\n' "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_DIR"
+    fi
+else
+    printf 'No model is downloaded: the service is parked until one is placed (README.md).\n'
+fi
 printf 'Service logs: pct exec %s -- journalctl -u colibri -f\n' "$CT_ID"
-printf 'Upgrade later: push the current install-target.sh and colibri.service to\n'
+printf 'Upgrade later: push install-target.sh, colibri.service and model-select.sh to\n'
 printf '  /root/colibri-target-deploy in the CT, then run it there with --upgrade.\n'
