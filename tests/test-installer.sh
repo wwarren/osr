@@ -151,7 +151,7 @@ unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL 
 # and restored by re-sourcing the extracted functions at the end.
 _tt="$(mktemp -d)"
 TARGETS_DIR="$_tt/targets"
-for _name in gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi; do
+for _name in gitea mattermost ollama airllm kindi colibri llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi; do
   mkdir -p "$TARGETS_DIR/$_name"
   # The fake provisioner records what it was given: settings, flags, and
   # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
@@ -193,6 +193,8 @@ _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_
   printf 'dsh-env openwebui=%s\n' "${OPENWEBUI:-default}" >> "$MOCK_LOG"
 [[ -z ${KINDI_BACKEND:-}${KINDI_CONTEXT:-} ]] ||
   printf 'kindi-env %s|%s|%s\n' "${KINDI_BACKEND:-}" "${GPU_DEVICES:-}" "${KINDI_CONTEXT:-}" >> "$MOCK_LOG"
+[[ -z ${COLIBRI_BACKEND:-} ]] ||
+  printf 'colibri-env %s|%s\n' "${COLIBRI_BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
   printf 'cuda-env %s|%s|%s|%s\n' "${CUDA_VERSION:-}" "${MAYA_CUDA_VERSION:-}" "${XOLOTL_CUDA_VERSION:-}" "${AVALON_CUDA_VERSION:-}" >> "$MOCK_LOG"
 if [[ -n ${HF_TOKEN:-} ]]; then
@@ -204,8 +206,8 @@ done
 unset _name
 
 describe target_table
-assert_eq "lists the nineteen targets in menu order" \
-  "gitea mattermost ollama airllm kindi llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi" \
+assert_eq "lists the twenty targets in menu order" \
+  "gitea mattermost ollama airllm kindi colibri llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi" \
   "$(target_table | cut -d'|' -f1 | paste -sd' ')"
 
 describe target_field
@@ -238,6 +240,10 @@ assert_eq "Kindi has its own key kind" kindi "$(target_field kindi key)"
 assert_eq "Kindi router entry template" "kindi+http://@IP@:@PORT@" "$(target_field kindi entry)"
 assert_eq "Kindi uses any NVIDIA card when present, of any generation" optional:nvidia "$(target_field kindi gpu)"
 assert_eq "Kindi is a model server" model "$(target_field kindi phase)"
+assert_eq "Colibri has its own key kind" colibri "$(target_field colibri key)"
+assert_eq "Colibri router entry template" "colibri+http://@IP@:@PORT@" "$(target_field colibri entry)"
+assert_eq "Colibri uses an NVIDIA, AMD or Intel Arc card when given one" optional:nvidia,amd,intel "$(target_field colibri gpu)"
+assert_eq "Colibri is a model server" model "$(target_field colibri phase)"
 assert_eq "no key for Ollama" "" "$(target_field ollama key)"
 assert_fail "an unknown target" target_field nope phase
 assert_eq "Strata needs an NVIDIA GPU" required:nvidia "$(target_field strata gpu)"
@@ -267,6 +273,10 @@ assert_eq "Avalon AVALON_BACKEND=cuda: NVIDIA" "required|nvidia|rdna3,rtx20,rtx3
 assert_eq "Kindi: an NVIDIA card when present" "optional|nvidia|" "$(target_gpu_spec kindi)"
 assert_eq "Kindi KINDI_BACKEND=cuda: one is required" "required|nvidia|" "$(KINDI_BACKEND=cuda target_gpu_spec kindi)"
 assert_eq "Kindi KINDI_BACKEND=cpu: none" "||" "$(KINDI_BACKEND=cpu target_gpu_spec kindi)"
+assert_eq "Colibri: any of the three vendors when present" "optional|nvidia,amd,intel|" "$(target_gpu_spec colibri)"
+assert_eq "Colibri COLIBRI_BACKEND=cuda: an NVIDIA card is required" "required|nvidia|" "$(COLIBRI_BACKEND=cuda target_gpu_spec colibri)"
+assert_eq "Colibri COLIBRI_BACKEND=vulkan: an AMD or Intel Arc card" "required|amd,intel|" "$(COLIBRI_BACKEND=vulkan target_gpu_spec colibri)"
+assert_eq "Colibri COLIBRI_BACKEND=cpu: none" "||" "$(COLIBRI_BACKEND=cpu target_gpu_spec colibri)"
 assert_fail "an unknown target" target_gpu_spec nope
 
 describe target_gpu_need
@@ -353,6 +363,8 @@ assert_fail "not Ollama on NVIDIA only" env GPU=nvidia bash -c "$(declare -f tar
 assert_fail "not without a GPU" env GPU=none bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted comfyui"
 assert_fail "not the NVIDIA-only targets" target_gpu_prompted strata
 assert_ok "but Kindi, meant for a spare old NVIDIA card" target_gpu_prompted kindi
+assert_ok "and Colibri, which can run on any vendor's card or none" target_gpu_prompted colibri
+assert_fail "not Colibri on the CPU" env COLIBRI_BACKEND=cpu bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted colibri"
 assert_fail "not Kindi on the CPU" env KINDI_BACKEND=cpu bash -c "$(declare -f target_gpu_prompted target_gpu_spec target_field target_table); target_gpu_prompted kindi"
 assert_fail "not the targets without a GPU" target_gpu_prompted hermes
 
@@ -617,6 +629,22 @@ GPU_RESULT_KINDI="declined||||"
 assert_eq "Kindi given no card: its CPU engine" KINDI_BACKEND=cpu "$(target_gpu_env kindi)"
 GPU_RESULT_KINDI="absent||||"
 assert_eq "Kindi without a GPU: its CPU engine" KINDI_BACKEND=cpu "$(target_gpu_env kindi)"
+GPU_RESULT_COLIBRI="ready|nvidia||2|0000:02:00.0"
+assert_eq "Colibri on an NVIDIA card: CUDA with its /dev/nvidia<minor>" \
+  $'COLIBRI_BACKEND=cuda\nGPU_DEVICES=/dev/nvidia2 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools' "$(target_gpu_env colibri)"
+GPU_RESULT_COLIBRI="ready|amd|/dev/dri/renderD128||0000:03:00.0"
+assert_eq "Colibri on an AMD card: Vulkan with the card's render node" \
+  $'COLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD128' "$(target_gpu_env colibri)"
+GPU_RESULT_COLIBRI="ready|intel|/dev/dri/renderD129||0000:04:00.0"
+assert_eq "Colibri on an Intel Arc card: Vulkan too" \
+  $'COLIBRI_BACKEND=vulkan\nGPU_DEVICES=/dev/dri/renderD129' "$(target_gpu_env colibri)"
+assert_eq "a preset COLIBRI_BACKEND and GPU_DEVICES are kept" "" \
+  "$(COLIBRI_BACKEND=vulkan GPU_DEVICES=/dev/dri/renderD130 target_gpu_env colibri)"
+GPU_RESULT_COLIBRI="declined||||"
+assert_eq "Colibri given no card: the CPU" COLIBRI_BACKEND=cpu "$(target_gpu_env colibri)"
+GPU_RESULT_COLIBRI="absent||||"
+assert_eq "Colibri without a GPU: the CPU" COLIBRI_BACKEND=cpu "$(target_gpu_env colibri)"
+unset GPU_RESULT_COLIBRI
 _gpu_reset
 
 describe target_var_prefix
@@ -644,6 +672,7 @@ assert_ok "Maya takes a template" target_needs_template maya
 assert_ok "Xolotl takes a template" target_needs_template xolotl
 assert_ok "Avalon takes a template" target_needs_template avalon
 assert_ok "Kindi takes a template" target_needs_template kindi
+assert_ok "Colibri takes a template" target_needs_template colibri
 assert_fail "llama.cpp prompts for its own" target_needs_template llamacpp
 assert_fail "Hermes uses the router's" target_needs_template hermes
 assert_fail "OpenClaw uses the router's" target_needs_template openclaw
@@ -652,16 +681,16 @@ assert_fail "OpenCode uses the router's" target_needs_template opencode
 assert_fail "ComfyUI's community script picks its own" target_needs_template comfyui
 
 describe valid_target_selection
-for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "19" "comfyui" "freellmapi" "xolotl" "avalon" "kindi" "openclaw" "opencode"; do
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "19" "20" "comfyui" "freellmapi" "xolotl" "avalon" "kindi" "colibri" "openclaw" "opencode"; do
   assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
 done
-for _sel in 0 20 bogus "ollama,bogus"; do
+for _sel in 0 21 bogus "ollama,bogus"; do
   assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
 done
 unset _sel
 
 describe normalize_target_selection
-assert_eq "names and numbers, in menu order" "gitea ollama kindi strata hermes" "$(normalize_target_selection 'hermes,3, 7,1,5')"
+assert_eq "names and numbers, in menu order" "gitea ollama kindi strata hermes" "$(normalize_target_selection 'hermes,3, 8,1,5')"
 assert_eq "each target once" ollama "$(normalize_target_selection '3,ollama')"
 assert_eq "none is empty" "" "$(normalize_target_selection none)"
 assert_eq "blank is empty" "" "$(normalize_target_selection '')"
@@ -682,19 +711,20 @@ assert_fail "also when the menu would be shown" prompt_target_selection <<< $'\n
 NONINTERACTIVE=true
 NONINTERACTIVE=false; INSTALL_TARGETS=""
 _out="$(mktemp)"
-prompt_target_selection > "$_out" 2>&1 <<< $'20\n6,hermes\n'
+prompt_target_selection > "$_out" 2>&1 <<< $'21\n7,hermes\n'
 assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
-assert_contains "the menu lists the model servers" "10) xolotl" "$(cat "$_out")"
-assert_contains "Avalon among them" "11) avalon" "$(cat "$_out")"
+assert_contains "the menu lists the model servers" "11) xolotl" "$(cat "$_out")"
+assert_contains "Avalon among them" "12) avalon" "$(cat "$_out")"
 assert_contains "Kindi with the CPU or optional-GPU servers" "5) kindi" "$(sed -n '/CPU or optional GPU/,/GPU required/p' "$_out")"
-assert_contains "the menu lists the companions" "13) hermes" "$(cat "$_out")"
-assert_contains "ComfyUI among them" "18) comfyui" "$(cat "$_out")"
-assert_contains "OpenClaw is grouped with agents" "14) openclaw" "$(cat "$_out")"
-assert_contains "DeepSeek Harness has its own menu choice" "15) deepseek-harness" "$(cat "$_out")"
-assert_contains "OpenCode follows the other agents" "16) opencode" "$(cat "$_out")"
-assert_contains "FreeLLMAPI is last, so earlier numbers stay" "19) freellmapi" "$(cat "$_out")"
+assert_contains "and Colibri" "6) colibri" "$(sed -n '/CPU or optional GPU/,/GPU required/p' "$_out")"
+assert_contains "the menu lists the companions" "14) hermes" "$(cat "$_out")"
+assert_contains "ComfyUI among them" "19) comfyui" "$(cat "$_out")"
+assert_contains "OpenClaw is grouped with agents" "15) openclaw" "$(cat "$_out")"
+assert_contains "DeepSeek Harness has its own menu choice" "16) deepseek-harness" "$(cat "$_out")"
+assert_contains "OpenCode follows the other agents" "17) opencode" "$(cat "$_out")"
+assert_contains "FreeLLMAPI is last, so earlier numbers stay" "20) freellmapi" "$(cat "$_out")"
 assert_contains "under its own heading" "Cloud gateway (CPU): prompts leave your network; never chosen by auto." "$(cat "$_out")"
-assert_contains "and Open Terminal after them" "17) open-terminal" "$(cat "$_out")"
+assert_contains "and Open Terminal after them" "18) open-terminal" "$(cat "$_out")"
 assert_contains "memory comes before agents" "Memory infrastructure (CPU)" "$(cat "$_out")"
 assert_contains "the GPU model group is explicit" "Model servers (GPU required by default)" "$(cat "$_out")"
 assert_contains "the CPU model group is explicit" "Model servers (CPU or optional GPU)" "$(cat "$_out")"
@@ -820,6 +850,22 @@ assert_ok "Kindi on Debian 12" valid_kindi_template local:vztmpl/debian-12-stand
 assert_fail "not Ubuntu 26.04 (the CUDA 10.2 runfile is not checked there)" valid_kindi_template local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
 assert_fail "nor another distro" valid_kindi_template local:vztmpl/alpine-3.20-default_20240908_amd64.tar.xz
 
+describe valid_colibri_template
+assert_ok "Colibri on Debian 13" valid_colibri_template local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+assert_ok "Colibri on Ubuntu 22.04" valid_colibri_template local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+assert_fail "not Ubuntu 26.04 (its CUDA toolkit lane has no repository for it)" valid_colibri_template local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+
+describe valid_colibri_memory_mb
+assert_ok "8 GiB of RAM is the floor" valid_colibri_memory_mb 8192
+assert_ok "and 64 GiB fine" valid_colibri_memory_mb 65536
+assert_fail "less is refused" valid_colibri_memory_mb 4096
+assert_fail "and junk" valid_colibri_memory_mb 64G
+
+describe valid_colibri_rootfs_gb
+assert_ok "40 GiB of disk is the floor" valid_colibri_rootfs_gb 40
+assert_ok "and 500 GiB fine" valid_colibri_rootfs_gb 500
+assert_fail "less is refused" valid_colibri_rootfs_gb 20
+
 describe host_gpu_cuda_arch
 HOST_GPU_CUDA_ARCH=120
 assert_eq "the GPU step's result first" 120 "$(host_gpu_cuda_arch)"
@@ -836,6 +882,7 @@ assert_eq "Maya on an RTX card: Debian 13 first" "debian-13 ubuntu-26.04 ubuntu-
 assert_eq "Maya on a V100: only CUDA 12 distributions" "ubuntu-24.04 ubuntu-22.04 debian-12" "$(HOST_GPU_CUDA_ARCH=70 gpu_target_template_order maya)"
 assert_eq "Avalon: the Ubuntu releases ROCm supports" "ubuntu-24.04 ubuntu-22.04" "$(gpu_target_template_order avalon)"
 assert_eq "Kindi: Strata's releases, Debian 13 first" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order kindi)"
+assert_eq "Colibri: the same" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order colibri)"
 
 describe target_cuda_env
 assert_eq "Basalt on Ubuntu 26.04 uses CUDA 13.3" CUDA_VERSION=13.3 "$(target_cuda_env basalt local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst)"
@@ -1252,6 +1299,7 @@ unset KINDI_IP_CIDR
 
 describe target_default_port
 assert_eq "Kindi keeps its own 8093" 8093 "$(target_default_port kindi)"
+assert_eq "Colibri uses 8080 like the other Strata-style targets" 8080 "$(target_default_port colibri)"
 assert_eq "the other Strata-style targets 8080" 8080 "$(target_default_port avalon)"
 
 describe preset_target_model_servers
@@ -1679,6 +1727,21 @@ mock_reset_log
 run_target_provisioner kindi
 assert_contains "Kindi given no card runs on the CPU" "kindi-env cpu||auto" "$(mock_calls)"
 unset KINDI_CT_ID KINDI_IP_CIDR KINDI_STORAGE KINDI_TEMPLATE KINDI_CONTEXT GPU_RESULT_KINDI
+COLIBRI_CT_ID=924; COLIBRI_IP_CIDR=192.0.2.104/24; COLIBRI_STORAGE=gpu-store
+COLIBRI_TEMPLATE=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+COLIBRI_MEMORY_MB=98304; COLIBRI_ROOTFS_GB=600
+GPU_RESULT_COLIBRI="ready|amd|/dev/dri/renderD128||0000:03:00.0"
+mock_reset_log
+run_target_provisioner colibri
+assert_contains "Colibri gets its AMD card's render node and Vulkan" "colibri-env vulkan|/dev/dri/renderD128" "$(mock_calls)"
+assert_contains "and the RAM chosen for it" "memory-env 98304" "$(mock_calls)"
+assert_contains "and the disk" "|600|" "$(mock_calls)"
+assert_not_contains "and no CUDA version of the template's repository" "cuda-env" "$(mock_calls)"
+GPU_RESULT_COLIBRI="declined||||"
+mock_reset_log
+run_target_provisioner colibri
+assert_contains "Colibri given no card runs on the CPU" "colibri-env cpu|" "$(mock_calls)"
+unset COLIBRI_CT_ID COLIBRI_IP_CIDR COLIBRI_STORAGE COLIBRI_TEMPLATE COLIBRI_MEMORY_MB COLIBRI_ROOTFS_GB GPU_RESULT_COLIBRI
 mock_reset_log
 run_target_provisioner llamacpp
 assert_contains "llama.cpp without a model only gets its CT" "|no|" "$(mock_calls)"
@@ -2205,6 +2268,9 @@ assert_fail "rejects avalon:// junk"     valid_ollama_addr "avalon://a b"
 assert_ok   "accepts kindi://host"       valid_ollama_addr kindi://10.0.0.14
 assert_ok   "accepts kindi+http url"     valid_ollama_addr kindi+http://h:8093
 assert_fail "rejects kindi:// junk"      valid_ollama_addr "kindi://a b"
+assert_ok   "accepts colibri://host"     valid_ollama_addr colibri://10.0.0.15
+assert_ok   "accepts colibri+http url"   valid_ollama_addr colibri+http://h:8080
+assert_fail "rejects colibri:// junk"    valid_ollama_addr "colibri://a b"
 
 describe normalize_ollama_url
 assert_eq "bare ip gets scheme and port" "http://10.0.0.5:11434" "$(normalize_ollama_url 10.0.0.5)"
@@ -2233,6 +2299,8 @@ assert_eq "avalon+http passes through"      "avalon+http://h:8181"   "$(normaliz
 assert_eq "kindi:// gets Kindi's own port"  "kindi+http://h:8093"    "$(normalize_ollama_url kindi://h)"
 assert_eq "kindi+http passes through"       "kindi+http://h:8094"    "$(normalize_ollama_url kindi+http://h:8094/)"
 assert_eq "KINDI_PORT sets kindi://'s port" "kindi+http://h:8100"    "$(KINDI_PORT=8100 normalize_ollama_url kindi://h)"
+assert_eq "colibri:// gets 8080"            "colibri+http://h:8080"  "$(normalize_ollama_url colibri://h)"
+assert_eq "COLIBRI_PORT sets its port"      "colibri+http://h:8000"  "$(COLIBRI_PORT=8000 normalize_ollama_url colibri://h)"
 AVALON_PORT=8181
 assert_eq "AVALON_PORT sets avalon://'s port" "avalon+http://h:8181"  "$(normalize_ollama_url avalon://h)"
 unset AVALON_PORT

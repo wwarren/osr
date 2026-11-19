@@ -68,7 +68,7 @@ serves right now (`served_context_length`):
 | LM Studio | the loaded instance's context length (a model loaded with 262144 tokens gives 262144) |
 | Ollama | a `num_ctx` in the model's Modelfile; without one, nothing (it serves `OLLAMA_CONTEXT_LENGTH`, which Ollama does not report) |
 | llama.cpp bridge, AirLLM | the active per-slot window |
-| Strata, Basalt, Maya, Xolotl, Avalon, Kindi | the window the server reports in `/v1/models` |
+| Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri | the window the server reports in `/v1/models` |
 
 A model whose server reports nothing counts as 65536, the window every OSR
 model target defaults to (or the model's own limit, when that is smaller). A

@@ -36,9 +36,9 @@ LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Default ports of the other server kinds are in kind_field (LM Studio 1234,
-# Strata/Basalt/Maya/Xolotl/Avalon 8080, Kindi 8093); LMSTUDIO_PORT,
-# STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT and KINDI_PORT
-# in the environment override them.
+# Strata/Basalt/Maya/Xolotl/Avalon/Colibri 8080, Kindi 8093); LMSTUDIO_PORT,
+# STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT, KINDI_PORT and
+# COLIBRI_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -101,11 +101,12 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask OSR to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             LM Studio, Strata, Basalt, Maya, Xolotl, Avalon and
-                             Kindi are detected automatically, or use
+                             LM Studio, Strata, Basalt, Maya, Xolotl, Avalon,
+                             Kindi and Colibri are detected automatically, or use
                              lmstudio://host / strata://host / basalt://host /
                              maya://host / xolotl://host / avalon://host /
-                             kindi://host or --type.
+                             kindi://host / colibri://host or --type. A Colibri
+                             started with an API key needs colibri://host.
                              Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
@@ -150,6 +151,9 @@ Commands:
   set-kindi-token [token|--off]
                              Bearer token for Kindi servers with an API key
                              (stored in secrets.env)
+  set-colibri-token [token|--off]
+                             Bearer token for Colibri servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on OSR
                              API (Open WebUI is given the same key)
@@ -174,7 +178,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi|colibri> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -200,6 +204,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh add http://10.0.0.56:11434 10.0.0.57 --tier medium
     manage-model-servers.sh add lmstudio://10.0.0.9 --tier fast --apply
     manage-model-servers.sh add 10.0.0.14:8093 --type kindi --tier xlarge --apply
+    manage-model-servers.sh add colibri://10.0.0.15 --tier large --apply
     manage-model-servers.sh add 10.0.0.60 --no-probe --type ollama --tier fast
     manage-model-servers.sh add 10.0.0.61 --tier large --dry-run
     manage-model-servers.sh remove 10.0.0.52 --apply
@@ -237,6 +242,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-avalon-token <token> --apply
     manage-model-servers.sh set-kindi-token <token> --apply
     manage-model-servers.sh set-kindi-token --off --apply
+    manage-model-servers.sh set-colibri-token <token> --apply
     manage-model-servers.sh set-webhook https://mm.example.lan/hooks/abc123 --apply
     manage-model-servers.sh set-webhook --channel alerts --username osr-monitor --apply
     manage-model-servers.sh set-webhook --verify-tls false --apply
@@ -277,7 +283,7 @@ valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
 #   port   -- default port (overridable through the <KIND>_PORT variable)
 #   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
 #             openai provider), 0 for LM Studio (its own API and provider)
-server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi; }
+server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi colibri; }
 kind_field() {
   local spec key label port_var port_default openai value
   case "$1" in
@@ -288,6 +294,7 @@ kind_field() {
     xolotl)   spec='XOLOTL_API_KEY|Xolotl|XOLOTL_PORT|8080|1' ;;
     avalon)   spec='AVALON_API_KEY|Avalon|AVALON_PORT|8080|1' ;;
     kindi)    spec='KINDI_API_KEY|Kindi|KINDI_PORT|8093|1' ;;
+    colibri)  spec='COLIBRI_API_KEY|Colibri|COLIBRI_PORT|8080|1' ;;
     *) return 1 ;;
   esac
   IFS='|' read -r key label port_var port_default openai <<< "$spec"
@@ -311,7 +318,7 @@ is_server_kind() {
 }
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
-# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon or Kindi"
+# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri"
 kind_labels() {
   local out=Ollama k label last=""
   for k in $(server_kinds); do
@@ -467,6 +474,11 @@ detect_server_kind() {
     if [[ "$body" =~ \"owned_by\"[[:space:]]*:[[:space:]]*\"llamacpp\" ]] &&
        [[ "$body" =~ \"id\"[[:space:]]*:[[:space:]]*\"[^\"]*avalon[^\"]*\" ]]; then
       echo avalon; return 0
+    fi
+    # Colibri's /health says only "status" without a key; a keyless Colibri
+    # lists its model as owned by colibri (a keyed one needs colibri://).
+    if [[ "$body" =~ \"owned_by\"[[:space:]]*:[[:space:]]*\"colibri\" ]]; then
+      echo colibri; return 0
     fi
   fi
   # LM Studio: its native model API (0.4+ /api/v1, 0.3 /api/v0). A 401 still
@@ -2776,7 +2788,7 @@ cmd_set_api_key() {
 
 # Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
 # LM Studio servers with "Require authentication" on, or Strata, Basalt, Maya,
-# Xolotl, Avalon and Kindi servers started with an API key. One token per kind, stored in
+# Xolotl, Avalon, Kindi and Colibri servers started with an API key. One token per kind, stored in
 # secrets.env (outside the repo) like the other secrets.
 cmd_set_kind_token() {
   local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd

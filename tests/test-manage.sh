@@ -688,6 +688,22 @@ case "$*" in
 esac
 EOF
 assert_status "a /health without Kindi's version is not taken for Kindi" 1 detect_server_kind http://h:8093
+# Colibri's public /health says only "status"; a keyless one lists its model as
+# owned by colibri (a keyed one answers 401 and has to be named colibri://).
+mock_script curl <<'EOF2'
+case "$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok"}';;
+  *"/v1/status"*) printf '{"error":{"code":404}}\n404';;
+  *"/api/v1/models"*|*"/api/v0/models"*) printf 404;;
+  *"/v1/models"*) echo '{"object":"list","data":[{"id":"qwen3.6-colibri","object":"model","created":1,"owned_by":"colibri","capabilities":["chat","systemone"]}]}';;
+  *) exit 22;;
+esac
+EOF2
+mock_reset_log
+assert_eq "a keyless Colibri is identified by its model's owner" "colibri" "$(detect_server_kind http://h:8080)"
+assert_not_contains "Colibri detection sends no key" "-H @" "$(mock_calls)"
+assert_eq "colibri:// names a keyed one, on 8080" "colibri+http://h:8080" "$(normalize_addr colibri://h)"
 # A keyed older Strata without a distinguishing public /health response still
 # cannot be identified safely, so such a host has to be named.
 reset_repo
@@ -1956,7 +1972,7 @@ assert_eq "--off clears it" "" "$(env_get ROUTER_API_KEY)"
 reset_repo
 
 describe server_kinds
-assert_eq "kinds, in detection order" "lmstudio strata basalt maya xolotl avalon kindi" "$(server_kinds | paste -sd' ' -)"
+assert_eq "kinds, in detection order" "lmstudio strata basalt maya xolotl avalon kindi colibri" "$(server_kinds | paste -sd' ' -)"
 
 describe kind_field
 assert_eq "maya key" MAYA_API_KEY "$(kind_field maya key)"
@@ -1980,10 +1996,10 @@ assert_fail "LM Studio is not" is_openai_kind lmstudio
 assert_fail "nor is Ollama" is_openai_kind ollama
 
 describe openai_kinds
-assert_eq "OpenAI-style kinds" "strata basalt maya xolotl avalon kindi" "$(openai_kinds | paste -sd' ' -)"
+assert_eq "OpenAI-style kinds" "strata basalt maya xolotl avalon kindi colibri" "$(openai_kinds | paste -sd' ' -)"
 
 describe kind_labels
-assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon or Kindi" "$(kind_labels)"
+assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri" "$(kind_labels)"
 
 describe kind_secret_name
 assert_eq "LM Studio has a token" "LM Studio token" "$(kind_secret_name lmstudio)"
@@ -2008,8 +2024,8 @@ assert_fail "unknown token commands do not" command_writes set-bogus-token
 
 describe secret_keys
 assert_eq "secrets include every kind's key" \
-  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY XOLOTL_API_KEY AVALON_API_KEY KINDI_API_KEY" \
-  "$(secret_keys | tail -n 7 | paste -sd' ' -)"
+  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY XOLOTL_API_KEY AVALON_API_KEY KINDI_API_KEY COLIBRI_API_KEY" \
+  "$(secret_keys | tail -n 8 | paste -sd' ' -)"
 
 describe litellm_provider
 assert_eq "litellm provider for maya" openai "$(litellm_provider maya+http://h:8080)"

@@ -204,7 +204,7 @@ _DEFAULTS = {
         # tool-capable. Their APIs say nothing per model, but each of these
         # servers parses "tools" and returns OpenAI tool_calls. A kind left
         # out is reported unknown. Blank: none.
-        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi",
+        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -280,7 +280,7 @@ _DEFAULTS = {
         "sticky_seconds": "1800",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya, Xolotl, Avalon) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl, Avalon, Colibri) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
@@ -294,6 +294,23 @@ _DEFAULTS = {
         "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
         "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
         "qwen3.8-flash-next-avalon": "125B",  # Avalon's default alias (Qwen3.8-Flash-Next)
+        # Colibri's ids for the models whose id gives no size (its family
+        # registry's display scale; ids such as qwen3-coder-30b-a3b-colibri
+        # name theirs). Qwen3.8-Flash-Next counts 125B as for Strata and Avalon.
+        "glm-5.3-flash-colibri": "321B",
+        "glm-5.2-colibri": "744B",
+        "mistral-large-4-colibri": "1000B",
+        "inkling-colibri": "975B",
+        "kimi-k3-colibri": "2800B",
+        "olmoe-colibri": "7B",
+        "qwen3.6-colibri": "35B",
+        "qwen3.8-flash-next-colibri": "125B",
+        "flint-colibri": "40B",
+        "muse-spark-open-colibri": "816B",
+        "deepseek-v4-colibri": "284B",
+        "deepseek-v4.1-flash-colibri": "552B",
+        "mimo-v2.6-flash": "309B",
+        "mimo-v2.6-pro": "1020B",
     },
 }
 ROUTER_INI = os.getenv(
@@ -555,8 +572,17 @@ SERVER_KINDS = {
                "label": "Avalon", "openai": True},
     "kindi": {"prefix": "kindi+", "key_env": "KINDI_API_KEY",
               "label": "Kindi", "openai": True},
+    "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
+                "label": "Colibri", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
+# Capabilities a /v1/models entry can declare (Colibri's "capabilities") that
+# mean it answers no chat: an image generator or a decision model. Such an
+# entry is not offered for chat at all.
+NON_CHAT_CAPABILITIES = frozenset({"image_generation", "decision"})
+# Models of a tool kind whose engine takes no tools: Colibri parses tools on
+# every chat engine except Inkling and OLMoE. Their tool support is unknown.
+NO_TOOL_MODELS = {"colibri": frozenset({"inkling-colibri", "olmoe-colibri"})}
 # Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
 # servers with "Require authentication" (0.4+).
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
@@ -1097,7 +1123,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt, Maya, Xolotl, Avalon or Kindi model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -1110,6 +1136,10 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
         entries = []
         for model in models:
             if not isinstance(model, dict) or not model.get("id"):
+                continue
+            declared = model.get("capabilities")
+            if (isinstance(declared, list) and NON_CHAT_CAPABILITIES & set(declared)
+                    and not {"chat", "completion"} & set(declared)):
                 continue
             architecture = model.get("architecture") or {}
             modalities = model.get("input_modalities") or []
@@ -1146,6 +1176,8 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
             # /v1/images model) outputs no text, so it takes no tools.
             if server_kind(server) in TOOL_KINDS:
                 raw["tools"] = True if not isinstance(outputs, list) or "text" in outputs else None
+                if str(model["id"]).lower() in NO_TOOL_MODELS.get(server_kind(server), ()):
+                    raw["tools"] = None
             entries.append(build_entry(server, raw, caps))
         return server, entries, None
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:

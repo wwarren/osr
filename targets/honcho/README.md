@@ -55,7 +55,7 @@ get both ports (an agent's MCP rule is tagged `# osr-honcho-client-mcp`). See
   (32768 with `auto`, 131072 when blank).
 - **Both reported in the inventory.** Ollama, the llama.cpp bridge (with
   `tools` in `MODEL_CAPABILITIES`), tool-trained LM Studio models, and Strata,
-  Basalt, Maya, Xolotl, Avalon and Kindi (`tool_kinds`) report tools and
+  Basalt, Maya, Xolotl, Avalon, Kindi and Colibri (`tool_kinds`) report tools and
   context; AirLLM has neither. Strata, Xolotl and Maya produce JSON by
   prompting rather than constrained decoding (Basalt and Avalon constrain it),
   and Maya does not validate it against the schema. Reported context is a

@@ -146,6 +146,35 @@ when `BASALT_REF` is unpinned; set `BASALT_COMMIT` to the installed commit to
 keep the engine version. The native context limit of Qwen3.8-Flash-Next is
 262,144 tokens.
 
+## Compaction from clients
+
+Basalt's chat and Responses APIs are stateless: a client sends the active
+conversation on each request. To compact a conversation, the client asks the
+model to summarize older turns, retains the summary and recent turns, and
+sends that shorter history on its next request. Basalt matches the new prompt
+against its cached prefixes and reads the changed portion. No Basalt cache
+command or server-side Responses compaction endpoint is involved. Keep
+`BASALT_KV_RESIDENT` if you need KV streaming; it does not prevent client
+compaction.
+
+| Client | How to use compaction with Basalt |
+| --- | --- |
+| [Open WebUI](https://docs.openwebui.com/troubleshooting/context-window/#the-built-in-option-context-compaction) | An admin enables **Context Compaction** in Settings > Interface. Set its token threshold below the Basalt context served, leaving room for the summary and next answer. For the default 65,536-token Basalt window, 49,152 is a starting point. If other models use the same WebUI, set their model-specific thresholds in Advanced Params; the global token cap must be at least as high as any per-model threshold. An admin or API client can request compaction with `POST /api/v1/chats/{id}/compact` on Open WebUI, not on Basalt. |
+| [OpenClaw](https://docs.openclaw.ai/concepts/compaction) | Its built-in runtime automatically summarizes near the configured model window. Use `/compact` in the chat for an immediate summary. Keep `OPENCLAW_CONTEXT_LENGTH=auto` (or set it to the actual served window). |
+| [Hermes](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/context-compression-and-caching.md) | Its `compression.enabled` default is `true`; use `/compress` to summarize now. Keep `HERMES_CONTEXT_LENGTH=auto` (or set it to the actual served window). Its compression model must have enough context to read the history being summarized. |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/compaction/README.md) | The shipped `dsh` base enables automatic summary compaction and `/compact`. Keep `DSH_CONTEXT_WINDOW=auto` (or set it to the actual served window). |
+| [OpenCode](https://opencode.ai/docs/compaction) | Automatic summary compaction is on by default. Use `opencode api post /api/session/<session-id>/compact --data '{}'` to request it. Keep `OPENCODE_CONTEXT_LENGTH=auto` (or set it to the actual served window). Use OpenCode's `summary` compaction type for Basalt; its `native` type calls a provider compaction endpoint that Basalt does not implement. |
+
+Select the concrete Basalt model in an agent when possible: an `auto` or tier
+alias can route the summary request to another model with a different context
+window. The router advertises Basalt's served context from `/v1/models`, and
+the agent installers use that value with their `auto` context setting.
+
+Compaction reduces the **tokens in later requests**. It does not shrink the KV
+cache allocated for `BASALT_CONTEXT`, change the pinned RAM estimate above, or
+immediately erase cached checkpoints of the old prompt. Size the CT and KV
+settings for the configured maximum context even when clients compact early.
+
 ## Router registration
 
 ```bash

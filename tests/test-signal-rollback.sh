@@ -27,7 +27,7 @@ for f in "$targets"/*/install-target.sh; do
     assert_contains "${f#"$targets"/}: an ERR-trap rollback has the signal helper" "$v1_start" "$(cat "$f")"
   fi
 done
-for t in strata basalt maya xolotl avalon kindi; do
+for t in strata basalt maya xolotl avalon kindi colibri; do
   f=$targets/$t/install-target.sh
   assert_eq "$t carries the shared upgrade guard" "$(block "$targets/upgrade-guard.sh" "$v2_start" "$v2_end")" "$(block "$f" "$v2_start" "$v2_end")"
   upgrade=$(awk '/^do_upgrade\(\)/{c=1} c{print} c && /^}/{exit}' "$f")

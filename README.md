@@ -24,7 +24,7 @@ the router services as `osr-router`, plus a small local metrics stack:
 Normal request path: **client or Open WebUI → router :8000 → model host**.
 LiteLLM serves static tiers only when discovery is off or the inventory is
 empty. The pool can mix Ollama, LM Studio, llama.cpp, AirLLM, Strata, Basalt,
-Maya, Xolotl, Avalon and Kindi. Optional service, model and companion CTs are
+Maya, Xolotl, Avalon, Kindi and Colibri. Optional service, model and companion CTs are
 listed under [Inference targets](#inference-targets); standalone
 [MQTT and hcom targets](#agent-coordination-targets) connect agents across
 containers.
@@ -39,7 +39,7 @@ bash open-smart-router-install.sh
 ```
 
 The installer's menu offers, grouped by purpose: Gitea and Mattermost
-services; Ollama, AirLLM, Kindi, llama.cpp, Strata, Basalt, Maya, Xolotl and
+services; Ollama, AirLLM, Kindi, Colibri, llama.cpp, Strata, Basalt, Maya, Xolotl and
 Avalon model servers; Honcho memory; Hermes, OpenClaw, DeepSeek Harness and
 OpenCode agents; Open Terminal and ComfyUI tools; and the FreeLLMAPI cloud
 gateway (Proxmox VE 9.1 and `skopeo` needed). Enter names or menu numbers
@@ -47,10 +47,13 @@ gateway (Proxmox VE 9.1 and `skopeo` needed). Enter names or menu numbers
 ([Agent coordination targets](#agent-coordination-targets)).
 
 You enter the router's CT ID and static IP/CIDR, then a CT ID, static IP/CIDR
-and storage for each selected target (Strata, Basalt, Maya, Xolotl, Avalon and
-Kindi also a template; Strata also its RAM, `STRATA_MEMORY_MB`, default 65536
+and storage for each selected target (Strata, Basalt, Maya, Xolotl, Avalon,
+Kindi and Colibri also a template; Strata also its RAM, `STRATA_MEMORY_MB`, default 65536
 MiB, at least 32768, shown beside the host's RAM: it holds its model in RAM,
-about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S). Each CT ID defaults to the cluster's next free ID,
+about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S; Colibri also its RAM,
+`COLIBRI_MEMORY_MB` (65536, at least 8192), and disk, `COLIBRI_ROOTFS_GB` (160,
+at least 40), sized for the model you will place in it, since none is
+downloaded). Each CT ID defaults to the cluster's next free ID,
 skipping IDs already given out in this run (Enter takes it; type another, or
 preset `CT_ID` / `<NAME>_CT_ID`, to override). Addresses are never chosen;
 presets prefill prompts. It then checks the host GPU, creates
@@ -85,6 +88,7 @@ passwords are in `/etc/<service>-target/admin-password` in their CTs.
 | Basalt, Maya, Xolotl | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 |
 | Strata | Debian 13 | Debian 12; Ubuntu 22.04/24.04 |
 | Kindi | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (CUDA 10.2 runfile) |
+| Colibri | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (Vulkan wants Debian 13's Mesa) |
 | Avalon | Ubuntu 24.04 | Ubuntu 22.04 (ROCm); with CUDA also Debian 12/13, Ubuntu 26.04 |
 
 The installer asks for the router's template storage (default `local`) and
@@ -110,21 +114,24 @@ must match the loaded host driver. Ubuntu 26.04 needs an available template
 | AirLLM | NVIDIA when `GPU_DEVICES` is set |
 | Ollama, ComfyUI | NVIDIA, AMD or Intel if present, else CPU |
 | Kindi | Any NVIDIA from Kepler (sm_30) on the host's driver (Kepler: the 470 driver, installed by hand), else its AVX2 CPU engine |
+| Colibri | NVIDIA (CUDA), AMD Radeon RX 7000/9000 or Intel Arc (Vulkan), or none (CPU) |
 
 **Which GPU each target gets.** The installer lists the host's NVIDIA cards
 and AMD Radeon RX 7000/9000 and Intel Arc A/B cards (from `lspci`; iGPUs,
 older Radeons and `vfio-pci`-bound cards are not offered). Ollama, llama.cpp,
-ComfyUI, Avalon (RDNA 3 or NVIDIA) and Kindi (meant for a spare old or small
-NVIDIA card) each ask which card to use; Ollama, Kindi and ComfyUI also offer
-`none` (CPU). Several targets may share a card; a single fitting card is taken
+ComfyUI, Avalon (RDNA 3 or NVIDIA), Kindi (meant for a spare old or small
+NVIDIA card) and Colibri each ask which card to use; Ollama, Kindi, Colibri and
+ComfyUI also offer `none` (CPU). Several targets may share a card; a single fitting card is taken
 without asking. Presets: `OLLAMA_GPU_CARD`, `LLAMACPP_GPU_CARD`,
-`AVALON_GPU_CARD`, `KINDI_GPU_CARD`, `COMFYUI_GPU_CARD` (a PCI address such as
+`AVALON_GPU_CARD`, `KINDI_GPU_CARD`, `COLIBRI_GPU_CARD`, `COMFYUI_GPU_CARD` (a PCI address such as
 `0000:03:00.0`, or `none`). Strata, Basalt, Maya, Xolotl and AirLLM are
 NVIDIA-only and use GPU 0 (or their `GPU_DEVICES`). Ollama and ComfyUI receive
 `GPU` (vendor) and `GPU_CARD` and keep only that card's nodes after their
 community scripts pass every card of the vendor; llama.cpp gets `BACKEND` and
 `GPU_DEVICES` (render node for Vulkan, `/dev/nvidia<minor>` for CUDA), as do
-Avalon (`AVALON_BACKEND`) and Kindi (`KINDI_BACKEND`). Presets are kept.
+Avalon (`AVALON_BACKEND`), Kindi (`KINDI_BACKEND`) and Colibri
+(`COLIBRI_BACKEND`: cuda on NVIDIA, vulkan with the render node on AMD or
+Intel Arc, cpu without a card). Presets are kept.
 
 **Each model target's context window.** The installer then asks the context
 window (tokens per request) of each selected Ollama, llama.cpp, Strata, Basalt,
@@ -239,7 +246,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
 | Mattermost | `MATTERMOST_WEBHOOK_URL`, `MATTERMOST_MONITOR_USER` (`OSRMonitor`), `MATTERMOST_CHANNEL` (`osr-monitor`) |
 | Cluster | `CLUSTER_SSH` (`fix`, the default: check and repair root SSH between nodes; `check`: report only; `skip`) |
-| Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `STRATA_MEMORY_MB` (65536), `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
+| Targets | `INSTALL_TARGETS` (names only; menu numbers are refused because they change), `INSTALL_GITEA` / `INSTALL_MATTERMOST`, `<NAME>_CT_ID`, `<NAME>_IP_CIDR`, `<NAME>_STORAGE`, `<NAME>_TEMPLATE`, `STRATA_MEMORY_MB` (65536), `COLIBRI_MEMORY_MB` (65536), `COLIBRI_ROOTFS_GB` (160), `COMFYUI_IMAGE_VARIANT` (`klein-4b`/`klein-9b`), `HF_TOKEN`, `OPENWEBUI_ADMIN_TOKEN`, `OPENWEBUI_WAIT_SECONDS` (900), `TARGETS_DIR` |
 
 `NONINTERACTIVE=true` requires `IP_CIDR`, `GATEWAY` and every
 `MODEL_SERVER_<n>`, takes the next free CT ID unless `CT_ID` is set, accepts
@@ -300,6 +307,7 @@ settings and recovery steps.
 | [Xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | NVIDIA 24 GB; ~372 GB of pinned weights |
 | [Avalon](targets/avalon/README.md) | `avalon://` | 8080 | AMD RX 7000 (ROCm) or NVIDIA, experts in RAM; ~90 GiB of pinned weights |
 | [Kindi](targets/kindi/README.md) | `kindi://` | 8093 | Old or small NVIDIA (from a 1 GB Kepler) or CPU; one request at a time |
+| [Colibri](targets/colibri/README.md) | `colibri://` | 8080 | Large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); no model is downloaded |
 
 Services and companions use separate CTs and stay out of the model pool:
 
@@ -328,7 +336,7 @@ alongside the router; the last tag is the target's directory name under
 | CT | Tags |
 |---|---|
 | Router | `ai`, `ai-tools`, `osr-router`, `openwebui` |
-| Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI, FreeLLMAPI | `ai`, `ai-model`, `osr-target`, `<target>` |
+| Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI, FreeLLMAPI | `ai`, `ai-model`, `osr-target`, `<target>` |
 | Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, OpenCode, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
 
 `tools/upgrade-all.sh` finds CTs only by these tags (`osr-router`, and
@@ -715,7 +723,7 @@ manage-model-servers set-model large qwen3:32b --apply       # every server in t
 manage-model-servers set-server-model large 10.0.0.54 llama3.3:70b --apply   # one server
 manage-model-servers set-keepalive 2h --apply
 manage-model-servers set-api-key [key|--generate|--off]
-manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi
+manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi, colibri
 manage-model-servers set-cloud-key <openai|anthropic|gemini> [key|--off]
 manage-model-servers set-cloud-models <openai|anthropic|gemini> <id[,id...]|--off>
 manage-model-servers set-freellmapi <url|--off> [key]      # FreeLLMAPI: freellmapi/<id>, explicit only
@@ -741,7 +749,9 @@ Strata, Basalt, Maya, Xolotl (Strata's server, told apart by its DeepSeek-V4
 model) and Kindi (`"kindi": "<version>"`), then LM Studio, trying each kind's
 default port. Avalon is identified from `/v1/models` (`"owned_by": "llamacpp"`
 and an Avalon id), which needs its key once set, so add a keyed Avalon as
-`avalon://host`. Set the token before adding a keyed server, so the probe can
+`avalon://host`. Colibri is identified the same way (`"owned_by": "colibri"`),
+so add a keyed Colibri (every one the target installs) as `colibri://host`.
+Set the token before adding a keyed server, so the probe can
 authenticate; a keyed server that cannot identify itself is added as
 `kind://host` (or with `--no-probe`).
 
@@ -755,6 +765,7 @@ authenticate; a keyed server that cannot identify itself is added as
 | Xolotl | 8080 | `set-xolotl-token` | `XOLOTL_MODEL_NAME` (default `deepseek-v4.1-flash`, sized 552B) |
 | Avalon | 8080 | `set-avalon-token` | `AVALON_MODEL_NAME` (default `qwen3.8-flash-next-avalon`, sized 125B) |
 | Kindi | 8093 | `set-kindi-token` | `bonsai2-<size>` or `nanbeige-33b-iq3`, sized from the id; one request at a time |
+| Colibri | 8080 | `set-colibri-token` | `<model>-colibri` ids, sized from the id or `[model_sizes]`; tool calls on every chat engine but Inkling and OLMoE; image and decision models are not offered for chat |
 
 ```bash
 manage-model-servers set-maya-token --apply
@@ -774,8 +785,8 @@ counts them down while `/v1/models` is empty (engine not running).
 
 ### Model sizes for unsized IDs
 
-Strata, Basalt, Maya, Xolotl and Avalon report no parameter count (Kindi's ids
-include it). `[model_sizes]` in `router.ini` maps exact IDs
+Strata, Basalt, Maya, Xolotl, Avalon and most Colibri models report no
+parameter count (Kindi's ids include it). `[model_sizes]` in `router.ini` maps exact IDs
 (case-insensitive) to a size; built-in entries include:
 
 ```ini
@@ -893,7 +904,7 @@ settings or rollback changes:
 |---|---|---|
 | Router | `update-router-services.sh --host --no-push`, pushed once checks pass | Updater never touches `env/*.env`, tiers, `litellm_config.yaml`, ini files or secrets |
 | Open WebUI | `set-webui-version <pin> --apply` (never a downgrade) | `apply`'s snapshot and `webui.db` backup |
-| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say) | Each target's settings record or env files |
+| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say) | Each target's settings record or env files |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request); then its Open WebUI connection is enabled for all users (needs the admin token; skipped without it) | Its recorded port, passed back; workspace limits kept by the installer; `OPEN_TERMINAL_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true`. Honcho's Open WebUI connection is enabled for all users | Recorded answers; an Open WebUI admin key is requested once when needed; `HONCHO_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
@@ -940,7 +951,7 @@ header file, never on a command line):
 | Open WebUI | `services/open-webui/requirements.txt` | PyPI `open-webui` | `set-webui-version` |
 | Ollama, llama.cpp, Honcho | the installer's (provisioner's) default | highest `vX.Y.Z` GitHub release, no pre-releases | `OLLAMA_VERSION`, `LLAMA_CPP_REF`, `HONCHO_REF` |
 | ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT`; Open Terminal resolves a newer release's Python dependencies with pip when they differ from its lock |
-| Strata, Xolotl, Avalon, Kindi | the tested commit | the tip of `main` | `*_COMMIT` |
+| Strata, Xolotl, Avalon, Kindi, Colibri | the tested commit | the tip of `main` | `*_COMMIT` |
 | DeepSeek Harness, OpenCode | the provisioner's default | npm `latest` tag | `DSH_VERSION`, `OPENCODE_VERSION` |
 | FreeLLMAPI | the provisioner's tested release | highest `vX.Y.Z` GitHub release | `FREELLMAPI_VERSION` (its image tag) |
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
@@ -952,7 +963,7 @@ and `--pinned` takes every pin. The latest is untested here, and a commit the
 installer checks is the one upstream names at that moment, not a reviewed one;
 the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
 newer release on later runs that take the pin; Ollama, llama.cpp, Strata,
-Xolotl, Avalon and Kindi go back to the pin then. An unreachable upstream is reported
+Xolotl, Avalon, Kindi and Colibri go back to the pin then. An unreachable upstream is reported
 and the pins are used. Basalt, Maya, OpenClaw, Gitea and Mattermost follow
 upstream with no pin here; they are listed, not asked about.
 
@@ -1065,7 +1076,7 @@ may roll back later.
 Target upgrades check readiness and restore the prior code and settings on
 failure; see each target README and the
 [upgrade contract](ARCHITECTURE.md#16-inference-targets-targets). Strata,
-Basalt, Maya, Xolotl, Avalon and Kindi need disk for one runtime snapshot and
+Basalt, Maya, Xolotl, Avalon, Kindi and Colibri need disk for one runtime snapshot and
 carry their settings forward unless overridden. Interrupting an upgrade
 (Ctrl-C, closed SSH) rolls it back; after a hangup its output is in the CT's
 `/var/log/osr-install-interrupted.log`. If a model target's rollback fails too,
@@ -1203,5 +1214,5 @@ an `act_runner` with an ubuntu-latest style image whose job containers run as
 root (`--strict` fails on skipped root-only tests). `.github/workflows/tests.yml`
 is the same file for GitHub Actions, where the suites run through `sudo`;
 `tests/test-repo.sh` keeps the two identical. The `strata-upstream`,
-`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `freellmapi-upstream` and
+`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `colibri-upstream`, `freellmapi-upstream` and
 `honcho-upstream` jobs also need GitHub (and PyPI) access.

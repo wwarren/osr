@@ -191,6 +191,8 @@ SERVER_KINDS = {
                "label": "Avalon", "openai": True},
     "kindi": {"prefix": "kindi+", "key_env": "KINDI_API_KEY",
               "label": "Kindi", "openai": True},
+    "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
+                "label": "Colibri", "openai": True},
 }
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
              for kind, spec in SERVER_KINDS.items()}

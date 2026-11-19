@@ -159,7 +159,7 @@ describe upgrade_contract
 # rollback restores configuration as well as code, is health-checked, and
 # says when it failed too. The behaviour itself is exercised by each target's
 # own tests; this keeps a new or edited target from silently dropping a part.
-for name in strata basalt maya xolotl avalon kindi; do
+for name in strata basalt maya xolotl avalon kindi colibri; do
   t="${ROOT}/targets/${name}/install-target.sh"
   assert_ok "${name}: stages the settings of a good install" grep -q 'stage_record "\$[A-Z_]*ETC_DIR/installed-env" settings_env' "$t"
   assert_ok "${name}: publishes installed settings durably" grep -q 'publish_record "\$env_temporary" "\$[A-Z_]*ETC_DIR/installed-env"' "$t"
@@ -320,6 +320,30 @@ assert_ok "the README names the tested pin" grep -q "$pin" "${kindi}/README.md"
 assert_ok "CI fetches the default pin" grep -q 'targets/kindi/upstream-commit.txt' "${ROOT}/.gitea/workflows/tests.yml"
 assert_ok "CI checks the target against the pinned upstream code" \
   grep -q 'targets/kindi/test-pinned-upstream.py' "${ROOT}/.gitea/workflows/tests.yml"
+
+describe colibri_target
+# The Colibri target builds a pinned commit, never downloads a model, and gives
+# coli serve its key through a root-only EnvironmentFile (never argv).
+colibri="${ROOT}/targets/colibri"
+pin="$(sed -n 's/^COLIBRI_DEFAULT_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${colibri}/install-target.sh")"
+assert_ok "the Colibri default pin is a full commit" test "${#pin}" -eq 40
+assert_eq "the provisioner pins the same commit" "$pin" \
+  "$(sed -n 's/^COLIBRI_DEFAULT_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${colibri}/provision-lxc.sh")"
+assert_ok "the README names the tested pin" grep -q "$pin" "${colibri}/README.md"
+assert_ok "CI fetches the default pin" grep -q 'targets/colibri/install-target.sh)' "${ROOT}/.gitea/workflows/tests.yml"
+assert_ok "CI checks the target against the pinned upstream code" \
+  grep -q 'targets/colibri/test-pinned-upstream.py' "${ROOT}/.gitea/workflows/tests.yml"
+assert_ok "the unit loads the key from secrets.env" grep -qx 'EnvironmentFile=/etc/colibri-target/secrets.env' "${colibri}/colibri.service"
+assert_fail "the unit names no key file" grep -q '/api-key' <(grep -v '^#' "${colibri}/colibri.service")
+assert_fail "the launcher never puts the key on a command line" grep -qE -- '--api-key "\$api_key"|\( *--api-key' "${colibri}/install-target.sh"
+assert_ok "the router knows the colibri kind" grep -q '"colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY"' "${ROOT}/services/osr-router/router.py"
+assert_ok "the installer offers the target with its key" grep -q "'colibri|model|.*|colibri+http://@IP@:@PORT@|colibri|optional:nvidia,amd,intel'" "$INSTALLER"
+for agent in hermes openclaw opencode; do
+  assert_ok "${agent} reaches colibri servers" grep -q '"kindi", "colibri")' "${ROOT}/targets/${agent}/provision-lxc.sh"
+done
+for agent in hermes openclaw opencode honcho; do
+  assert_ok "${agent} copies the Colibri key" grep -q 'KINDI_API_KEY|COLIBRI_API_KEY)' "${ROOT}/targets/${agent}/provision-lxc.sh"
+done
 
 describe venv_permissions
 # Venvs are built after the secret-bearing tree (umask 077); the service account

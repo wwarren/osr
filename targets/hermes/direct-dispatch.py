@@ -29,6 +29,7 @@ KEY_NAMES = {
     "xolotl": "XOLOTL_API_KEY",
     "avalon": "AVALON_API_KEY",
     "kindi": "KINDI_API_KEY",
+    "colibri": "COLIBRI_API_KEY",
 }
 PREFIXES = {kind: kind + "+" for kind in KEY_NAMES}
 MAX_BODY = 64 * 1024 * 1024

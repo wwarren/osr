@@ -844,6 +844,8 @@ valid_ollama_addr() {
   [[ "$raw" == avalon://* ]] && raw="${raw#avalon://}"
   raw="${raw#kindi+}"
   [[ "$raw" == kindi://* ]] && raw="${raw#kindi://}"
+  raw="${raw#colibri+}"
+  [[ "$raw" == colibri://* ]] && raw="${raw#colibri://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     valid_http_url "$raw"; return $?
   fi
@@ -857,7 +859,7 @@ valid_ollama_addr() {
 }
 # Normalise any accepted form to a base URL with an explicit port.
 # Stored form: http://host:port for Ollama or a kind-prefixed URL for
-# LM Studio, Strata, Basalt, Maya, Xolotl, Avalon and Kindi, matching the manager, router and monitor.
+# LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri, matching the manager, router and monitor.
 normalize_ollama_url() {
   local raw="${1%/}" prefix="" port="$OLLAMA_PORT"
   if [[ "$raw" == lmstudio+* ]]; then
@@ -888,6 +890,10 @@ normalize_ollama_url() {
     prefix="kindi+"; raw="${raw#kindi+}"; port="${KINDI_PORT:-8093}"
   elif [[ "$raw" == kindi://* ]]; then
     prefix="kindi+"; raw="${raw#kindi://}"; port="${KINDI_PORT:-8093}"
+  elif [[ "$raw" == colibri+* ]]; then
+    prefix="colibri+"; raw="${raw#colibri+}"; port="${COLIBRI_PORT:-8080}"
+  elif [[ "$raw" == colibri://* ]]; then
+    prefix="colibri+"; raw="${raw#colibri://}"; port="${COLIBRI_PORT:-8080}"
   fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     printf '%s%s\n' "$prefix" "$raw"
@@ -1015,6 +1021,7 @@ target_table() {
     'ollama|model|Ollama from the PVE community script (NVIDIA, AMD or Intel Arc GPU when present)|http://@IP@:11434||optional:nvidia,amd,intel' \
     'airllm|model|AirLLM: one model larger than RAM/VRAM, streamed from disk (slow)|http://@IP@:11434||:nvidia' \
     'kindi|model|Kindi (Ternary-Bonsai-2 2B-27B) on a small or old NVIDIA GPU (Kepler to RTX 50), or the CPU|kindi+http://@IP@:@PORT@|kindi|optional:nvidia' \
+    'colibri|model|Colibri: large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); you place the model|colibri+http://@IP@:@PORT@|colibri|optional:nvidia,amd,intel' \
     'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (CUDA, or Vulkan on AMD/Intel Arc)|http://@IP@:11434||required:nvidia,amd,intel' \
     'strata|model|Strata (Qwen3.8-Flash-Next) on an NVIDIA GPU|strata+http://@IP@:@PORT@|strata|required:nvidia' \
     'basalt|model|Basalt on a Blackwell GPU (CUDA 13)|basalt+http://@IP@:@PORT@|basalt|required:nvidia:rtx50' \
@@ -1056,7 +1063,9 @@ llamacpp_model_given() {
 # (AMD, Intel Arc), unset for whichever the host has; BACKEND=cpu does without.
 # AirLLM uses an NVIDIA GPU only when GPU_DEVICES is given. Avalon follows
 # AVALON_BACKEND (rocm: AMD, cuda: NVIDIA). Kindi uses an NVIDIA GPU when
-# present, needs one with KINDI_BACKEND=cuda and none with cpu. Ollama and
+# present, needs one with KINDI_BACKEND=cuda and none with cpu. Colibri uses a
+# GPU when given one (CUDA on NVIDIA, Vulkan on AMD or Intel Arc), needs one
+# with COLIBRI_BACKEND=cuda or vulkan and none with cpu. Ollama and
 # ComfyUI follow GPU (nvidia, amd or intel picks one; no or none runs on the CPU).
 target_gpu_spec() {
   local need vendors gens
@@ -1079,6 +1088,12 @@ target_gpu_spec() {
     kindi)
       case "${KINDI_BACKEND:-auto}" in
         cuda) need=required ;;
+        cpu) need="" ;;
+      esac ;;
+    colibri)
+      case "${COLIBRI_BACKEND:-auto}" in
+        cuda) need=required vendors=nvidia ;;
+        vulkan) need=required vendors=amd,intel ;;
         cpu) need="" ;;
       esac ;;
     ollama|comfyui)
@@ -1440,7 +1455,9 @@ prepare_cluster_ssh() {
 # /dev/nvidia<minor> with the control and UVM devices for CUDA; for Avalon
 # AVALON_BACKEND (rocm or cuda) and GPU_DEVICES: /dev/kfd and the card's
 # render node for ROCm, the NVIDIA nodes for CUDA; for Kindi KINDI_BACKEND
-# (cuda with a ready NVIDIA card, else cpu) and that card's NVIDIA nodes.
+# (cuda with a ready NVIDIA card, else cpu) and that card's NVIDIA nodes; for
+# Colibri COLIBRI_BACKEND (cuda with a ready NVIDIA card, vulkan with a ready
+# AMD or Intel Arc card, else cpu) and that card's NVIDIA nodes or render node.
 target_gpu_env() {
   local state vendor render minor pci
   IFS='|' read -r state vendor render minor pci <<< "$(target_gpu_result "$1")"
@@ -1486,12 +1503,29 @@ target_gpu_env() {
       if [[ -z "${GPU_DEVICES:-}" && -n "$minor" ]]; then
         echo "GPU_DEVICES=/dev/nvidia${minor} /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools"
       fi ;;
+    colibri)
+      local colibri_backend="${COLIBRI_BACKEND:-auto}"
+      if [[ $state != ready ]]; then
+        [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=cpu"
+        return 0
+      fi
+      case "$vendor" in
+        nvidia)
+          [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=cuda"
+          if [[ -z "${GPU_DEVICES:-}" && -n "$minor" ]]; then
+            echo "GPU_DEVICES=/dev/nvidia${minor} /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools"
+          fi ;;
+        amd|intel)
+          [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=vulkan"
+          if [[ -z "${GPU_DEVICES:-}" && -n "$render" ]]; then echo "GPU_DEVICES=${render}"; fi ;;
+        *) [[ "$colibri_backend" != auto ]] || echo "COLIBRI_BACKEND=cpu" ;;
+      esac ;;
   esac
 }
 
-# Strata, Basalt, Maya, Xolotl, Avalon and Kindi take a template; the others choose or prompt for theirs.
+# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri take a template; the others choose or prompt for theirs.
 target_needs_template() {
-  [[ "$1" == strata || "$1" == basalt || "$1" == maya || "$1" == xolotl || "$1" == avalon || "$1" == kindi ]]
+  [[ "$1" == strata || "$1" == basalt || "$1" == maya || "$1" == xolotl || "$1" == avalon || "$1" == kindi || "$1" == colibri ]]
 }
 
 # The newer NVIDIA repositories do not carry the targets' CUDA defaults.
@@ -1550,7 +1584,7 @@ normalize_target_selection() {
 target_menu_group() {
   case "$1" in
     gitea|mattermost) echo 'Services (CPU): configuration and alerts; created before OSR.' ;;
-    ollama|airllm|kindi) echo 'Model servers (CPU or optional GPU):' ;;
+    ollama|airllm|kindi|colibri) echo 'Model servers (CPU or optional GPU):' ;;
     honcho) echo 'Memory infrastructure (CPU): created before agents.' ;;
     freellmapi) echo 'Cloud gateway (CPU): prompts leave your network; never chosen by auto.' ;;
     *)
@@ -1656,6 +1690,13 @@ valid_avalon_template() {
 }
 # Kindi: the CUDA 10.2 runfile runs on Debian 12/13 and Ubuntu 22.04/24.04.
 valid_kindi_template() { valid_strata_template "$1"; }
+# Colibri: the releases its CUDA toolkit lane knows (Debian 12/13, Ubuntu
+# 22.04/24.04); Debian 13 first, whose Mesa 25 its Vulkan lane wants.
+valid_colibri_template() { valid_strata_template "$1"; }
+# valid_colibri_memory_mb MIB / valid_colibri_rootfs_gb GIB: its provisioner's
+# floors (8192 MiB, 40 GiB) - for the engine; the model needs more.
+valid_colibri_memory_mb() { [[ $1 =~ ^[1-9][0-9]{3,8}$ ]] && (( $1 >= 8192 )); }
+valid_colibri_rootfs_gb() { [[ $1 =~ ^[1-9][0-9]{1,5}$ ]] && (( $1 >= 40 )); }
 show_strata_template_alternatives() {
   local selected="$1" storage ref shown=0
   while IFS= read -r storage; do
@@ -1712,10 +1753,11 @@ host_gpu_cuda_arch() {
 # (compute capability below 7.5, e.g. a V100) needs CUDA 12.x, which only the
 # Ubuntu 24.04/22.04 and Debian 12 repositories carry. Avalon's ROCm build
 # needs Ubuntu 24.04 or 22.04 (AMD's Radeon support; its CUDA build runs there too).
-# Kindi's CUDA 10.2 runfile runs on the releases Strata uses.
+# Kindi's CUDA 10.2 runfile runs on the releases Strata uses, and so does
+# Colibri's toolkit lane (Debian 13 also has the Mesa its Vulkan lane wants).
 gpu_target_template_order() {
   case "$1" in
-    strata|kindi) echo debian-13 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
+    strata|kindi|colibri) echo debian-13 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
     avalon) echo ubuntu-24.04 ubuntu-22.04 ;;
     maya)
       local arch
@@ -1758,7 +1800,7 @@ ensure_target_template() {
 
 # For each selected target: a CT ID (default: the next free one not already
 # taken by this install), static address and storage (and a template for
-# Strata, Basalt, Maya, Xolotl, Avalon and Kindi). Presets: <NAME>_CT_ID,
+# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri). Presets: <NAME>_CT_ID,
 # <NAME>_IP_CIDR, <NAME>_STORAGE, <NAME>_TEMPLATE.
 prompt_target_settings() {
   local name prefix id_var ip_var storage_var template_var default ip id_default host_mib
@@ -1844,6 +1886,10 @@ prompt_target_settings() {
         [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
         prompt_until_valid "    Template (Debian 12/13 or Ubuntu 22.04/24.04; downloaded if missing)" \
           "$template_var" "$default" valid_kindi_template || return 1
+      elif [[ $name == colibri ]]; then
+        [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
+        prompt_until_valid "    Template (Debian 13 or 12, Ubuntu 24.04 or 22.04; Debian 13 for Vulkan; downloaded if missing)" \
+          "$template_var" "$default" valid_colibri_template || return 1
       else
         [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
         prompt_until_valid "    Template (Ubuntu 22.04/24.04/26.04 or Debian 12/13; downloaded if missing; Ubuntu 26.04 needs CUDA 13.3+)" \
@@ -1860,6 +1906,21 @@ prompt_target_settings() {
       if [[ -n $host_mib ]] && (( STRATA_MEMORY_MB > host_mib )); then
         echo "    WARNING: ${STRATA_MEMORY_MB} MiB is more than this host's ${host_mib} MiB." >&2
       fi
+    fi
+    if [[ $name == colibri ]]; then
+      host_mib="$(host_memory_mib)"
+      echo "    No model is downloaded: Colibri starts parked until you place one (its README says how)."
+      echo "    It keeps a model's always-used weights in RAM and streams the experts from disk,"
+      echo "    so size both for the model you will run: Qwen3.6-35B-A3B is a 23 GB download and"
+      echo "    runs in 16 GB of RAM; GLM-5.2 takes 429 GB of disk. More RAM keeps more experts resident."
+      [[ -z $host_mib ]] || echo "    This host has ${host_mib} MiB; leave some for Proxmox."
+      prompt_until_valid "    RAM (MiB, 8192 or more)" COLIBRI_MEMORY_MB "${COLIBRI_MEMORY_MB:-65536}" \
+        valid_colibri_memory_mb || return 1
+      if [[ -n $host_mib ]] && (( COLIBRI_MEMORY_MB > host_mib )); then
+        echo "    WARNING: ${COLIBRI_MEMORY_MB} MiB is more than this host's ${host_mib} MiB." >&2
+      fi
+      prompt_until_valid "    Disk (GiB, 40 or more; the model's files go on it)" COLIBRI_ROOTFS_GB \
+        "${COLIBRI_ROOTFS_GB:-160}" valid_colibri_rootfs_gb || return 1
     fi
   done
 }
@@ -2194,7 +2255,8 @@ prompt_strata_message_cache() {
 }
 
 # target_default_port NAME: the API port a model target serves by default
-# (Kindi keeps its own 8093; the other Strata-style targets use 8080).
+# (Kindi keeps its own 8093; the other Strata-style targets, Colibri included,
+# use 8080).
 target_default_port() { if [[ $1 == kindi ]]; then echo 8093; else echo 8080; fi; }
 # target_server_entry NAME: the router's server entry for a model target.
 target_server_entry() {
@@ -2313,6 +2375,8 @@ run_target_provisioner() {
     [[ "$name" != strata || -z ${STRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$STRATA_MEMORY_MB"
     [[ "$name" != basalt || -z ${BASALT_MEMORY_MB:-} ]] || export MEMORY_MB="$BASALT_MEMORY_MB"
     [[ "$name" != basalt || -z ${BASALT_ROOTFS_GB:-} ]] || export ROOTFS_GB="$BASALT_ROOTFS_GB"
+    [[ "$name" != colibri || -z ${COLIBRI_MEMORY_MB:-} ]] || export MEMORY_MB="$COLIBRI_MEMORY_MB"
+    [[ "$name" != colibri || -z ${COLIBRI_ROOTFS_GB:-} ]] || export ROOTFS_GB="$COLIBRI_ROOTFS_GB"
     if [[ "$phase" == gateway ]]; then
       # FreeLLMAPI hands its endpoint and key to the router CT itself, and
       # admits the router and the API access range to its one port.
@@ -2745,7 +2809,7 @@ prompt_model_servers() {
   for (( i = 1; i <= MODEL_SERVER_COUNT; i++ )); do
     local var="MODEL_SERVER_${i}"
     default_addr="${!var:-}"
-    prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host, xolotl://host, avalon://host or kindi://host)" \
+    prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host, xolotl://host, avalon://host, kindi://host or colibri://host)" \
       raw "$default_addr" valid_ollama_addr || return 1
     MODEL_SERVERS+=("$(normalize_ollama_url "$raw")")
   done
@@ -3985,7 +4049,7 @@ _DEFAULTS = {
         # tool-capable. Their APIs say nothing per model, but each of these
         # servers parses "tools" and returns OpenAI tool_calls. A kind left
         # out is reported unknown. Blank: none.
-        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi",
+        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -4061,7 +4125,7 @@ _DEFAULTS = {
         "sticky_seconds": "1800",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya, Xolotl, Avalon) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl, Avalon, Colibri) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
@@ -4075,6 +4139,23 @@ _DEFAULTS = {
         "glm-5.3-flash": "321B",        # Project Maya (GLM-5.3-Flash, 321B total)
         "deepseek-v4.1-flash": "552B",  # Xolotl's default id (DeepSeek-V4.1-Flash, 552B total)
         "qwen3.8-flash-next-avalon": "125B",  # Avalon's default alias (Qwen3.8-Flash-Next)
+        # Colibri's ids for the models whose id gives no size (its family
+        # registry's display scale; ids such as qwen3-coder-30b-a3b-colibri
+        # name theirs). Qwen3.8-Flash-Next counts 125B as for Strata and Avalon.
+        "glm-5.3-flash-colibri": "321B",
+        "glm-5.2-colibri": "744B",
+        "mistral-large-4-colibri": "1000B",
+        "inkling-colibri": "975B",
+        "kimi-k3-colibri": "2800B",
+        "olmoe-colibri": "7B",
+        "qwen3.6-colibri": "35B",
+        "qwen3.8-flash-next-colibri": "125B",
+        "flint-colibri": "40B",
+        "muse-spark-open-colibri": "816B",
+        "deepseek-v4-colibri": "284B",
+        "deepseek-v4.1-flash-colibri": "552B",
+        "mimo-v2.6-flash": "309B",
+        "mimo-v2.6-pro": "1020B",
     },
 }
 ROUTER_INI = os.getenv(
@@ -4336,8 +4417,17 @@ SERVER_KINDS = {
                "label": "Avalon", "openai": True},
     "kindi": {"prefix": "kindi+", "key_env": "KINDI_API_KEY",
               "label": "Kindi", "openai": True},
+    "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
+                "label": "Colibri", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
+# Capabilities a /v1/models entry can declare (Colibri's "capabilities") that
+# mean it answers no chat: an image generator or a decision model. Such an
+# entry is not offered for chat at all.
+NON_CHAT_CAPABILITIES = frozenset({"image_generation", "decision"})
+# Models of a tool kind whose engine takes no tools: Colibri parses tools on
+# every chat engine except Inkling and OLMoE. Their tool support is unknown.
+NO_TOOL_MODELS = {"colibri": frozenset({"inkling-colibri", "olmoe-colibri"})}
 # Bearer tokens the router adds per kind (secrets.env). LM Studio's is for
 # servers with "Require authentication" (0.4+).
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
@@ -4878,7 +4968,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt, Maya, Xolotl, Avalon or Kindi model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -4891,6 +4981,10 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
         entries = []
         for model in models:
             if not isinstance(model, dict) or not model.get("id"):
+                continue
+            declared = model.get("capabilities")
+            if (isinstance(declared, list) and NON_CHAT_CAPABILITIES & set(declared)
+                    and not {"chat", "completion"} & set(declared)):
                 continue
             architecture = model.get("architecture") or {}
             modalities = model.get("input_modalities") or []
@@ -4927,6 +5021,8 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
             # /v1/images model) outputs no text, so it takes no tools.
             if server_kind(server) in TOOL_KINDS:
                 raw["tools"] = True if not isinstance(outputs, list) or "text" in outputs else None
+                if str(model["id"]).lower() in NO_TOOL_MODELS.get(server_kind(server), ()):
+                    raw["tools"] = None
             entries.append(build_entry(server, raw, caps))
         return server, entries, None
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
@@ -6436,6 +6532,8 @@ SERVER_KINDS = {
                "label": "Avalon", "openai": True},
     "kindi": {"prefix": "kindi+", "key_env": "KINDI_API_KEY",
               "label": "Kindi", "openai": True},
+    "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
+                "label": "Colibri", "openai": True},
 }
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
              for kind, spec in SERVER_KINDS.items()}
@@ -6895,6 +6993,10 @@ PYEOF
         printf '      api_base: %s/v1\n' "${url#kindi+}"
         printf '      api_key: none\n'
         printf '      timeout: 3600\n'
+      elif [[ "$url" == colibri+* ]]; then
+        printf '      model: openai/%s\n' "$tag"
+        printf '      api_base: %s/v1\n' "${url#colibri+}"
+        printf '      api_key: none\n'
       else
         printf '      model: ollama/%s\n' "$tag"
         printf '      api_base: %s\n' "$url"
@@ -7045,9 +7147,10 @@ tools_min_class = large
 tools_strict = false
 # Server kinds whose text models are reported tool-capable. Their /v1/models
 # says nothing per model, but each of these servers takes "tools" and returns
-# OpenAI tool_calls. Remove a kind to report its models' tool support as
+# OpenAI tool_calls (Colibri on every chat engine but Inkling and OLMoE, whose
+# support stays unknown). Remove a kind to report its models' tool support as
 # unknown again. Blank: none.
-tool_kinds = strata, basalt, maya, xolotl, avalon, kindi
+tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri
 
 [http]
 # Seconds to open a connection to a backend. This is how long a dead host can
@@ -7148,7 +7251,7 @@ sticky_seconds = 1800
 
 [model_sizes]
 # Sizes for exact model ids that an OpenAI-compatible server (Strata, Basalt,
-# Maya, Xolotl, Avalon) lists without a parameter count, so the router can size-band them.
+# Maya, Xolotl, Avalon, Colibri) lists without a parameter count, so the router can size-band them.
 # Matching is by the whole id, case-insensitive: variants and aliases (Strata's
 # Coder, a renamed Basalt alias) stay unknown-size unless listed here.
 # Add a line for a custom alias (e.g. the BASALT_ALIAS a target serves);
@@ -7166,6 +7269,23 @@ deepseek-v4.1-flash = 552B
 # Avalon's default alias (Qwen3.8-Flash-Next, its IQ3_KS hybrid).
 qwen3.8-flash-next-avalon = 125B
 # Kindi's ids name their size (bonsai2-27b, nanbeige-33b-iq3) and need no line.
+# Colibri's ids for models whose id names no size (its registry's display
+# scale; qwen3-coder-30b-a3b-colibri and the like name theirs). Its
+# Qwen3.8-Flash-Next counts 125B, as for Strata and Avalon.
+glm-5.3-flash-colibri = 321B
+glm-5.2-colibri = 744B
+mistral-large-4-colibri = 1000B
+inkling-colibri = 975B
+kimi-k3-colibri = 2800B
+olmoe-colibri = 7B
+qwen3.6-colibri = 35B
+qwen3.8-flash-next-colibri = 125B
+flint-colibri = 40B
+muse-spark-open-colibri = 816B
+deepseek-v4-colibri = 284B
+deepseek-v4.1-flash-colibri = 552B
+mimo-v2.6-flash = 309B
+mimo-v2.6-pro = 1020B
 INIEOF
 
 cat > "${REPO_DIR}/services/osr-monitor/monitor.ini" <<'INIEOF'
@@ -7176,9 +7296,10 @@ cat > "${REPO_DIR}/services/osr-monitor/monitor.ini" <<'INIEOF'
 interval_seconds = 15
 timeout_seconds = 5
 # Path appended to each Ollama backend URL for the health probe. LM Studio,
-# Strata, Basalt, Maya, Xolotl, Avalon and Kindi are probed on /v1/models with their own keys
-# when set, and are skipped by the keep-alive pinner. They count as down while
-# that list is empty (their engine is not running).
+# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri are probed on /v1/models with
+# their own keys when set, and are skipped by the keep-alive pinner. They count
+# as down while that list is empty (their engine is not running), and so does a
+# Colibri that is parked until a model is placed.
 health_path = /api/tags
 
 [alerting]
@@ -7324,9 +7445,9 @@ LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Default ports of the other server kinds are in kind_field (LM Studio 1234,
-# Strata/Basalt/Maya/Xolotl/Avalon 8080, Kindi 8093); LMSTUDIO_PORT,
-# STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT and KINDI_PORT
-# in the environment override them.
+# Strata/Basalt/Maya/Xolotl/Avalon/Colibri 8080, Kindi 8093); LMSTUDIO_PORT,
+# STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT, KINDI_PORT and
+# COLIBRI_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -7389,11 +7510,12 @@ Commands:
   status                     As list, plus a live reachability probe of each host
   discover                   Ask OSR to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
-                             LM Studio, Strata, Basalt, Maya, Xolotl, Avalon and
-                             Kindi are detected automatically, or use
+                             LM Studio, Strata, Basalt, Maya, Xolotl, Avalon,
+                             Kindi and Colibri are detected automatically, or use
                              lmstudio://host / strata://host / basalt://host /
                              maya://host / xolotl://host / avalon://host /
-                             kindi://host or --type.
+                             kindi://host / colibri://host or --type. A Colibri
+                             started with an API key needs colibri://host.
                              Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
@@ -7438,6 +7560,9 @@ Commands:
   set-kindi-token [token|--off]
                              Bearer token for Kindi servers with an API key
                              (stored in secrets.env)
+  set-colibri-token [token|--off]
+                             Bearer token for Colibri servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on OSR
                              API (Open WebUI is given the same key)
@@ -7462,7 +7587,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi|colibri> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -7488,6 +7613,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh add http://10.0.0.56:11434 10.0.0.57 --tier medium
     manage-model-servers.sh add lmstudio://10.0.0.9 --tier fast --apply
     manage-model-servers.sh add 10.0.0.14:8093 --type kindi --tier xlarge --apply
+    manage-model-servers.sh add colibri://10.0.0.15 --tier large --apply
     manage-model-servers.sh add 10.0.0.60 --no-probe --type ollama --tier fast
     manage-model-servers.sh add 10.0.0.61 --tier large --dry-run
     manage-model-servers.sh remove 10.0.0.52 --apply
@@ -7525,6 +7651,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-avalon-token <token> --apply
     manage-model-servers.sh set-kindi-token <token> --apply
     manage-model-servers.sh set-kindi-token --off --apply
+    manage-model-servers.sh set-colibri-token <token> --apply
     manage-model-servers.sh set-webhook https://mm.example.lan/hooks/abc123 --apply
     manage-model-servers.sh set-webhook --channel alerts --username osr-monitor --apply
     manage-model-servers.sh set-webhook --verify-tls false --apply
@@ -7565,7 +7692,7 @@ valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
 #   port   -- default port (overridable through the <KIND>_PORT variable)
 #   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
 #             openai provider), 0 for LM Studio (its own API and provider)
-server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi; }
+server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi colibri; }
 kind_field() {
   local spec key label port_var port_default openai value
   case "$1" in
@@ -7576,6 +7703,7 @@ kind_field() {
     xolotl)   spec='XOLOTL_API_KEY|Xolotl|XOLOTL_PORT|8080|1' ;;
     avalon)   spec='AVALON_API_KEY|Avalon|AVALON_PORT|8080|1' ;;
     kindi)    spec='KINDI_API_KEY|Kindi|KINDI_PORT|8093|1' ;;
+    colibri)  spec='COLIBRI_API_KEY|Colibri|COLIBRI_PORT|8080|1' ;;
     *) return 1 ;;
   esac
   IFS='|' read -r key label port_var port_default openai <<< "$spec"
@@ -7599,7 +7727,7 @@ is_server_kind() {
 }
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
-# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon or Kindi"
+# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri"
 kind_labels() {
   local out=Ollama k label last=""
   for k in $(server_kinds); do
@@ -7755,6 +7883,11 @@ detect_server_kind() {
     if [[ "$body" =~ \"owned_by\"[[:space:]]*:[[:space:]]*\"llamacpp\" ]] &&
        [[ "$body" =~ \"id\"[[:space:]]*:[[:space:]]*\"[^\"]*avalon[^\"]*\" ]]; then
       echo avalon; return 0
+    fi
+    # Colibri's /health says only "status" without a key; a keyless Colibri
+    # lists its model as owned by colibri (a keyed one needs colibri://).
+    if [[ "$body" =~ \"owned_by\"[[:space:]]*:[[:space:]]*\"colibri\" ]]; then
+      echo colibri; return 0
     fi
   fi
   # LM Studio: its native model API (0.4+ /api/v1, 0.3 /api/v0). A 401 still
@@ -10064,7 +10197,7 @@ cmd_set_api_key() {
 
 # Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
 # LM Studio servers with "Require authentication" on, or Strata, Basalt, Maya,
-# Xolotl, Avalon and Kindi servers started with an API key. One token per kind, stored in
+# Xolotl, Avalon, Kindi and Colibri servers started with an API key. One token per kind, stored in
 # secrets.env (outside the repo) like the other secrets.
 cmd_set_kind_token() {
   local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd

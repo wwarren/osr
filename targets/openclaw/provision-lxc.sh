@@ -298,7 +298,7 @@ from urllib.parse import urlsplit
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 if not data.get("enabled") or not isinstance(data.get("servers"), list):
     raise SystemExit("Router discovery is disabled; enable [discovery] before installing OpenClaw")
-kinds = ("lmstudio", "strata", "basalt", "maya", "xolotl", "avalon", "kindi")
+kinds = ("lmstudio", "strata", "basalt", "maya", "xolotl", "avalon", "kindi", "colibri")
 names = {}
 seen = set()
 for item in data["servers"]:
@@ -730,7 +730,7 @@ if (( ! dry_run )); then
   # Straight into a 0600 file: the key never passes through argv or a variable.
   router_exec awk -F= '$1=="ROUTER_API_KEY" {sub(/^[^=]*=/,""); print; exit}' /app/router/secrets.env \
     > "$stage/router-api-key" 2>/dev/null || : > "$stage/router-api-key"
-  router_exec awk -F= '$1 ~ /^(LMSTUDIO_API_TOKEN|STRATA_API_KEY|BASALT_API_KEY|MAYA_API_KEY|XOLOTL_API_KEY|AVALON_API_KEY|KINDI_API_KEY)$/ {print}' /app/router/secrets.env \
+  router_exec awk -F= '$1 ~ /^(LMSTUDIO_API_TOKEN|STRATA_API_KEY|BASALT_API_KEY|MAYA_API_KEY|XOLOTL_API_KEY|AVALON_API_KEY|KINDI_API_KEY|COLIBRI_API_KEY)$/ {print}' /app/router/secrets.env \
     > "$stage/backend-keys" 2>/dev/null || : > "$stage/backend-keys"
   if [[ -s $stage/router-api-key ]]; then
     note "Read ROUTER_API_KEY from ${router_label}."

@@ -1,0 +1,49 @@
+[Unit]
+Description=Colibri OpenAI-compatible inference API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=colibri
+Group=colibri
+WorkingDirectory=/opt/colibri
+# Written by install-target.sh. colibri.env holds COLIBRI_RUN_SCRIPT only: the
+# path to the generated launcher lives there, never in this unit. secrets.env
+# (root-only, read by systemd before it drops privileges) holds COLI_API_KEY,
+# which coli serve takes as its --api-key default.
+EnvironmentFile=/etc/colibri-target/colibri.env
+EnvironmentFile=/etc/colibri-target/secrets.env
+ExecStart=/bin/sh ${COLIBRI_RUN_SCRIPT}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+# Colibri pins model memory; the CT's lxc.prlimit.memlock must allow it too.
+LimitMEMLOCK=infinity
+Environment=HOME=/var/lib/colibri
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Colibri keeps its checkout and engine binaries in /opt/colibri and its models
+# in the data directory.
+ReadWritePaths=/opt/colibri /var/lib/colibri
+PrivateTmp=true
+# Colibri is CPU-first and can be built for Vulkan (make VK=1) or CUDA
+# (make CUDA=1), so no GPU is required: GPU access is optional, and a CT with
+# no GPU device nodes must still start (on the CPU backend) and install cleanly.
+# PrivateDevices stays false so GPU nodes are visible when the CT *does* pass
+# them through; access is still limited to the devices the CT hands out, and
+# install-target.sh adds the account to their group.
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

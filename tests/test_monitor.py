@@ -517,7 +517,7 @@ def test_maya_health_key_and_keep_alive(monkeypatch):
     assert pinned == [A]
 
 
-@pytest.mark.parametrize("kind", ["strata", "basalt", "maya", "xolotl", "avalon", "kindi"])
+@pytest.mark.parametrize("kind", ["strata", "basalt", "maya", "xolotl", "avalon", "kindi", "colibri"])
 def test_openai_host_with_an_empty_model_list_is_down(monkeypatch, kind):
     """Strata-style servers answer /v1/models with 200 and no models while
     their engine is down; the router cannot use them, so neither is the host up."""

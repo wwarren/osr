@@ -143,9 +143,9 @@ USAGE
 
 # Upgrade order of the tagged targets: services the others use first, Honcho
 # before the agents that use it, the broker before hcom.
-TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi
+TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri
               freellmapi comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
-MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi "
+MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri "
 
 # Services that must be active afterwards if they were active before.
 # NAME=OLD: the unit was called OLD before it was renamed; either one being
@@ -157,6 +157,9 @@ declare -A UNITS=(
     [airllm]='airllm-ollama-api'
     [ollama]='ollama'
     [strata]='strata' [basalt]='basalt' [maya]='maya' [xolotl]='xolotl' [avalon]='avalon' [kindi]='kindi'
+    # A Colibri without a model is parked (its unit inactive by design), so its
+    # unit counts only when it was active before, like every unit here.
+    [colibri]='colibri'
     [comfyui]='comfyui'
     # FreeLLMAPI's CT is its container image, without systemd: none here. It is
     # checked by its /api/ping instead (collect_state, http:freellmapi-ping).
@@ -182,6 +185,7 @@ declare -A UNITS=(
 declare -A GUEST_DIR=(
     [strata]=strata-target-deploy [basalt]=basalt-target-deploy [maya]=maya-target-deploy
     [xolotl]=xolotl-target-deploy [avalon]=avalon-target-deploy [kindi]=kindi-target-deploy
+    [colibri]=colibri-target-deploy
     [airllm]=airllm-target-deploy [llamacpp]=llama-target-deploy [ollama]=ollama-target-deploy
     [comfyui]=comfyui-target-deploy [open-terminal]=open-terminal-deploy
 )
@@ -192,6 +196,7 @@ declare -A GUEST_FILES=(
     [xolotl]='install-target.sh cuda-toolkit.sh engram-index.py xolotl.service xolotl-weights.txt upstream-commit.txt'
     [avalon]='install-target.sh rocm-toolkit.sh cuda-toolkit.sh avalon.service avalon-weights.txt upstream-commit.txt'
     [kindi]='install-target.sh cuda-toolkit.sh kindi.service kindi-weights.txt upstream-commit.txt requirements-cpu.lock requirements-cuda.lock uv.lock'
+    [colibri]='install-target.sh colibri.service'
     [airllm]='install-target.sh server.py requirements.txt requirements.lock airllm.env.example airllm-ollama-api.service README.md'
     [llamacpp]='install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example dashboard.py monitor.html llama-dashboard.service'
     [ollama]='install-target.sh ollama.env.example ollama-target.conf README.md'
@@ -1238,6 +1243,7 @@ declare -A UPSTREAM=(
     [xolotl]='gh-branch Indras-Mirror/Xolotl main'
     [avalon]='gh-branch freriadoc/Avalon main'
     [kindi]='gh-branch ahtx/kindi main'
+    [colibri]='gh-branch JustVugg/colibri main'
     [honcho]='gh-release plastic-labs/honcho'
     [deepseek-harness]='npm @deepseek-ai/dsh'
     [opencode]='npm @opencode/cli'
@@ -1266,6 +1272,7 @@ pinned_release() {
         comfyui) sed -n 's/^readonly COMFYUI_DEFAULT_VERSION=//p' "$f" ;;
         open-terminal) sed -n 's/^DEFAULT_VERSION=//p' "$f" ;;
         strata) sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$f" ;;
+        colibri) sed -n 's/^COLIBRI_DEFAULT_COMMIT=//p' "$f" ;;
         xolotl|avalon|kindi) cat -- "$REPO_ROOT/targets/$1/upstream-commit.txt" ;;
         honcho|opencode|freellmapi) repo_default "$1" ;;
         deepseek-harness) repo_default dsh ;;
@@ -1456,6 +1463,7 @@ decide_releases() {
             xolotl) I_ENV[i]="XOLOTL_COMMIT=${REL_COMMIT[$t]}" ;;
             avalon) I_ENV[i]="AVALON_COMMIT=${REL_COMMIT[$t]}" ;;
             kindi) I_ENV[i]="KINDI_COMMIT=${REL_COMMIT[$t]}" ;;
+            colibri) I_ENV[i]="COLIBRI_COMMIT=${REL_COMMIT[$t]}" ;;
         esac
     done
 }

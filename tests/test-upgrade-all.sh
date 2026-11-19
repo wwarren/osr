@@ -39,7 +39,7 @@ for n, line in enumerate(lines):
 print(" ".join(sorted(names)))
 PY
 }
-for target in strata basalt maya xolotl avalon kindi airllm llamacpp ollama comfyui open-terminal; do
+for target in strata basalt maya xolotl avalon kindi colibri airllm llamacpp ollama comfyui open-terminal; do
     listed=$(tables eval "printf '%s\n' \${GUEST_FILES[$target]} | sort | tr '\n' ' '")
     expected=$(pushed_files "$target" | tr ' ' '\n' | sort | tr '\n' ' ')
     assert_eq "$target deploys the provisioner's files" "$expected" "$listed"
