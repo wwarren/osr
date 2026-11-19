@@ -9,6 +9,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
+       bash provision-lxc.sh --reconfigure [--dry-run]   change an existing CT's model
 
 The installer asks for the CT ID (default: the cluster's next free ID, which
 unattended runs take), IP/CIDR (or dhcp) and a gateway for static IPs. Preset
@@ -17,10 +18,18 @@ CT_ID to choose another ID, and IP_CIDR and GATEWAY for unattended runs.
 Creates an unprivileged Proxmox VE 9 LXC, clones https://github.com/JustVugg/colibri
 inside the CT, builds its engine with make, and starts its OpenAI-compatible API
 as a systemd service. A random API key is generated inside the CT. After GPU
-selection it suggests a supported model for the target's RAM and asks before
-downloading. Unattended runs skip the download unless COLIBRI_MODEL_ID is set;
-without a model the service parks (see README.md). --dry-run validates settings
-and prints the PVE command plan.
+selection it lists colibri's text models (model-select.sh: each pinned to a
+Hugging Face commit, with what fits the CT's RAM and root disk) and downloads the
+one picked; Enter downloads none. Unattended runs skip the download unless
+COLIBRI_MODEL_ID is set; without a model the service parks (see README.md).
+--dry-run validates settings and prints the PVE command plan.
+
+--reconfigure changes the model an existing Colibri CT serves (CT_ID, or the
+one CT tagged colibri on this node): the same menu, with the CT's memory, GPU,
+free disk and current model, or COLIBRI_MODEL_ID=<id>, keep or remove
+unattended. It pushes the current deployment files and runs install-target.sh
+--model in the CT: the new model downloads while the old one keeps serving, and
+the old one comes back if the new one does not answer.
 
 Required: TEMPLATE (downloaded Ubuntu 22.04/24.04 or
 Debian 12/13 amd64; Debian 13 for Vulkan), STORAGE (rootdir storage), IP_CIDR
@@ -49,8 +58,9 @@ Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
           COLIBRI_REF=<branch or tag> (explicitly follow it when no commit is set),
           COLIBRI_MODEL_DIR=/var/lib/colibri/model (model destination; absolute
                     path without ".." inside the CT's data directory),
-          COLIBRI_MODEL_ID= (empty: prompt interactively or skip unattended;
-                    qwen36-35b or qwen3-coder-30b: download that model),
+          COLIBRI_MODEL_ID= (empty: the menu interactively, none unattended;
+                    none, or an ID of model-select.sh: download that model;
+                    with --reconfigure also keep or remove),
           COLIBRI_BACKEND=auto (auto|cpu|vulkan|cuda; auto: cuda for an NVIDIA
                     GPU, vulkan for an AMD Radeon or Intel Arc one, else cpu;
                     cpu never looks for a GPU),
@@ -94,9 +104,11 @@ run() {
 }
 
 dry_run=0
+reconfigure=0
 while (( $# )); do
     case $1 in
         --dry-run) dry_run=1 ;;
+        --reconfigure) reconfigure=1 ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -145,6 +157,60 @@ COLIBRI_HOST=${COLIBRI_HOST:-0.0.0.0}
 COLIBRI_PORT=${COLIBRI_PORT:-8080}
 COLIBRI_ALLOWED_HOST=${COLIBRI_ALLOWED_HOST:-}
 COLIBRI_READY_TIMEOUT=${COLIBRI_READY_TIMEOUT:-900}
+
+# --- --reconfigure: change the model of an existing Colibri CT ---------------
+# Reads the CT (read-only, so a dry run reads it too), asks, then runs the
+# guest's install-target.sh --model, which downloads beside the served model,
+# swaps, restarts and puts the old one back if the new one does not answer.
+reconfigure_model() {
+    local source_dir file shown
+    source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    for file in install-target.sh colibri.service model-select.sh; do
+        [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
+    done
+    command -v pct >/dev/null || die 'Missing PVE command: pct (run --reconfigure on the Proxmox host).'
+    (( dry_run )) || [[ $EUID -eq 0 ]] || die 'Run as root on the PVE host.'
+    if [[ -z $CT_ID ]]; then
+        CT_ID=$(pve_tagged_ct colibri) || CT_ID=''
+        if pve_asks && (( ! dry_run )); then
+            printf 'Colibri CT ID%s: ' "${CT_ID:+ [$CT_ID]}" >&2
+            IFS= read -r shown || die 'Input ended; nothing was changed.'
+            CT_ID=${shown:-$CT_ID}
+        fi
+    fi
+    [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'Set CT_ID to the Colibri CT to reconfigure (no single CT here is tagged colibri).'
+    [[ $(pct status "$CT_ID" 2>/dev/null) == 'status: running' ]] || die "CT $CT_ID is not running (or does not exist); start it and retry."
+    pct exec "$CT_ID" -- test -x /opt/colibri/bin/coli </dev/null ||
+        die "CT $CT_ID has no Colibri installation (/opt/colibri/bin/coli); create one with this script without --reconfigure."
+    colibri_ct_facts "$CT_ID" || die "Could not read CT $CT_ID's configuration."
+    colibri_choose_model "$COLIBRI_CT_MEMORY_MIB" "$COLIBRI_CT_BACKEND" "$COLIBRI_CT_MODEL_DIR" \
+        "$(if pve_asks && (( ! dry_run )); then echo true; else echo false; fi)" "$COLIBRI_CT_DISK" "$COLIBRI_CT_CURRENT" ||
+        die 'No model was chosen; nothing was changed.'
+    pve_summary "Colibri: change the model of CT $CT_ID"
+    pve_row 'CT' "$CT_ID, ${COLIBRI_CT_MEMORY_MIB} MiB, $COLIBRI_CT_BACKEND$( [[ -z $COLIBRI_CT_DISK ]] || printf ', %s GB free for the model' "$(( COLIBRI_CT_DISK / 1000000000 ))")"
+    pve_row 'Served now' "$(colibri_model_label "$COLIBRI_CT_CURRENT") in $COLIBRI_CT_MODEL_DIR"
+    case ${COLIBRI_MODEL_ID:-} in
+        '') pve_row 'Change' 'none (the served model stays)'
+            printf 'Nothing to change.\n'
+            return 0 ;;
+        remove) pve_row 'Change' 'remove it; the service parks until a model is placed' ;;
+        *) colibri_model_details "$COLIBRI_MODEL_ID"
+           pve_row 'Change' "serve $COLIBRI_MODEL_NAME ($COLIBRI_MODEL_GB GB from $COLIBRI_MODEL_REPO@${COLIBRI_MODEL_REVISION:0:12}); downloaded beside the served model, which keeps serving until the swap" ;;
+    esac
+    pve_confirm "Change the model of Colibri CT $CT_ID?"
+    run pct exec "$CT_ID" -- install -d -m 0700 /root/colibri-target-deploy
+    for file in install-target.sh colibri.service model-select.sh; do
+        run pct push "$CT_ID" "$source_dir/$file" "/root/colibri-target-deploy/$file" --perms "$( [[ $file == install-target.sh ]] && echo 0755 || echo 0644)"
+    done
+    run pct exec "$CT_ID" -- env NONINTERACTIVE=true "COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID" \
+        bash /root/colibri-target-deploy/install-target.sh --model
+    if (( dry_run )); then printf 'Dry run: CT %s was only read.\n' "$CT_ID"
+    else printf 'CT %s: %s.\n' "$CT_ID" "$( [[ $COLIBRI_MODEL_ID == remove ]] && echo 'the model was removed' || printf 'now serves %s' "$COLIBRI_MODEL_NAME")"; fi
+}
+if (( reconfigure )); then
+    reconfigure_model
+    exit 0
+fi
 
 # --- Questions: the container, one section ----------------------------------
 valid_template_volume() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/[A-Za-z0-9._-]+$ ]]; }
@@ -339,7 +405,10 @@ model_backend=cpu
 if (( have_nvidia )); then model_backend=cuda
 elif (( have_dri )); then model_backend=vulkan
 fi
-colibri_choose_model "$MEMORY_MB" "$model_backend" "$COLIBRI_MODEL_DIR" "$(if pve_asks && (( ! dry_run )); then echo true; else echo false; fi)" ||
+# The model lives on the root disk: its size less about 10 GiB for the system,
+# the checkout and the engines.
+model_disk=$(( (ROOTFS_GB > 10 ? ROOTFS_GB - 10 : 0) * 1073741824 ))
+colibri_choose_model "$MEMORY_MB" "$model_backend" "$COLIBRI_MODEL_DIR" "$(if pve_asks && (( ! dry_run )); then echo true; else echo false; fi)" "$model_disk" ||
     die 'Could not choose a Colibri model.'
 [[ -z $COLIBRI_MODEL_ID || -n $COLIBRI_MODEL_DIR ]] || die 'COLIBRI_MODEL_DIR is required when downloading a model.'
 
@@ -460,5 +529,6 @@ else
     printf 'No model is downloaded: the service is parked until one is placed (README.md).\n'
 fi
 printf 'Service logs: pct exec %s -- journalctl -u colibri -f\n' "$CT_ID"
+printf 'Change the model later: bash %s/provision-lxc.sh --reconfigure (CT_ID=%s)\n' "$source_dir" "$CT_ID"
 printf 'Upgrade later: push install-target.sh, colibri.service and model-select.sh to\n'
 printf '  /root/colibri-target-deploy in the CT, then run it there with --upgrade.\n'

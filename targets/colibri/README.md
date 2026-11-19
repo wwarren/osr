@@ -39,13 +39,14 @@ servers. For it the installer asks:
   will place: Qwen3.6-35B-A3B is a 23 GB download, needs at least 10 GB RAM
   (20 GB preferred). GLM-5.2 needs 429 GB of disk. More RAM keeps more experts
   resident.
-- **Model download**: suggests Qwen3.6-35B-A3B (23.1 GB) when RAM is at
-  least 20 GiB on CPU or 10 GiB with a GPU; otherwise suggests
-  Qwen3-Coder-30B-A3B (19.4 GB). These are the two text models in the
-  [tested Colibri catalog](https://github.com/JustVugg/colibri/blob/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/c/setup_catalog.py)
-  that run from RAM. A download starts only after answering yes. For unattended
-  setup, set `COLIBRI_MODEL_ID=qwen36-35b` or `qwen3-coder-30b` to opt in;
-  leave it unset or set it to `none` to skip. See
+- **Model**: a menu of every text model in the
+  [tested Colibri catalog](https://github.com/JustVugg/colibri/blob/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/c/setup_catalog.py),
+  from Qwen3-Coder-30B-A3B (19.4 GB) to Kimi K3 (1561 GB), each marked
+  `fits` or with what it lacks (RAM, or room on the root disk less about
+  10 GiB). The one that runs from RAM best on this CT is marked `(suggested)`:
+  Qwen3.6-35B-A3B with at least 20 GiB on the CPU or 10 GiB with a GPU,
+  otherwise Qwen3-Coder-30B-A3B. Enter downloads nothing. Unattended, set
+  `COLIBRI_MODEL_ID=<id>` to download one; unset or `none` skips it. See
   [Downloading a catalog model](#downloading-a-catalog-model).
 
 It adds the CT to the router's server list up front, then, once the CT is
@@ -64,10 +65,9 @@ STORAGE=local-lvm IP_CIDR=192.0.2.51/24 GATEWAY=192.0.2.1 \
 bash targets/colibri/provision-lxc.sh --dry-run     # then without --dry-run
 ```
 
-The standalone provisioner asks the same download question after detecting the
-GPU. To opt in without a prompt, set `COLIBRI_MODEL_ID=qwen36-35b` or
-`COLIBRI_MODEL_ID=qwen3-coder-30b`; unattended without it, nothing is
-downloaded and the provisioner says which ID it would suggest.
+The standalone provisioner shows the same model menu after detecting the GPU.
+To choose without a prompt, set `COLIBRI_MODEL_ID=<id>`; unattended without
+it, nothing is downloaded and the provisioner says which ID it would suggest.
 
 With `GPU_DEVICES` empty (the default) the provisioner finds the host's GPU the
 way the OSR installer does: `tools/setup-host-gpu.sh` checks the driver for an
@@ -101,6 +101,41 @@ A keyed Colibri cannot be identified without its key, so add it as
 The provisioner never deletes a CT and stops if the ID exists. A failed step
 keeps the CT; resume or upgrade with
 `pct exec <id> -- bash /root/colibri-target-deploy/install-target.sh`.
+
+## Changing the model
+
+One model is served at a time; picking another replaces it. Three ways in:
+
+```bash
+bash targets/colibri/provision-lxc.sh --reconfigure            # on the host: the menu
+CT_ID=251 COLIBRI_MODEL_ID=glm-5.3 bash targets/colibri/provision-lxc.sh --reconfigure --dry-run
+pct exec <id> -- bash /root/colibri-target-deploy/install-target.sh --model   # in the CT
+```
+
+`--reconfigure` takes `CT_ID` (or the one CT tagged `colibri` on the node),
+reads its memory, GPU line, model directory, free disk and current model, shows
+the menu (Enter keeps the current model, `r` removes it), pushes the current
+deployment files and runs `install-target.sh --model` in the CT. Unattended,
+`COLIBRI_MODEL_ID` is an ID, `keep` or `remove`. `tools/upgrade-all.sh` asks for
+each Colibri CT whether to serve another model after its upgrade (default no;
+unattended and dry runs keep it).
+
+`install-target.sh --model`:
+
+- downloads the new model into its stage while the current one keeps serving
+  (the free-space check counts both; unfinished downloads of other models are
+  removed first);
+- stops the service, moves the served files aside and the new ones in (each
+  phase recorded in the publication marker, so any interrupted run finishes
+  it), restarts and waits for `/v1/models`; the old files stay aside until the
+  new model answers, including across a plain `--upgrade` rerun;
+- if the new model does not answer, swaps the previous one back, restarts it,
+  keeps the download to try again, and fails;
+- on success deletes the replaced model when it was a catalog download (it can
+  be fetched again); a model placed by hand is kept in
+  `/var/lib/colibri/model-replaced-<time>` for you to delete;
+- `remove` takes the served model away the same way and leaves the service
+  parked.
 
 ## Source and build
 
@@ -164,16 +199,32 @@ offer an image or decision model (Qwen-Image, Laya, GLiNER) for chat.
 
 ## Downloading a catalog model
 
-`COLIBRI_MODEL_ID` names one of the two models in `model-select.sh`, each
-pinned to a Hugging Face commit:
+`COLIBRI_MODEL_ID` names one of colibri's text models in `model-select.sh`,
+each pinned to a Hugging Face commit (`test-pinned-upstream.py` keeps the table
+equal to colibri's catalog at the tested pin):
 
-| ID | Model | Download | RAM at least | Repository @ commit |
+| ID | Model | Download | RAM at least (good) | Repository @ commit |
 |---|---|---|---|---|
-| `qwen36-35b` | Qwen3.6-35B-A3B | 23.1 GB | 10 GiB (20 preferred) | `Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64` @ `c619aa59` |
-| `qwen3-coder-30b` | Qwen3-Coder-30B-A3B | 19.4 GB | 8 GiB (18 preferred) | `Justvugg/Qwen3-Coder-30B-A3B-colibri-int4` @ `d839110a` |
+| `qwen3-coder-30b` | Qwen3-Coder-30B-A3B | 19.4 GB | 8 GiB (18) | `Justvugg/Qwen3-Coder-30B-A3B-colibri-int4` @ `d839110a` |
+| `qwen36-35b` | Qwen3.6-35B-A3B | 23.1 GB | 10 GiB (20) | `Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64` @ `c619aa59` |
+| `deepseek-v4-flash-reap` | DeepSeek V4 Flash REAP 150B | 84.7 GB | 16 GiB (32) | `puwaer/DeepSeek-V4-Flash-0731-reap-150b` @ `7c76db22` |
+| `deepseek-v4-flash` | DeepSeek V4 Flash | 166.9 GB | 16 GiB (32) | `deepseek-ai/DeepSeek-V4-Flash-0731` @ `7872f01b` |
+| `mimo-v2.6-flash` | MiMo-V2.6 Flash | 171.8 GB | 32 GiB (52) | `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` @ `5220c3f5` |
+| `qwen38-flash-next` | Qwen3.8-Flash-Next | 185.6 GB | 24 GiB (32) | `Qwen/Qwen3.8-Flash-Next-FP8` @ `bcd9f01d` (upstream's pin) |
+| `glm-5.3` | GLM-5.3 | 419.3 GB | 16 GiB (24) | `Justvugg/GLM-5.3-colibri-int4-g64` @ `3930f4bb` |
+| `glm-5.2` | GLM-5.2 | 429.3 GB | 16 GiB (24) | `mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp` @ `6bbb01ed` |
+| `inkling` | Inkling | 514.1 GB | 120 GiB (128) | `nbeerbower/Inkling-colibri-int4` @ `3981e658` |
+| `mimo-v2.6-pro` | MiMo-V2.6 Pro | 563.6 GB | 54 GiB (64) | `XiaomiMiMo/MiMo-V2.6-Pro-MOPD` @ `da71ee15` |
+| `kimi-k3` | Kimi K3 | 1561.0 GB | 32 GiB (64) | `moonshotai/Kimi-K3` @ `f831ab66` |
 
-The guest installer downloads it only when the model directory holds no model,
-on the first install or any later run:
+The two MiMo models skip what the engine never reads (`dflash/`,
+`audio_tokenizer/`, `model_mtp.safetensors`), as colibri's catalog does; Kimi
+K3 gets its `tokenizer.json` from colibri's `tools/k3_tokenizer.py` before it
+is published. The large models stream their experts from disk. Qwen-Image is
+left out: it is an image model, not a chat server.
+
+An install or rerun downloads it only when the model directory holds no model
+(to replace a served model, see [Changing the model](#changing-the-model)):
 
 ```bash
 pct exec <CT_ID> -- env COLIBRI_MODEL_ID=qwen36-35b bash /root/colibri-target-deploy/install-target.sh
@@ -188,9 +239,14 @@ pct exec <CT_ID> -- env COLIBRI_MODEL_ID=qwen36-35b bash /root/colibri-target-de
 - Files land in an ID- and revision-specific folder under
   `/var/lib/colibri/model/.colibri-staging`, on the model's own filesystem even
   when that is a separate mount. A publication marker keeps the launcher parked
-  until all verified files have moved into place. Staging from another model
-  is never published with the selected one.
-- An interrupted download or publication is resumed by the same command.
+  while files move, then records validation while the service starts. Staging
+  from another model is never published with the selected one.
+- An interrupted download is resumed by the same command. An interrupted
+  publication is finished by any later run, with or without
+  `COLIBRI_MODEL_ID` (upgrade-all's plain `--upgrade` included); while files
+  are still moving, the launcher parks and logs the interruption.
+- After a publication every stage is removed. A plain rerun keeps an
+  unfinished download and names the ID that resumes it.
 - On an installed CT, the run then restarts the service; nothing is rebuilt.
 - `COLIBRI_MODEL_ID` is not recorded as a setting, so later runs and upgrades
   never download anything unless asked.
@@ -216,7 +272,8 @@ journalctl -u colibri -f
 
 Rerunning `install-target.sh` does the same (it restarts a parked or stopped
 service and rebuilds only if that does not bring it back). To serve another
-model, replace the directory's contents and restart. `COLIBRI_MODEL_DIR` moves
+model, use [Changing the model](#changing-the-model) (or replace the
+directory's contents and restart). `COLIBRI_MODEL_DIR` moves
 the directory (it must be under `/var/lib/colibri`); changing it is a settings
 change, so the next run re-applies the build.
 

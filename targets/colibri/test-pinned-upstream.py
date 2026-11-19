@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import types
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -126,23 +127,50 @@ def main():
     check('return ["image_generation"]' in server and 'return ["systemone", "decision"]' in server
           and 'return ["chat", "systemone"]' in server, "the capabilities /v1/models lists changed")
 
-    # model-select.sh's two downloads are colibri's catalog entries (repo,
-    # size, RAM minimum), and its downloader has what install-target.sh calls.
-    catalog = show("c/setup_catalog.py")
+    # model-select.sh is colibri's whole text catalog: the same IDs, repos,
+    # sizes, RAM, excludes and post-download steps, each pinned to a commit
+    # (upstream's own where it pins one). The catalog module is standard
+    # library only, so it is loaded from the pinned source as it is.
+    catalog_module = types.ModuleType("setup_catalog")
+    sys.modules["setup_catalog"] = catalog_module
+    exec(compile(show("c/setup_catalog.py"), "c/setup_catalog.py", "exec"), catalog_module.__dict__)
+    upstream_models = {entry.id: entry for entry in catalog_module.CATALOG if entry.modality == "text"}
     select = (HERE / "model-select.sh").read_text(encoding="utf-8")
-    for block in re.findall(r"\n        ([a-z0-9-]+)\)\n(.*?);;", select, re.S):
-        model_id, body = block
-        fields = dict(re.findall(r"COLIBRI_MODEL_([A-Z_]+)=(\S+)", body))
-        entry = re.search(rf'id="{re.escape(model_id)}".*?repo="([^"]+)", disk_gb=([0-9.]+).*?ram_min_gb=([0-9.]+)',
-                          catalog, re.S)
-        check(entry, f"{model_id} is not in colibri's catalog")
-        cat_repo, disk_gb, ram_min_gb = entry.groups()
-        check(fields.get("REPO") == cat_repo, f"{model_id}: repo {fields.get('REPO')} != catalog {cat_repo}")
-        check(fields.get("GB") == disk_gb, f"{model_id}: size {fields.get('GB')} != catalog {disk_gb}")
-        check(int(fields["MIN_MIB"]) >= float(ram_min_gb) * 1e9 / 2**20 - 1,
-              f"{model_id}: RAM minimum {fields['MIN_MIB']} MiB is below the catalog's {ram_min_gb} GB")
+    listed = re.search(r"COLIBRI_MODEL_IDS=\(([^)]*)\)", select).group(1).split()
+    details = select[select.index("colibri_model_details() {"):select.index("        *) return 1 ;;")]
+    blocks = dict(re.findall(r"\n        ([a-z0-9.-]+)\)\n(.*?);;", details, re.S))
+    check(sorted(listed) == sorted(upstream_models),
+          f"model-select.sh lists {sorted(listed)}; colibri's text catalog is {sorted(upstream_models)}")
+    check(sorted(blocks) == sorted(listed), f"COLIBRI_MODEL_IDS {sorted(listed)} != the entries {sorted(blocks)}")
+    sizes = [upstream_models[model_id].disk_gb for model_id in listed]
+    check(sizes == sorted(sizes), "COLIBRI_MODEL_IDS is not smallest first")
+    for model_id in listed:
+        entry, body = upstream_models[model_id], blocks[model_id]
+        fields = {k: v.strip("'") for k, v in re.findall(r"COLIBRI_MODEL_([A-Z_]+)=('[^']*'|\S+)", body)}
+        check(fields.get("REPO") == entry.repo, f"{model_id}: repo {fields.get('REPO')} != catalog {entry.repo}")
+        check(fields.get("NAME") == entry.name, f"{model_id}: name {fields.get('NAME')} != catalog {entry.name}")
+        check(float(fields.get("GB", "0")) == entry.disk_gb, f"{model_id}: size {fields.get('GB')} != catalog {entry.disk_gb}")
+        check(int(fields["MIN_MIB"]) == round(entry.ram_min_gb * 1024),
+              f"{model_id}: RAM minimum {fields['MIN_MIB']} MiB != the catalog's {entry.ram_min_gb} GB")
+        check(int(fields["GOOD_MIB"]) == round(entry.ram_good_gb * 1024),
+              f"{model_id}: RAM comfort point {fields['GOOD_MIB']} MiB != the catalog's {entry.ram_good_gb} GB")
         check(re.fullmatch(r"[0-9a-f]{40}", fields.get("REVISION", "")), f"{model_id}: no pinned revision")
-    check(select.count("COLIBRI_MODEL_REVISION=") == 2, "model-select.sh should pin both models")
+        if entry.revision != "main":
+            check(fields["REVISION"] == entry.revision, f"{model_id}: pin {fields['REVISION']} != upstream's {entry.revision}")
+        check(not entry.include, f"{model_id}: the catalog now has includes, which install-target.sh does not pass")
+        check(fields.get("EXCLUDE", "").split() == list(entry.exclude),
+              f"{model_id}: excludes {fields.get('EXCLUDE')} != catalog {entry.exclude}")
+        post = ",".join(f"{tool}:{creates}" for tool, creates in entry.post_install)
+        check(fields.get("POST", "") == post, f"{model_id}: post-download step {fields.get('POST')} != catalog {post}")
+        # install-target.sh runs it as upstream's setup does: python3
+        # <libexec>/tools/<tool>.py <model dir>, with the standard library only.
+        for tool, _ in entry.post_install:
+            source = show(f"c/tools/{tool}.py")
+            imported = set(re.findall(r"^(?:import|from) ([A-Za-z_][A-Za-z0-9_]*)", source, re.M))
+            check(imported <= set(sys.stdlib_module_names),
+                  f"c/tools/{tool}.py imports beyond the standard library: {sorted(imported - set(sys.stdlib_module_names))}")
+            check("sys.argv" in source or "argparse" in source, f"c/tools/{tool}.py no longer takes the model folder")
+    check("$(LIBEXECDIR)/tools/" in install, "make install no longer installs tools/ (the post-download steps)")
     downloader = show("c/setup_download.py")
     for signature in ("def hf_token():", "def list_repo_files(repo, revision=",
                       "def bytes_present(model_dir, files", "def download_repo(repo, revision, model_dir, files, *, token=None, progress=None",
@@ -160,7 +188,7 @@ def main():
     for name in sized + ["inkling-colibri", "olmoe-colibri"]:
         check(name in announced, f"router.ini's {name} is not an id colibri announces")
     print(f"PASS colibri {expected}: build layout, serve flags, key, Host guard, GPU run flags, "
-          f"the two catalog downloads and their downloader, "
+          f"the {len(listed)} text-catalog models and their downloader, "
           f"/v1/models and {len(sized)} sized ids match the target")
 
 

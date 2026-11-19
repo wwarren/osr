@@ -4,6 +4,8 @@
 #   bash install-target.sh             install or update Colibri and start it
 #   bash install-target.sh --upgrade   move to COLIBRI_COMMIT or an explicit COLIBRI_REF;
 #                                      roll back to the previous commit on failure
+#   bash install-target.sh --model     change the served model (a menu on a terminal,
+#                                      or COLIBRI_MODEL_ID=<id>|keep|remove)
 #   bash install-target.sh --dry-run   print the plan; change nothing
 #
 # Colibri has no upstream installer to drive: the C/Python project in <checkout>/c
@@ -64,7 +66,7 @@ run() {
 }
 usage() {
     cat <<'USAGE'
-Usage: bash install-target.sh [--dry-run] [--upgrade]
+Usage: bash install-target.sh [--dry-run] [--upgrade | --model]
 Installs Colibri from https://github.com/JustVugg/colibri as the "colibri"
 service account: it builds the C project in <checkout>/c with make, installs it
 into the checkout itself (PREFIX=$COLIBRI_DIR, so the launcher is
@@ -75,16 +77,24 @@ anything. When the commit, settings and unit are unchanged and Colibri is health
 it does nothing;
 otherwise it upgrades with rollback to the previous commit on failure.
 
-No model is downloaded by default. COLIBRI_MODEL_ID=qwen36-35b or
-qwen3-coder-30b explicitly requests one, on a first install or any rerun, when
-the model directory holds no model: colibri's own downloader fetches the
-pinned Hugging Face commit as the service account, checks free space and every
-file's SHA-256, stages each ID and revision under <model dir>/.colibri-staging
-(a rerun with the same ID resumes it), and publishes it only when complete. A
-publication marker parks the service until every file has moved; a rerun
-recovers an interrupted publication. Without a model, the service parks and
-logs where to put one. Copy one there and restart the service (or rerun this
-script).
+Models: colibri's text-model catalog, each pinned to a Hugging Face commit, is
+in model-select.sh (IDs from qwen3-coder-30b, 19.4 GB, to kimi-k3, 1561 GB). One
+is served at a time. No model is downloaded by default. COLIBRI_MODEL_ID=<id>
+on an install or rerun downloads it when the model directory serves none:
+colibri's own downloader fetches the pinned commit as the service account,
+checks free space and every file's SHA-256, stages it under
+<model dir>/.colibri-staging/<id>-<revision> (a rerun with the same ID resumes
+it), and publishes it only when complete. A publication marker parks the
+service until every file has moved; every run finishes an interrupted one.
+Without a model, the service parks and logs where to put one.
+
+--model changes the served model of an installed CT: a menu (with what fits
+this CT's RAM and disk) on a terminal, or COLIBRI_MODEL_ID=<id>, keep or
+remove. A new model downloads beside the served one, which keeps serving; then
+the service stops, the two are swapped and it restarts. If the new model does
+not answer, the previous one is put back. A replaced catalog model is deleted
+(it can be downloaded again); one placed by hand is kept in
+$COLIBRI_DATA_DIR/model-replaced-<time>.
 
 --upgrade moves an existing install to COLIBRI_COMMIT (or the current tip of
 COLIBRI_REF), rebuilds, restarts and health-checks the service, and returns to
@@ -231,8 +241,11 @@ MODEL_PUBLISHING=.colibri-publishing
 # empty. Without one the service parks (the launcher exits 0); that is the
 # state of every install until an operator places a model.
 model_placed() {
-    [[ -n $COLIBRI_MODEL_DIR && ! -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING &&
-       -n $(find "$COLIBRI_MODEL_DIR" -mindepth 1 -maxdepth 1 ! -name "$MODEL_STAGING" -print -quit 2>/dev/null) ]]
+    [[ -n $COLIBRI_MODEL_DIR ]] || return 1
+    if [[ -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]]; then
+        grep -q '^validate ' "$COLIBRI_MODEL_DIR/$MODEL_PUBLISHING" || return 1
+    fi
+    [[ -n $(find "$COLIBRI_MODEL_DIR" -mindepth 1 -maxdepth 1 ! -name "$MODEL_STAGING" ! -name "$MODEL_PUBLISHING" -print -quit 2>/dev/null) ]]
 }
 
 # settings_fingerprint: what the running service was built and launched with. A
@@ -567,7 +580,11 @@ generate_run_script() {
         printf '# The API key reaches coli serve as COLI_API_KEY from %s/secrets.env.\n' "$COLIBRI_ETC_DIR"
         printf 'model=%q\n' "${COLIBRI_MODEL_DIR:-}"
         # Staging and a publication in progress must both keep the unit parked.
-        printf 'if [ -z "$model" ] || [ -e "$model/.colibri-publishing" ] || [ -z "$(find "$model" -mindepth 1 -maxdepth 1 ! -name .colibri-staging -print 2>/dev/null | head -n 1)" ]; then\n'
+        printf 'if [ -n "$model" ] && [ -e "$model/.colibri-publishing" ] && ! grep -q "^validate " "$model/.colibri-publishing"; then\n'
+        printf '  echo %q\n' "colibri: parked, a model publication in $COLIBRI_MODEL_DIR was interrupted. Rerun bash /root/colibri-target-deploy/install-target.sh to finish it."
+        printf '  exit 0\n'
+        printf 'fi\n'
+        printf 'if [ -z "$model" ] || [ -z "$(find "$model" -mindepth 1 -maxdepth 1 ! -name .colibri-staging ! -name .colibri-publishing -print 2>/dev/null | head -n 1)" ]; then\n'
         printf '  echo %q\n' "$message"
         printf '  exit 0\n'
         printf 'fi\n'
@@ -839,60 +856,256 @@ ensure_service_user() {
         die "$SERVICE_USER cannot use the NVIDIA GPU even though the device nodes are visible; inspect the CT's --devN mappings and permissions, or set COLIBRI_BACKEND=cpu."
 }
 
-# download_selected_model: fetch COLIBRI_MODEL_ID (model-select.sh) into the
-# model directory, only when it holds no model. colibri's own downloader
-# (setup_download.py, installed by make install) does the transfer, as the
-# service account: standard library only, resumable (.part files), every file
-# checked against the pinned commit's SHA-256 listing, and a manifest that says
-# when the folder is complete. A rerun with the same ID resumes it. Each pinned
-# revision has its own stage; a publication marker parks the launcher until all
-# files are in place, and an interrupted publication moves them back to stage.
-download_selected_model() {
-    [[ -n ${COLIBRI_MODEL_ID:-} ]] || return 0
-    colibri_model_details "$COLIBRI_MODEL_ID" || die 'Unsupported COLIBRI_MODEL_ID.'
-    [[ -n $COLIBRI_MODEL_DIR ]] || die 'COLIBRI_MODEL_DIR is required for a model download.'
-    local stage_root="$COLIBRI_MODEL_DIR/$MODEL_STAGING"
-    local stage_key="$COLIBRI_MODEL_ID-$COLIBRI_MODEL_REVISION"
-    local stage="$stage_root/$stage_key" marker="$COLIBRI_MODEL_DIR/$MODEL_PUBLISHING"
-    local libexec="$COLIBRI_DIR/libexec/colibri" interrupted_key interrupted_stage
+# --- The model directory: downloads, publication, model changes ---------------
+# A catalog download (model-select.sh) is fetched into a stage of its own,
+# <model dir>/.colibri-staging/<id>-<revision>, on the model's filesystem (a
+# separate mount included), so publishing is a series of renames. Each
+# publication is recorded first in <model dir>/.colibri-publishing as
+# "<phase> <source> <aside> <direction>": retire moves the served files aside,
+# publish moves the source stage's files in, and validate waits for health.
+# The launcher parks during the moves and can serve during validation. A
+# every run of this script, with or without COLIBRI_MODEL_ID, finishes an
+# interrupted publication first (recover_model_publication). A source or aside
+# of - means none. The stage's download was complete and checked before the
+# publication began, so finishing forward needs no second download or check.
+MODEL_MANIFEST=.colibri-download.json
+
+model_stage_root() { printf '%s/%s\n' "$COLIBRI_MODEL_DIR" "$MODEL_STAGING"; }
+# The served entries: everything in the model directory but the stage and marker.
+model_live_entries() {
+    find "$COLIBRI_MODEL_DIR" -mindepth 1 -maxdepth 1 ! -name "$MODEL_STAGING" ! -name "$MODEL_PUBLISHING" "$@" 2>/dev/null
+}
+model_dir_sync() {
+    sync -- "$COLIBRI_MODEL_DIR"
+    [[ ! -d $(model_stage_root) ]] || sync -- "$(model_stage_root)"
+}
+valid_model_slot() { [[ $1 == - || $1 =~ ^[a-z0-9][a-z0-9.-]*-[0-9a-f]{40}$ || $1 =~ ^retired-[0-9]+$ ]]; }
+
+# write_publication PHASE SOURCE ASIDE [DIRECTION]: the marker, renamed whole.
+write_publication() {
+    local root
+    root=$(model_stage_root)
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$root"
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "${4:-forward}" > "$root/.publishing.tmp"
+    sync -- "$root/.publishing.tmp"
+    mv -fT -- "$root/.publishing.tmp" "$COLIBRI_MODEL_DIR/$MODEL_PUBLISHING"
+    model_dir_sync
+}
+# model_move_aside ASIDE: every served entry into .colibri-staging/ASIDE.
+model_move_aside() {
+    [[ $1 != - ]] || return 0
+    local aside
+    aside="$(model_stage_root)/$1"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$aside"
+    model_live_entries -exec mv -t "$aside" -- {} +
+}
+# model_move_in SOURCE: every entry of .colibri-staging/SOURCE into the model directory.
+model_move_in() {
+    local source
+    [[ $1 != - ]] || return 0
+    source="$(model_stage_root)/$1"
+    [[ -d $source ]] || return 0
+    find "$source" -mindepth 1 -maxdepth 1 -exec mv -t "$COLIBRI_MODEL_DIR" -- {} +
+    rmdir -- "$source"
+}
+# swap_model SOURCE ASIDE [DIRECTION]: leave the marker until health is checked.
+swap_model() {
+    write_publication retire "$1" "$2" "${3:-forward}"
+    model_move_aside "$2"
+    model_dir_sync
+    write_publication publish "$1" "$2" "${3:-forward}"
+    model_move_in "$1"
+    model_dir_sync
+    write_publication validate "$1" "$2" "${3:-forward}"
+}
+
+# recover_model_publication: finish a publication a crash or signal stopped.
+# Also reads the one-line marker of the first catalog-download version (the
+# stage key alone), which was always a publication into an empty directory.
+recover_model_publication() {
+    local marker phase source aside direction extra
+    [[ -n $COLIBRI_MODEL_DIR ]] || return 0
+    marker="$COLIBRI_MODEL_DIR/$MODEL_PUBLISHING"
+    [[ -e $marker ]] || return 0
     if (( dry_run )); then
-        printf '+ (as %s) download %s (%s GB) from %s@%s with colibri'"'"'s setup_download.py into %s, checking free space and every file'"'"'s SHA-256, then publish it in %s (skipped when a model is there)\n' \
-            "$SERVICE_USER" "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_REPO" "$COLIBRI_MODEL_REVISION" "$stage" "$COLIBRI_MODEL_DIR"
+        printf '+ finish the interrupted model publication recorded in %s\n' "$marker"
         return 0
     fi
-    if [[ -e $marker ]]; then
-        IFS= read -r interrupted_key < "$marker" || die "Cannot read interrupted model publication at $marker."
-        [[ $interrupted_key =~ ^(qwen36-35b|qwen3-coder-30b)-[0-9a-f]{40}$ ]] ||
-            die "Invalid interrupted model publication at $marker; inspect it before retrying."
-        interrupted_stage="$stage_root/$interrupted_key"
-        install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$interrupted_stage"
-        # Restore every entry moved before the interruption. Leave the marker
-        # in place until this finishes, so another interruption still parks.
-        find "$COLIBRI_MODEL_DIR" -mindepth 1 -maxdepth 1 \
-            ! -name "$MODEL_STAGING" ! -name "$MODEL_PUBLISHING" \
-            -exec mv -t "$interrupted_stage" -- {} +
-        rm -- "$marker"
-        note "Recovered an interrupted model publication into $interrupted_stage."
+    read -r phase source aside direction extra < "$marker" || true
+    if [[ -n $phase && -z ${source:-} ]]; then source=$phase phase=publish aside=-; fi
+    direction=${direction:-forward}
+    [[ ( $phase == retire || $phase == publish || $phase == validate ) && ( $direction == forward || $direction == rollback ) && -z ${extra:-} ]] && valid_model_slot "$source" && valid_model_slot "$aside" ||
+        die "Unreadable model publication marker $marker; inspect $COLIBRI_MODEL_DIR and $(model_stage_root) before retrying."
+    if [[ $phase == retire ]]; then
+        model_move_aside "$aside"
+        model_dir_sync
+        write_publication publish "$source" "$aside" "$direction"
     fi
-    if model_placed; then
-        note "A model is already in $COLIBRI_MODEL_DIR; COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID downloads nothing."
+    if [[ $phase != validate ]]; then
+        model_move_in "$source"
+        model_dir_sync
+        write_publication validate "$source" "$aside" "$direction"
+    fi
+    note "Finished an interrupted model publication in $COLIBRI_MODEL_DIR; checking the served model before finalizing it."
+}
+
+# A validated switch is durable only after the old model has been dealt with.
+# A failed forward switch is reversed through the same recoverable marker.
+settle_model_publication() {
+    local marker phase source aside direction extra
+    marker="$COLIBRI_MODEL_DIR/$MODEL_PUBLISHING"
+    [[ -e $marker ]] || return 0
+    read -r phase source aside direction extra < "$marker" || true
+    [[ $phase == validate && -z ${extra:-} ]] || die "Model publication in $marker is not ready for validation."
+    direction=${direction:-forward}
+    if wait_ready; then
+        if [[ $direction == forward ]]; then
+            finalize_aside "$aside"
+            cleanup_model_staging after-publish
+        fi
+        rm -f -- "$marker"
+        model_dir_sync
         return 0
     fi
+    if [[ $direction == rollback ]]; then
+        die 'The previous model did not come back either; the publication marker is kept for another retry.'
+    fi
+    note 'The new model did not come up; putting the previous model back.'
+    systemctl stop colibri.service || true
+    swap_model "$aside" "$source" rollback
+    systemctl restart colibri.service
+    if wait_ready; then
+        rm -f -- "$marker"
+        model_dir_sync
+        die "The new model did not start; the previous model is back (or the service is parked if there was none), and the download is kept in $(model_stage_root)/$source to try again."
+    fi
+    die 'The previous model did not come back either; the publication marker is kept for another retry.'
+}
+
+# model_manifest_id DIR: the catalog ID of the model in DIR (from colibri's
+# download manifest): an ID, other (a repository not in the catalog), or hand
+# (files without a manifest); none for an empty directory.
+model_manifest_id() {
+    local dir=$1 repo revision
+    if [[ -f $dir/$MODEL_MANIFEST ]]; then
+        repo=$(sed -n 's/.*"repo":[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/$MODEL_MANIFEST" | head -n1)
+        revision=$(sed -n 's/.*"revision":[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/$MODEL_MANIFEST" | head -n1)
+        colibri_model_from_manifest "$repo" "$revision" || echo other
+    elif [[ -n $(find "$dir" -mindepth 1 -maxdepth 1 ! -name '.colibri-*' -print -quit 2>/dev/null) ]]; then
+        echo hand
+    else
+        echo none
+    fi
+}
+current_model_id() {
+    if model_placed; then model_manifest_id "$COLIBRI_MODEL_DIR"; else echo none; fi
+}
+
+# finalize_aside ASIDE: a model moved aside is deleted when it was a catalog
+# download (it can be fetched again), never when it was placed by hand: that one
+# moves to <data dir>/model-replaced-<time> for the operator to delete.
+finalize_aside() {
+    local dir target label
+    [[ $1 != - ]] || return 0
+    dir="$(model_stage_root)/$1"
+    [[ -d $dir ]] || return 0
+    if [[ -f $dir/$MODEL_MANIFEST ]]; then
+        label=$(colibri_model_label "$(model_manifest_id "$dir")")
+        rm -rf -- "$dir"
+        note "Removed the replaced catalog model, $label."
+    elif [[ -z $(find "$dir" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        rmdir -- "$dir"
+    else
+        target="$COLIBRI_DATA_DIR/model-replaced-$(date +%Y%m%d-%H%M%S)"
+        mv -T -- "$dir" "$target"
+        note "The replaced model was placed by hand, so it is kept in $target; delete it when it is no longer needed."
+    fi
+}
+
+# cleanup_model_staging MODE [KEEP]: what is left in .colibri-staging.
+#   before-download KEEP  partial downloads of other models (frees their disk
+#                         before this one is checked against the free space)
+#   after-publish         every stage, and models moved aside
+#   served                models moved aside (left by a recovered publication)
+cleanup_model_staging() {
+    local mode=$1 keep=${2:-} root entry name
+    root=$(model_stage_root)
+    [[ -d $root ]] || return 0
+    rm -f -- "$root/.publishing.tmp"
+    for entry in "$root"/* "$root"/.[!.]*; do
+        [[ -e $entry ]] || continue
+        name=${entry##*/}
+        if [[ $name =~ ^retired-[0-9]+$ ]]; then
+            [[ $mode == before-download ]] || finalize_aside "$name"
+        elif [[ $mode != served && $name != "$keep" ]]; then
+            rm -rf -- "$entry"
+            note "Removed the unfinished or leftover download $name from $root."
+        fi
+    done
+    rmdir -- "$root" 2>/dev/null || true
+}
+
+# Older installers cleared the marker before checking health. With exactly one
+# retired model, a healthy live model can discard it; an unhealthy catalog model
+# can be moved back into its pinned stage and the retired model restored.
+settle_unmarked_model_swap() {
+    local root retired id source
+    local -a asides
+    [[ -n $COLIBRI_MODEL_DIR && ! -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]] || return 0
+    root=$(model_stage_root)
+    asides=( "$root"/retired-* )
+    [[ -d ${asides[0]} ]] || return 0
+    if ((${#asides[@]} != 1)); then
+        note "More than one retired model remains in $root; inspect them before cleanup."
+        return 0
+    fi
+    retired=${asides[0]##*/}
+    if probe_health || { ! model_placed && [[ $(systemctl is-active colibri.service 2>/dev/null) == inactive ]]; }; then
+        cleanup_model_staging served
+        model_dir_sync
+        return 0
+    fi
+    id=$(model_manifest_id "$COLIBRI_MODEL_DIR")
+    if ! colibri_model_details "$id"; then
+        note "The served model did not answer and $root/$retired is still kept; inspect both before retrying."
+        return 0
+    fi
+    source="$id-$COLIBRI_MODEL_REVISION"
+    note "The earlier model switch did not validate; restoring $root/$retired."
+    systemctl stop colibri.service || true
+    swap_model "$retired" "$source" rollback
+    systemctl restart colibri.service
+    settle_model_publication
+    die "The earlier model switch did not start; the previous model is back, and its download is kept in $root/$source."
+}
+
+# download_model_stage ID: fetch the catalog model ID into its stage (resuming
+# what is there) and run its post-download step. Sets MODEL_STAGE_KEY. colibri's
+# own downloader (setup_download.py, installed by make install) does the
+# transfer as the service account: standard library only, resumable (.part
+# files), every file checked against the pinned commit's SHA-256 listing, the
+# model's free space checked first, and a manifest that says when it is complete.
+download_model_stage() {
+    local stage libexec tool creates
+    colibri_model_details "$1" || die "Unknown Colibri model: $1"
+    MODEL_STAGE_KEY="$1-$COLIBRI_MODEL_REVISION"
+    stage="$(model_stage_root)/$MODEL_STAGE_KEY"
+    libexec="$COLIBRI_DIR/libexec/colibri"
     [[ -r $libexec/setup_download.py ]] ||
         die "colibri's downloader is missing ($libexec/setup_download.py); rerun this script to rebuild Colibri first."
-    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$COLIBRI_MODEL_DIR" "$stage"
-    note "Downloading $COLIBRI_MODEL_NAME ($COLIBRI_MODEL_GB GB, $COLIBRI_MODEL_REPO@$COLIBRI_MODEL_REVISION) into $stage; rerun with COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID to resume if it is interrupted."
-    as_service python3 -I - "$libexec" "$COLIBRI_MODEL_REPO" "$COLIBRI_MODEL_REVISION" "$stage" <<'PY' ||
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$COLIBRI_MODEL_DIR" "$(model_stage_root)" "$stage"
+    note "Downloading $COLIBRI_MODEL_NAME ($COLIBRI_MODEL_GB GB, $COLIBRI_MODEL_REPO@$COLIBRI_MODEL_REVISION) into $stage; rerun with COLIBRI_MODEL_ID=$1 to resume if it is interrupted."
+    as_service python3 -I - "$libexec" "$COLIBRI_MODEL_REPO" "$COLIBRI_MODEL_REVISION" "$stage" "$COLIBRI_MODEL_EXCLUDE" <<'PY' ||
 import shutil
 import sys
 
-libexec, repo, revision, stage = sys.argv[1:5]
+libexec, repo, revision, stage, exclude = sys.argv[1:6]
 sys.path.insert(0, libexec)
 import setup_download as hub  # noqa: E402  (colibri's own module, from libexec)
 
 try:
     token = hub.hf_token()
-    files = hub.list_repo_files(repo, revision, token=token)
+    files = hub.list_repo_files(repo, revision, exclude=tuple(exclude.split()), token=token)
     if not files:
         raise hub.DownloadError(f"{repo}@{revision} lists no files")
     total = sum(int(spec["size"]) for spec in files)
@@ -901,7 +1114,8 @@ try:
     margin = 1 << 30
     if needed + margin > free:
         print(f"Not enough disk for the model: {needed / 1e9:.1f} GB more to download plus 1 GiB, "
-              f"{free / 1e9:.1f} GB free in {stage}. Grow the CT's disk (or the mount there) and rerun.",
+              f"{free / 1e9:.1f} GB free in {stage}. Grow the CT's disk (or the mount there), "
+              "or remove the served model first (install-target.sh --model with COLIBRI_MODEL_ID=remove), and rerun.",
               file=sys.stderr)
         sys.exit(3)
     shown = [-1]
@@ -920,18 +1134,139 @@ except hub.DownloadError as error:
     print(f"Model download failed: {error}", file=sys.stderr)
     sys.exit(1)
 PY
-        die "The download of $COLIBRI_MODEL_NAME did not finish; nothing was published. Rerun with COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID to resume it."
-    # The marker is renamed into place before the first move. If interrupted,
-    # the launcher parks and the next requested download restores moved files
-    # to their stage before it proceeds. All paths remain on the model disk.
-    printf '%s\n' "$stage_key" > "$stage_root/.publishing.tmp"
-    mv -T -- "$stage_root/.publishing.tmp" "$marker"
-    find "$stage" -mindepth 1 -maxdepth 1 -exec mv -t "$COLIBRI_MODEL_DIR" -- {} +
-    rmdir -- "$stage"
-    rmdir -- "$stage_root" 2>/dev/null || true
-    rm -- "$marker"
+        die "The download of $COLIBRI_MODEL_NAME did not finish; nothing was published. Rerun with COLIBRI_MODEL_ID=$1 to resume it."
+    if [[ -n $COLIBRI_MODEL_POST ]]; then
+        tool=${COLIBRI_MODEL_POST%%:*} creates=${COLIBRI_MODEL_POST#*:}
+        if [[ ! -e $stage/$creates ]]; then
+            note "Writing $creates for $COLIBRI_MODEL_NAME (colibri's tools/$tool.py)."
+            as_service python3 -I "$libexec/tools/$tool.py" "$stage" && [[ -e $stage/$creates ]] ||
+                die "tools/$tool.py did not write $creates in $stage; nothing was published."
+        fi
+    fi
+}
+
+# download_into_empty: install and upgrade runs. COLIBRI_MODEL_ID downloads that
+# model only into a model directory that serves none; replacing a served model
+# is install-target.sh --model.
+download_into_empty() {
+    [[ -n ${COLIBRI_MODEL_ID:-} ]] || return 0
+    colibri_model_details "$COLIBRI_MODEL_ID" || die 'Unsupported COLIBRI_MODEL_ID.'
+    [[ -n $COLIBRI_MODEL_DIR ]] || die 'COLIBRI_MODEL_DIR is required for a model download.'
+    if (( dry_run )); then
+        printf '+ (as %s) download %s (%s GB) from %s@%s with colibri'"'"'s setup_download.py into %s/%s-%s, checking free space and every file'"'"'s SHA-256, then publish it in %s (only when no model is served there)\n' \
+            "$SERVICE_USER" "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_REPO" "$COLIBRI_MODEL_REVISION" \
+            "$(model_stage_root)" "$COLIBRI_MODEL_ID" "$COLIBRI_MODEL_REVISION" "$COLIBRI_MODEL_DIR"
+        return 0
+    fi
+    if model_placed; then
+        note "A model is already served from $COLIBRI_MODEL_DIR ($(colibri_model_label "$(current_model_id)")); COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID downloads nothing. To replace it: install-target.sh --model."
+        return 0
+    fi
+    cleanup_model_staging before-download "$COLIBRI_MODEL_ID-$COLIBRI_MODEL_REVISION"
+    download_model_stage "$COLIBRI_MODEL_ID"
+    swap_model "$MODEL_STAGE_KEY" -
     model_placed || die "Publishing $COLIBRI_MODEL_NAME in $COLIBRI_MODEL_DIR failed."
     note "Published $COLIBRI_MODEL_NAME in $COLIBRI_MODEL_DIR."
+}
+
+# note_model_leftovers: what a plain run keeps in .colibri-staging (an
+# unfinished download stays resumable; a model moved aside by an interrupted
+# model change stays until one is confirmed to serve).
+note_model_leftovers() {
+    local root entry name
+    root=$(model_stage_root)
+    [[ -d $root ]] || return 0
+    for entry in "$root"/*; do
+        [[ -d $entry ]] || continue
+        name=${entry##*/}
+        if [[ $name =~ ^retired-[0-9]+$ ]]; then
+            note "A replaced model is still kept in $entry (a model change stopped before it finished); install-target.sh --model deletes it once the served model answers, or delete it yourself."
+        else
+            note "An unfinished download ($(du -sh -- "$entry" 2>/dev/null | cut -f1)) is in $entry; rerun with COLIBRI_MODEL_ID=${name%-*} to finish it. Downloading another model removes it."
+        fi
+    done
+}
+
+# prepare_model_dir: every install and upgrade run, with or without
+# COLIBRI_MODEL_ID: finish an interrupted publication, then download into an
+# empty model directory when asked.
+prepare_model_dir() {
+    if [[ -z $COLIBRI_MODEL_DIR ]]; then
+        [[ -z ${COLIBRI_MODEL_ID:-} ]] || die 'COLIBRI_MODEL_DIR is required for a model download.'
+        return 0
+    fi
+    recover_model_publication
+    [[ -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]] || download_into_empty
+    (( dry_run )) || { [[ -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]] || note_model_leftovers; }
+}
+
+# do_model: install-target.sh --model. Change the served model of an installed
+# CT: a menu on a terminal, else COLIBRI_MODEL_ID (an ID, keep or remove). A new
+# model is downloaded beside the served one, which keeps serving meanwhile;
+# then the service stops, the two are swapped, and it restarts. If the new model
+# does not come up, the previous one is swapped back and served again.
+do_model() {
+    local current memory free staged disk interactive aside label
+    if (( dry_run )); then
+        printf '+ finish any interrupted model publication in %s\n' "$COLIBRI_MODEL_DIR"
+        printf '+ pick a model: %s\n' "${COLIBRI_MODEL_ID:-the menu on a terminal (Enter keeps the current one)}"
+        printf '+ a new model: download it beside the served one, stop colibri.service, swap them, restart, wait for /v1/models; if it does not come up, swap the previous model back and restart\n'
+        printf '+ remove: stop colibri.service, take the served model away (a catalog download is deleted, one placed by hand is kept in %s/model-replaced-<time>), restart (parked)\n' "$COLIBRI_DATA_DIR"
+        return 0
+    fi
+    [[ -d $COLIBRI_DIR/.git && -f $UNIT_DIR/colibri.service && -x $COLIBRI_DIR/bin/coli ]] ||
+        die "No Colibri installation at $COLIBRI_DIR; install it first (without --model)."
+    [[ -n $COLIBRI_MODEL_DIR ]] || die 'COLIBRI_MODEL_DIR is empty.'
+    ensure_service_user
+    resolve_backend
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$COLIBRI_MODEL_DIR"
+    recover_model_publication
+    if [[ -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]]; then
+        systemctl restart colibri.service
+        settle_model_publication
+    else
+        settle_unmarked_model_swap
+    fi
+    current=$(current_model_id)
+    memory=$(awk '/^MemTotal:/ { print int($2 / 1024); exit }' "${COLIBRI_MEMINFO:-/proc/meminfo}")
+    [[ $memory =~ ^[0-9]+$ ]] || die 'Cannot read this CT'"'"'s memory.'
+    free=$(df -PB1 "$COLIBRI_MODEL_DIR" | awk 'NR == 2 { print $4 }')
+    # Unfinished downloads count as room: the chosen one resumes, the others go.
+    staged=0
+    if [[ -d $(model_stage_root) ]]; then
+        staged=$(find "$(model_stage_root)" -mindepth 1 -maxdepth 1 ! -name 'retired-*' -exec du -sb -- {} + | awk '{ s += $1 } END { print s + 0 }')
+    fi
+    disk=''
+    if [[ $free =~ ^[0-9]+$ ]]; then free=$(( free + staged )); disk=$(( free > 1073741824 ? free - 1073741824 : 0 )); fi
+    interactive=false
+    if [[ -t 0 && ${NONINTERACTIVE:-false} != true ]]; then interactive=true; fi
+    note "Served now: $(colibri_model_label "$current")."
+    colibri_choose_model "$memory" "$colibri_backend" "$COLIBRI_MODEL_DIR" "$interactive" "$disk" "$current" ||
+        die 'No model was chosen; nothing was changed.'
+    case ${COLIBRI_MODEL_ID:-} in
+        '')
+            note 'The served model stays as it is.'
+            return 0 ;;
+        remove)
+            aside="retired-$(date +%s)"
+            systemctl stop colibri.service
+            swap_model - "$aside"
+            systemctl restart colibri.service
+            settle_model_publication
+            note "The model was removed; Colibri is parked until a model is placed."
+            return 0 ;;
+    esac
+    label=$(colibri_model_label "$COLIBRI_MODEL_ID")
+    colibri_model_details "$COLIBRI_MODEL_ID"
+    cleanup_model_staging before-download "$COLIBRI_MODEL_ID-$COLIBRI_MODEL_REVISION"
+    download_model_stage "$COLIBRI_MODEL_ID"
+    aside=-
+    if [[ -n $(model_live_entries -print -quit) ]]; then aside="retired-$(date +%s)"; fi
+    systemctl stop colibri.service
+    swap_model "$MODEL_STAGE_KEY" "$aside"
+    systemctl restart colibri.service
+    settle_model_publication
+    note "Colibri now serves $label."
 }
 
 do_install() {
@@ -958,7 +1293,7 @@ do_install() {
             "$( [[ -n $COLIBRI_MODEL_DIR ]] && printf ' --model %s' "$COLIBRI_MODEL_DIR" )" \
             "$( [[ $colibri_backend == cuda ]] && printf ' --gpu auto' )$( [[ $colibri_backend == vulkan ]] && printf ' (with COLI_VULKAN=1)' )"
         printf '+ %s\n' "$( [[ -n $COLIBRI_MODEL_DIR ]] && printf 'serve the model in %s (parked while it is empty)' "$COLIBRI_MODEL_DIR" || printf 'no model configured (no COLIBRI_MODEL_DIR): the launcher logs where to put a model and exits 0 (no model is ever downloaded; they are 18GB-500GB+), and the unit parks inactive')"
-        download_selected_model
+        prepare_model_dir
         printf '+ write %s/colibri.env (COLIBRI_RUN_SCRIPT only), %s/secrets.env (0600: COLI_API_KEY) and %s/colibri.service\n' "$COLIBRI_ETC_DIR" "$COLIBRI_ETC_DIR" "$UNIT_DIR"
         run systemctl enable colibri.service
         run systemctl restart colibri.service
@@ -990,11 +1325,15 @@ do_install() {
     checkout_local "$target"
     probe_build_env
     run_setup
-    download_selected_model
+    prepare_model_dir
     write_unit
     systemctl enable colibri.service
     systemctl restart colibri.service
-    wait_ready || die 'Colibri did not become ready.'
+    if [[ -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]]; then
+        settle_model_publication
+    else
+        wait_ready || die 'Colibri did not become ready.'
+    fi
     save_settings
 }
 
@@ -1058,7 +1397,7 @@ do_upgrade() {
     if (( dry_run )); then
         ensure_vulkan_packages
         resolve_backend
-        download_selected_model
+        prepare_model_dir
         printf '+ git fetch --depth 1 %s %s (before anything is stopped; a failed fetch changes nothing)\n' \
             "$COLIBRI_URL" "${COLIBRI_COMMIT:-$COLIBRI_REF}"
         printf '+ same commit, settings (model dir, backend as built, host, port, allowed hosts) and unit, and serving (or parked without a model): nothing to do\n'
@@ -1077,11 +1416,17 @@ do_upgrade() {
     # since the last run); the fingerprint compares it with the one built.
     ensure_vulkan_packages
     resolve_backend
-    # A model asked for on an installed CT (one skipped at install, or a first
+    # An interrupted model publication is finished first, on every run. Then a
+    # model asked for on an installed CT (one skipped at install, or a first
     # install's download that was interrupted after the unit was written). It
     # changes no build or setting: with it placed, the unchanged install below
     # only needs the restart it takes when a model is there but not served.
-    download_selected_model
+    prepare_model_dir
+    if [[ -n $COLIBRI_MODEL_DIR && -e $COLIBRI_MODEL_DIR/$MODEL_PUBLISHING ]]; then
+        systemctl restart colibri.service
+        settle_model_publication
+    fi
+    settle_unmarked_model_swap
     local previous target rc
     previous=$(git_root rev-parse HEAD)
     # Keep the running commit reachable so rollback never needs the network.
@@ -1167,6 +1512,7 @@ while (( $# )); do
     case $1 in
         --dry-run) dry_run=1 ;;
         --upgrade) mode=upgrade ;;
+        --model) mode=model ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -1221,9 +1567,12 @@ source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -r $source_dir/model-select.sh ]] || die "Missing $source_dir/model-select.sh"
 source "$source_dir/model-select.sh"
 COLIBRI_MODEL_ID=${COLIBRI_MODEL_ID:-}
-if [[ -n $COLIBRI_MODEL_ID ]]; then
-    colibri_model_details "$COLIBRI_MODEL_ID" || die 'COLIBRI_MODEL_ID must be qwen36-35b or qwen3-coder-30b.'
-fi
+case $COLIBRI_MODEL_ID in
+    none) COLIBRI_MODEL_ID='' ;;
+    keep|remove) [[ $mode == model ]] || die "COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID only applies with --model." ;;
+    '') ;;
+    *) colibri_model_details "$COLIBRI_MODEL_ID" || die "COLIBRI_MODEL_ID must be one of: ${COLIBRI_MODEL_IDS[*]} (or none; with --model also keep or remove)." ;;
+esac
 api_key='[generated inside CT]'
 colibri_backend=''
 colibri_build_flags=()
@@ -1243,9 +1592,9 @@ if (( ! dry_run )); then
     fi
 fi
 
-if [[ $mode == upgrade ]]; then
-    do_upgrade
-else
-    do_install
-fi
+case $mode in
+    upgrade) do_upgrade ;;
+    model) do_model ;;
+    *) do_install ;;
+esac
 printf 'Colibri is configured on %s:%s; API key: %s/api-key\n' "$COLIBRI_HOST" "$COLIBRI_PORT" "$COLIBRI_ETC_DIR"

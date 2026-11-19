@@ -420,6 +420,9 @@ I_TARGET=() I_CT=() I_INFO=() I_RESULT=() I_NOTE=()
 # I_ENV: KEY=VALUE words for an item's installer (an upstream release chosen
 # instead of the pin), set after discovery has ordered the items.
 I_ENV=()
+# I_MODEL: the model a Colibri CT serves after its upgrade (an ID of
+# targets/colibri/model-select.sh, or remove), asked per CT; empty keeps it.
+I_MODEL=()
 ROUTER_CT=''
 add_item() {
     I_TARGET+=("$1"); I_CT+=("$2"); I_INFO+=("${3:-}"); I_RESULT+=(''); I_NOTE+=('')
@@ -1137,13 +1140,31 @@ update_hermes() {
     fi
 }
 
+# run_colibri_model ITEM: after a good upgrade, serve the chosen model.
+# install-target.sh --model downloads it beside the served one and puts the
+# old one back if it does not answer, so a failure here leaves the CT serving
+# as before: it is reported, not rolled back (a snapshot rollback would also
+# undo the upgrade that worked).
+run_colibri_model() {
+    local id=${I_CT[$1]}
+    if pct exec "$id" -- env NONINTERACTIVE=true "COLIBRI_MODEL_ID=${I_MODEL[$1]}" \
+        bash "/root/${GUEST_DIR[colibri]}/install-target.sh" --model </dev/null; then
+        echo "OSR-COLIBRI: model changed to ${I_MODEL[$1]}"
+    else
+        echo "OSR-COLIBRI: model change to ${I_MODEL[$1]} failed; the previous model is served"
+    fi
+}
+
 run_item() {  # run_item ITEM MODE
     case $(method_of "${I_TARGET[$1]}") in
         router) run_router ;;
         webui) run_webui "$1" ;;
         guest)
             run_guest "$1" "$2" || return
-            if [[ ${I_TARGET[$1]} == open-terminal ]]; then open_terminal_access "$1"; fi ;;
+            case ${I_TARGET[$1]} in
+                open-terminal) open_terminal_access "$1" ;;
+                colibri) [[ -z ${I_MODEL[$1]:-} ]] || run_colibri_model "$1" ;;
+            esac ;;
         reconfigure)
             run_reconfigure "$1" "$2" || return
             if hermes_update_wanted "$1"; then update_hermes "$1"; fi ;;
@@ -1167,6 +1188,11 @@ describe_item() {  # what run_item does, for the plan
             else echo -n "push files to /root/${GUEST_DIR[$t]}; install-target.sh --upgrade"; fi
             if [[ -n ${I_ENV[$i]:-} ]]; then echo -n " with ${I_ENV[$i]} (latest upstream)"; fi
             if [[ $(info_value "$i" access) == all ]]; then echo -n '; enable its Open WebUI connection for all users'; fi
+            case ${I_MODEL[$i]:-} in
+                '') ;;
+                remove) echo -n '; then install-target.sh --model: remove its model (the service parks)' ;;
+                *) echo -n "; then install-target.sh --model: serve $(colibri_model_label "${I_MODEL[$i]}") (downloaded beside the served model; the old one comes back if it does not answer)" ;;
+            esac
             echo ;;
         reconfigure)
             if unpinned_service "$t"; then
@@ -1543,6 +1569,32 @@ needs_webui_token() {
     esac
 }
 
+# decide_colibri_model ITEM: ask whether this Colibri CT should serve another
+# model after its upgrade (the menu of targets/colibri/model-select.sh, with
+# the CT's memory, GPU, free disk and current model). Unattended runs and
+# dry runs keep the served model.
+decide_colibri_model() {
+    local i=$1 id=${I_CT[$1]} label
+    $INTERACTIVE || return 0
+    if ! declare -F colibri_choose_model >/dev/null; then
+        # shellcheck source=targets/colibri/model-select.sh
+        source "$REPO_ROOT/targets/colibri/model-select.sh"
+    fi
+    colibri_ct_facts "$id" || { note "Colibri CT $id: its model could not be read, so it stays as it is."; return 0; }
+    label=$(colibri_model_label "$COLIBRI_CT_CURRENT")
+    if $DRY_RUN; then
+        note "Colibri CT $id serves $label; without --dry-run, a run asks whether to change it after the upgrade."
+        return 0
+    fi
+    section "Colibri CT $id: model"
+    ask_yes "Colibri CT $id serves $label. Serve another model (or none) after its upgrade?" n || return 0
+    local COLIBRI_MODEL_ID=''
+    if colibri_choose_model "$COLIBRI_CT_MEMORY_MIB" "$COLIBRI_CT_BACKEND" "$COLIBRI_CT_MODEL_DIR" true \
+        "$COLIBRI_CT_DISK" "$COLIBRI_CT_CURRENT" <&"$PROMPT_FD"; then
+        I_MODEL[i]=$COLIBRI_MODEL_ID
+    fi
+}
+
 prepare() {
     local i t id recorded
     HCOM_MQTT_CT=${MQTT_CT_ID:-$(single_tagged mqtt)}
@@ -1556,6 +1608,7 @@ prepare() {
         fi
         case $t in
             open-webui) decide_webui "$i" ;;
+            colibri) decide_colibri_model "$i" ;;
             deepseek-harness)
                 recorded=$(pct exec "$id" -- sed -n 's/^DSH_VERSION=//p' /etc/deepseek-harness/settings 2>/dev/null | head -n 1 | tr -d '"'\''\r')
                 decide_pin "$i" DSH_VERSION "$recorded" "$(repo_default dsh)" "$(release_pick deepseek-harness)" ;;
@@ -1841,7 +1894,7 @@ process_item() {
         if verify_item "$i" "$pre" "$post"; then
             broken=no
             if (( status == 0 )); then
-                if tail -n "+$((attempt_start + 1))" "$log" | grep -q '^OSR-HERMES: moved '; then
+                if tail -n "+$((attempt_start + 1))" "$log" | grep -q '^OSR-HERMES: moved \|^OSR-COLIBRI: model changed '; then
                     I_RESULT[i]=upgraded
                 elif tail -n "+$((attempt_start + 1))" "$log" | grep -qi 'nothing to do'; then
                     I_RESULT[i]=current
@@ -1857,6 +1910,9 @@ process_item() {
                 fi
                 if [[ $t == llamacpp && $(info_value "$i" dashboard) == missing ]]; then
                     I_NOTE[i]=$(llamacpp_dashboard_outcome "$id")
+                fi
+                if [[ $t == colibri && -n ${I_MODEL[$i]:-} ]]; then
+                    I_NOTE[i]=$(tail -n "+$((attempt_start + 1))" "$log" | sed -n 's/^OSR-COLIBRI: //p' | tail -n 1)
                 fi
                 note "$label: OK"
                 $KEEP_SNAPSHOTS || drop_snapshot "$id" "$SNAP" "$log"

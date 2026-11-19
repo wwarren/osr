@@ -49,7 +49,10 @@ stub getent 'exit 2'
 # openssl rand -hex 32 is the API-key generator: a fixed value so the checks
 # below can look for it without a real CSPRNG call.
 stub openssl 'case "$1 $2" in "rand -hex") printf "%s\n" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";; *) exit 0;; esac'
+# Room on the model's filesystem for --model's fit check (bytes in column 4).
+stub df 'printf "Filesystem 1B-blocks Used Available Use%% Mounted\nfake 0 0 %s 0%% /\n" "${FAKE_DF_FREE:-900000000000}"'
 stub runuser 'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"'
+stub sync 'if [[ ${FAKE_SYNC_FAIL:-0} == 1 && ${1:-} == -- && ${2:-} == "$FAKE_MODEL_DIR" ]]; then exit 74; fi; exec /usr/bin/sync "$@"'
 # Fail after moving one published entry, simulating interruption during the
 # non-atomic sequence of same-filesystem renames.
 stub mv 'if [[ ${FAKE_PARTIAL_PUBLISH:-0} == 1 && ${1:-} == -t && ${2:-} == "$FAKE_MODEL_DIR" ]]; then
@@ -71,6 +74,8 @@ esac; exit 0'
 stub curl 'url=${@: -1}
 case $url in
     */v1/models)
+        # A model that never answers: the live manifest names this repository.
+        [[ -n ${FAKE_UNHEALTHY_REPO:-} ]] && grep -qF "$FAKE_UNHEALTHY_REPO" "$FAKE_MODEL_DIR/.colibri-download.json" 2>/dev/null && exit 22
         [[ -n ${FAKE_RESTART_HEALS:-} && -e $FAKE_RESTART_HEALS ]] && exit 0
         [[ ${FAKE_HEALTHY:-1} == 1 ]] || exit 22 ;;
     *) echo "unexpected download: $url" >&2; exit 22 ;;
@@ -195,9 +200,10 @@ rt() {
         GPU_NODES= DRI_NODES= COLIBRI_ICD_DIRS="$tmp_root/no-icd" COLIBRI_BACKEND=cpu \
         COLIBRI_NVCC="$tmp_root/cuda/bin/nvcc" \
         FAKE_COLIBRI_DIR="$tree/opt/colibri" FAKE_DL_LOG="$dl_log" \
-        FAKE_MODEL_DIR="$tree/var/lib/colibri/model" \
+        FAKE_MODEL_DIR="$tree/var/lib/colibri/model" COLIBRI_MEMINFO="$tmp_root/meminfo" NONINTERACTIVE=true \
         "${extra[@]+"${extra[@]}"}" bash "$target" "$@"
 }
+printf 'MemTotal:       67108864 kB\n' > "$tmp_root/meminfo"
 # The commit already installed: how a rerun of an unchanged pin arrives.
 at_head() { printf 'COLIBRI_COMMIT=%s' "$(cat "$tree/opt/colibri/.git/HEAD")"; }
 contains() { grep -Fq -- "$1" "$2" || fail "$2 lacks: $1"; }
@@ -437,7 +443,7 @@ rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
     { cat "$tmp_root/out"; fail 'a download on an installed CT'; }
 contains 'list Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c' "$dl_log"
 contains 'Published Qwen3.6-35B-A3B' "$tmp_root/out"
-contains 'is back after a restart' "$tmp_root/out"
+grep -q 'systemctl restart colibri.service' "$log" || fail 'the downloaded model was not restarted'
 grep -q '^make ' "$log" && fail 'a download on an installed CT rebuilt the engines'
 pass 'a download asked for on an installed CT is served after a restart, without a rebuild'
 
@@ -459,18 +465,45 @@ grep -qE 'systemctl (stop|restart)|^make ' "$log" && fail "a failed download tou
 sh "$launcher" | grep -q 'is empty' || fail 'the launcher took a partial download for a model'
 pass 'a failed download publishes nothing, keeps its staging folder to resume, and the launcher still parks'
 
-# Switching IDs after a failed transfer must leave the first model's partial
-# files in its own stage, never in the live model directory.
+# Switching IDs after a failed transfer removes the first model's partial
+# download before the free-space check (its disk is needed), and never
+# publishes any of it.
 : > "$qwen_stage/old-model.part"
 : > "$log"; rm -f -- "$tmp_root/healed"
 rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
     COLIBRI_MODEL_ID=qwen3-coder-30b "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
     { cat "$tmp_root/out"; fail 'switching models after a failed download'; }
-[[ -f $qwen_stage/old-model.part ]] || fail 'the previous model stage was changed'
+[[ ! -e $qwen_stage ]] || fail 'the other model'"'"'s partial download was kept'
+contains "Removed the unfinished or leftover download ${qwen_stage##*/}" "$tmp_root/out"
 [[ ! -e $modeldir/old-model.part ]] || fail 'a stale partial file was published with another model'
 [[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors ]] ||
     fail 'the newly selected model was not published'
-pass 'switching models keeps the old staging files out of the live model'
+[[ ! -e $modeldir/.colibri-staging ]] || fail 'the staging folder was left after a publication'
+pass 'switching models removes the other partial download first and publishes only the new model'
+
+# A plain rerun keeps an unfinished download (it is resumable) and says so.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install'; }
+rt FAKE_DL=fail COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1 && fail 'a failed download reported success'
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a plain rerun with an unfinished download'; }
+[[ -d $qwen_stage ]] || fail 'a plain rerun removed a resumable download'
+contains "rerun with COLIBRI_MODEL_ID=qwen36-35b to finish it" "$tmp_root/out"
+pass 'a plain rerun keeps an unfinished download and names the ID that resumes it'
+
+# A failed directory sync stops publication with its marker still available to
+# the next invocation. It must not report that the model was published.
+reset_tree; : > "$dl_log"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install before the sync failure'; }
+if rt FAKE_SYNC_FAIL=1 COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1; then
+    fail 'a failed model directory sync reported success'
+fi
+[[ -f $modeldir/.colibri-publishing && -d $qwen_stage ]] ||
+    fail 'a sync failure lost the publication marker or its complete stage'
+[[ ! -e $modeldir/config.json ]] || fail 'a sync failure published files anyway'
+pass 'a model directory sync error stops publication and keeps the stage recoverable'
 
 # A crash during publication leaves a marker that parks the launcher. The next
 # run restores moved entries to stage, verifies them, and finishes publication.
@@ -485,19 +518,34 @@ fi
 [[ -d $qwen_stage ]] || fail 'the interrupted publication lost its stage'
 [[ -n $(find "$modeldir" -mindepth 1 -maxdepth 1 ! -name .colibri-staging ! -name .colibri-publishing -print -quit) ]] ||
     fail 'the interruption did not move a model entry'
-sh "$launcher" | grep -q 'is empty' || fail 'the launcher served a partially published model'
+sh "$launcher" | grep -q 'publication in .* was interrupted' || fail 'the launcher did not report the interrupted publication'
 grep -qE 'systemctl (stop|restart)|^make ' "$log" && fail 'an interrupted publication touched the service'
-: > "$log"; rm -f -- "$tmp_root/healed"
+# A plain rerun (no COLIBRI_MODEL_ID, as tools/upgrade-all.sh runs it) finishes it.
+: > "$log"; : > "$dl_log"; rm -f -- "$tmp_root/healed"
 rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" \
-    COLIBRI_MODEL_ID=qwen36-35b "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
     { cat "$tmp_root/out"; fail 'resuming an interrupted publication'; }
-contains 'Recovered an interrupted model publication' "$tmp_root/out"
+contains 'Finished an interrupted model publication' "$tmp_root/out"
+grep -q 'systemctl restart colibri.service' "$log" || fail 'the recovered publication was not restarted'
+[[ ! -s $dl_log ]] || fail 'finishing a publication downloaded again'
 [[ ! -e $modeldir/.colibri-publishing && ! -e $qwen_stage ]] ||
     fail 'the publication marker or stage remained after recovery'
 [[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors ]] ||
     fail 'recovery did not publish the whole model'
 grep -q '^make ' "$log" && fail 'recovering publication rebuilt the engines'
-pass 'interrupted publication stays parked and resumes to a complete live model'
+pass 'an interrupted publication parks, says so, and any rerun finishes it without a download'
+
+# The first catalog-download version wrote the stage key alone in the marker.
+reset_tree
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a parked install before a legacy marker'; }
+mkdir -p "$qwen_stage"; printf '{}' > "$qwen_stage/.colibri-download.json"; : > "$qwen_stage/model-00000.safetensors"
+: > "$modeldir/config.json"; printf '%s\n' "${qwen_stage##*/}" > "$modeldir/.colibri-publishing"
+rt FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'recovering a legacy marker'; }
+[[ -f $modeldir/config.json && -f $modeldir/model-00000.safetensors && ! -e $modeldir/.colibri-publishing ]] ||
+    fail 'a legacy marker was not finished'
+pass 'a marker of the first download version is finished too'
 
 # Too little disk stops before anything is fetched.
 reset_tree; : > "$dl_log"
@@ -509,5 +557,146 @@ fi
 contains 'Not enough disk for the model' "$tmp_root/out"
 grep -q '^download ' "$dl_log" && fail 'a download started without the disk for it'
 pass 'a download larger than the free disk stops before fetching anything'
+
+# --- install-target.sh --model ------------------------------------------------
+# A served catalog model is replaced: the new one downloads while the old keeps
+# serving, the service stops only for the swap, the old download is deleted.
+reset_tree; : > "$dl_log"
+rt COLIBRI_MODEL_ID=qwen3-coder-30b COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'an install serving a model'; }
+: > "$log"; : > "$dl_log"
+rt COLIBRI_MODEL_ID=qwen36-35b -- --model > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail '--model replacing a served model'; }
+contains 'Served now: Qwen3-Coder-30B-A3B (19.4 GB).' "$tmp_root/out"
+contains 'list Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c' "$dl_log"
+contains '"repo": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"' "$modeldir/.colibri-download.json"
+contains 'Removed the replaced catalog model, Qwen3-Coder-30B-A3B (19.4 GB).' "$tmp_root/out"
+contains 'Colibri now serves Qwen3.6-35B-A3B' "$tmp_root/out"
+[[ ! -e $modeldir/.colibri-staging && ! -e $modeldir/.colibri-publishing ]] || fail '--model left staging behind'
+grep -q '^make ' "$log" && fail '--model rebuilt the engines'
+[[ $(grep -n 'systemctl stop' "$log" | head -1 | cut -d: -f1) -gt $(grep -n 'runuser' "$log" | head -1 | cut -d: -f1) ]] ||
+    fail 'the service stopped before the new model was downloaded'
+pass '--model downloads beside the served model, swaps it in, and deletes the replaced download'
+
+# The same model again, or keep, changes nothing.
+: > "$log"; : > "$dl_log"
+rt COLIBRI_MODEL_ID=qwen36-35b -- --model > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model with the served ID'; }
+rt COLIBRI_MODEL_ID=keep -- --model >> "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model keep'; }
+rt -- --model >> "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model unattended without an ID'; }
+[[ $(grep -c 'The served model stays as it is.' "$tmp_root/out") == 3 ]] || { cat "$tmp_root/out"; fail '--model keep did not keep'; }
+[[ ! -s $dl_log ]] && ! grep -q 'systemctl stop' "$log" || fail '--model keep touched the model or the service'
+pass '--model with the served ID, keep, or no answer changes nothing'
+
+# A new model that does not come up is swapped back out.
+: > "$log"; : > "$dl_log"
+if rt FAKE_UNHEALTHY_REPO=Justvugg/Qwen3-Coder COLIBRI_MODEL_ID=qwen3-coder-30b -- --model > "$tmp_root/out" 2>&1; then
+    fail '--model reported success for a model that never answered'
+fi
+contains 'did not come up; putting the previous model back' "$tmp_root/out"
+contains 'the previous model is back' "$tmp_root/out"
+contains '"repo": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"' "$modeldir/.colibri-download.json"
+[[ -f $coder_stage/.colibri-download.json ]] || fail 'the failed model'"'"'s download was not kept to try again'
+[[ ! -e $modeldir/.colibri-publishing ]] || fail 'the restore left a publication marker'
+pass '--model puts the previous model back when the new one does not answer, keeping the download'
+
+# A crash in the middle of the retire phase: the next run finishes the swap.
+mkdir -p "$modeldir/.colibri-staging/retired-1"
+mv "$modeldir/config.json" "$modeldir/.colibri-staging/retired-1/"
+printf 'retire %s retired-1\n' "${coder_stage##*/}" > "$modeldir/.colibri-publishing"
+: > "$log"
+rt COLIBRI_MODEL_ID=keep -- --model > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model after an interrupted swap'; }
+contains 'Finished an interrupted model publication' "$tmp_root/out"
+contains '"repo": "Justvugg/Qwen3-Coder-30B-A3B-colibri-int4"' "$modeldir/.colibri-download.json"
+[[ ! -e $modeldir/.colibri-staging ]] || fail 'the replaced model was not removed once the new one answered'
+pass 'an interrupted swap is finished, and the replaced model removed once the served one answers'
+
+# A crash after the files moved but before health validation must also be
+# recoverable by a plain upgrade. An unhealthy new model returns to its stage.
+mkdir -p "$qwen_stage" "$modeldir/.colibri-staging/retired-2"
+printf '{"repo": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64", "revision": "c619aa594ad1e70af82168fb6b4878427896e21c"}\n' > "$qwen_stage/.colibri-download.json"
+: > "$qwen_stage/config.json"; : > "$qwen_stage/model-00000.safetensors"
+find "$modeldir" -mindepth 1 -maxdepth 1 ! -name .colibri-staging -exec mv -t "$modeldir/.colibri-staging/retired-2" -- {} +
+find "$qwen_stage" -mindepth 1 -maxdepth 1 -exec mv -t "$modeldir" -- {} +
+rmdir "$qwen_stage"
+printf 'validate %s retired-2 forward\n' "${qwen_stage##*/}" > "$modeldir/.colibri-publishing"
+sh "$launcher" | grep -q '^coli ' || fail 'the launcher parked during model validation'
+: > "$log"; : > "$dl_log"
+if rt FAKE_UNHEALTHY_REPO=Kreuzzelg/qwen36 "$(at_head)" -- --upgrade > "$tmp_root/out" 2>&1; then
+    fail 'an unhealthy pending model switch was accepted by a plain upgrade'
+fi
+contains 'the previous model is back' "$tmp_root/out"
+contains '"repo": "Justvugg/Qwen3-Coder-30B-A3B-colibri-int4"' "$modeldir/.colibri-download.json"
+[[ -f $qwen_stage/.colibri-download.json && ! -e $modeldir/.colibri-publishing ]] ||
+    fail 'a plain upgrade did not restore the old model and keep the failed download'
+[[ ! -s $dl_log ]] || fail 'a plain upgrade downloaded the failed model again'
+grep -q '^make ' "$log" && fail 'a failed model switch rebuilt the runtime'
+pass 'a plain upgrade rolls back an unhealthy model after an interrupted validation'
+
+# The same pending switch with a healthy model finalizes the old files.
+mkdir -p "$modeldir/.colibri-staging/retired-3"
+find "$modeldir" -mindepth 1 -maxdepth 1 ! -name .colibri-staging -exec mv -t "$modeldir/.colibri-staging/retired-3" -- {} +
+find "$qwen_stage" -mindepth 1 -maxdepth 1 -exec mv -t "$modeldir" -- {} +
+rmdir "$qwen_stage"
+printf 'validate %s retired-3 forward\n' "${qwen_stage##*/}" > "$modeldir/.colibri-publishing"
+: > "$log"; : > "$dl_log"
+rt "$(at_head)" -- --upgrade > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a healthy pending model switch on a plain upgrade'; }
+contains '"repo": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"' "$modeldir/.colibri-download.json"
+[[ ! -e $modeldir/.colibri-publishing && ! -e $modeldir/.colibri-staging ]] ||
+    fail 'a plain upgrade left a validated model switch unfinished'
+[[ ! -s $dl_log ]] || fail 'a plain upgrade downloaded the validated model again'
+grep -q '^make ' "$log" && fail 'a healthy model switch rebuilt the runtime'
+pass 'a plain upgrade finalizes a healthy model after an interrupted validation'
+
+# Previous installers could clear the marker before validation. A lone retired
+# model still gives a plain upgrade enough information to reverse that switch.
+mkdir -p "$coder_stage" "$modeldir/.colibri-staging/retired-4"
+printf '{"repo": "Justvugg/Qwen3-Coder-30B-A3B-colibri-int4", "revision": "d839110a17d31b4e6fa9f3d973b751f779b6b9c6"}\n' > "$coder_stage/.colibri-download.json"
+: > "$coder_stage/config.json"; : > "$coder_stage/model-00000.safetensors"
+find "$modeldir" -mindepth 1 -maxdepth 1 ! -name .colibri-staging -exec mv -t "$modeldir/.colibri-staging/retired-4" -- {} +
+find "$coder_stage" -mindepth 1 -maxdepth 1 -exec mv -t "$modeldir" -- {} +
+rmdir "$coder_stage"
+: > "$log"; : > "$dl_log"
+if rt FAKE_UNHEALTHY_REPO=Justvugg/Qwen3-Coder "$(at_head)" -- --upgrade > "$tmp_root/out" 2>&1; then
+    fail 'an unmarked unhealthy switch was accepted by a plain upgrade'
+fi
+contains 'the previous model is back' "$tmp_root/out"
+contains '"repo": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"' "$modeldir/.colibri-download.json"
+[[ -f $coder_stage/.colibri-download.json && ! -e $modeldir/.colibri-publishing ]] ||
+    fail 'an unmarked model switch did not restore the old model'
+[[ ! -s $dl_log ]] || fail 'an unmarked model switch downloaded again'
+pass 'a plain upgrade restores the old model when an earlier installer cleared the marker too soon'
+
+# remove parks the service; a model placed by hand is kept, not deleted.
+: > "$log"
+rt COLIBRI_MODEL_ID=remove -- --model > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model remove'; }
+[[ -z $(find "$modeldir" -mindepth 1 -print -quit) ]] || fail 'remove left files in the model directory'
+contains 'The model was removed' "$tmp_root/out"
+: > "$modeldir/weights.bin"
+rt COLIBRI_MODEL_ID=remove -- --model > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail '--model remove of a hand-placed model'; }
+contains 'it is kept in' "$tmp_root/out"
+compgen -G "$tree/var/lib/colibri/model-replaced-*/weights.bin" >/dev/null || fail 'a hand-placed model was not kept'
+pass '--model remove deletes a catalog download, keeps a hand-placed model aside, and parks'
+
+# A model with a post-download step (Kimi K3's tokenizer.json from colibri's
+# tools/k3_tokenizer.py) runs it as the service account before publishing.
+mkdir -p "$tree/opt/colibri/libexec/colibri/tools"
+printf 'import pathlib, sys\npathlib.Path(sys.argv[1], "tokenizer.json").write_text("{}")\n' \
+    > "$tree/opt/colibri/libexec/colibri/tools/k3_tokenizer.py"
+: > "$log"
+rt FAKE_DF_FREE=2000000000000 COLIBRI_MODEL_ID=kimi-k3 -- --model > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail '--model kimi-k3'; }
+contains 'Writing tokenizer.json for Kimi K3' "$tmp_root/out"
+[[ -f $modeldir/tokenizer.json ]] || fail 'the post-download step did not run before publishing'
+contains 'moonshotai/Kimi-K3@f831ab66814297da540d832a5235f8e904f29d06' "$dl_log"
+pass 'a model with a post-download step gets it before it is published'
+
+# Too large for the CT: refused before anything changes.
+if rt FAKE_DF_FREE=50000000000 COLIBRI_MODEL_ID=glm-5.2 -- --model > "$tmp_root/out" 2>&1; then fail 'a model larger than the disk was accepted'; fi
+contains 'glm-5.2 does not fit this CT: needs 429.3 GB disk' "$tmp_root/out"
+if rt COLIBRI_MODEL_ID=inkling -- --model > "$tmp_root/out" 2>&1; then fail 'a model larger than the RAM was accepted'; fi
+contains 'needs 120 GiB RAM' "$tmp_root/out"
+if rt COLIBRI_MODEL_ID=remove COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1; then fail 'remove was accepted without --model'; fi
+pass '--model refuses a model the RAM or disk cannot hold, and remove needs --model'
 
 printf '%s Colibri upgrade cases passed. No system files, packages or services were touched.\n' "$passed"

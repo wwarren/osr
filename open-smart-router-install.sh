@@ -1217,10 +1217,16 @@ prompt_colibri_model() {
   vendor="$(target_gpu_result colibri vendor)"
   case $vendor in nvidia) backend=cuda ;; amd|intel) backend=vulkan ;; esac
   if [[ ${COLIBRI_BACKEND:-} == cpu ]]; then backend=cpu; fi
-  local interactive=true
+  local interactive=true rootfs="${COLIBRI_ROOTFS_GB:-160}"
   [[ ${NONINTERACTIVE:-false} != true ]] || interactive=false
+  [[ $rootfs =~ ^[0-9]+$ ]] || rootfs=160
+  # The menu of colibri's text models, each marked with whether it fits the
+  # CT's RAM and its root disk (less about 10 GiB for the system and engines).
+  echo
+  echo "--- Colibri model ---"
   colibri_choose_model "${COLIBRI_MEMORY_MB:-65536}" "$backend" \
-    "${COLIBRI_MODEL_DIR:-/var/lib/colibri/model}" "$interactive"
+    "${COLIBRI_MODEL_DIR:-/var/lib/colibri/model}" "$interactive" \
+    "$(( (rootfs > 10 ? rootfs - 10 : 0) * 1073741824 ))"
 }
 
 # prompt_target_gpus: for each selected target that runs on AMD Radeon or Intel

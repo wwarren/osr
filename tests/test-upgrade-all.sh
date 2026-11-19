@@ -119,7 +119,9 @@ printf '%s %s\n' "${OSR_MOCK_NODE:-pve1}" "$*" >> "$MOCK/pct.log"
 cmd=$1 id=${2:-}
 case $cmd in
     status) if [[ -e $MOCK/$id.stopped ]]; then echo 'status: stopped'; else echo 'status: running'; fi ;;
-    config) printf 'hostname: ct%s\nnet0: name=eth0,bridge=vmbr0,ip=10.0.0.%s/24,gw=10.0.0.1\n' "$id" "$((id % 250))" ;;
+    config) printf 'hostname: ct%s\nnet0: name=eth0,bridge=vmbr0,ip=10.0.0.%s/24,gw=10.0.0.1\n' "$id" "$((id % 250))"
+            # <id>.memory: the CT's memory line (Colibri's model menu reads it).
+            [[ ! -e $MOCK/$id.memory ]] || printf 'memory: %s\n' "$(cat "$MOCK/$id.memory")" ;;
     snapshot) [[ ! -e $MOCK/$id.nosnap ]] || exit 1 ;;
     delsnapshot|stop|start) : ;;
     rollback) cp "$MOCK/$id.state.orig" "$MOCK/$id.state" ;;
@@ -200,6 +202,9 @@ case $cmd in
                 fi
                 echo 'mqtts://broker.lan:8883' ;;
             test) [[ -e $MOCK/$id.tls ]] ;;
+            # A Colibri CT's download manifest (<id>.manifest) and free disk.
+            cat) [[ -e $MOCK/$id.manifest ]] || exit 1; cat "$MOCK/$id.manifest" ;;
+            df) printf 'Filesystem 1B-blocks Used Available Use%% Mounted\nfake 0 0 900000000000 0%% /\n' ;;
             # FreeLLMAPI's /api/ping probe (node in its image): <id>.ping answers.
             node) [[ $3 == *'/api/ping'* && -e $MOCK/$id.ping ]]; exit ;;
             grep) [[ -e $MOCK/$id.webui-api ]] || exit 1 ;;
@@ -1368,5 +1373,36 @@ assert_eq 'a lock that cannot be created stops the run' 1 "$rc"
 assert_contains 'saying the cluster filesystem would not take it' 'Cannot create the cluster lock' "$out"
 assert_contains 'and how to check quorum' 'pvecm status' "$out"
 assert_not_contains 'not blaming another run' 'Another upgrade-all.sh holds' "$out"
+
+describe 'a Colibri CT can change its model after its upgrade'
+colibri_ct() {
+    reset_mock
+    conf 270 'ai;ai-model;osr-target;colibri'; state 270 colibri
+    echo 65536 > "$tmp/mock/270.memory"
+    printf '{"repo": "Justvugg/Qwen3-Coder-30B-A3B-colibri-int4", "revision": "d839110a17d31b4e6fa9f3d973b751f779b6b9c6", "complete": true}\n' \
+        > "$tmp/mock/270.manifest"
+}
+colibri_ct
+run_tool 'y\nglm-5.3\ny\n' --only colibri --pinned
+assert_eq 'the run succeeds' 0 "$rc"
+assert_contains 'it names the served model' 'Colibri CT 270 serves Qwen3-Coder-30B-A3B (19.4 GB)' "$out"
+assert_contains 'the menu shows what fits' 'glm-5.3                 GLM-5.3                        419.3 GB  RAM  16- 24 GiB  fits' "$out"
+assert_contains 'the plan names the model change' 'then install-target.sh --model: serve GLM-5.3 (419.3 GB)' "$out"
+install_lines=$(grep '^INSTALL 270 ' "$tmp/mock/installs.log")
+assert_contains 'the upgrade runs first' 'bash /root/colibri-target-deploy/install-target.sh --upgrade' "$install_lines"
+assert_contains 'then the model change' 'NONINTERACTIVE=true COLIBRI_MODEL_ID=glm-5.3 bash /root/colibri-target-deploy/install-target.sh --model' "$install_lines"
+assert_eq 'in that order' '--upgrade --model' "$(sed -n 's/.*install-target.sh \(--[a-z]*\)$/\1/p' <<< "$install_lines" | paste -sd' ')"
+assert_eq 'reported as upgraded' upgraded "$(summary_line colibri 270)"
+colibri_ct
+run_tool 'n\ny\n' --only colibri --pinned
+assert_eq 'keeping the model succeeds' 0 "$rc"
+assert_not_contains 'no model change without a yes' 'install-target.sh --model' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
+colibri_ct
+run_tool '' --only colibri --pinned --yes
+assert_not_contains 'an unattended run never asks' 'Serve another model' "$out"
+assert_not_contains 'nor changes the model' 'install-target.sh --model' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
+colibri_ct
+run_tool 'y\n' --only colibri --pinned --dry-run
+assert_contains 'a dry run only says it would ask' 'without --dry-run, a run asks whether to change it' "$out"
 
 summary

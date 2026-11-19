@@ -456,12 +456,24 @@ cp "$HERE/../targets/colibri/model-select.sh" "$TARGETS_DIR/colibri/model-select
 TARGETS=colibri COLIBRI_MEMORY_MB=12288 GPU_RESULT_COLIBRI='ready|nvidia||0|0000:01:00.0'
 COLIBRI_MODEL_ID=''
 _out="$(mktemp)"
-prompt_colibri_model > "$_out" 2>&1 <<< 'y'
-assert_eq "GPU and 12 GiB suggest the general model" qwen36-35b "$COLIBRI_MODEL_ID"
-assert_contains "the download size and destination are shown" '23.1 GB' "$(cat "$_out")"
+prompt_colibri_model > "$_out" 2>&1 <<< ''
+assert_eq "Enter downloads nothing" '' "$COLIBRI_MODEL_ID"
+assert_contains "GPU and 12 GiB suggest the general model" '23.1 GB  RAM  10- 20 GiB  fits (suggested)' "$(cat "$_out")"
+assert_contains "the whole text catalog is listed" 'kimi-k3                 Kimi K3' "$(cat "$_out")"
+assert_contains "a model needing more RAM is marked" 'needs 16 GiB RAM' "$(cat "$_out")"
+COLIBRI_MODEL_ID=''
+prompt_colibri_model > "$_out" 2>&1 <<< '2'
+assert_eq "a number picks that model" qwen36-35b "$COLIBRI_MODEL_ID"
 COLIBRI_MODEL_ID=''; GPU_RESULT_COLIBRI='declined||||'
-prompt_colibri_model > "$_out" 2>&1 <<< 'y'
-assert_eq "CPU and 12 GiB suggest the coding model" qwen3-coder-30b "$COLIBRI_MODEL_ID"
+prompt_colibri_model > "$_out" 2>&1 <<< $'4\nqwen3-coder-30b'
+assert_eq "an ID picks that model" qwen3-coder-30b "$COLIBRI_MODEL_ID"
+assert_contains "CPU and 12 GiB suggest the coding model" '19.4 GB  RAM   8- 18 GiB  fits (suggested)' "$(cat "$_out")"
+assert_contains "a model that does not fit is refused" 'deepseek-v4-flash does not fit this CT' "$(cat "$_out")"
+COLIBRI_MODEL_ID=''; COLIBRI_ROOTFS_GB=500 COLIBRI_MEMORY_MB=65536
+prompt_colibri_model > "$_out" 2>&1 <<< 'glm-5.3'
+assert_eq "a larger root disk takes a larger model" glm-5.3 "$COLIBRI_MODEL_ID"
+assert_contains "a model larger than the root disk is marked" 'needs 563.6 GB disk' "$(cat "$_out")"
+unset COLIBRI_ROOTFS_GB
 COLIBRI_MODEL_ID=''; NONINTERACTIVE=true
 prompt_colibri_model </dev/null >/dev/null 2>&1
 assert_eq "unattended setup does not download" '' "$COLIBRI_MODEL_ID"

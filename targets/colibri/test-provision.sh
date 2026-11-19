@@ -198,10 +198,19 @@ has 'Qwen3.6-35B-A3B (23.1 GB) from Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64'
 has 'COLIBRI_MODEL_ID=qwen36-35b'
 plan COLIBRI_MODEL_ID=qwen3-coder-30b MEMORY_MB=8192 GPU_DEVICES=
 has 'Qwen3-Coder-30B-A3B (19.4 GB)'
-reject 'needs at least 10240 MiB' COLIBRI_MODEL_ID=qwen36-35b MEMORY_MB=8192
+reject 'qwen36-35b does not fit this CT: needs 10 GiB RAM' COLIBRI_MODEL_ID=qwen36-35b MEMORY_MB=8192
+# The model goes on the root disk: a model larger than it is refused, a larger
+# root disk takes it. Every catalog ID is accepted where it fits.
+reject 'glm-5.2 does not fit this CT: needs 429.3 GB disk' COLIBRI_MODEL_ID=glm-5.2
+plan COLIBRI_MODEL_ID=glm-5.3 ROOTFS_GB=500
+has 'GLM-5.3 (419.3 GB) from Justvugg/GLM-5.3-colibri-int4-g64'
+plan COLIBRI_MODEL_ID=kimi-k3 ROOTFS_GB=1700
+has 'Kimi K3 (1561.0 GB) from moonshotai/Kimi-K3'
+reject 'inkling does not fit this CT: needs 120 GiB RAM' COLIBRI_MODEL_ID=inkling ROOTFS_GB=600
+reject 'COLIBRI_MODEL_ID=remove only applies to an installed CT' COLIBRI_MODEL_ID=remove
 # Unattended with no ID: a suggestion and how to opt in, nothing downloaded.
 plan
-has 'Colibri suggestion for 65536 MiB RAM'; has 'set COLIBRI_MODEL_ID=qwen36-35b to download it'
+has 'Colibri suggestion for 65536 MiB RAM'; has 'set COLIBRI_MODEL_ID=qwen36-35b (or another ID of model-select.sh)'
 # none is the OSR installer's answer already given: nothing suggested again.
 plan COLIBRI_MODEL_ID=none
 lacks 'Colibri suggestion'; has 'COLIBRI_MODEL_ID= '; has 'none is downloaded'
@@ -275,6 +284,83 @@ passed=$((passed + 1))
 output=$(env -i "PATH=$PATH" COLIBRI_BACKEND=metal bash "$guest" --dry-run 2>&1) && {
     printf 'FAIL accepted COLIBRI_BACKEND=metal\n' >&2; exit 1; }
 has 'COLIBRI_BACKEND must be auto, cpu, vulkan or cuda'
+passed=$((passed + 1))
+
+# --- --reconfigure: an existing CT, read through a fake pct ------------------
+# FAKE_MANIFEST is the served model's download manifest (none: nothing served),
+# FAKE_FREE the free bytes on its filesystem; FAKE_STAGED a resumable download.
+cat > "$fake/bin/pct" <<'PCT'
+#!/usr/bin/env bash
+case "$1 $*" in
+    status*) [[ ${FAKE_CT:-running} == missing ]] && exit 2; echo "status: ${FAKE_CT:-running}" ;;
+    config*) printf 'arch: amd64\nmemory: %s\nrootfs: local-lvm:vm-280-disk-0,size=160G\n' "${FAKE_MEMORY:-65536}"
+             [[ ${FAKE_GPU_LINE:-nvidia} != nvidia ]] || printf 'dev0: path=/dev/nvidia0,gid=44,mode=0660\n'
+             [[ ${FAKE_GPU_LINE:-} != amd ]] || printf 'dev0: path=/dev/dri/renderD128,gid=44,mode=0660\n' ;;
+    *' test -x /opt/colibri/bin/coli') [[ ${FAKE_INSTALLED:-1} == 1 ]] ;;
+    *installed-env) echo /srv/models/colibri ;;  # the value sed prints in the CT
+    *' df -PB1 '*) printf 'Filesystem 1B-blocks Used Available Use%% Mounted\nfake 0 0 %s 0%% /\n' "${FAKE_FREE:-200000000000}" ;;
+    *'.colibri-staging'*) [[ ${FAKE_STAGED:-0} == 0 ]] || printf '%s /srv/models/colibri/.colibri-staging/partial\n' "$FAKE_STAGED" ;;
+    *' cat '*) [[ ${FAKE_MANIFEST:-none} != none ]] || exit 1
+               printf '{"repo": "%s", "revision": "%s", "complete": true}\n' "${FAKE_MANIFEST%@*}" "${FAKE_MANIFEST#*@}" ;;
+    *' find '*) [[ ${FAKE_HAND:-0} == 0 ]] || echo /srv/models/colibri/weights.bin ;;
+    *) echo "unexpected pct $*" >&2; exit 9 ;;
+esac
+PCT
+chmod +x "$fake/bin/pct"
+coder=Justvugg/Qwen3-Coder-30B-A3B-colibri-int4@d839110a17d31b4e6fa9f3d973b751f779b6b9c6
+reconf() {
+    output=$(env -i "PATH=$fake/bin:$PATH" CT_ID=280 "$@" bash "$provision" --reconfigure --dry-run 2>&1) || {
+        printf 'FAIL reconfigure plan\n%s\n' "$output" >&2; exit 1; }
+    passed=$((passed + 1))
+}
+reconf_reject() {
+    local reason=$1; shift
+    if output=$(env -i "PATH=$fake/bin:$PATH" CT_ID=280 "$@" bash "$provision" --reconfigure --dry-run 2>&1); then
+        printf 'FAIL reconfigure accepted\n%s\n' "$output" >&2; exit 1
+    fi
+    has "$reason"; lacks '+ pct push'
+    passed=$((passed + 1))
+}
+reconf FAKE_MANIFEST=$coder COLIBRI_MODEL_ID=glm-5.3 FAKE_FREE=600000000000
+has 'Colibri: change the model of CT 280'; has '65536 MiB, cuda, 598 GB free for the model'
+has 'Served now                 Qwen3-Coder-30B-A3B (19.4 GB) in /srv/models/colibri'
+has 'serve GLM-5.3 (419.3 GB from Justvugg/GLM-5.3-colibri-int4-g64@3930f4bb756e)'
+has '/root/colibri-target-deploy/model-select.sh --perms 0644'
+has 'env NONINTERACTIVE=true COLIBRI_MODEL_ID=glm-5.3 bash /root/colibri-target-deploy/install-target.sh --model'
+lacks '+ pct create'
+reconf FAKE_MANIFEST=$coder COLIBRI_MODEL_ID=qwen3-coder-30b
+has 'Nothing to change.'; lacks '+ pct push'
+reconf FAKE_MANIFEST=$coder COLIBRI_MODEL_ID=keep
+has 'Nothing to change.'
+reconf FAKE_MANIFEST=$coder
+has 'Nothing to change.'; lacks 'Colibri suggestion'
+reconf FAKE_HAND=1 COLIBRI_MODEL_ID=remove FAKE_GPU_LINE=amd
+has 'a model placed by hand in /srv/models/colibri'; has 'vulkan'; has 'COLIBRI_MODEL_ID=remove'
+reconf FAKE_MANIFEST=other/repo@0123456789012345678901234567890123456789 COLIBRI_MODEL_ID=qwen36-35b FAKE_GPU_LINE=cpu
+has 'a downloaded model not in this catalog'; has '65536 MiB, cpu'
+reconf COLIBRI_MODEL_ID=remove
+has 'Nothing to change.'
+reconf_reject 'glm-5.2 does not fit this CT: needs 429.3 GB disk' COLIBRI_MODEL_ID=glm-5.2
+reconf_reject 'qwen36-35b does not fit this CT' COLIBRI_MODEL_ID=qwen36-35b FAKE_FREE=10000000000
+reconf COLIBRI_MODEL_ID=qwen36-35b FAKE_FREE=10000000000 FAKE_STAGED=15000000000
+has 'serve Qwen3.6-35B-A3B'; has '23 GB free for the model'
+reconf_reject 'needs 32 GiB RAM' COLIBRI_MODEL_ID=mimo-v2.6-flash FAKE_MEMORY=16384 FAKE_FREE=900000000000
+reconf_reject 'CT 280 is not running' FAKE_CT=stopped COLIBRI_MODEL_ID=qwen36-35b
+reconf_reject 'CT 280 has no Colibri installation' FAKE_INSTALLED=0 COLIBRI_MODEL_ID=qwen36-35b
+reconf_reject 'COLIBRI_MODEL_ID must be one of' COLIBRI_MODEL_ID=bogus
+
+# The menu: numbers, IDs, fit refusals and Enter (driven through model-select.sh).
+menu_out=$( (source "$here/model-select.sh"; COLIBRI_MODEL_ID=''
+    colibri_choose_model 65536 cuda /m true 200000000000 qwen3-coder-30b <<< $'8\nnope\n3'
+    printf 'chosen=%s\n' "$COLIBRI_MODEL_ID") 2>&1)
+output=$menu_out
+has 'r) remove it'; has '0) keep the current model: Qwen3-Coder-30B-A3B (19.4 GB)'
+has 'glm-5.2 does not fit this CT: needs 429.3 GB disk. Pick another'
+has 'Answer a number from the list'; has 'chosen=deepseek-v4-flash-reap'
+has '1) qwen3-coder-30b         Qwen3-Coder-30B-A3B             19.4 GB  RAM   8- 18 GiB  fits (current)'
+output=$( (source "$here/model-select.sh"; COLIBRI_MODEL_ID=''
+    colibri_choose_model 8192 cpu /m true '' '' <<< ''; printf 'chosen=[%s]\n' "$COLIBRI_MODEL_ID") 2>&1)
+has '0) none: download nothing'; has 'chosen=[]'; has 'qwen3-coder-30b         Qwen3-Coder-30B-A3B             19.4 GB  RAM   8- 18 GiB  fits (suggested)'
 passed=$((passed + 1))
 
 # --- the unit file ------------------------------------------------------------

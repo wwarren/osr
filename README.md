@@ -307,7 +307,7 @@ settings and recovery steps.
 | [Xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | NVIDIA 24 GB; ~372 GB of pinned weights |
 | [Avalon](targets/avalon/README.md) | `avalon://` | 8080 | AMD RX 7000 (ROCm) or NVIDIA, experts in RAM; ~90 GiB of pinned weights |
 | [Kindi](targets/kindi/README.md) | `kindi://` | 8093 | Old or small NVIDIA (from a 1 GB Kepler) or CPU; one request at a time |
-| [Colibri](targets/colibri/README.md) | `colibri://` | 8080 | Large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); optional model download after a prompt |
+| [Colibri](targets/colibri/README.md) | `colibri://` | 8080 | Large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); a menu of colibri's 11 pinned text models (what fits the CT marked), changeable later with `provision-lxc.sh --reconfigure` |
 
 Services and companions use separate CTs and stay out of the model pool:
 
@@ -904,7 +904,7 @@ settings or rollback changes:
 |---|---|---|
 | Router | `update-router-services.sh --host --no-push`, pushed once checks pass | Updater never touches `env/*.env`, tiers, `litellm_config.yaml`, ini files or secrets |
 | Open WebUI | `set-webui-version <pin> --apply` (never a downgrade) | `apply`'s snapshot and `webui.db` backup |
-| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say) | Each target's settings record or env files |
+| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say). An interactive run asks for each Colibri CT whether to serve another model afterwards (default no); a yes shows the model menu and runs `install-target.sh --model` after its upgrade | Each target's settings record or env files; the served Colibri model unless another is chosen |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request); then its Open WebUI connection is enabled for all users (needs the admin token; skipped without it) | Its recorded port, passed back; workspace limits kept by the installer; `OPEN_TERMINAL_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true`. Honcho's Open WebUI connection is enabled for all users | Recorded answers; an Open WebUI admin key is requested once when needed; `HONCHO_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
