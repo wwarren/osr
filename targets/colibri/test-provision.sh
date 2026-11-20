@@ -202,6 +202,9 @@ reject 'qwen36-35b does not fit this CT: needs 10 GiB RAM' COLIBRI_MODEL_ID=qwen
 # The model goes on the root disk: a model larger than it is refused, a larger
 # root disk takes it. Every catalog ID is accepted where it fits.
 reject 'glm-5.2 does not fit this CT: needs 429.3 GB disk' COLIBRI_MODEL_ID=glm-5.2
+plan COLIBRI_MODEL_ID=qwen-image-2.1
+has 'Qwen-Image-2.1 (33.1 GB) from Qwen/Qwen-Image-2.1'; has 'It draws pictures (POST /v1/images/generations)'
+has 'webui-images.sh --expect-model qwen-image-2.1-colibri'
 plan COLIBRI_MODEL_ID=glm-5.3 ROOTFS_GB=500
 has 'GLM-5.3 (419.3 GB) from Justvugg/GLM-5.3-colibri-int4-g64'
 plan COLIBRI_MODEL_ID=kimi-k3 ROOTFS_GB=1700
@@ -340,6 +343,9 @@ reconf FAKE_MANIFEST=other/repo@0123456789012345678901234567890123456789 COLIBRI
 has 'a downloaded model not in this catalog'; has '65536 MiB, cpu'
 reconf COLIBRI_MODEL_ID=remove
 has 'Nothing to change.'
+reconf FAKE_MANIFEST=$coder COLIBRI_MODEL_ID=qwen-image-2.1
+has 'serve Qwen-Image-2.1 (33.1 GB'; has 'the router lists it as qwen-image-2.1-colibri'
+has 'tools/webui-images.sh --expect-model qwen-image-2.1-colibri'
 reconf_reject 'glm-5.2 does not fit this CT: needs 429.3 GB disk' COLIBRI_MODEL_ID=glm-5.2
 reconf_reject 'qwen36-35b does not fit this CT' COLIBRI_MODEL_ID=qwen36-35b FAKE_FREE=10000000000
 reconf COLIBRI_MODEL_ID=qwen36-35b FAKE_FREE=10000000000 FAKE_STAGED=15000000000
@@ -358,9 +364,36 @@ has 'r) remove it'; has '0) keep the current model: Qwen3-Coder-30B-A3B (19.4 GB
 has 'glm-5.2 does not fit this CT: needs 429.3 GB disk. Pick another'
 has 'Answer a number from the list'; has 'chosen=deepseek-v4-flash-reap'
 has '1) qwen3-coder-30b         Qwen3-Coder-30B-A3B             19.4 GB  RAM   8- 18 GiB  fits (current)'
+has '12) qwen-image-2.1'
 output=$( (source "$here/model-select.sh"; COLIBRI_MODEL_ID=''
     colibri_choose_model 8192 cpu /m true '' '' <<< ''; printf 'chosen=[%s]\n' "$COLIBRI_MODEL_ID") 2>&1)
-has '0) none: download nothing'; has 'chosen=[]'; has 'qwen3-coder-30b         Qwen3-Coder-30B-A3B             19.4 GB  RAM   8- 18 GiB  fits (suggested)'
+has '0) none: download nothing'; has 'chosen=[]'
+has 'qwen3-coder-30b         Qwen3-Coder-30B-A3B             19.4 GB  RAM   8- 18 GiB  fits, tight (best with 18 GiB) (suggested)'
+# The menu is grouped by type, with a suggestion in each group the CT can run.
+has 'Chat, runs from RAM'; has 'Chat, large: the dense part stays in RAM'
+has 'Images: text to picture on POST /v1/images/generations, not chat; on this CT the CPU draws them'
+has 'qwen-image-2.1          Qwen-Image-2.1                  33.1 GB  RAM  12- 18 GiB  needs 12 GiB RAM; non-commercial licence'
+output=$( (source "$here/model-select.sh"; colibri_model_menu 65536 cuda 400000000000 '') 2>&1)
+has 'on this CT the CPU draws them (colibri'"'"'s image engine has no CUDA lane)'
+has 'qwen-image-2.1          Qwen-Image-2.1                  33.1 GB  RAM  12- 18 GiB  fits (suggested); CPU only here (no CUDA lane); non-commercial licence'
+has 'mimo-v2.6-flash         MiMo-V2.6 Flash                171.8 GB  RAM  32- 52 GiB  fits; CPU only here (no CUDA lane)'
+has 'glm-5.3                 GLM-5.3                        419.3 GB  RAM  16- 24 GiB  needs 419.3 GB disk'
+output=$( (source "$here/model-select.sh"; colibri_model_menu 16384 vulkan 200000000000 '') 2>&1)
+has 'on this CT the GPU draws them (Vulkan)'
+has 'qwen-image-2.1          Qwen-Image-2.1                  33.1 GB  RAM  12- 18 GiB  fits, tight (best with 18 GiB) (suggested)'
+# Suggestions per group: the most capable that runs well, a GPU lane first.
+sug() { (source "$here/model-select.sh"; colibri_model_suggest "$@"); }
+[[ $(sug chat-ram 65536 cpu 400000000000) == qwen36-35b ]] || { echo 'FAIL chat-ram suggestion' >&2; exit 1; }
+[[ $(sug chat-ram 65536 cpu 21000000000) == qwen3-coder-30b ]] || { echo 'FAIL chat-ram suggestion on a small disk' >&2; exit 1; }
+[[ $(sug chat-disk 65536 cuda 150000000000) == deepseek-v4-flash-reap ]] || { echo 'FAIL chat-disk on 150 GB' >&2; exit 1; }
+[[ $(sug chat-disk 65536 cuda 450000000000) == glm-5.3 ]] || { echo 'FAIL chat-disk with CUDA' >&2; exit 1; }
+[[ $(sug chat-disk 65536 vulkan 600000000000) == mimo-v2.6-pro ]] || { echo 'FAIL chat-disk with Vulkan' >&2; exit 1; }
+[[ $(sug chat-disk 16384 cpu 200000000000) == deepseek-v4-flash-reap ]] || { echo 'FAIL tight chat-disk takes the smallest' >&2; exit 1; }
+[[ -z $(sug chat-disk 8192 cpu 200000000000) ]] || { echo 'FAIL chat-disk suggested without the RAM' >&2; exit 1; }
+[[ $(sug image 16384 cpu 200000000000) == qwen-image-2.1 && -z $(sug image 8192 cpu 200000000000) ]] ||
+    { echo 'FAIL image suggestion' >&2; exit 1; }
+output=$( (source "$here/model-select.sh"; COLIBRI_MODEL_ID=qwen-image-2.1; colibri_choose_model 16384 vulkan /m false 200000000000 && echo "chosen=$COLIBRI_MODEL_ID") 2>&1)
+has 'chosen=qwen-image-2.1'
 passed=$((passed + 1))
 
 # --- the unit file ------------------------------------------------------------

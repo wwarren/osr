@@ -1416,8 +1416,11 @@ def test_colibri_model_capabilities(monkeypatch, entry, offered, tools):
 
     _, entries, error = asyncio.run(fetch())
     assert error is None
-    names = {e["name"]: e for e in entries}
+    names = {e["name"]: e for e in entries if not e.get("is_image")}
     assert (entry["id"] in names) == offered
+    # An image generator is kept apart as an image model; a decision model is dropped.
+    images = [e["name"] for e in entries if e.get("is_image")]
+    assert images == ([entry["id"]] if "image_generation" in entry["capabilities"] else [])
     if offered:
         assert names[entry["id"]]["tools"] is tools
         if entry["id"] == "qwen3-coder-30b-a3b-colibri":
@@ -2977,3 +2980,399 @@ def test_the_number_of_series_is_capped(router, monkeypatch):
     router.count("osr_requests_total", route="r0")           # an existing series still counts
     assert len(router._COUNTERS) == 3 and len(router._HISTOGRAMS) == 3
     assert router._COUNTERS[("osr_requests_total", (("route", "r0"),))] == 2
+
+
+
+# --- image generation ---------------------------------------------------------------
+COLIBRI_IMG = "colibri+http://10.0.0.16:8080"
+COMFY = "http://10.0.0.30:8188"
+KLEIN4 = {"unet_name": "flux-2-klein-4b-fp8.safetensors", "clip_name": "qwen_3_4b.safetensors",
+          "vae_name": "flux2-vae.safetensors"}
+
+
+class ImageUpstream:
+    """A Colibri CT serving Qwen-Image, a ComfyUI CT with Klein 4B, LiteLLM."""
+
+    def __init__(self):
+        self.calls = []
+        self.colibri = 200          # status, or "connect"
+        self.comfy = "ok"           # ok, connect, refuse, error, poll_error
+        self.cancel_status = 200    # POST /api/jobs/p1/cancel (404: a ComfyUI without the jobs API)
+        self.comfy_files = dict(KLEIN4)
+        self.history_polls = 0
+
+    def __call__(self, request):
+        host = f"{request.url.scheme}://{request.url.host}:{request.url.port}"
+        path = request.url.path
+        body = json.loads(request.content) if request.content else None
+        self.calls.append((host, path, body, request.headers.get("authorization")))
+        if host == "http://10.0.0.16:8080":
+            if path == "/v1/models":
+                return httpx.Response(200, json={"data": [
+                    {"id": "qwen-image-2.1-colibri", "owned_by": "colibri",
+                     "capabilities": ["image_generation"]}]})
+            if path == "/v1/images/generations":
+                if self.colibri == "connect":
+                    raise httpx.ConnectError("refused", request=request)
+                if self.colibri != 200:
+                    return httpx.Response(self.colibri, json={"error": {"message": "nope"}})
+                return httpx.Response(200, json={"created": 1, "data": [{"b64_json": "Q09MSUJSSQ==",
+                                                                        "revised_prompt": None}],
+                                                 "colibri": {"seed": 7, "steps": 8}})
+        if host == COMFY:
+            if self.comfy == "connect":
+                raise httpx.ConnectError("refused", request=request)
+            if path == "/system_stats":
+                return httpx.Response(200, json={"system": {"comfyui_version": "0.9.0"}})
+            if path.startswith("/object_info/"):
+                node = path.rsplit("/", 1)[1]
+                key = dict(router_loaders())[node]
+                return httpx.Response(200, json={node: {"input": {"required": {
+                    key: ["COMBO", {"options": [self.comfy_files.get(key, "other.safetensors")]}]}}}})
+            if path == "/prompt":
+                if self.comfy == "refuse":
+                    return httpx.Response(400, json={"error": "bad workflow"})
+                return httpx.Response(200, json={"prompt_id": "p1"})
+            if path == "/history/p1":
+                if self.comfy == "poll_error":
+                    raise httpx.ReadTimeout("slow", request=request)
+                self.history_polls += 1
+                if self.history_polls < 2:
+                    return httpx.Response(200, json={})
+                status = ({"status_str": "error", "completed": False, "messages": ["oom"]}
+                          if self.comfy == "error" else {"status_str": "success", "completed": True})
+                return httpx.Response(200, json={"p1": {"status": status, "outputs": {
+                    "13": {"images": [{"filename": "Flux2-Klein_0001_.png", "subfolder": "",
+                                       "type": "output"}]}}}})
+            if path == "/view":
+                return httpx.Response(200, content=b"PNGDATA")
+            if path == "/api/jobs/p1/cancel":
+                return httpx.Response(self.cancel_status, json={"cancelled": True})
+        if request.url.host == "litellm.test":
+            if path == "/v1/models":
+                return httpx.Response(200, json={"data": [
+                    {"id": "openai/gpt-image-1"}, {"id": "openai/gpt-4.1"},
+                    {"id": "qwen-image-2.1-colibri"}, {"id": "custom/flux-image"}]})
+            if path == "/model/info":
+                return httpx.Response(200, json={"data": [
+                    {"model_name": "custom/flux-image", "model_info": {"mode": "image_generation"}}]})
+            return streamed(200, {"created": 2, "data": [{"url": "https://cloud/x.png"}], "via": "litellm"})
+        return httpx.Response(404)
+
+
+def router_loaders():
+    return (("UNETLoader", "unet_name"), ("CLIPLoader", "clip_name"), ("VAELoader", "vae_name"))
+
+
+@pytest.fixture
+def imaging(monkeypatch):
+    def start(**env):
+        router = load_router(monkeypatch, **{"MODEL_SERVERS": COLIBRI_IMG, "COLIBRI_API_KEY": "colibri-secret",
+                                             "COMFYUI_SERVERS": COMFY, **env})
+        router.COMFYUI_POLL_SECONDS = 0
+        upstream = ImageUpstream()
+        router._HTTP["transport"] = httpx.MockTransport(upstream)
+        return router, upstream
+    return start
+
+
+def test_router_klein_workflows_match_the_comfyui_target(router):
+    for variant, size in (("flux2-klein-4b", "4b"), ("flux2-klein-9b", "9b")):
+        shipped = json.loads((ROOT / f"targets/comfyui/flux2-klein-{size}-api.json").read_text())
+        assert router.COMFYUI_VARIANTS[variant]["workflow"] == shipped
+        loaders = {node["class_type"]: node["inputs"] for node in shipped.values()}
+        assert router.COMFYUI_VARIANTS[variant]["files"] == {
+            "unet_name": loaders["UNETLoader"]["unet_name"], "clip_name": loaders["CLIPLoader"]["clip_name"],
+            "vae_name": loaders["VAELoader"]["vae_name"]}
+
+
+def test_image_models_are_listed_apart_from_chat(imaging):
+    router, upstream = imaging()
+    with TestClient(router.app) as client:
+        chat = [m["id"] for m in client.get("/v1/models").json()["data"]]
+        images = [m["id"] for m in client.get("/v1/images/models").json()["data"]]
+        inventory = client.get("/routing/inventory").json()
+    assert "qwen-image-2.1-colibri" not in chat and "flux2-klein-4b-comfyui" not in chat
+    assert images == ["image", "flux2-klein-4b-comfyui", "qwen-image-2.1-colibri"]
+    assert {(e["name"], e["kind"]) for e in inventory["images"]} == {
+        ("flux2-klein-4b-comfyui", "comfyui"), ("qwen-image-2.1-colibri", "colibri")}
+    assert inventory["image_alias"] == "image"
+    assert inventory["server_status"][COMFY] == {"up": True, "model_count": 0, "image_models": 1}
+    assert inventory["server_status"][COLIBRI_IMG]["image_models"] == 1
+    assert router.INVENTORY["models"] == []
+
+
+def test_down_image_server_is_not_listed(imaging):
+    router, _ = imaging(COMFYUI_SERVERS="")
+    with TestClient(router.app) as client:
+        router.mark_server_down(COLIBRI_IMG, "connection lost")
+        assert client.get("/v1/images/models").json()["data"] == []
+        response = client.post("/v1/images/generations", json={
+            "model": "qwen-image-2.1-colibri", "prompt": "a fox"})
+    assert response.status_code == 503
+
+
+# The second case: an image deployment added to LiteLLM by hand, which the
+# router's CLOUD_*_MODELS does not name.
+@pytest.mark.parametrize("cloud", ["gpt-image-1", ""])
+def test_litellm_fallback_does_not_offer_image_models_for_chat(imaging, cloud):
+    router, _ = imaging(OPENAI_API_KEY="sk-test", CLOUD_OPENAI_MODELS=cloud)
+    with TestClient(router.app) as client:
+        router.INVENTORY = dict(router.INVENTORY, models=[])
+        models = [item["id"] for item in client.get("/v1/models").json()["data"]]
+    assert "openai/gpt-4.1" in models
+    assert "openai/gpt-image-1" not in models
+    assert "qwen-image-2.1-colibri" not in models
+    assert "custom/flux-image" not in models
+
+
+def test_comfyui_without_the_klein_files_offers_nothing(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    upstream.comfy_files = {"unet_name": "flux-2-klein-4b-fp8.safetensors"}
+    with TestClient(router.app) as client:
+        assert client.get("/v1/images/models").json()["data"] == []
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+    assert response.status_code == 503 and response.json()["error"]["code"] == "no_image_server"
+
+
+def test_alias_prefers_comfyui_and_fills_the_klein_workflow(imaging):
+    router, upstream = imaging()
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={
+            "model": "image", "prompt": "a lighthouse", "size": "1000x700", "seed": 42, "steps": 6, "n": 1})
+    assert response.status_code == 200, response.text
+    assert response.headers["x-router-server"] == COMFY
+    assert response.headers["x-router-model"] == "flux2-klein-4b-comfyui"
+    payload = response.json()
+    assert payload["data"][0]["b64_json"] == "UE5HREFUQQ=="
+    assert payload["comfyui"] == {"width": 1008, "height": 704, "seed": 42, "steps": 6}
+    workflow = next(body for host, path, body, _ in upstream.calls if path == "/prompt")["prompt"]
+    assert workflow["4"]["inputs"]["text"] == "a lighthouse"
+    assert workflow["6"]["inputs"] == {"width": 1008, "height": 704, "batch_size": 1}
+    assert workflow["7"]["inputs"] == {"steps": 6, "width": 1008, "height": 704}
+    assert workflow["8"]["inputs"]["noise_seed"] == 42
+    assert workflow["1"]["inputs"]["unet_name"] == KLEIN4["unet_name"]
+    assert not any(path == "/v1/images/generations" for _, path, _, _ in upstream.calls)
+
+
+def test_named_colibri_model_gets_its_own_api_and_key(imaging):
+    router, upstream = imaging()
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={
+            "model": "qwen-image-2.1-colibri", "prompt": "a fox", "size": "500x300", "user": "u1"})
+    assert response.status_code == 200, response.text
+    assert response.json()["colibri"] == {"seed": 7, "steps": 8}
+    assert response.headers["x-router-mode"] == "image"
+    sent = [(body, auth) for host, path, body, auth in upstream.calls if path == "/v1/images/generations"]
+    assert sent == [({"model": "qwen-image-2.1-colibri", "prompt": "a fox", "n": 1,
+                      "response_format": "b64_json", "size": "512x288"}, "Bearer colibri-secret")]
+
+
+def test_colibri_draws_n_images_one_at_a_time(imaging):
+    router, upstream = imaging(COMFYUI_SERVERS="")
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox", "n": 3})
+        too_many = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox", "n": 9})
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 3 and "colibri" not in response.json()
+    assert sum(path == "/v1/images/generations" for _, path, _, _ in upstream.calls) == 3
+    assert too_many.status_code == 400 and "max_n" in too_many.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("failure", ["connect", "refuse", "error"])
+def test_a_failing_comfyui_falls_forward_to_colibri(imaging, failure):
+    router, upstream = imaging()
+    with TestClient(router.app) as client:
+        upstream.comfy = failure
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+        down = client.get("/routing/inventory").json()["server_status"][COMFY]["up"] is False
+    assert response.status_code == 200
+    assert response.headers["x-router-server"] == COLIBRI_IMG
+    assert down == (failure == "connect")
+
+
+def test_comfyui_timeout_cancels_only_its_own_job(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    router.IMAGE_READ_TIMEOUT = -1  # force expiry even on coarse monotonic clocks
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+    assert response.status_code == 504
+    paths = [path for _, path, _, _ in upstream.calls]
+    assert "/api/jobs/p1/cancel" in paths
+    assert "/interrupt" not in paths and "/queue" not in paths
+
+
+def test_a_refused_comfyui_cancel_is_logged(imaging, caplog):
+    router, upstream = imaging(MODEL_SERVERS="")
+    router.IMAGE_READ_TIMEOUT = -1
+    upstream.cancel_status = 404
+    with caplog.at_level("WARNING"), TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+    assert response.status_code == 504
+    assert any("did not cancel job p1: HTTP 404" in record.getMessage() for record in caplog.records)
+
+
+def _wait_for(predicate, seconds=2.0):
+    deadline = time.monotonic() + seconds
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_a_failed_comfyui_poll_cancels_its_job(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    upstream.comfy = "poll_error"
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+        cancelled = _wait_for(lambda: any(path == "/api/jobs/p1/cancel" for _, path, _, _ in upstream.calls))
+    assert response.status_code == 502
+    assert cancelled
+
+
+def test_disconnected_image_client_cancels_comfyui_job(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+
+    async def run():
+        await router.refresh_inventory()
+        body = json.dumps({"model": "image", "prompt": "a fox"}).encode()
+        messages = iter(({"type": "http.request", "body": body, "more_body": False},
+                         {"type": "http.disconnect"}))
+
+        async def receive():
+            return next(messages)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "path": "/v1/images/generations",
+                 "raw_path": b"/v1/images/generations", "query_string": b"", "headers": [],
+                 "scheme": "http", "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000)}
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await router.app(scope, receive, send)
+        await asyncio.gather(*router._COMFYUI_CANCELS)
+        await router.http_client().aclose()
+        return next(message["status"] for message in sent if message["type"] == "http.response.start")
+
+    status = asyncio.run(run())
+    assert status == 499
+    paths = [path for _, path, _, _ in upstream.calls]
+    assert "/api/jobs/p1/cancel" in paths
+    assert "/history/p1" not in paths
+
+
+def test_cancelled_timeout_keeps_comfyui_cleanup(imaging, monkeypatch):
+    router, _ = imaging(MODEL_SERVERS="")
+    router.IMAGE_READ_TIMEOUT = -1  # force expiry even on coarse monotonic clocks
+    calls = []
+
+    async def run():
+        await router.refresh_inventory()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_cancel(client, server, prompt_id):
+            calls.append(prompt_id)
+            started.set()
+            await release.wait()
+
+        class ConnectedRequest:
+            async def is_disconnected(self):
+                return False
+
+        monkeypatch.setattr(router, "comfyui_cancel", slow_cancel)
+        entry = router.image_candidates("image")[0]
+        task = asyncio.create_task(router.comfyui_image(entry, {"prompt": "a fox"}, 1,
+                                                        ConnectedRequest()))
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(*router._COMFYUI_CANCELS)
+        await router.http_client().aclose()
+
+    asyncio.run(run())
+    assert calls == ["p1", "p1"]
+
+
+def test_shutdown_waits_for_comfyui_cancellation(monkeypatch):
+    router = load_router(monkeypatch, MODEL_SERVERS="", COMFYUI_SERVERS="")
+    cancelled_before_close = []
+
+    async def run():
+        async with router.lifespan(router.app):
+            client = router.http_client()
+
+            async def finish_cancel():
+                await asyncio.sleep(0)
+                cancelled_before_close.append(not client.is_closed)
+
+            task = asyncio.create_task(finish_cancel())
+            router._COMFYUI_CANCELS.add(task)
+            task.add_done_callback(router._COMFYUI_CANCELS.discard)
+
+    asyncio.run(run())
+    assert cancelled_before_close == [True]
+
+
+def test_a_finished_comfyui_job_is_not_cancelled(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+        time.sleep(0.2)
+    assert response.status_code == 200
+    assert all(path != "/api/jobs/p1/cancel" for _, path, _, _ in upstream.calls)
+
+
+def test_a_full_colibri_queue_falls_forward_and_a_bad_request_does_not(imaging):
+    router, upstream = imaging(COMFYUI_SERVERS="")
+    upstream.colibri = 400
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+        assert response.status_code == 400 and response.json()["error"]["message"] == "nope"
+        upstream.colibri = 503
+        response = client.post("/v1/images/generations", json={"model": "image", "prompt": "a fox"})
+    assert response.status_code == 503
+
+
+def test_streaming_needs_colibri(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    with TestClient(router.app) as client:
+        response = client.post("/v1/images/generations",
+                               json={"model": "image", "prompt": "a fox", "stream": True})
+    assert response.status_code == 503 and "streams" in response.json()["error"]["message"]
+
+
+def test_cloud_image_models_only_when_named(imaging):
+    router, upstream = imaging(OPENAI_API_KEY="sk-test", CLOUD_OPENAI_MODELS="gpt-4.1,gpt-image-1")
+    with TestClient(router.app) as client:
+        chat = [m["id"] for m in client.get("/v1/models").json()["data"]]
+        images = [m["id"] for m in client.get("/v1/images/models").json()["data"]]
+        named = client.post("/v1/images/generations", json={"model": "openai/gpt-image-1", "prompt": "a fox"})
+        unknown = client.post("/v1/images/generations", json={"model": "dall-e-3", "prompt": "a fox"})
+        alias = client.post("/v1/images/generations", json={"prompt": "a fox"})
+    assert "openai/gpt-4.1" in chat and "openai/gpt-image-1" not in chat
+    assert images[-1] == "openai/gpt-image-1"
+    assert named.status_code == 200 and named.json()["via"] == "litellm"
+    assert named.headers["x-router-mode"] == "cloud"
+    assert unknown.json()["via"] == "litellm" and unknown.headers["x-router-mode"] == "litellm"
+    assert alias.headers["x-router-server"] == COMFY
+    litellm = [body["model"] for host, path, body, auth in upstream.calls if "litellm.test" in host and path == "/v1/images/generations"]
+    assert litellm == ["openai/gpt-image-1", "dall-e-3"]
+
+
+def test_image_requests_are_validated(imaging):
+    router, upstream = imaging()
+    with TestClient(router.app) as client:
+        for body, word in (({"model": "image"}, "prompt"),
+                           ({"model": "image", "prompt": "x", "size": "big"}, "size"),
+                           ({"model": "image", "prompt": "x", "n": 0}, "`n`")):
+            response = client.post("/v1/images/generations", json=body)
+            assert response.status_code == 400 and word in response.json()["error"]["message"]
+        metrics = client.get("/metrics").text
+    assert 'osr_requests_total{class="",mode="",model="",route="images",server="",status="400"} 3' in metrics
+    assert 'osr_server_up{kind="comfyui",server="http://10.0.0.30:8188"} 1' in metrics

@@ -458,7 +458,8 @@ COLIBRI_MODEL_ID=''
 _out="$(mktemp)"
 prompt_colibri_model > "$_out" 2>&1 <<< ''
 assert_eq "Enter downloads nothing" '' "$COLIBRI_MODEL_ID"
-assert_contains "GPU and 12 GiB suggest the general model" '23.1 GB  RAM  10- 20 GiB  fits (suggested)' "$(cat "$_out")"
+assert_contains "GPU and 12 GiB suggest the general model" '23.1 GB  RAM  10- 20 GiB  fits, tight (best with 20 GiB) (suggested)' "$(cat "$_out")"
+assert_contains "the image model is offered in its own group" '12) qwen-image-2.1' "$(cat "$_out")"
 assert_contains "the whole text catalog is listed" 'kimi-k3                 Kimi K3' "$(cat "$_out")"
 assert_contains "a model needing more RAM is marked" 'needs 16 GiB RAM' "$(cat "$_out")"
 COLIBRI_MODEL_ID=''
@@ -467,7 +468,7 @@ assert_eq "a number picks that model" qwen36-35b "$COLIBRI_MODEL_ID"
 COLIBRI_MODEL_ID=''; GPU_RESULT_COLIBRI='declined||||'
 prompt_colibri_model > "$_out" 2>&1 <<< $'4\nqwen3-coder-30b'
 assert_eq "an ID picks that model" qwen3-coder-30b "$COLIBRI_MODEL_ID"
-assert_contains "CPU and 12 GiB suggest the coding model" '19.4 GB  RAM   8- 18 GiB  fits (suggested)' "$(cat "$_out")"
+assert_contains "CPU and 12 GiB suggest the coding model" '19.4 GB  RAM   8- 18 GiB  fits, tight (best with 18 GiB) (suggested)' "$(cat "$_out")"
 assert_contains "a model that does not fit is refused" 'deepseek-v4-flash does not fit this CT' "$(cat "$_out")"
 COLIBRI_MODEL_ID=''; COLIBRI_ROOTFS_GB=500 COLIBRI_MEMORY_MB=65536
 prompt_colibri_model > "$_out" 2>&1 <<< 'glm-5.3'
@@ -477,6 +478,15 @@ unset COLIBRI_ROOTFS_GB
 COLIBRI_MODEL_ID=''; NONINTERACTIVE=true
 prompt_colibri_model </dev/null >/dev/null 2>&1
 assert_eq "unattended setup does not download" '' "$COLIBRI_MODEL_ID"
+describe colibri_image_model
+TARGETS=colibri COLIBRI_MODEL_ID=qwen-image-2.1
+assert_eq "an image model is named by the id the router lists" qwen-image-2.1-colibri "$(colibri_image_model)"
+COLIBRI_MODEL_ID=qwen36-35b
+assert_eq "a chat model needs no Open WebUI image step" "" "$(colibri_image_model)"
+COLIBRI_MODEL_ID=none
+assert_eq "nor does no model" "" "$(colibri_image_model)"
+TARGETS=ollama COLIBRI_MODEL_ID=qwen-image-2.1
+assert_eq "nor a run without the Colibri target" "" "$(colibri_image_model)"
 NONINTERACTIVE=false; TARGETS=''; unset COLIBRI_MEMORY_MB COLIBRI_MODEL_ID GPU_RESULT_COLIBRI
 rm -f "$_out"
 
@@ -3411,6 +3421,7 @@ MODEL_SERVERS=("${_saved_servers[@]}")
 describe is_installer_owned
 assert_ok   "router.py is owned"         is_installer_owned services/osr-router/router.py
 assert_ok   "the manage tool is owned"   is_installer_owned install/manage-model-servers.sh
+assert_ok   "the WebUI image picker patch is owned" is_installer_owned tools/webui-images.py
 assert_fail "router.ini is a tunable"    is_installer_owned services/osr-router/router.ini
 assert_fail "env files are config"       is_installer_owned env/router.env
 

@@ -400,7 +400,7 @@ rt COLIBRI_BACKEND=auto GPU_NODES="$tmp_root/gpus/nvidia*" "$(at_head)" -- > "$t
 contains 'Re-applying Colibri' "$tmp_root/out"
 grep -q "^make .* CUDA=1 CUDA_HOME=$tmp_root/cuda" "$log" || fail "the rebuild was not for CUDA: $(grep '^make ' "$log")"
 contains 'built_backend=cuda' "$etc/installed-settings"
-contains '--auto-tier --gpu auto' "$launcher"
+contains 'then set -- --gpu auto; fi' "$launcher"
 pass 'a GPU passed in later makes the next run rebuild for it'
 
 # --- an explicit model download ------------------------------------------------

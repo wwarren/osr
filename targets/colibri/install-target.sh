@@ -568,7 +568,6 @@ generate_run_script() {
     for host in "${hosts[@]}"; do args+=( --allowed-host "$host" ); done
     [[ -z $COLIBRI_MODEL_DIR ]] || args+=( --model "$COLIBRI_MODEL_DIR" )
     args+=( --auto-tier )
-    [[ ${colibri_backend:-cpu} != cuda ]] || args+=( --gpu auto )
     if [[ -n $COLIBRI_MODEL_DIR ]]; then
         message="colibri: parked, $COLIBRI_MODEL_DIR is empty. Copy a model directory there, then: systemctl restart colibri"
     else
@@ -593,9 +592,16 @@ generate_run_script() {
             printf 'export COLI_VK_SHADERS=%q\n' "$COLIBRI_DIR/c/shaders"
         fi
         printf 'cd %q\n' "$COLIBRI_DIR"
+        # --gpu auto puts a CUDA chat engine's dense part and experts on the
+        # card; colibri's image engine (a diffusers pipeline: model_index.json
+        # at the root) has no CUDA lane and refuses --gpu, so it runs on the CPU.
+        printf 'set --\n'
+        if [[ ${colibri_backend:-cpu} == cuda ]]; then
+            printf 'if [ -z "$model" ] || [ ! -f "$model/model_index.json" ]; then set -- --gpu auto; fi\n'
+        fi
         printf 'exec %q' "$COLIBRI_DIR/bin/coli"
         for part in "${args[@]}"; do printf ' %q' "$part"; done
-        printf '\n'
+        printf ' "$@"\n'
     } > "$run_script"
     chmod 0700 "$run_script"
     chown "$SERVICE_USER:$SERVICE_USER" "$run_script"
@@ -1291,7 +1297,7 @@ do_install() {
         printf '+ write %s/run-colibri.sh (0700, %s-owned): exec %s/bin/coli serve --host %s --port %s --allowed-host %s%s --auto-tier%s\n' \
             "$COLIBRI_DIR" "$SERVICE_USER" "$COLIBRI_DIR" "$COLIBRI_HOST" "$COLIBRI_PORT" "$COLIBRI_ALLOWED_HOST" \
             "$( [[ -n $COLIBRI_MODEL_DIR ]] && printf ' --model %s' "$COLIBRI_MODEL_DIR" )" \
-            "$( [[ $colibri_backend == cuda ]] && printf ' --gpu auto' )$( [[ $colibri_backend == vulkan ]] && printf ' (with COLI_VULKAN=1)' )"
+            "$( [[ $colibri_backend == cuda ]] && printf ' --gpu auto (not for an image model: no CUDA lane)' )$( [[ $colibri_backend == vulkan ]] && printf ' (with COLI_VULKAN=1)' )"
         printf '+ %s\n' "$( [[ -n $COLIBRI_MODEL_DIR ]] && printf 'serve the model in %s (parked while it is empty)' "$COLIBRI_MODEL_DIR" || printf 'no model configured (no COLIBRI_MODEL_DIR): the launcher logs where to put a model and exits 0 (no model is ever downloaded; they are 18GB-500GB+), and the unit parks inactive')"
         prepare_model_dir
         printf '+ write %s/colibri.env (COLIBRI_RUN_SCRIPT only), %s/secrets.env (0600: COLI_API_KEY) and %s/colibri.service\n' "$COLIBRI_ETC_DIR" "$COLIBRI_ETC_DIR" "$UNIT_DIR"

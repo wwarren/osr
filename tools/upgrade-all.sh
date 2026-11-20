@@ -1150,6 +1150,10 @@ run_colibri_model() {
     if pct exec "$id" -- env NONINTERACTIVE=true "COLIBRI_MODEL_ID=${I_MODEL[$1]}" \
         bash "/root/${GUEST_DIR[colibri]}/install-target.sh" --model </dev/null; then
         echo "OSR-COLIBRI: model changed to ${I_MODEL[$1]}"
+        if colibri_model_details "${I_MODEL[$1]}" && [[ $COLIBRI_MODEL_TYPE == image ]]; then
+            note "Colibri CT $id draws pictures now (the router lists $COLIBRI_MODEL_SERVED). For Open WebUI:"
+            note "  bash $REPO_ROOT/tools/webui-images.sh --expect-model $COLIBRI_MODEL_SERVED"
+        fi
     else
         echo "OSR-COLIBRI: model change to ${I_MODEL[$1]} failed; the previous model is served"
     fi

@@ -1461,6 +1461,17 @@ env_set TORCH_CPU_ONLY "false"
 openwebui_install >/dev/null 2>&1
 assert_eq "cpu-only disabled skips the extra index" "0" "$(grep -c pytorch.org "${WORK}/pip.log" || true)"
 env_set TORCH_CPU_ONLY "true"
+printf 'open-webui==0.12.4\n' > "$OPENWEBUI_REQ"
+mkdir -p "$REPO_DIR/tools"
+touch "$REPO_DIR/tools/webui-images.py"
+cat > "${OPENWEBUI_DIR}/venv/bin/python" <<PYEOF
+#!/usr/bin/env bash
+echo "python \$*" >> "${WORK}/pip.log"
+PYEOF
+chmod +x "${OPENWEBUI_DIR}/venv/bin/python"
+: > "${WORK}/pip.log"
+openwebui_install >/dev/null 2>&1
+assert_file_contains "patches the pinned image picker after pip" "--patch-only --webui-venv ${OPENWEBUI_DIR}/venv" "${WORK}/pip.log"
 
 # ── safe apply ────────────────────────────────────────────────────────────────
 describe validate_config
@@ -2111,6 +2122,32 @@ kv_set "$ENV_FILE" FREELLMAPI_MODELS 'everything'
 assert_contains "validate_config refuses an unknown list mode" 'FREELLMAPI_MODELS must be' "$(validate_config)"
 reset_repo
 
+describe cmd_set_comfyui
+reset_repo
+yaml_before="$(cat "$LITELLM_YAML")"
+cmd_set_comfyui 'http://10.0.0.30:8188/,http://10.0.0.31:8188,http://10.0.0.30:8188' >/dev/null 2>&1
+assert_eq "the URLs are stored once each, without slashes" 'http://10.0.0.30:8188,http://10.0.0.31:8188' "$(env_get COMFYUI_SERVERS)"
+assert_file_contains "in the committed env file" 'COMFYUI_SERVERS=http://10.0.0.30:8188,http://10.0.0.31:8188' "$ENV_FILE"
+assert_eq "LiteLLM gets no deployment for them" "$yaml_before" "$(cat "$LITELLM_YAML")"
+assert_eq "they are not model servers" "" "$(get_servers | grep 8188 || true)"
+assert_contains "list names them" 'ComfyUI image servers: http://10.0.0.30:8188, http://10.0.0.31:8188' "$(cmd_list false)"
+assert_eq "the configuration still validates" "" "$(validate_config)"
+cmd_add_comfyui http://10.0.0.32:8188 >/dev/null 2>&1
+assert_eq "add-comfyui appends" 'http://10.0.0.30:8188,http://10.0.0.31:8188,http://10.0.0.32:8188' "$(env_get COMFYUI_SERVERS)"
+CHANGED=false
+assert_contains "adding one already there changes nothing" 'unchanged' "$(cmd_add_comfyui http://10.0.0.31:8188/ 2>&1)"
+assert_eq "and does not mark the config changed" false "$CHANGED"
+assert_fail "a URL with a path is refused" cmd_set_comfyui http://10.0.0.30:8188/prompt
+assert_fail "a URL is required" cmd_set_comfyui ''
+assert_fail "add-comfyui needs a URL" cmd_add_comfyui ''
+cmd_set_comfyui --off >/dev/null 2>&1
+assert_eq "--off clears them" "" "$(env_get COMFYUI_SERVERS)"
+assert_not_contains "list no longer names them" 'ComfyUI image servers' "$(cmd_list false)"
+reset_repo
+kv_set "$ENV_FILE" COMFYUI_SERVERS 'http://10.0.0.30:8188,ftp://x'
+assert_contains "validate_config refuses a bad ComfyUI URL" "COMFYUI_SERVERS: 'ftp://x' is not a root URL" "$(validate_config)"
+reset_repo
+
 describe cmd_commit
 reset_repo
 mock_command git 0
@@ -2256,7 +2293,8 @@ assert_ok "returns immediately when the config is local" ensure_config_or_forwar
 
 describe command_writes
 for c in add remove set-tier set-model set-server-model set-keepalive apply commit \
-         set-token set-api-key set-cloud-key set-cloud-models set-freellmapi set-lmstudio-token set-strata-token set-webhook set-webui-version; do
+         set-token set-api-key set-cloud-key set-cloud-models set-freellmapi set-comfyui add-comfyui \
+         set-lmstudio-token set-strata-token set-webhook set-webui-version; do
   assert_ok "${c} takes the lock" command_writes "$c"
 done
 for c in list status models discover test-alert clear-lock; do

@@ -1,9 +1,11 @@
 # ComfyUI image generation target
 
-[ComfyUI](https://github.com/Comfy-Org/ComfyUI) in its own CT, used by the
-router's Open WebUI as its **image generation engine** (the image button in
-chats and image requests through Open WebUI's API). It is not a model server:
-chat routing never sends requests to it. The CT and first install come from
+[ComfyUI](https://github.com/Comfy-Org/ComfyUI) in its own CT, one of the
+router's **image servers**: the router answers `POST /v1/images/generations`
+(the `image` alias, or `flux2-klein-4b-comfyui` / `flux2-klein-9b-comfyui`) by
+running the Klein workflow on it, and the router's Open WebUI draws through the
+router (the image button in chats and image requests through Open WebUI's API).
+It is not a model server: chat routing never sends requests to it. The CT and first install come from
 the Proxmox VE community script
 [`ct/comfyui.sh`](https://community-scripts.org/scripts/comfyui); this target
 presets it, adopts the result with a systemd drop-in
@@ -32,7 +34,9 @@ Open WebUI (router CT) --HTTP + WebSocket :8188--> comfyui.service (this CT) -->
 | `install-target.sh` | In the CT: adopts (re-runnable), downloads the Klein weights, `--upgrade` |
 | `klein-weights.txt` | Each Klein variant's files: folder, name, size, SHA-256, access, URL |
 | `comfyui-target.conf`, `comfyui.env.example` | The drop-in; listen address, port, extra options |
-| `integrate-webui.py`, `flux2-klein-{4b,9b}-api.json` | Run in the router CT: set ComfyUI and the selected workflow in Open WebUI |
+| `flux2-klein-{4b,9b}-api.json` | The Klein workflows (the router runs a copy of each; its tests check they match) |
+| `../../tools/webui-images.py` | Run in the router CT: make the router Open WebUI's image engine |
+| `integrate-webui.py` | Run in the router CT instead, for Open WebUI's direct ComfyUI engine (a custom model, `COMFYUI_WEBUI_ENGINE=comfyui`, or a router without `add-comfyui`) |
 | `test-install.sh`, `test-provision.sh`, `test-integration.py` | Stubbed tests and mock servers; nothing downloaded or created |
 
 ## Provision
@@ -66,8 +70,12 @@ address is chosen automatically. The CT ID defaults to the cluster's next free I
 4. **Adoption and weights** (below). For `klein-9b` the token is pushed into
    the CT as a 0600 file for this step only and removed afterwards, also on
    failure.
-5. **Open WebUI.** `integrate-webui.py` runs in the router CT from a 0700
-   staging directory that is removed afterwards.
+5. **Router and Open WebUI.** `manage-model-servers add-comfyui
+   http://<CT address>:8188 --apply` in the router CT makes ComfyUI an image
+   server; then `tools/webui-images.py` runs there from a 0700 staging
+   directory (removed afterwards) and points Open WebUI's image engine at the
+   router, enabled once the router lists the variant
+   (`flux2-klein-<size>-comfyui`). See [Open WebUI image settings](#open-webui-image-settings).
 
 | Variant | Why | License and access |
 | --- | --- | --- |
@@ -122,10 +130,27 @@ other data (model configs, example input and node, settings database) into
 restarts the service, waits for `/system_stats` (`READY_TIMEOUT`, 300 s) and
 reports the torch device.
 
-## Open WebUI image settings (`integrate-webui.py`)
+## Open WebUI image settings
 
-It reads `GET /api/v1/images/config`, changes only the ComfyUI fields and
-writes the full set back (`POST /api/v1/images/config/update`):
+**Through the router (the default).** `tools/webui-images.py` reads
+`GET /api/v1/images/config`, changes only the engine fields and writes the full
+set back: engine `openai`, base URL `http://127.0.0.1:8000/v1` (the router), the
+router key, model `image`, `COMFYUI_IMAGE_SIZE` (else the current size, or
+1024x1024) and `COMFYUI_IMAGE_STEPS` as `{"steps": N}` in the OpenAI
+parameters. Generation stays **off** until the router lists the variant: the
+router discovers it from ComfyUI's loaders (the diffusion model, Qwen text
+encoder and Flux.2 VAE must all be there), which also proves the router
+reaches ComfyUI through the firewall. The router reads both of ComfyUI's
+model-list formats. A Colibri image model joins the same `image` alias, and the
+router fails forward between them ([README](../../README.md#image-generation)).
+An admin's custom ComfyUI workflow in Open WebUI is kept (rerun
+`tools/webui-images.sh --replace-custom` to replace it).
+
+**Directly (`integrate-webui.py`).** With `COMFYUI_IMAGE_MODEL` (a compatible
+diffusion model the router's workflow does not name), `COMFYUI_WEBUI_ENGINE=comfyui`,
+or a router whose manager has no `add-comfyui`, Open WebUI drives ComfyUI
+itself, as before. The script reads `GET /api/v1/images/config`, changes only
+the ComfyUI fields and writes the full set back (`POST /api/v1/images/config/update`):
 
 * engine `comfyui`, base URL `http://<CT address>:8188`;
 * the selected distilled Klein API workflow (`flux2-klein-{4b,9b}-api.json`:
@@ -184,8 +209,9 @@ then keep it as a custom workflow.
 | 9B | [`qwen_3_8b_fp8mixed.safetensors`](https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors) | `text_encoders/` |
 | 9B | [`flux2-vae.safetensors`](https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors) | `vae/` |
 
-Both variants share the VAE. To add or switch a variant, in the CT, then rerun
-`provision-lxc.sh --integrate-only` with that variant:
+Both variants share the VAE. To add or switch a variant, in the CT (the router
+finds the new files at its next poll; with Open WebUI's direct engine, rerun
+`provision-lxc.sh --integrate-only` with that variant):
 
 ```bash
 COMFYUI_IMAGE_VARIANT=klein-4b bash /root/comfyui-target-deploy/install-target.sh

@@ -272,7 +272,17 @@ pass 'each allowed host gets its own --allowed-host'
 
 colibri_backend=cuda
 generate_run_script || fail 'generate_run_script failed for cuda'
-grep -q -- '--auto-tier --gpu auto' "$run_script" || fail 'a CUDA launcher does not put the plan on the GPU'
+# What the launcher runs, through a coli that prints its arguments: --gpu auto
+# for a chat model, none for an image model (colibri's image engine refuses it).
+mkdir -p "$COLIBRI_DIR/bin"
+printf '#!/bin/sh\necho "coli $*"\n' > "$COLIBRI_DIR/bin/coli"; chmod +x "$COLIBRI_DIR/bin/coli"
+sh "$run_script" > "$tmp_root/run.out" 2>&1
+grep -q -- '--auto-tier --gpu auto$' "$tmp_root/run.out" || fail "a CUDA launcher does not put a chat model on the GPU: $(cat "$tmp_root/run.out")"
+: > "$COLIBRI_MODEL_DIR/model_index.json"
+sh "$run_script" > "$tmp_root/run.out" 2>&1
+grep -q -- '--auto-tier$' "$tmp_root/run.out" || fail "a CUDA launcher passes --gpu to an image model: $(cat "$tmp_root/run.out")"
+rm -f -- "$COLIBRI_MODEL_DIR/model_index.json"
+pass 'a CUDA launcher gives chat models the GPU and leaves an image model (no CUDA lane) on the CPU'
 colibri_backend=vulkan
 generate_run_script || fail 'generate_run_script failed for vulkan'
 grep -qx 'export COLI_VULKAN=1' "$run_script" || fail 'a Vulkan launcher leaves the GPU off (COLI_VULKAN)'

@@ -203,6 +203,7 @@ INSTALLER_OWNED_CODE=(
   services/litellm-proxy/requirements.lock
   services/litellm-proxy/litellm-proxy.service
   services/open-webui/open-webui.service
+  tools/webui-images.py
   install/apply-config.sh
   install/manage-model-servers.sh
   install/setup-metrics.sh
@@ -2562,6 +2563,34 @@ prompt_openwebui_admin_token() {
   [[ -n "$TARGET_ADMIN_TOKEN" ]]
 }
 
+# colibri_image_model: the id the router lists the Colibri target's model by,
+# when that model draws pictures (Qwen-Image); nothing otherwise.
+colibri_image_model() {
+  [[ " ${TARGETS:-} " == *' colibri '* && -n ${COLIBRI_MODEL_ID:-} && $COLIBRI_MODEL_ID != none ]] || return 0
+  [[ -r "${TARGETS_DIR}/colibri/model-select.sh" ]] || return 0
+  # shellcheck source=targets/colibri/model-select.sh
+  source "${TARGETS_DIR}/colibri/model-select.sh"
+  colibri_model_details "$COLIBRI_MODEL_ID" 2>/dev/null || return 0
+  [[ $COLIBRI_MODEL_TYPE != image ]] || printf '%s\n' "$COLIBRI_MODEL_SERVED"
+}
+
+# integrate_webui_images MODEL: make the router Open WebUI's image engine
+# (tools/webui-images.py in the router CT), enabled once the router lists MODEL.
+# The admin key reaches the CT in a 0600 file, never on a command line.
+integrate_webui_images() {
+  local model="$1" tool="${TARGETS_DIR}/../tools/webui-images.py" stage rc=0
+  [[ -r "$tool" ]] || { echo "Missing ${tool}." >&2; return 1; }
+  stage="$(run_ct mktemp -d /root/webui-images.XXXXXX </dev/null)" || return 1
+  stage="${stage//[$'\r\n']/}"
+  [[ "$stage" =~ ^/root/webui-images\.[A-Za-z0-9]{6}$ ]] || { echo "Unexpected staging path: ${stage}" >&2; return 1; }
+  pct push "$CT_ID" "$tool" "${stage}/webui-images.py" --perms 0700 &&
+    printf '%s\n' "$TARGET_ADMIN_TOKEN" | run_ct sh -c "umask 077; cat > '${stage}/admin-token'" &&
+    run_ct python3 "${stage}/webui-images.py" --webui-url "http://127.0.0.1:${OPENWEBUI_PORT}" \
+      --admin-token-file "${stage}/admin-token" --expect-model "$model" </dev/null || rc=$?
+  run_ct rm -rf -- "$stage" </dev/null >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 # provision_selected_targets: after the router is up, create the model
 # targets, give the router their keys, then add the companions. A failed target
 # leaves the router as it is; the summary says how to retry.
@@ -2609,6 +2638,18 @@ provision_selected_targets() {
       for name in "${key_targets[@]}"; do
         result[$name]="failed (OSR key apply)"
       done
+    fi
+  fi
+  # A Colibri target that draws pictures: Open WebUI asks the router for them.
+  local image_model
+  image_model="$(colibri_image_model)"
+  if [[ -n "$image_model" && "${result[colibri]:-}" == ok* ]]; then
+    echo
+    echo "=== Open WebUI images through the router (${image_model}) ==="
+    if ! { wait_for_openwebui && prompt_openwebui_admin_token; }; then
+      result[colibri]="ok (Open WebUI images left as they are: no admin key; run tools/webui-images.sh)"
+    elif ! integrate_webui_images "$image_model"; then
+      result[colibri]="ok (Open WebUI images failed; run tools/webui-images.sh)"
     fi
   fi
   if $companions; then
@@ -3806,7 +3847,8 @@ mkdir -p \
   "${REPO_DIR}/services/osr-monitor" \
   "${REPO_DIR}/services/open-webui" \
   "${REPO_DIR}/env" \
-  "${REPO_DIR}/install"
+  "${REPO_DIR}/install" \
+  "${REPO_DIR}/tools"
 
 # --- env/router.env ---
 # Shared by the router, litellm-proxy and monitor units (they run from one venv).
@@ -3961,7 +4003,7 @@ _HISTOGRAMS = {}    # (name, ((label, value), ...)) -> [per-bucket counts..., su
 DURATION_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
 METRIC_SERIES_MAX = 5000   # a last guard; never reached with bounded labels
 METRICS = {
-    "osr_requests_total": ("counter", "Requests answered, by route (chat, v1, routing), "
+    "osr_requests_total": ("counter", "Requests answered, by route (chat, images, v1, routing), "
                            "how they were served and the HTTP status returned."),
     "osr_upstream_failures_total": ("counter", "Attempts on a model server that failed, by reason: "
                                     "connect, transport, no_reply, http_<status>, tool_rejection."),
@@ -4103,6 +4145,22 @@ _DEFAULTS = {
         # long prompt slowly on a small card (its agent guide: 30-60 minutes).
         # Never below read_timeout_seconds.
         "kindi_read_timeout_seconds": "3600",
+    },
+    "images": {
+        # The model name that asks for any image server that is up (Open WebUI
+        # is set to it). A name of a model listed by GET /v1/images/models
+        # asks for that one.
+        "alias": "image",
+        # Server kinds the alias tries first, in order: a ComfyUI CT has a GPU
+        # for its diffusion model; Colibri draws on a Vulkan GPU or the CPU.
+        "prefer": "comfyui, colibri",
+        # Seconds one picture may take (a CPU takes minutes). Never below
+        # read_timeout_seconds.
+        "read_timeout_seconds": "900",
+        # How often a ComfyUI job is polled for its result.
+        "comfyui_poll_seconds": "1",
+        # The most images one request may ask for (n); each is drawn in turn.
+        "max_n": "4",
     },
     "discovery": {
         "enabled": "true",
@@ -4311,6 +4369,94 @@ CLOUD_MODELS = {
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", model.strip())
 }
 
+# --- image generation -------------------------------------------------------------
+# POST /v1/images/generations goes to an image server the router knows:
+#   * a /v1/models server whose entry declares "capabilities":
+#     ["image_generation"] (Colibri serving Qwen-Image), sent the request as is;
+#   * a ComfyUI CT (COMFYUI_SERVERS, set with manage-model-servers set-comfyui),
+#     sent the FLUX.2 Klein workflow of targets/comfyui with the prompt, size,
+#     steps and seed filled in, then polled for the picture.
+# The alias ([images] alias) picks one that is up, [images] prefer first, the
+# least busy next, and fails forward. Cloud image models (openai/gpt-image-1,
+# gemini/imagen-...) go to LiteLLM, and only when a request names them.
+IMAGE_KINDS = ("comfyui", "colibri")
+CLOUD_IMAGE_NAME = re.compile(r"(?:^|/)(dall-e|gpt-image|imagen)", re.I)
+
+
+def is_cloud_image_model(name: str) -> bool:
+    return name in CLOUD_MODELS and bool(CLOUD_IMAGE_NAME.search(name))
+
+
+def _root_urls(value: str) -> list:
+    """Comma-separated http(s) root URLs, in order, without repeats."""
+    seen, out = set(), []
+    for url in (value or "").split(","):
+        url = url.strip().rstrip("/")
+        try:
+            parts = urlsplit(url)
+            ok = (parts.scheme in ("http", "https") and bool(parts.hostname)
+                  and not (parts.path or parts.query or parts.fragment
+                           or parts.username or parts.password))
+        except ValueError:
+            ok = False
+        if url and not ok:
+            log.error("ignoring image server %r: use a root URL such as http://10.0.0.30:8188", url)
+            continue
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+COMFYUI_SERVERS = _root_urls(os.getenv("COMFYUI_SERVERS", ""))
+# FLUX.2 Klein as targets/comfyui installs it (klein-weights.txt) and
+# describes it (flux2-klein-{4b,9b}-api.json; tests/test_router.py checks these
+# copies match). Node 4 takes the prompt, 6 and 7 the size, 6 the batch, 7 the
+# steps, 8 the seed. A variant is offered when ComfyUI lists its three files.
+COMFYUI_VARIANTS = {
+    "flux2-klein-4b": {
+        "files": {"unet_name": "flux-2-klein-4b-fp8.safetensors",
+                  "clip_name": "qwen_3_4b.safetensors",
+                  "vae_name": "flux2-vae.safetensors"},
+        "workflow": {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-4b-fp8.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "flux2", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "Prompt", "clip": ["2", 0]}},
+            "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+            "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": 4, "width": 1024, "height": 1024}},
+            "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+            "9": {"class_type": "CFGGuider", "inputs": {"cfg": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0]}},
+            "10": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["9", 0], "sampler": ["10", 0], "sigmas": ["7", 0], "latent_image": ["6", 0]}},
+            "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+            "13": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Flux2-Klein", "images": ["12", 0]}},
+        },
+    },
+    "flux2-klein-9b": {
+        "files": {"unet_name": "flux-2-klein-9b-fp8.safetensors",
+                  "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+                  "vae_name": "flux2-vae.safetensors"},
+        "workflow": {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-9b-fp8.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "Prompt", "clip": ["2", 0]}},
+            "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+            "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": 4, "width": 1024, "height": 1024}},
+            "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+            "9": {"class_type": "CFGGuider", "inputs": {"cfg": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0]}},
+            "10": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["9", 0], "sampler": ["10", 0], "sigmas": ["7", 0], "latent_image": ["6", 0]}},
+            "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+            "13": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Flux2-Klein", "images": ["12", 0]}},
+        },
+    },
+}
+COMFYUI_LOADERS = (("UNETLoader", "unet_name"), ("CLIPLoader", "clip_name"), ("VAELoader", "vae_name"))
+
 # FreeLLMAPI (targets/freellmapi) fronts the free tiers of cloud providers with
 # one OpenAI-compatible endpoint and one key. Like the cloud models above it is
 # an explicit choice: a request must name freellmapi/<id> (freellmapi/auto lets
@@ -4514,6 +4660,11 @@ for _kind in sorted(set(_json_list(_cfg, "classification", "tool_kinds")) - TOOL
 CONNECT_TIMEOUT = _cfg.getfloat("http", "connect_timeout_seconds")
 READ_TIMEOUT = _cfg.getfloat("http", "read_timeout_seconds")
 KINDI_READ_TIMEOUT = max(READ_TIMEOUT, _cfg.getfloat("http", "kindi_read_timeout_seconds"))
+IMAGE_ALIAS = _cfg.get("images", "alias").strip() or "image"
+IMAGE_READ_TIMEOUT = max(READ_TIMEOUT, _cfg.getfloat("images", "read_timeout_seconds"))
+IMAGE_PREFER = [k for k in _json_list(_cfg, "images", "prefer") if k in IMAGE_KINDS]
+COMFYUI_POLL_SECONDS = max(0.2, _cfg.getfloat("images", "comfyui_poll_seconds"))
+IMAGE_MAX_N = max(1, _cfg.getint("images", "max_n"))
 
 # Request headers never forwarded upstream.
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
@@ -4596,7 +4747,7 @@ def tier_has_kindi(tier: str) -> bool:
 
 # --- live inventory -----------------------------------------------------------
 # Replaced wholesale on each refresh, so readers never see a half-built dict.
-INVENTORY = {"models": [], "servers": {}, "updated_at": 0.0, "errors": {}}
+INVENTORY = {"models": [], "images": [], "servers": {}, "updated_at": 0.0, "errors": {}}
 _rotation = {}
 
 # --- load and conversation affinity -------------------------------------------
@@ -5027,6 +5178,10 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
             declared = model.get("capabilities")
             if (isinstance(declared, list) and NON_CHAT_CAPABILITIES & set(declared)
                     and not {"chat", "completion"} & set(declared)):
+                # Not for chat. An image generator is an image server's model
+                # (POST /v1/images/generations); a decision model is skipped.
+                if "image_generation" in declared:
+                    entries.append(image_entry(server, str(model["id"]), server_kind(server)))
                 continue
             architecture = model.get("architecture") or {}
             modalities = model.get("input_modalities") or []
@@ -5072,6 +5227,50 @@ async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
 
 
 fetch_strata_models = fetch_openai_models  # preserve the existing callable
+
+
+def image_entry(server: str, name: str, kind: str, variant: str = "") -> dict:
+    """One image model on one server. Kept apart from the chat inventory
+    (INVENTORY["images"]), so no chat path can ever pick it."""
+    return {"server": server, "name": name, "kind": kind, "is_image": True,
+            **({"variant": variant} if variant else {})}
+
+
+def combo_options(spec) -> list:
+    """The choices of a ComfyUI combo input, in either /object_info format:
+    [["a", "b"], {...}] (older) or ["COMBO", {"options": ["a", "b"]}]."""
+    if not isinstance(spec, list) or not spec:
+        return []
+    if isinstance(spec[0], list):
+        return [item for item in spec[0] if isinstance(item, str)]
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        return [item for item in spec[1].get("options", []) if isinstance(item, str)]
+    return []
+
+
+async def fetch_comfyui_images(client: httpx.AsyncClient, server: str) -> tuple:
+    """A ComfyUI CT's image models: each Klein variant whose diffusion model,
+    text encoder and VAE its loaders list. ComfyUI has no authentication; its
+    CT's firewall admits the router."""
+    try:
+        response = await client.get(f"{server}/system_stats", timeout=DISCOVERY_TIMEOUT)
+        response.raise_for_status()
+        stats = response.json()
+        system = stats.get("system") if isinstance(stats, dict) else None
+        if not isinstance(system, dict) or not system.get("comfyui_version"):
+            raise ValueError("not a ComfyUI server (no system.comfyui_version)")
+        files = {}
+        for node, key in COMFYUI_LOADERS:
+            response = await client.get(f"{server}/object_info/{node}", timeout=DISCOVERY_TIMEOUT)
+            response.raise_for_status()
+            info = response.json().get(node) or {}
+            files[key] = set(combo_options(((info.get("input") or {}).get("required") or {}).get(key)))
+        entries = [image_entry(server, f"{variant}-comfyui", "comfyui", variant)
+                   for variant, spec in COMFYUI_VARIANTS.items()
+                   if all(name in files[key] for key, name in spec["files"].items())]
+        return server, entries, None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return server, None, f"{type(exc).__name__}: {exc}"
 
 
 async def fetch_server_models(client: httpx.AsyncClient, server: str,
@@ -5120,15 +5319,16 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str,
 async def refresh_inventory(force_probe: bool = False) -> dict:
     """Poll every target for the models it is currently serving."""
     global INVENTORY
-    if not SERVERS:
-        INVENTORY = {"models": [], "servers": {}, "updated_at": time.time(),
+    if not SERVERS and not COMFYUI_SERVERS:
+        INVENTORY = {"models": [], "images": [], "servers": {}, "updated_at": time.time(),
                      "errors": {"config": "no servers configured"}}
         return INVENTORY
     results = await asyncio.gather(
         *[fetch_server_models(http_client(), s, force_probe) for s in SERVERS],
+        *[fetch_comfyui_images(http_client(), s) for s in COMFYUI_SERVERS],
         return_exceptions=True,
     )
-    models, servers, errors = [], {}, {}
+    models, images, servers, errors = [], [], {}, {}
     for result in results:
         if isinstance(result, Exception):
             continue
@@ -5141,9 +5341,14 @@ async def refresh_inventory(force_probe: bool = False) -> dict:
             continue
         if not INVENTORY.get("servers", {}).get(server, {}).get("up", True):
             log.info("discovery: %s is back (%d models)", server, len(entries))
-        servers[server] = {"up": True, "model_count": len(entries)}
-        models.extend(entries)
-    INVENTORY = {"models": models, "servers": servers,
+        drawn = [e for e in entries if e.get("is_image")]
+        chat = [e for e in entries if not e.get("is_image")]
+        servers[server] = {"up": True, "model_count": len(chat)}
+        if drawn or server in COMFYUI_SERVERS:
+            servers[server]["image_models"] = len(drawn)
+        models.extend(chat)
+        images.extend(drawn)
+    INVENTORY = {"models": models, "images": images, "servers": servers,
                  "updated_at": time.time(), "errors": errors}
     return INVENTORY
 
@@ -5204,7 +5409,7 @@ async def lifespan(_app):
                     "anyone who can reach port %d can use every backend. Set "
                     "it with `manage-model-servers set-api-key`.",
                     ROUTER_HOST, ROUTER_PORT)
-    if DISCOVERY_ENABLED and SERVERS:
+    if DISCOVERY_ENABLED and (SERVERS or COMFYUI_SERVERS):
         await refresh_inventory()
         # Keep the reference: a bare create_task() can be garbage-collected.
         _HTTP["task"] = asyncio.create_task(_discovery_loop())
@@ -5217,6 +5422,8 @@ async def lifespan(_app):
         task = _HTTP.get("task")
         if task:
             task.cancel()
+        if _COMFYUI_CANCELS:
+            await asyncio.gather(*tuple(_COMFYUI_CANCELS), return_exceptions=True)
         if _HTTP["client"] is not None:
             await _HTTP["client"].aclose()
             _HTTP["client"] = None
@@ -5273,6 +5480,8 @@ def _metrics_route(path: str) -> str:
     for the ones not counted (/healthz and /metrics are polled by machines)."""
     if path == "/v1/chat/completions":
         return "chat"
+    if path == "/v1/images/generations":
+        return "images"
     if path.startswith("/v1/"):
         return "v1"
     if path.startswith("/routing/"):
@@ -6058,6 +6267,9 @@ async def routing_inventory():
         "in_flight": dict(_IN_FLIGHT),
         "errors": INVENTORY.get("errors", {}),
         "models": INVENTORY.get("models", []),
+        # Image models (POST /v1/images/generations), never offered for chat.
+        "images": INVENTORY.get("images", []),
+        "image_alias": IMAGE_ALIAS,
         # The direct dispatchers of Hermes, OpenClaw and Honcho compare this
         # with the budget their CT was configured for.
         "kindi_read_timeout_seconds": KINDI_READ_TIMEOUT,
@@ -6070,7 +6282,8 @@ def render_metrics() -> str:
     known = list(dict.fromkeys([*SERVERS, *servers, *_IN_FLIGHT]))
     gauges = {
         "osr_in_flight_requests": [((("server", s),), _IN_FLIGHT.get(s, 0)) for s in known],
-        "osr_server_up": [((("kind", server_kind(s)), ("server", s)), 1 if state.get("up") else 0)
+        "osr_server_up": [((("kind", "comfyui" if s in COMFYUI_SERVERS else server_kind(s)), ("server", s)),
+                           1 if state.get("up") else 0)
                           for s, state in servers.items()],
         "osr_server_models": [((("server", s),), state.get("model_count", 0))
                               for s, state in servers.items()],
@@ -6318,7 +6531,8 @@ async def list_models(request: Request):
             data.append({"id": alias, "object": "model", "owned_by": "router"})
 
     for name, provider in CLOUD_MODELS.items():
-        if name not in seen:
+        # An image model is not a chat model: GET /v1/images/models lists it.
+        if name not in seen and not is_cloud_image_model(name):
             seen.add(name)
             data.append({"id": name, "object": "model", "owned_by": provider})
 
@@ -6349,13 +6563,321 @@ async def list_models(request: Request):
             f"{LITELLM_BASE}/v1/models",
             headers=_forward_headers(request, drop_auth=True),
             timeout=DISCOVERY_TIMEOUT)
-        for entry in (response.json().get("data") or []):
+        entries = response.json().get("data") or []
+        # /v1/models is often just OpenAI's id-only shape. LiteLLM's richer
+        # /model/info gives the mode for image deployments with arbitrary
+        # public names (for example an admin's "art" alias).
+        image_names = set()
+        try:
+            details = await http_client().get(
+                f"{LITELLM_BASE}/model/info",
+                headers=_forward_headers(request, drop_auth=True),
+                timeout=DISCOVERY_TIMEOUT)
+            details.raise_for_status()
+            for detail in details.json().get("data") or []:
+                info = detail.get("model_info") if isinstance(detail, dict) else None
+                if isinstance(info, dict) and info.get("mode") == "image_generation":
+                    image_names.add(str(detail.get("model_name") or "").lower())
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            log.debug("model list: LiteLLM model modes unavailable; using listed metadata and names")
+        for entry in entries:
             name = str(entry.get("id") or "").strip()
-            if name and name not in seen:
+            info = entry.get("model_info") or {}
+            mode = entry.get("mode") or (info.get("mode") if isinstance(info, dict) else None)
+            if name and name not in seen and mode != "image_generation" and name.lower() not in image_names \
+                    and not CLOUD_IMAGE_NAME.search(name) and not any(
+                    image["name"].lower() == name.lower() for image in INVENTORY.get("images", [])):
                 seen.add(name)
                 data.append({"id": name, "object": "model", "owned_by": "litellm"})
     except Exception as exc:  # noqa: BLE001 - the alias list must still be served
         log.warning("model list: LiteLLM unreachable (%s); serving aliases only", exc)
+    return JSONResponse({"object": "list", "data": data})
+
+
+# --- image generation ---------------------------------------------------------------
+class ImageFailure(Exception):
+    """An image server could not answer. retry: try the next one; down: also
+    take this server out of rotation until the next poll."""
+
+    def __init__(self, status: int, message: str, code: str, retry: bool = True, down: bool = False,
+                 response: Response = None):
+        super().__init__(message)
+        self.status, self.message, self.code = status, message, code
+        self.retry, self.down, self.response = retry, down, response
+
+
+def image_candidates(requested: str) -> list:
+    """The image models that can answer, best first: the alias takes every one
+    that is up, [images] prefer's kinds first, then the least busy; a name takes
+    its own copies the same way."""
+    servers = INVENTORY.get("servers", {})
+    up = [e for e in INVENTORY.get("images", []) if servers.get(e["server"], {}).get("up", True)]
+    wanted = requested.lower()
+    if wanted != IMAGE_ALIAS.lower():
+        up = [e for e in up if e["name"].lower() == wanted]
+    rank = {kind: index for index, kind in enumerate(IMAGE_PREFER)}
+    return sorted(up, key=lambda e: (rank.get(e["kind"], len(rank)), _IN_FLIGHT.get(e["server"], 0)))
+
+
+def known_image_model(requested: str) -> bool:
+    wanted = requested.lower()
+    return wanted == IMAGE_ALIAS.lower() or any(e["name"].lower() == wanted
+                                                for e in INVENTORY.get("images", []))
+
+
+def image_size(body: dict, multiple: int) -> tuple:
+    """(width, height) the request asks for, each rounded to the server's
+    multiple within 256-2048; (0, 0) when it gives none (the server's default)."""
+    size = body.get("size")
+    if size in (None, "", "auto"):
+        width, height = body.get("width"), body.get("height")
+        if width is None and height is None:
+            return 0, 0
+    elif isinstance(size, str) and re.fullmatch(r"[1-9][0-9]{1,4}x[1-9][0-9]{1,4}", size):
+        width, height = (int(part) for part in size.split("x"))
+    else:
+        raise ValueError("`size` must be WIDTHxHEIGHT, e.g. 1024x1024.")
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in (width, height)):
+        raise ValueError("`width` and `height` must be positive integers.")
+    return tuple(min(2048, max(256, int(v / multiple + 0.5) * multiple)) for v in (width, height))
+
+
+def image_payload(images: list, extra: dict = None) -> dict:
+    return {"created": int(time.time()),
+            "data": [{"b64_json": b64, "revised_prompt": None} for b64 in images], **(extra or {})}
+
+
+async def openai_image(entry: dict, body: dict, n: int, request_headers: dict) -> Response:
+    """Colibri (any /v1/models server that declares image_generation): its own
+    OpenAI images API, one image per request, b64_json."""
+    server = entry["server"]
+    url = f"{server_base(server)}/v1/images/generations"
+    headers = dict(request_headers, **backend_headers(server))
+    width, height = image_size(body, 32)
+    upstream = {k: v for k, v in body.items() if k not in ("size", "width", "height", "user")}
+    upstream.update(model=entry["name"], n=1, response_format="b64_json")
+    if width:
+        upstream["size"] = f"{width}x{height}"
+    extra = {"X-Router-Mode": "image", "X-Router-Model": entry["name"], "X-Router-Server": server}
+    if body.get("stream") is True:
+        if n != 1:
+            raise ImageFailure(400, "A streamed image request takes n=1.", "invalid_value", retry=False)
+        return await _stream_upstream("POST", url, headers, json_body=upstream,
+                                      extra_headers=extra, read_timeout=IMAGE_READ_TIMEOUT)
+    drawn, last = [], None
+    for _ in range(n):
+        slot = InFlight(server)
+        try:
+            response = await http_client().post(
+                url, json=upstream, headers=headers,
+                timeout=httpx.Timeout(IMAGE_READ_TIMEOUT, connect=CONNECT_TIMEOUT))
+        except httpx.ConnectError as exc:
+            raise ImageFailure(502, f"{server}: {exc}", "connect", down=True) from exc
+        except httpx.RequestError as exc:
+            raise ImageFailure(502, f"{server}: {type(exc).__name__}: {exc}", "transport") from exc
+        finally:
+            slot.release()
+        if response.status_code >= 400:
+            failure = Response(response.content, status_code=response.status_code,
+                               headers=_response_headers(response, extra))
+            # 503 is Colibri's full queue (one image at a time): another server may be free.
+            raise ImageFailure(response.status_code, f"{server}: HTTP {response.status_code}",
+                               f"http_{response.status_code}",
+                               retry=response.status_code in RETRYABLE_STATUS, response=failure)
+        try:
+            last = response.json()
+            drawn.extend(item["b64_json"] for item in last["data"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ImageFailure(502, f"{server}: not an images answer ({exc})", "no_reply") from exc
+    extra_fields = {"colibri": last["colibri"]} if n == 1 and isinstance(last.get("colibri"), dict) else {}
+    return JSONResponse(image_payload(drawn, extra_fields), headers=extra)
+
+
+_COMFYUI_CANCELS: set = set()   # background cancels; a bare create_task() can be garbage-collected
+
+
+async def comfyui_cancel(client: httpx.AsyncClient, server: str, prompt_id: str) -> None:
+    """Cancel one ComfyUI job by id: POST /api/jobs/{id}/cancel dequeues it if
+    pending and interrupts it only if it is the one running. /interrupt would
+    stop whichever user's job happens to be running now."""
+    try:
+        response = await client.post(f"{server}/api/jobs/{prompt_id}/cancel", timeout=DISCOVERY_TIMEOUT)
+    except (httpx.HTTPError, RuntimeError) as exc:   # RuntimeError: the client closed at shutdown
+        log.warning("image: could not cancel ComfyUI job %s on %s (%s); it may still draw",
+                    prompt_id, server, exc)
+        return
+    if response.status_code >= 400:
+        log.warning("image: %s did not cancel job %s: HTTP %s (a ComfyUI without /api/jobs?); "
+                    "it may still draw", server, prompt_id, response.status_code)
+
+
+async def comfyui_image(entry: dict, body: dict, n: int, request: Request) -> Response:
+    """ComfyUI: the variant's Klein workflow with the prompt, size, steps and
+    seed filled in, queued, polled until done, and its pictures fetched."""
+    import base64
+    import copy
+    server = entry["server"]
+    extra = {"X-Router-Mode": "image", "X-Router-Model": entry["name"], "X-Router-Server": server}
+    if body.get("stream") is True:
+        raise ImageFailure(400, "ComfyUI images are not streamed.", "invalid_value")
+    width, height = image_size(body, 16)
+    workflow = copy.deepcopy(COMFYUI_VARIANTS[entry["variant"]]["workflow"])
+    width, height = width or workflow["6"]["inputs"]["width"], height or workflow["6"]["inputs"]["height"]
+    steps = body.get("steps", workflow["7"]["inputs"]["steps"])
+    seed = body.get("seed")
+    if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 200:
+        raise ImageFailure(400, "`steps` must be an integer from 1 to 200.", "invalid_value", retry=False)
+    if seed is None:
+        seed = secrets.randbelow(2 ** 32)
+    elif not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2 ** 64:
+        raise ImageFailure(400, "`seed` must be a non-negative integer.", "invalid_value", retry=False)
+    workflow["4"]["inputs"]["text"] = str(body.get("prompt") or "")
+    workflow["6"]["inputs"].update(width=width, height=height, batch_size=n)
+    workflow["7"]["inputs"].update(steps=steps, width=width, height=height)
+    workflow["8"]["inputs"]["noise_seed"] = seed
+    client = http_client()
+    slot = InFlight(server)
+    prompt_id = ""
+    settled = False   # the job finished, failed or was cancelled: nothing left to cancel
+    try:
+        try:
+            queued = await client.post(f"{server}/prompt", timeout=DISCOVERY_TIMEOUT,
+                                       json={"prompt": workflow, "client_id": f"osr-router-{request_id()}"})
+            if queued.status_code >= 400:
+                raise ImageFailure(502, f"{server}: ComfyUI refused the workflow: HTTP {queued.status_code} "
+                                   f"{queued.text[:300]}", f"http_{queued.status_code}")
+            prompt_id = str(queued.json()["prompt_id"])
+            deadline = time.monotonic() + IMAGE_READ_TIMEOUT
+            while True:
+                await asyncio.sleep(COMFYUI_POLL_SECONDS)
+                if await request.is_disconnected():
+                    raise ImageFailure(499, "Client disconnected before the image was ready",
+                                       "client_disconnected", retry=False)
+                history = (await client.get(f"{server}/history/{prompt_id}",
+                                            timeout=DISCOVERY_TIMEOUT)).json().get(prompt_id)
+                if isinstance(history, dict):
+                    status = history.get("status") or {}
+                    if status.get("status_str") == "error":
+                        settled = True
+                        raise ImageFailure(502, f"{server}: ComfyUI failed the job: "
+                                           f"{json.dumps(status.get('messages'))[:300]}", "engine_error")
+                    if status.get("completed", bool(history.get("outputs"))):
+                        settled = True
+                        break
+                if time.monotonic() > deadline:
+                    await comfyui_cancel(client, server, prompt_id)
+                    settled = True
+                    raise ImageFailure(504, f"{server}: no picture within {IMAGE_READ_TIMEOUT:g} s "
+                                       "([images] read_timeout_seconds)", "timeout", retry=False)
+            drawn = []
+            for output in (history.get("outputs") or {}).values():
+                for image in (output or {}).get("images") or []:
+                    if image.get("type", "output") != "output":
+                        continue
+                    picture = await client.get(f"{server}/view", timeout=DISCOVERY_TIMEOUT, params={
+                        "filename": image["filename"], "subfolder": image.get("subfolder", ""),
+                        "type": "output"})
+                    picture.raise_for_status()
+                    drawn.append(base64.b64encode(picture.content).decode("ascii"))
+        except httpx.ConnectError as exc:
+            raise ImageFailure(502, f"{server}: {exc}", "connect", down=not prompt_id) from exc
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise ImageFailure(502, f"{server}: {type(exc).__name__}: {exc}", "transport") from exc
+    finally:
+        slot.release()
+        if prompt_id and not settled:
+            # A poll that failed, or a caller that went away (CancelledError),
+            # would leave the job drawing for nobody. Cancel it in a task of
+            # its own, which still runs when this one is being cancelled.
+            task = asyncio.create_task(comfyui_cancel(client, server, prompt_id))
+            _COMFYUI_CANCELS.add(task)
+            task.add_done_callback(_COMFYUI_CANCELS.discard)
+    if not drawn:
+        raise ImageFailure(502, f"{server}: ComfyUI finished without a picture", "no_reply")
+    return JSONResponse(image_payload(drawn, {"comfyui": {"width": width, "height": height,
+                                                          "seed": seed, "steps": steps}}),
+                        headers=extra)
+
+
+@app.post("/v1/images/generations")
+async def route_image_generation(request: Request):
+    """Pictures from the image servers the router knows (the alias picks one;
+    a name asks for that model), or from LiteLLM for a cloud image model or a
+    name the router does not know."""
+    if request.headers.get("x-router-subscription") == "1":
+        return await _proxy_subscription(request)
+    raw = await request.body()
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return _error(400, "Invalid JSON body.", "invalid_body")
+    if not isinstance(body, dict):
+        return _error(400, "Request body must be a JSON object.", "invalid_body")
+    requested = str(body.get("model") or "").strip() or IMAGE_ALIAS
+    if requested in CLOUD_MODELS or not known_image_model(requested):
+        # Cloud models only when named; any other name is LiteLLM's to answer.
+        mode = "cloud" if requested in CLOUD_MODELS else "litellm"
+        return await _stream_upstream(
+            "POST", f"{LITELLM_BASE}/v1/images/generations", _forward_headers(request, drop_auth=True),
+            content=raw, read_timeout=IMAGE_READ_TIMEOUT,
+            extra_headers={"X-Router-Mode": mode, **({"X-Router-Model": requested} if mode == "cloud" else {})})
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _error(400, "`prompt` must be a non-empty string.", "invalid_value")
+    n = body.get("n", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= IMAGE_MAX_N:
+        return _error(400, f"`n` must be an integer from 1 to {IMAGE_MAX_N} ([images] max_n).",
+                      "invalid_value")
+    try:
+        image_size(body, 16)
+    except ValueError as exc:
+        return _error(400, str(exc), "invalid_value")
+    candidates = image_candidates(requested)
+    if body.get("stream") is True:
+        candidates = [e for e in candidates if e["kind"] != "comfyui"]
+    if not candidates:
+        return _error(503, f"No image server for '{requested}' is up"
+                      + (" that streams (Colibri)" if body.get("stream") is True else "")
+                      + "; see GET /routing/inventory.", "no_image_server")
+    headers = {"X-Request-ID": request_id()} if request_id() else {}
+    last = None
+    for entry in candidates:
+        try:
+            if entry["kind"] == "comfyui":
+                return await comfyui_image(entry, body, n, request)
+            return await openai_image(entry, body, n, headers)
+        except ImageFailure as failure:
+            count("osr_upstream_failures_total", server=entry["server"], reason=failure.code)
+            log.warning("image: %s on %s failed (%s)", entry["name"], entry["server"], failure.message)
+            if failure.down:
+                mark_server_down(entry["server"], failure.message)
+            if not failure.retry:
+                return failure.response or _error(failure.status, failure.message, failure.code)
+            last = failure
+    if last is not None and last.response is not None:
+        return last.response
+    return _error(502, f"Every image server failed; the last: {last.message}", "image_servers_failed")
+
+
+@app.get("/v1/images/models")
+async def list_image_models():
+    """What /v1/images/generations can draw with: the alias when an image
+    server is up, every image model, and the configured cloud image models."""
+    data, seen = [], set()
+    if image_candidates(IMAGE_ALIAS):
+        data.append({"id": IMAGE_ALIAS, "object": "model", "owned_by": "router"})
+        seen.add(IMAGE_ALIAS)
+    rank = {kind: index for index, kind in enumerate(IMAGE_PREFER)}
+    available = [entry for entry in INVENTORY.get("images", [])
+                 if INVENTORY.get("servers", {}).get(entry["server"], {}).get("up", True)]
+    for entry in sorted(available, key=lambda e: rank.get(e["kind"], len(rank))):
+        if entry["name"] not in seen:
+            seen.add(entry["name"])
+            data.append({"id": entry["name"], "object": "model", "owned_by": entry["kind"]})
+    for name, provider in CLOUD_MODELS.items():
+        if is_cloud_image_model(name) and name not in seen:
+            seen.add(name)
+            data.append({"id": name, "object": "model", "owned_by": provider})
     return JSONResponse({"object": "list", "data": data})
 
 
@@ -7205,6 +7727,22 @@ read_timeout_seconds = 300
 # server is Kindi. Never below read_timeout_seconds.
 kindi_read_timeout_seconds = 3600
 
+[images]
+# POST /v1/images/generations: Colibri image servers (a /v1/models entry with
+# "capabilities": ["image_generation"]) and ComfyUI CTs (COMFYUI_SERVERS,
+# manage-model-servers set-comfyui). Open WebUI asks for the alias.
+# The model name that takes any image server that is up.
+alias = image
+# Server kinds the alias tries first, in order (JSON array or comma list).
+prefer = comfyui, colibri
+# Seconds one picture may take: a CPU draws for minutes. Never below
+# read_timeout_seconds.
+read_timeout_seconds = 900
+# Seconds between polls of a ComfyUI job.
+comfyui_poll_seconds = 1
+# The most pictures one request may ask for (n); Colibri draws them in turn.
+max_n = 4
+
 [discovery]
 # Poll each Ollama target's /api/tags for the models it is actually serving,
 # and route from that live inventory instead of the static tier mapping.
@@ -7613,6 +8151,14 @@ Commands:
                              when omitted); --off removes its deployments
   set-cloud-models <openai|anthropic|gemini> <model[,model...]|--off>
                              Expose specific provider model IDs through OSR
+  set-comfyui <url[,url...]|--off>
+                             The ComfyUI CTs the router draws pictures with
+                             (POST /v1/images/generations, the FLUX.2 Klein
+                             workflow; Open WebUI asks for the "image" alias).
+                             Root URLs, e.g. http://10.0.0.30:8188. Not model
+                             servers: no tier, no LiteLLM deployment
+  add-comfyui <url>          Add one ComfyUI CT to that list (no change when
+                             it is already there)
   set-freellmapi <url|--off> [key]
                              Offer a FreeLLMAPI server's models as
                              freellmapi/<id>, used only when asked for by name
@@ -8356,6 +8902,10 @@ cmd_list() {
   # No apostrophe inside the ${...:-default}: bash re-parses that word and a
   # lone quote there opens a quote context, breaking everything after it.
   echo "Keep-alive: ${ka:-<server default (OLLAMA_KEEP_ALIVE on each host)>}"
+  local comfyui; comfyui="$(env_get COMFYUI_SERVERS)"
+  if [[ -n "$comfyui" ]]; then
+    echo "ComfyUI image servers: ${comfyui//,/, } (POST /v1/images/generations; the image alias)"
+  fi
   local freellmapi; freellmapi="$(env_get FREELLMAPI_BASE_URL)"
   if [[ -n "$freellmapi" ]]; then
     echo "FreeLLMAPI: ${freellmapi} (freellmapi/<id>; only when named, never by auto)"
@@ -9215,7 +9765,15 @@ openwebui_install() {
     fi
   fi
 
-  "$pip" install --no-cache-dir -r "$OPENWEBUI_REQ"
+  "$pip" install --no-cache-dir -r "$OPENWEBUI_REQ" || return 1
+  # pip replaces images.py on an upgrade; restore the router-backed picker
+  # before the Open WebUI unit is restarted. A failed patch does not fail the
+  # install (the new version is in the venv either way, and the unit must be
+  # restarted onto it): the caller patches again and warns if it still fails.
+  if [[ "$(openwebui_current_version)" == 0.12.4 ]]; then
+    "${OPENWEBUI_DIR}/venv/bin/python" "${REPO_DIR}/tools/webui-images.py" \
+      --patch-only --webui-venv "${OPENWEBUI_DIR}/venv" || true
+  fi
 }
 
 # --- LiteLLM venv ---------------------------------------------------------------
@@ -9395,6 +9953,16 @@ for rel in ("env/router.env", "env/openwebui.env"):
                 err(rel, "FREELLMAPI_BASE_URL needs a root URL such as http://10.0.0.20:3001")
         if entries.get("FREELLMAPI_MODELS", "available") not in ("", "available", "auto"):
             err(rel, "FREELLMAPI_MODELS must be available or auto")
+        for base in filter(None, (u.strip().rstrip("/") for u in entries.get("COMFYUI_SERVERS", "").split(","))):
+            try:
+                url = urlsplit(base)
+                valid = url.scheme in ("http", "https") and bool(url.hostname) and \
+                    (url.port is None or url.port > 0) and not (
+                    url.path or url.username or url.password or url.query or url.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                err(rel, f"COMFYUI_SERVERS: {base!r} is not a root URL such as http://10.0.0.30:8188")
 
 # Python services must at least compile.
 for rel in ("services/osr-router/router.py", "services/osr-monitor/monitor.py"):
@@ -9870,6 +10438,17 @@ cmd_apply() {
       note "  WARNING: install failed; the service keeps running ${have_v:-its current version}."
     fi
   fi
+  # Applying a newer config repo also repairs an existing 0.12.4 venv that
+  # predates the picker patch, without reinstalling Open WebUI.
+  if [[ "$want_v" == 0.12.4 && "$want_v" == "$(openwebui_installed_version)" ]]; then
+    local picker_result
+    if picker_result="$("${OPENWEBUI_DIR}/venv/bin/python" \
+        "${REPO_DIR}/tools/webui-images.py" --patch-only --webui-venv "${OPENWEBUI_DIR}/venv")"; then
+      [[ "$picker_result" != *": patched ("* ]] || affected+=(open-webui)
+    else
+      note "  WARNING: Open WebUI image picker patch failed; its image model list may be stale."
+    fi
+  fi
   # A venv the service account cannot read fails at exec (status=203/EXEC).
   repair_venv_access || true
   # De-duplicate, keeping SERVICES order.
@@ -10310,6 +10889,45 @@ sys.exit(0 if ok else 1)
 PY
 }
 
+# ComfyUI (targets/comfyui): image servers. The router sends them
+# POST /v1/images/generations as the FLUX.2 Klein workflow, polls for the
+# picture and answers in the OpenAI images format. They are not model
+# servers: no tier, no LiteLLM deployment, no chat.
+cmd_set_comfyui() {
+  local value="${1:-}" url
+  local -a urls=()
+  [[ -n "$value" ]] || die "set-comfyui: give ComfyUI root URLs (http://host:8188, comma-separated) or --off"
+  if [[ "$value" == --off ]]; then
+    env_set COMFYUI_SERVERS ""
+    echo "No ComfyUI image servers: the router no longer draws pictures with ComfyUI."
+    CHANGED=true
+    return 0
+  fi
+  while IFS= read -r url || [[ -n "$url" ]]; do
+    url="${url%/}"
+    [[ -n "$url" ]] || continue
+    valid_freellmapi_url "$url" || die "set-comfyui: '${url}' is not a root URL such as http://10.0.0.30:8188"
+    printf '%s\n' "${urls[@]}" | contains_line "$url" || urls+=("$url")
+  done < <(csv_to_lines "$value")
+  ((${#urls[@]})) || die "set-comfyui: no URL given"
+  value="$(printf '%s\n' "${urls[@]}" | lines_to_csv)"
+  if [[ "$value" == "$(env_get COMFYUI_SERVERS)" ]]; then
+    echo "ComfyUI image servers: ${value//,/, } (unchanged)."
+    return 0
+  fi
+  env_set COMFYUI_SERVERS "$value"
+  echo "ComfyUI image servers: ${value//,/, }. The router offers their FLUX.2 Klein models on"
+  echo "POST /v1/images/generations (GET /v1/images/models lists them; Open WebUI asks for 'image')."
+  CHANGED=true
+}
+
+cmd_add_comfyui() {
+  local url="${1:-}" current
+  [[ -n "$url" ]] || die "add-comfyui: give a ComfyUI root URL such as http://10.0.0.30:8188"
+  current="$(env_get COMFYUI_SERVERS)"
+  cmd_set_comfyui "${current:+${current},}${url%/}"
+}
+
 cmd_set_freellmapi() {
   local url="${1:-}" key="${2:-}" confirm_key=""
   [[ -n "$url" ]] || die "set-freellmapi: give the server's root URL (http://host:3001) or --off"
@@ -10391,7 +11009,8 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-webhook|set-webui-version) return 0 ;;
+    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-comfyui|add-comfyui|\
+    set-webhook|set-webui-version) return 0 ;;
     *) [[ -n "$(token_command_kind "$1")" ]] ;;
   esac
 }
@@ -10626,7 +11245,8 @@ while (( $# > 0 )); do
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
       [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-cloud-key" ||
-         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
+         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || "$COMMAND" == "set-comfyui" ||
+         -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -10667,6 +11287,8 @@ case "$COMMAND" in
   set-cloud-key) cmd_set_cloud_key "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-cloud-models) cmd_set_cloud_models "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-freellmapi) cmd_set_freellmapi "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
+  set-comfyui) cmd_set_comfyui "${ARGS[0]:-}" ;;
+  add-comfyui) cmd_add_comfyui "${ARGS[0]:-}" ;;
   set-*-token)
     token_kind="$(token_command_kind "$COMMAND")"
     [[ -n "$token_kind" ]] || die "unknown command '${COMMAND}' (try --help)"
@@ -10692,7 +11314,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-cloud-key|set-freellmapi|set-*-token)
+  set-api-key|set-cloud-key|set-freellmapi|set-comfyui|add-comfyui|set-*-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac
@@ -11194,6 +11816,333 @@ UMask=0027
 WantedBy=multi-user.target
 UNITEOF
 
+cat > "${REPO_DIR}/tools/webui-images.py" <<'WEBUIIMAGESEOF'
+#!/usr/bin/env python3
+"""Make the router Open WebUI's image generation engine.
+
+Run inside the router CT as root (the ComfyUI and Colibri provisioners, the OSR
+installer and tools/webui-images.sh stage it there). Open WebUI has one image
+engine at a time. This sets its OpenAI engine to the router's
+POST /v1/images/generations and its model to the router's image alias, which
+draws with whichever image server is up (a ComfyUI CT first, then Colibri) and
+fails forward to the next. API clients use the same endpoint.
+
+The admin token is read from a file, never from argv. Open WebUI's image
+settings are read, the engine fields changed, and the whole set written back,
+so every other setting is kept. An admin's custom ComfyUI workflow (engine
+comfyui with a workflow that is not one of OSR's) is kept as it is unless
+--replace-custom is given. On failure the previous settings are restored.
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# OSR's own ComfyUI workflows (targets/comfyui) and Open WebUI's built-in one:
+# a ComfyUI engine using any of them is replaced; anything else was an admin's.
+OSR_WORKFLOW_NAMES = ("flux2-klein-4b-api.json", "flux2-klein-9b-api.json")
+DEFAULT_SIZE = "1024x1024"
+PICKER_MARKER = "# OSR_IMAGE_MODELS_PATCH"
+PICKER_OLD = """        if image_config.IMAGE_GENERATION_ENGINE == 'openai':
+            return [
+                {'id': 'dall-e-2', 'name': 'DALL·E 2'},
+                {'id': 'dall-e-3', 'name': 'DALL·E 3'},
+                {'id': 'gpt-image-1', 'name': 'GPT-IMAGE 1'},
+                {'id': 'gpt-image-1.5', 'name': 'GPT-IMAGE 1.5'},
+            ]
+"""
+PICKER_NEW = """        if image_config.IMAGE_GENERATION_ENGINE == 'openai':
+            # OSR_IMAGE_MODELS_PATCH: ask the local router for its live image models.
+            api_base = image_config.IMAGES_OPENAI_API_BASE_URL.rstrip('/')
+            parsed = urlparse(api_base)
+            if parsed.hostname in ('127.0.0.1', 'localhost', '::1') and parsed.path.rstrip('/') == '/v1':
+                session = await get_session()
+                async with session.get(
+                    url=f'{api_base}/images/models',
+                    headers={'Authorization': f'Bearer {image_config.IMAGES_OPENAI_API_KEY}'},
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                ) as r:
+                    r.raise_for_status()
+                    listed = await r.json()
+                return [
+                    {'id': item['id'], 'name': 'Automatic (image)' if item['id'] == 'image' else item['id']}
+                    for item in listed['data']
+                    if isinstance(item, dict) and isinstance(item.get('id'), str)
+                ]
+            return [
+                {'id': 'dall-e-2', 'name': 'DALL·E 2'},
+                {'id': 'dall-e-3', 'name': 'DALL·E 3'},
+                {'id': 'gpt-image-1', 'name': 'GPT-IMAGE 1'},
+                {'id': 'gpt-image-1.5', 'name': 'GPT-IMAGE 1.5'},
+            ]
+"""
+
+
+class HTTPStatusError(RuntimeError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def openwebui_images_path(venv):
+    """Find the installed module without importing Open WebUI's server."""
+    python = pathlib.Path(venv) / "bin" / "python"
+    result = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True, text=True, check=True)
+    return pathlib.Path(result.stdout.strip()) / "open_webui" / "routers" / "images.py"
+
+
+def patch_image_picker(path):
+    """Patch only the reviewed Open WebUI 0.12.4 model-list branch."""
+    path = pathlib.Path(path)
+    original = path.read_text(encoding="utf-8")
+    if PICKER_MARKER in original:
+        return False
+    if original.count(PICKER_OLD) != 1:
+        raise RuntimeError(f"{path}: unsupported Open WebUI image picker; expected the 0.12.4 branch")
+    updated = original.replace(PICKER_OLD, PICKER_NEW, 1)
+    compile(updated, str(path), "exec")
+    current = path.stat()
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                     dir=path.parent, prefix=".images-osr-", delete=False) as tmp:
+        tmp.write(updated)
+        temporary = pathlib.Path(tmp.name)
+    try:
+        os.chmod(temporary, stat.S_IMODE(current.st_mode))
+        if hasattr(os, "chown"):
+            os.chown(temporary, current.st_uid, current.st_gid)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def request(url, token=None, data=None, method=None, expect=dict, timeout=30):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(data, separators=(",", ":")).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with OPENER.open(req, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(500).decode("utf-8", "replace")
+        exc.close()
+        raise HTTPStatusError(f"{url}: HTTP {exc.code}: {detail}", exc.code) from exc
+    try:
+        body = json.loads(raw) if raw else None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{url}: response is not JSON") from exc
+    if expect is not None and not isinstance(body, expect):
+        raise RuntimeError(f"{url}: unexpected {type(body).__name__} response")
+    return body
+
+
+def env_value(path, key):
+    """KEY=value from an env file (the last one wins); '' when absent."""
+    value = ""
+    try:
+        for line in pathlib.Path(path).read_text().splitlines():
+            if line.startswith(f"{key}="):
+                value = line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return value
+
+
+def router_key(secrets_file):
+    """The key Open WebUI already sends the router for chat."""
+    key = env_value(secrets_file, "ROUTER_API_KEY")
+    if not key:
+        key = env_value(secrets_file, "OPENAI_API_KEYS").split(";")[0].strip()
+    return key or "none"
+
+
+def osr_workflows(script_dir):
+    """The workflows OSR itself puts in Open WebUI: staged beside this script,
+    or in the repository's targets/comfyui when run from a checkout."""
+    found = []
+    for name in OSR_WORKFLOW_NAMES:
+        for folder in (script_dir, script_dir.parent / "targets" / "comfyui"):
+            try:
+                found.append(json.loads((folder / name).read_text()))
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
+    return found
+
+
+def custom_comfyui(config, known):
+    """Is Open WebUI drawing with an admin's own ComfyUI workflow?"""
+    if config.get("IMAGE_GENERATION_ENGINE") != "comfyui":
+        return False
+    text = config.get("COMFYUI_WORKFLOW")
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        workflow = json.loads(text)
+    except json.JSONDecodeError:
+        return True
+    # Open WebUI's built-in checkpoint graph has a CheckpointLoaderSimple and a KSampler.
+    classes = {node.get("class_type") for node in workflow.values() if isinstance(node, dict)}
+    builtin = classes == {"KSampler", "CheckpointLoaderSimple", "EmptyLatentImage",
+                          "CLIPTextEncode", "VAEDecode", "SaveImage"}
+    return not builtin and workflow not in known
+
+
+def router_models(router, key, wait, expect):
+    """The router's image models, after a refresh; waits up to `wait` seconds
+    for the alias (and `expect`, when given) to appear."""
+    deadline = time.monotonic() + max(0, wait)
+    while True:
+        try:
+            request(f"{router}/routing/refresh?probe=false", key, data={}, method="POST", expect=None)
+        except (RuntimeError, urllib.error.URLError, OSError):
+            pass
+        listed = request(f"{router}/v1/images/models", key)
+        names = [item.get("id") for item in listed.get("data", []) if isinstance(item, dict)]
+        wanted = expect in names if expect else bool(names)
+        if wanted or time.monotonic() >= deadline:
+            return names
+        time.sleep(3)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--webui-url", default="")
+    parser.add_argument("--admin-token-file", default="")
+    parser.add_argument("--webui-venv", default="/app/openwebui/venv")
+    parser.add_argument("--picker-module", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--no-restart", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--patch-only", action="store_true",
+                        help="patch the installed Open WebUI 0.12.4 image picker after a pip install")
+    parser.add_argument("--router-url", default="")
+    parser.add_argument("--router-env", default="/app/router/.env")
+    parser.add_argument("--router-secrets", default="/app/router/secrets.env")
+    parser.add_argument("--alias", default="image")
+    parser.add_argument("--expect-model", default="",
+                        help="an image model the router must list before generation is enabled")
+    parser.add_argument("--image-size", default="")
+    parser.add_argument("--image-steps", type=int, default=0)
+    parser.add_argument("--wait", type=int, default=120, help="seconds to wait for the router's image models")
+    parser.add_argument("--replace-custom", action="store_true",
+                        help="replace an admin's custom ComfyUI workflow too")
+    parser.add_argument("--off", action="store_true", help="turn image generation off")
+    args = parser.parse_args(argv)
+    if args.patch_only:
+        picker = pathlib.Path(args.picker_module) if args.picker_module else openwebui_images_path(args.webui_venv)
+        changed = patch_image_picker(picker)
+        print(f"Open WebUI image picker: {'patched' if changed else 'already patched'} ({picker}).")
+        return
+    if not args.webui_url or not args.admin_token_file:
+        parser.error("--webui-url and --admin-token-file are required")
+    if args.image_size and not re.fullmatch(r"[1-9][0-9]{1,4}x[1-9][0-9]{1,4}", args.image_size):
+        raise ValueError("--image-size must be WIDTHxHEIGHT, e.g. 1024x1024")
+    if args.image_steps < 0:
+        raise ValueError("--image-steps must be positive")
+    admin_token = pathlib.Path(args.admin_token_file).read_text().strip()
+    if not admin_token:
+        raise RuntimeError("The admin token file is empty")
+    webui = args.webui_url.rstrip("/")
+    base = f"{webui}/api/v1/images"
+    port = env_value(args.router_env, "ROUTER_PORT") or "8000"
+    router = (args.router_url or f"http://127.0.0.1:{port}").rstrip("/")
+    key = router_key(args.router_secrets)
+
+    original = request(f"{base}/config", admin_token)
+    if "IMAGES_OPENAI_API_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
+        raise RuntimeError("This Open WebUI's image settings API is not supported "
+                           "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.12.4)")
+    if args.off:
+        if original.get("IMAGE_GENERATION_ENGINE") == "openai" and \
+                str(original.get("IMAGES_OPENAI_API_BASE_URL", "")).rstrip("/") == f"{router}/v1":
+            request(f"{base}/config/update", admin_token, dict(original, ENABLE_IMAGE_GENERATION=False))
+            print("Open WebUI's image generation through the router is off.")
+        else:
+            print("Open WebUI does not draw through the router; its image settings were left as they are.")
+        return
+    if custom_comfyui(original, osr_workflows(pathlib.Path(__file__).resolve().parent)) and not args.replace_custom:
+        print("Open WebUI draws with a custom ComfyUI workflow an admin set up; it is kept.")
+        print(f"The router's image models are still on {router}/v1/images/generations for API clients;")
+        print("rerun with --replace-custom to make the router Open WebUI's image engine.")
+        return
+
+    names = router_models(router, key, args.wait, args.expect_model)
+    picker = pathlib.Path(args.picker_module) if args.picker_module else openwebui_images_path(args.webui_venv)
+    picker_changed = patch_image_picker(picker)
+    if picker_changed and not args.no_restart:
+        subprocess.run(["systemctl", "restart", "open-webui.service"], check=True)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                request(f"{base}/config", admin_token)
+                break
+            except (RuntimeError, urllib.error.URLError, OSError):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Open WebUI did not answer after the image picker patch")
+                time.sleep(2)
+    ready = args.alias in names and (not args.expect_model or args.expect_model in names)
+    size = args.image_size or original.get("IMAGE_SIZE") or DEFAULT_SIZE
+    if not re.fullmatch(r"[1-9][0-9]{1,4}x[1-9][0-9]{1,4}", str(size)):
+        size = DEFAULT_SIZE   # "auto" is for gpt-image; the router's servers need a size
+    params = original.get("IMAGES_OPENAI_API_PARAMS")
+    if args.image_steps:
+        params = dict(params if isinstance(params, dict) else {}, steps=args.image_steps)
+    new = dict(original,
+               IMAGE_GENERATION_ENGINE="openai",
+               IMAGES_OPENAI_API_BASE_URL=f"{router}/v1",
+               IMAGES_OPENAI_API_KEY=key,
+               IMAGES_OPENAI_API_VERSION="",
+               IMAGES_OPENAI_API_PARAMS=params,
+               IMAGE_GENERATION_MODEL=args.alias,
+               IMAGE_SIZE=size,
+               ENABLE_IMAGE_GENERATION=ready)
+    request(f"{base}/config/update", admin_token, new)
+    try:
+        saved = request(f"{base}/config", admin_token)
+        for field in ("IMAGE_GENERATION_ENGINE", "IMAGES_OPENAI_API_BASE_URL", "IMAGE_GENERATION_MODEL"):
+            if saved.get(field) != new[field]:
+                raise RuntimeError(f"Open WebUI did not keep {field}={new[field]!r} (it has {saved.get(field)!r})")
+    except (RuntimeError, urllib.error.URLError, OSError) as exc:
+        try:
+            request(f"{base}/config/update", admin_token, original)
+            restored = "the previous image settings were restored"
+        except (RuntimeError, urllib.error.URLError, OSError) as again:
+            restored = f"restoring the previous image settings failed too ({again})"
+        raise RuntimeError(f"{exc}; {restored}") from exc
+
+    print(f"Open WebUI generates images through the router ({router}/v1, model {args.alias!r}, {size}).")
+    if ready:
+        shown = ", ".join(n for n in names if n != args.alias)
+        print(f"The router draws with: {shown}. Change the size or steps under Admin Settings > Images.")
+    else:
+        wanted = args.expect_model or "an image model"
+        print(f"Image generation is left off: the router does not list {wanted} yet "
+              f"(it lists: {', '.join(names) or 'nothing'}). Check GET {router}/routing/inventory,")
+        print("then rerun this step, or turn it on under Admin Settings > Images once a model is up.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"Image integration failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+WEBUIIMAGESEOF
+
 if [[ "$CONFIG_SOURCE" == "repo" ]]; then
   echo "Seeding the Gitea config repository (missing files; installer-owned code is updated)."
   seed_gitea_repo "$REPO_DIR" "$GITEA_DEPLOY_TOKEN_KEEP" || \
@@ -11285,6 +12234,9 @@ fi
 # large dependency tree (torch, transformers, chromadb…) and takes a while.
 run_ct /app/openwebui/venv/bin/pip install --no-cache-dir \
   -r "${CONFIG_REPO_DIR}/services/open-webui/requirements.txt"
+if [[ "$OPENWEBUI_VERSION" == 0.12.4 ]]; then
+  run_ct /app/openwebui/venv/bin/python "${CONFIG_REPO_DIR}/tools/webui-images.py" --patch-only
+fi
 
 echo "Setting ownership and permissions."
 run_ct chown -R osr-router:osr-router /app/router /app/openwebui

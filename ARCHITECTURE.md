@@ -67,7 +67,8 @@ flowchart LR
     webui -->|"OpenAI API (openclaw)"| openclaw
     webui -->|"OpenAI API (opencode)"| opencode
     webui -->|"OpenAI API (deepseek-harness)"| deepseek
-    webui -->|"image generation"| comfy
+    webui -->|"image generation (OpenAI images API)"| router
+    router -->|"Klein workflow"| comfy
     hermes -.->|inventory and ranking :8000| router
     hermes -->|direct inference| pool
     openclaw -.->|inventory and ranking :8000| router
@@ -108,7 +109,7 @@ flowchart LR
 | DeepSeek Harness Web UI (`:3080`), chat endpoint (`:3081`) | Optional | Its agent UI, and `deepseek-harness` in Open WebUI, are unavailable |
 | OpenCode server (`:4096`), chat endpoint (`:4097`) | Optional | Its web UI and API, and `opencode` in Open WebUI, are unavailable |
 | Honcho (`:8000`, `:3000`) | Optional | Agent memory and Open WebUI MCP tools unavailable; chat unaffected |
-| ComfyUI (`:8188`) | Optional | Image generation fails; chat unaffected |
+| ComfyUI (`:8188`) | Optional | The image alias fails forward to a Colibri image model, else 503; chat unaffected |
 | Cloud provider APIs (HTTPS) | Optional | Only explicitly chosen cloud models fail |
 | Subscription gateway (`SUBSCRIPTION_GATEWAY_BASE_URL`) | Optional | Requests with `x-router-subscription: 1` get 502 |
 | MQTT broker (`:1883` or the TLS port) | Optional | Cross-CT hcom synchronization pauses; routing unaffected |
@@ -170,8 +171,10 @@ FastAPI/uvicorn on `:8000`; the only component that makes routing decisions.
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | Classify, select, dispatch; a configured cloud ID goes to LiteLLM (§4.2), a `freellmapi/<id>` straight to FreeLLMAPI with the router's key (§17.9) |
-| `GET /v1/models` | `auto`, tier aliases, configured cloud IDs (`owned_by` = provider), `freellmapi/<id>` when FreeLLMAPI is set (`owned_by` = `freellmapi`, cached five minutes), discovered chat models (`owned_by` = kind) |
-| `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state, the router's requests in flight per server (`in_flight`) and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll, which also asks every Ollama model for its capabilities again unless `?probe=false` |
+| `GET /v1/models` | `auto`, tier aliases, configured cloud IDs (`owned_by` = provider; image models such as `openai/gpt-image-1` excepted), `freellmapi/<id>` when FreeLLMAPI is set (`owned_by` = `freellmapi`, cached five minutes), discovered chat models (`owned_by` = kind) |
+| `POST /v1/images/generations` | Pictures (§5.4): the `image` alias or a named image model on a ComfyUI CT or a Colibri image server, fail-forward; a configured cloud image model or an unknown name goes to LiteLLM |
+| `GET /v1/images/models` | The `image` alias (while an image server is up), the discovered image models (`owned_by` = `comfyui`/`colibri`) and the configured cloud image models |
+| `GET /routing/inventory` / `POST /routing/refresh` | Live inventory with per-host state, the image models (`images`, never offered for chat), the router's requests in flight per server (`in_flight`) and `kindi_read_timeout_seconds` (which the agent and Honcho dispatchers follow when lower than theirs); force a re-poll, which also asks every Ollama model for its capabilities again unless `?probe=false` |
 | `POST /routing/explain` | Decision and scored candidates, without executing |
 | `GET /healthz` | Liveness (never needs the key) |
 | `GET /metrics` | Prometheus text format: requests by route, mode, class, model, server and status; upstream failures by server and reason; response-start and duration histograms; per-server load and state (§12) |
@@ -352,6 +355,45 @@ dispatchers answer 424 with `x-should-retry: false` (LiteLLM's 408 on a Kindi
 tier becomes the same) and then send that Kindi nothing until its `/health`
 shows it idle, answering a retryable 503 meanwhile. Details:
 [Kindi README](targets/kindi/README.md#timeouts-and-retries).
+
+### 5.4 Image generation
+
+`POST /v1/images/generations` is the OpenAI images API, answered from the
+router's own image servers:
+
+* **Colibri** CTs serving an image model (Qwen-Image-2.1): their `/v1/models`
+  entry declares `"capabilities": ["image_generation"]`, so discovery files it
+  under `INVENTORY["images"]`, never with the chat models. The request goes to
+  the CT's own `/v1/images/generations` with its key, `n` = 1 per call (the
+  router loops for `n` > 1, up to `[images] max_n`), `response_format` =
+  `b64_json` and the size rounded to colibri's multiple of 32 (256-2048).
+  `stream: true` is relayed as colibri's SSE.
+* **ComfyUI** CTs in `COMFYUI_SERVERS` (`manage-model-servers set-comfyui` /
+  `add-comfyui`; the ComfyUI provisioner adds its CT). Discovery reads
+  `/system_stats` and the three loaders' `/object_info` and offers
+  `flux2-klein-4b-comfyui` / `flux2-klein-9b-comfyui` when ComfyUI lists that
+  variant's diffusion model, text encoder and VAE. A request fills the
+  variant's workflow (`targets/comfyui/flux2-klein-*-api.json`, copied into
+  router.py and checked equal by the tests) with the prompt, size (multiple of
+  16), steps, seed and `n` as the batch, queues it (`POST /prompt`), polls
+  `/history/<id>` every `comfyui_poll_seconds`, fetches the pictures from
+  `/view` and answers `b64_json`. A job past `read_timeout_seconds` is
+  cancelled by its own ID, whether queued or running. The router also detects
+  a disconnected client while polling and cancels that client's job.
+
+The model name is the `[images] alias` (`image`, Open WebUI's) or an image
+model's own name. The alias tries `[images] prefer` (`comfyui, colibri`)
+first, then the least busy, and fails forward on a connect error (host marked
+down), a transport error, a failed ComfyUI job or a 5xx (Colibri's full queue
+is 503); a 400 is returned as is. `[images] read_timeout_seconds` (900) bounds
+one picture. A configured cloud image model (`openai/gpt-image-1`,
+`gemini/imagen-...`) goes to LiteLLM only when named, as cloud chat models do;
+an unknown name also goes to LiteLLM, as before. Open WebUI's image engine is
+set by `tools/webui-images.py`: engine OpenAI, base
+`http://127.0.0.1:8000/v1`, the router key, model `image`. The helper patches
+the pinned Open WebUI 0.12.4 image picker to read the router's live
+`/v1/images/models` list; the installer and manager reapply it after pip
+installs that version.
 
 ---
 
@@ -541,7 +583,7 @@ service account before its venv is built.
 | 3080 / 3081 | DeepSeek Harness Web UI / chat endpoint | CT IPv4 address / CT IPv4 address when Open WebUI is on | Browser UI, inbound limited by `DSH_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → Harness's ACP server on a local socket, inbound from the router only |
 | 4096 / 4097 / 8765 | OpenCode server (web UI, API) / chat endpoint / dispatcher | `0.0.0.0` (loopback with `OPENCODE_WEB=false`) / `0.0.0.0` when Open WebUI is on / `127.0.0.1` | Browsers (Basic auth) → OpenCode, inbound limited by `OPENCODE_ACCESS_CIDR`; Open WebUI (bearer key) → chat endpoint → OpenCode on loopback, inbound from the router only; dispatcher as for Hermes |
 | 8000 / 3000 / 8010, 3010 / 8765, 8766 | Honcho gateway (API / MCP) / Honcho API, MCP / proxy, embeddings | In its CT / in its CT / `127.0.0.1` / `127.0.0.1` | Open WebUI and selected agents → gateway (own keys; a workspace per Open WebUI user) → Honcho; source-restricted firewall |
-| 8188 | ComfyUI | `0.0.0.0` in its CT | Open WebUI → ComfyUI (HTTP and WebSocket) |
+| 8188 | ComfyUI | `0.0.0.0` in its CT | Router → ComfyUI (`/prompt`, `/history`, `/view`); Open WebUI → ComfyUI (HTTP and WebSocket) only with its direct ComfyUI engine |
 | 3001 | FreeLLMAPI dashboard and API | `0.0.0.0` in its CT | Router and `FREELLMAPI_ACCESS_CIDR` → FreeLLMAPI; FreeLLMAPI → cloud providers (outbound HTTPS) |
 | 3000 / 8065 | Gitea / Mattermost | CT addresses | Configuration repository / alerts and handoffs |
 | 1883, or 8883 for TLS | MQTT broker | `MQTT_BIND_IP` (CT IP; loopback for direct guest installs) | Relays → broker; inbound limited by `MQTT_CLIENT_CIDR` |
@@ -714,7 +756,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | OpenClaw and Honcho reuse Hermes's dispatcher (`DIRECT_ETC`, `DIRECT_SECRETS_FILE`, `DIRECT_CONTEXT_SETTING`) | A copy per agent | One implementation of ranking, task pinning, failover, Kindi gating and stream checks (`tests/test-repo.sh` checks the copies match) |
 | Cloud models only when named | Cloud models in the pool or fallbacks | Automatic routing must never incur API charges |
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
-| ComfyUI as Open WebUI's image engine | An image route in the router | The router is chat-only; Open WebUI already drives ComfyUI's workflow API |
+| Image generation through the router (`/v1/images/generations`, an `image` alias), Open WebUI's engine set to it | ComfyUI as Open WebUI's engine | Open WebUI has one image engine; through the router it reaches ComfyUI and Colibri alike with fail-forward, API clients get the same endpoint, and ComfyUI's newer COMBO model lists (which Open WebUI 0.12.4's picker cannot read) are read by the router. An admin's custom ComfyUI workflow keeps Open WebUI's ComfyUI engine |
 | Affinity and load only reorder or nudge near-equal candidates | Pin a conversation to its server, or always pick the idle one | Fit and residency must still decide: a pinned conversation would stay on a model too small for a later turn, and "always idle" would load a model on every server |
 | New installs use only `osr-*` names (units, `services/` directories, service account, Gitea router account, Mattermost team, channel and posting name); existing installs are migrated or keep what they recorded | Keep the `ollama-*` names; keep them on existing installs with drop-ins | The router routes to every kind of model server, so `ollama-*` misnamed it. `update-router.sh` moves the config repo's directories (`git mv`, keeping tuned `.ini` files), installer seeding moves them in an existing Gitea repo, and `apply` replaces the old units and renames the service account in place (same UID, so ownership is unchanged); `apply-config.sh` never installs a leftover old unit beside the new one. Gitea and Mattermost keep the accounts, team and channel they recorded, since renaming a login or moving a webhook would break running installs. Other renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
 
@@ -784,7 +826,8 @@ uses its own idle TTL).
   given; otherwise `[model_sizes]` sizes exact IDs
   ([README](README.md#model-sizes-for-unsized-ids)). An entry whose
   `capabilities` mark an image generator or a decision model and no chat
-  (Colibri's Qwen-Image, Laya, GLiNER) is not offered for chat.
+  (Colibri's Qwen-Image, Laya, GLiNER) is not offered for chat; an image
+  generator is an image model of `/v1/images/generations` (§5.4).
 * **Health:** an empty `/v1/models` means the engine is not running: down.
 * **Detection without a key:** Strata and Basalt by the `service` field of their
   public `/health`; Maya by `glm-5.3-flash` plus a `version` field; Xolotl
@@ -924,9 +967,11 @@ guest setup.
 
 ### 17.3 ComfyUI image generation (`targets/comfyui/`)
 
-[ComfyUI](targets/comfyui/README.md) is Open WebUI's image engine on :8188,
-outside the chat pool; Open WebUI drives its queue, WebSocket progress and
-image retrieval. The community-script CT is adopted under an unprivileged
+[ComfyUI](targets/comfyui/README.md) on :8188 is one of the router's image
+servers (§5.4), outside the chat pool: the router queues its Klein workflow,
+polls for the result and fetches the picture, and Open WebUI asks the router.
+With a custom diffusion model or `COMFYUI_WEBUI_ENGINE=comfyui`, Open WebUI
+drives ComfyUI's queue, WebSocket progress and image retrieval itself instead. The community-script CT is adopted under an unprivileged
 `comfyui` account with data in `/var/lib/comfyui-target/`, its unauthenticated
 port firewalled to the router and optional `UI_ALLOW_CIDR`. The guest
 downloads and verifies the selected FLUX.2 Klein weights before integration;
@@ -1252,7 +1297,7 @@ Coordination paths (§17.7):
 
 | File | Owns |
 |---|---|
-| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict, tool_kinds), `[http]` timeouts, `[discovery]` (bands, name lists, LM Studio behaviour, capability probe and its cache), `[weights]`, `[balancing]` (busy_penalty, sticky_seconds), `[model_sizes]` |
+| `router.ini` | `[thresholds]`, `[keywords]`, `[tiers]`, `[classification]` (scope, vision_strict, tools_min_class, tools_strict, tool_kinds), `[http]` timeouts, `[images]` (alias, prefer, read timeout, ComfyUI poll, max_n), `[discovery]` (bands, name lists, LM Studio behaviour, capability probe and its cache), `[weights]`, `[balancing]` (busy_penalty, sticky_seconds), `[model_sizes]` |
 | `monitor.ini` | Interval, timeout, Ollama health path, alert thresholds, startup notice, local services, keep-alive |
 | `env/router.env` | Where things are: hosts, per-tier backends and tags, keep-alive, the LiteLLM base URL, `CLOUD_*_MODELS`, `SUBSCRIPTION_GATEWAY_BASE_URL`, Gitea/Mattermost settings (no credentials). Every key is read by the router, the monitor or the manager (`tests/test-repo.sh`). The monitor's `MONITOR_*` and `KEEP_ALIVE_REFRESH_SECONDS` variables override `monitor.ini` and are logged when they do |
 | `secrets.env` (not in git) | Gitea token, webhook, router key, backend tokens, cloud keys |

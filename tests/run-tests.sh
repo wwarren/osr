@@ -98,6 +98,7 @@ add_suite opencode-openai-proxy     python "${ROOT}/targets/opencode/test-openai
 add_suite deepseek-harness-integration  python "${ROOT}/targets/deepseek-harness/test-integration.py"  python3
 add_suite deepseek-harness-openai-proxy python "${ROOT}/targets/deepseek-harness/test-openai-proxy.py" python3
 add_suite comfyui-integration       python "${ROOT}/targets/comfyui/test-integration.py"       python3
+add_suite webui-images              python "${HERE}/test-webui-images.py"                      python3
 add_suite honcho-integration        python "${ROOT}/targets/honcho/test-integrate.py"          python3
 add_suite honcho-gateway            python "${ROOT}/targets/honcho/test-gateway.py"            python3
 add_suite honcho-budgets            python "${ROOT}/targets/honcho/test-budgets.py"            python3

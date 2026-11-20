@@ -127,23 +127,30 @@ def main():
     check('return ["image_generation"]' in server and 'return ["systemone", "decision"]' in server
           and 'return ["chat", "systemone"]' in server, "the capabilities /v1/models lists changed")
 
-    # model-select.sh is colibri's whole text catalog: the same IDs, repos,
-    # sizes, RAM, excludes and post-download steps, each pinned to a commit
-    # (upstream's own where it pins one). The catalog module is standard
+    # model-select.sh is colibri's whole catalog: the same IDs, repos, sizes,
+    # RAM, rank, group (size class and modality), excludes and post-download
+    # steps, each pinned to a commit (upstream's own where it pins one). The catalog module is standard
     # library only, so it is loaded from the pinned source as it is.
     catalog_module = types.ModuleType("setup_catalog")
     sys.modules["setup_catalog"] = catalog_module
     exec(compile(show("c/setup_catalog.py"), "c/setup_catalog.py", "exec"), catalog_module.__dict__)
-    upstream_models = {entry.id: entry for entry in catalog_module.CATALOG if entry.modality == "text"}
+    upstream_models = {entry.id: entry for entry in catalog_module.CATALOG}
+    check({entry.modality for entry in upstream_models.values()} <= {"text", "image"},
+          "colibri's catalog has a modality model-select.sh does not group")
     select = (HERE / "model-select.sh").read_text(encoding="utf-8")
     listed = re.search(r"COLIBRI_MODEL_IDS=\(([^)]*)\)", select).group(1).split()
     details = select[select.index("colibri_model_details() {"):select.index("        *) return 1 ;;")]
     blocks = dict(re.findall(r"\n        ([a-z0-9.-]+)\)\n(.*?);;", details, re.S))
     check(sorted(listed) == sorted(upstream_models),
-          f"model-select.sh lists {sorted(listed)}; colibri's text catalog is {sorted(upstream_models)}")
+          f"model-select.sh lists {sorted(listed)}; colibri's catalog is {sorted(upstream_models)}")
     check(sorted(blocks) == sorted(listed), f"COLIBRI_MODEL_IDS {sorted(listed)} != the entries {sorted(blocks)}")
-    sizes = [upstream_models[model_id].disk_gb for model_id in listed]
-    check(sizes == sorted(sizes), "COLIBRI_MODEL_IDS is not smallest first")
+    def group(entry):
+        if entry.modality == "image":
+            return "image"
+        return "chat-ram" if entry.size_class == "small" else "chat-disk"
+    order = ["chat-ram", "chat-disk", "image"]
+    keys = [(order.index(group(upstream_models[i])), upstream_models[i].disk_gb) for i in listed]
+    check(keys == sorted(keys), "COLIBRI_MODEL_IDS is not grouped (chat-ram, chat-disk, image), smallest first")
     for model_id in listed:
         entry, body = upstream_models[model_id], blocks[model_id]
         fields = {k: v.strip("'") for k, v in re.findall(r"COLIBRI_MODEL_([A-Z_]+)=('[^']*'|\S+)", body)}
@@ -155,6 +162,14 @@ def main():
         check(int(fields["GOOD_MIB"]) == round(entry.ram_good_gb * 1024),
               f"{model_id}: RAM comfort point {fields['GOOD_MIB']} MiB != the catalog's {entry.ram_good_gb} GB")
         check(re.fullmatch(r"[0-9a-f]{40}", fields.get("REVISION", "")), f"{model_id}: no pinned revision")
+        check(fields.get("TYPE", "chat-disk") == group(entry), f"{model_id}: group {fields.get('TYPE')} != {group(entry)}")
+        check(int(fields.get("RANK", "-1")) == entry.rank, f"{model_id}: rank {fields.get('RANK')} != catalog {entry.rank}")
+        check(bool(fields.get("NOTE")) == bool(entry.license_note), f"{model_id}: licence note {fields.get('NOTE')!r} vs {entry.license_note!r}")
+        if entry.modality == "image":
+            # The router lists it, and tools/webui-images.py waits for it, by this id.
+            served = re.search(rf'id="{re.escape(entry.family)}".*?default_model_id="([^"]+)"', show("c/family_registry.py"), re.S)
+            check(served and fields.get("SERVED") == served.group(1),
+                  f"{model_id}: served id {fields.get('SERVED')!r} != the registry's {served and served.group(1)!r}")
         if entry.revision != "main":
             check(fields["REVISION"] == entry.revision, f"{model_id}: pin {fields['REVISION']} != upstream's {entry.revision}")
         check(not entry.include, f"{model_id}: the catalog now has includes, which install-target.sh does not pass")
@@ -171,6 +186,17 @@ def main():
                   f"c/tools/{tool}.py imports beyond the standard library: {sorted(imported - set(sys.stdlib_module_names))}")
             check("sys.argv" in source or "argparse" in source, f"c/tools/{tool}.py no longer takes the model folder")
     check("$(LIBEXECDIR)/tools/" in install, "make install no longer installs tools/ (the post-download steps)")
+    # An image model is a diffusers pipeline (model_index.json at its root): the
+    # launcher keys on that file to leave --gpu off, since the image family has
+    # no accelerator lane and coli refuses --gpu for it.
+    check("qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)" in install, "make install no longer installs the qwenimage engine")
+    check('"model_index.json"' in show("c/image_engine.py"), "image models are no longer recognised by model_index.json")
+    registry_source = show("c/family_registry.py")
+    image_family = registry_source[registry_source.index('id="qwen_image"'):]
+    image_family = image_family[:image_family.index("FamilyDescriptor(")]
+    check("supports_accelerator=False" in image_family, "the image family now has a GPU lane: pass --gpu to it")
+    check("not family.supports_accelerator" in show("c/coli") and "--gpu is unavailable" in show("c/coli"),
+          "coli no longer refuses --gpu for a CPU-only family")
     downloader = show("c/setup_download.py")
     for signature in ("def hf_token():", "def list_repo_files(repo, revision=",
                       "def bytes_present(model_dir, files", "def download_repo(repo, revision, model_dir, files, *, token=None, progress=None",
@@ -188,7 +214,7 @@ def main():
     for name in sized + ["inkling-colibri", "olmoe-colibri"]:
         check(name in announced, f"router.ini's {name} is not an id colibri announces")
     print(f"PASS colibri {expected}: build layout, serve flags, key, Host guard, GPU run flags, "
-          f"the {len(listed)} text-catalog models and their downloader, "
+          f"the {len(listed)} catalog models (grouped) and their downloader, image launch, "
           f"/v1/models and {len(sized)} sized ids match the target")
 
 

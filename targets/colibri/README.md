@@ -39,15 +39,16 @@ servers. For it the installer asks:
   will place: Qwen3.6-35B-A3B is a 23 GB download, needs at least 10 GB RAM
   (20 GB preferred). GLM-5.2 needs 429 GB of disk. More RAM keeps more experts
   resident.
-- **Model**: a menu of every text model in the
+- **Model**: a menu of every model in the
   [tested Colibri catalog](https://github.com/JustVugg/colibri/blob/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/c/setup_catalog.py),
-  from Qwen3-Coder-30B-A3B (19.4 GB) to Kimi K3 (1561 GB), each marked
-  `fits` or with what it lacks (RAM, or room on the root disk less about
-  10 GiB). The one that runs from RAM best on this CT is marked `(suggested)`:
-  Qwen3.6-35B-A3B with at least 20 GiB on the CPU or 10 GiB with a GPU,
-  otherwise Qwen3-Coder-30B-A3B. Enter downloads nothing. Unattended, set
-  `COLIBRI_MODEL_ID=<id>` to download one; unset or `none` skips it. See
-  [Downloading a catalog model](#downloading-a-catalog-model).
+  in three groups: chat models that run from RAM, large chat models whose
+  experts stream from disk, and image models (text to picture). Each is marked
+  `fits`, `fits, tight` (below the RAM colibri measured it at) or with what
+  it lacks (RAM, or room on the root disk less about 10 GiB); models whose
+  engine has no lane for the CT's GPU say `CPU only here`. Each group marks
+  its `(suggested)` model; see [Suggestions](#suggestions). Enter downloads
+  nothing. Unattended, set `COLIBRI_MODEL_ID=<id>` to download one; unset or
+  `none` skips it. See [Downloading a catalog model](#downloading-a-catalog-model).
 
 It adds the CT to the router's server list up front, then, once the CT is
 built, reads `/etc/colibri-target/api-key` and gives it to the router with
@@ -195,18 +196,24 @@ Health is `GET /v1/models` with the key; it lists the served model as
 `owned_by: colibri` with its `context_length`, input modalities and
 capabilities. The router sizes the ids colibri announces without a size
 (`qwen3.6-colibri`, `glm-5.2-colibri`, ...) from `[model_sizes]` and does not
-offer an image or decision model (Qwen-Image, Laya, GLiNER) for chat.
+offer an image or decision model (Qwen-Image, Laya, GLiNER) for chat. An image
+model (Qwen-Image, listed with `capabilities: ["image_generation"]`) is one of
+the router's image models instead: `POST /v1/images/generations` on the router
+sends it the request (its `image` alias too), and Open WebUI draws through the
+router ([README](../../README.md#image-generation)).
 
 ## Downloading a catalog model
 
-`COLIBRI_MODEL_ID` names one of colibri's text models in `model-select.sh`,
-each pinned to a Hugging Face commit (`test-pinned-upstream.py` keeps the table
-equal to colibri's catalog at the tested pin):
+`COLIBRI_MODEL_ID` names one of colibri's models in `model-select.sh`, each
+pinned to a Hugging Face commit (`test-pinned-upstream.py` keeps the table
+equal to colibri's catalog at the tested pin, groups and ranks included):
 
 | ID | Model | Download | RAM at least (good) | Repository @ commit |
 |---|---|---|---|---|
+| **Chat, from RAM** | | | | |
 | `qwen3-coder-30b` | Qwen3-Coder-30B-A3B | 19.4 GB | 8 GiB (18) | `Justvugg/Qwen3-Coder-30B-A3B-colibri-int4` @ `d839110a` |
 | `qwen36-35b` | Qwen3.6-35B-A3B | 23.1 GB | 10 GiB (20) | `Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64` @ `c619aa59` |
+| **Chat, experts from disk** | | | | |
 | `deepseek-v4-flash-reap` | DeepSeek V4 Flash REAP 150B | 84.7 GB | 16 GiB (32) | `puwaer/DeepSeek-V4-Flash-0731-reap-150b` @ `7c76db22` |
 | `deepseek-v4-flash` | DeepSeek V4 Flash | 166.9 GB | 16 GiB (32) | `deepseek-ai/DeepSeek-V4-Flash-0731` @ `7872f01b` |
 | `mimo-v2.6-flash` | MiMo-V2.6 Flash | 171.8 GB | 32 GiB (52) | `XiaomiMiMo/MiMo-V2.6-Flash-MOPD` @ `5220c3f5` |
@@ -216,12 +223,43 @@ equal to colibri's catalog at the tested pin):
 | `inkling` | Inkling | 514.1 GB | 120 GiB (128) | `nbeerbower/Inkling-colibri-int4` @ `3981e658` |
 | `mimo-v2.6-pro` | MiMo-V2.6 Pro | 563.6 GB | 54 GiB (64) | `XiaomiMiMo/MiMo-V2.6-Pro-MOPD` @ `da71ee15` |
 | `kimi-k3` | Kimi K3 | 1561.0 GB | 32 GiB (64) | `moonshotai/Kimi-K3` @ `f831ab66` |
+| **Images** | | | | |
+| `qwen-image-2.1` | Qwen-Image-2.1 (Qwen Research licence: non-commercial use only) | 33.1 GB | 12 GiB (18) | `Qwen/Qwen-Image-2.1` @ `d26bb612` |
 
 The two MiMo models skip what the engine never reads (`dflash/`,
 `audio_tokenizer/`, `model_mtp.safetensors`), as colibri's catalog does; Kimi
 K3 gets its `tokenizer.json` from colibri's `tools/k3_tokenizer.py` before it
-is published. The large models stream their experts from disk. Qwen-Image is
-left out: it is an image model, not a chat server.
+is published. The large models stream their experts from disk.
+
+Qwen-Image-2.1 draws pictures and does not chat: a CT serving it answers
+`POST /v1/images/generations` (the OpenAI images API, `b64_json`, one image
+at a time) and lists the model with `capabilities: ["image_generation"]`.
+colibri's image engine runs on a Vulkan GPU or the CPU (about 2 min 40 s for
+768x512 at 8 steps on 8 Zen 4 cores); it has no CUDA lane, so on an NVIDIA CT
+the launcher leaves `--gpu` off for it and it uses the CPU.
+
+Through OSR the router lists it as `qwen-image-2.1-colibri` and answers
+`POST /v1/images/generations` with it (also as the `image` alias, after any
+ComfyUI CT). The OSR installer then points Open WebUI's image engine at the
+router (it asks for the Open WebUI admin key); after `--reconfigure` or a
+standalone install run `bash tools/webui-images.sh --expect-model
+qwen-image-2.1-colibri` on the Proxmox host.
+
+### Suggestions
+
+Each group's `(suggested)` model comes from the CT's RAM, disk and GPU:
+
+- **Chat, from RAM**: Qwen3.6-35B-A3B with at least 20 GiB on the CPU or
+  10 GiB with a GPU, otherwise Qwen3-Coder-30B-A3B (the most capable that fits
+  if that one does not).
+- **Chat, experts from disk**: the most capable model (colibri's rank) that
+  fits with the RAM colibri measured it at, the smaller download on a tie;
+  with a GPU, models whose engine has a lane for it come first (MiMo has
+  Vulkan only). If none fits that well, the smallest download that fits.
+- **Images**: Qwen-Image-2.1 when it fits.
+
+An unattended run without `COLIBRI_MODEL_ID` names the chat-from-RAM
+suggestion (else the large one) and downloads nothing.
 
 An install or rerun downloads it only when the model directory holds no model
 (to replace a served model, see [Changing the model](#changing-the-model)):

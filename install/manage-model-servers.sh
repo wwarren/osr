@@ -162,6 +162,14 @@ Commands:
                              when omitted); --off removes its deployments
   set-cloud-models <openai|anthropic|gemini> <model[,model...]|--off>
                              Expose specific provider model IDs through OSR
+  set-comfyui <url[,url...]|--off>
+                             The ComfyUI CTs the router draws pictures with
+                             (POST /v1/images/generations, the FLUX.2 Klein
+                             workflow; Open WebUI asks for the "image" alias).
+                             Root URLs, e.g. http://10.0.0.30:8188. Not model
+                             servers: no tier, no LiteLLM deployment
+  add-comfyui <url>          Add one ComfyUI CT to that list (no change when
+                             it is already there)
   set-freellmapi <url|--off> [key]
                              Offer a FreeLLMAPI server's models as
                              freellmapi/<id>, used only when asked for by name
@@ -905,6 +913,10 @@ cmd_list() {
   # No apostrophe inside the ${...:-default}: bash re-parses that word and a
   # lone quote there opens a quote context, breaking everything after it.
   echo "Keep-alive: ${ka:-<server default (OLLAMA_KEEP_ALIVE on each host)>}"
+  local comfyui; comfyui="$(env_get COMFYUI_SERVERS)"
+  if [[ -n "$comfyui" ]]; then
+    echo "ComfyUI image servers: ${comfyui//,/, } (POST /v1/images/generations; the image alias)"
+  fi
   local freellmapi; freellmapi="$(env_get FREELLMAPI_BASE_URL)"
   if [[ -n "$freellmapi" ]]; then
     echo "FreeLLMAPI: ${freellmapi} (freellmapi/<id>; only when named, never by auto)"
@@ -1764,7 +1776,15 @@ openwebui_install() {
     fi
   fi
 
-  "$pip" install --no-cache-dir -r "$OPENWEBUI_REQ"
+  "$pip" install --no-cache-dir -r "$OPENWEBUI_REQ" || return 1
+  # pip replaces images.py on an upgrade; restore the router-backed picker
+  # before the Open WebUI unit is restarted. A failed patch does not fail the
+  # install (the new version is in the venv either way, and the unit must be
+  # restarted onto it): the caller patches again and warns if it still fails.
+  if [[ "$(openwebui_current_version)" == 0.12.4 ]]; then
+    "${OPENWEBUI_DIR}/venv/bin/python" "${REPO_DIR}/tools/webui-images.py" \
+      --patch-only --webui-venv "${OPENWEBUI_DIR}/venv" || true
+  fi
 }
 
 # --- LiteLLM venv ---------------------------------------------------------------
@@ -1944,6 +1964,16 @@ for rel in ("env/router.env", "env/openwebui.env"):
                 err(rel, "FREELLMAPI_BASE_URL needs a root URL such as http://10.0.0.20:3001")
         if entries.get("FREELLMAPI_MODELS", "available") not in ("", "available", "auto"):
             err(rel, "FREELLMAPI_MODELS must be available or auto")
+        for base in filter(None, (u.strip().rstrip("/") for u in entries.get("COMFYUI_SERVERS", "").split(","))):
+            try:
+                url = urlsplit(base)
+                valid = url.scheme in ("http", "https") and bool(url.hostname) and \
+                    (url.port is None or url.port > 0) and not (
+                    url.path or url.username or url.password or url.query or url.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                err(rel, f"COMFYUI_SERVERS: {base!r} is not a root URL such as http://10.0.0.30:8188")
 
 # Python services must at least compile.
 for rel in ("services/osr-router/router.py", "services/osr-monitor/monitor.py"):
@@ -2419,6 +2449,17 @@ cmd_apply() {
       note "  WARNING: install failed; the service keeps running ${have_v:-its current version}."
     fi
   fi
+  # Applying a newer config repo also repairs an existing 0.12.4 venv that
+  # predates the picker patch, without reinstalling Open WebUI.
+  if [[ "$want_v" == 0.12.4 && "$want_v" == "$(openwebui_installed_version)" ]]; then
+    local picker_result
+    if picker_result="$("${OPENWEBUI_DIR}/venv/bin/python" \
+        "${REPO_DIR}/tools/webui-images.py" --patch-only --webui-venv "${OPENWEBUI_DIR}/venv")"; then
+      [[ "$picker_result" != *": patched ("* ]] || affected+=(open-webui)
+    else
+      note "  WARNING: Open WebUI image picker patch failed; its image model list may be stale."
+    fi
+  fi
   # A venv the service account cannot read fails at exec (status=203/EXEC).
   repair_venv_access || true
   # De-duplicate, keeping SERVICES order.
@@ -2859,6 +2900,45 @@ sys.exit(0 if ok else 1)
 PY
 }
 
+# ComfyUI (targets/comfyui): image servers. The router sends them
+# POST /v1/images/generations as the FLUX.2 Klein workflow, polls for the
+# picture and answers in the OpenAI images format. They are not model
+# servers: no tier, no LiteLLM deployment, no chat.
+cmd_set_comfyui() {
+  local value="${1:-}" url
+  local -a urls=()
+  [[ -n "$value" ]] || die "set-comfyui: give ComfyUI root URLs (http://host:8188, comma-separated) or --off"
+  if [[ "$value" == --off ]]; then
+    env_set COMFYUI_SERVERS ""
+    echo "No ComfyUI image servers: the router no longer draws pictures with ComfyUI."
+    CHANGED=true
+    return 0
+  fi
+  while IFS= read -r url || [[ -n "$url" ]]; do
+    url="${url%/}"
+    [[ -n "$url" ]] || continue
+    valid_freellmapi_url "$url" || die "set-comfyui: '${url}' is not a root URL such as http://10.0.0.30:8188"
+    printf '%s\n' "${urls[@]}" | contains_line "$url" || urls+=("$url")
+  done < <(csv_to_lines "$value")
+  ((${#urls[@]})) || die "set-comfyui: no URL given"
+  value="$(printf '%s\n' "${urls[@]}" | lines_to_csv)"
+  if [[ "$value" == "$(env_get COMFYUI_SERVERS)" ]]; then
+    echo "ComfyUI image servers: ${value//,/, } (unchanged)."
+    return 0
+  fi
+  env_set COMFYUI_SERVERS "$value"
+  echo "ComfyUI image servers: ${value//,/, }. The router offers their FLUX.2 Klein models on"
+  echo "POST /v1/images/generations (GET /v1/images/models lists them; Open WebUI asks for 'image')."
+  CHANGED=true
+}
+
+cmd_add_comfyui() {
+  local url="${1:-}" current
+  [[ -n "$url" ]] || die "add-comfyui: give a ComfyUI root URL such as http://10.0.0.30:8188"
+  current="$(env_get COMFYUI_SERVERS)"
+  cmd_set_comfyui "${current:+${current},}${url%/}"
+}
+
 cmd_set_freellmapi() {
   local url="${1:-}" key="${2:-}" confirm_key=""
   [[ -n "$url" ]] || die "set-freellmapi: give the server's root URL (http://host:3001) or --off"
@@ -2940,7 +3020,8 @@ cmd_commit() {
 command_writes() {
   case "$1" in
     add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
-    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-webhook|set-webui-version) return 0 ;;
+    set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-comfyui|add-comfyui|\
+    set-webhook|set-webui-version) return 0 ;;
     *) [[ -n "$(token_command_kind "$1")" ]] ;;
   esac
 }
@@ -3175,7 +3256,8 @@ while (( $# > 0 )); do
       ARGS+=("$1" "$2"); shift 2 ;;
     --generate|--off)
       [[ "$COMMAND" == "set-api-key" || "$COMMAND" == "set-cloud-key" ||
-         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
+         "$COMMAND" == "set-cloud-models" || "$COMMAND" == "set-freellmapi" || "$COMMAND" == "set-comfyui" ||
+         -n "$(token_command_kind "$COMMAND")" ]] || die "unknown option: $1"
       ARGS+=("$1"); shift ;;
     --all)       APPLY_ALL=true; shift ;;
     --type)      SERVER_TYPE="${2:-}"; shift 2 ;;
@@ -3216,6 +3298,8 @@ case "$COMMAND" in
   set-cloud-key) cmd_set_cloud_key "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-cloud-models) cmd_set_cloud_models "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-freellmapi) cmd_set_freellmapi "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
+  set-comfyui) cmd_set_comfyui "${ARGS[0]:-}" ;;
+  add-comfyui) cmd_add_comfyui "${ARGS[0]:-}" ;;
   set-*-token)
     token_kind="$(token_command_kind "$COMMAND")"
     [[ -n "$token_kind" ]] || die "unknown command '${COMMAND}' (try --help)"
@@ -3241,7 +3325,7 @@ case "$COMMAND" in
       note "Config changed but NOT applied. Run: $0 apply"
     fi
     ;;
-  set-api-key|set-cloud-key|set-freellmapi|set-*-token)
+  set-api-key|set-cloud-key|set-freellmapi|set-comfyui|add-comfyui|set-*-token)
     if $CHANGED && $AUTO_APPLY && ! $DRY_RUN; then cmd_apply; fi
     ;;
 esac

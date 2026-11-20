@@ -83,8 +83,8 @@ has '+ write /etc/pve/firewall/286.fw:'
 has 'IN ACCEPT -source <router-source-ip>/32 -p tcp -dport 8188'
 has 'COMFYUI_DEVICE=cpu'
 has 'bash /root/comfyui-target-deploy/install-target.sh'
-has '--comfyui-url http://192.0.2.86:8188'
-has '--variant klein-4b'; has 'COMFYUI_IMAGE_VARIANT=klein-4b'
+has 'add-comfyui http://192.0.2.86:8188'
+has '--expect-model flux2-klein-4b-comfyui'; has 'COMFYUI_IMAGE_VARIANT=klein-4b'
 has '+ check that the klein-4b weights answer on Hugging Face (3 files)'
 has 'klein-weights.txt /root/comfyui-target-deploy/klein-weights.txt'; lacks 'hf-token'
 has 'Pin and verify the ComfyUI release'
@@ -104,12 +104,19 @@ lacks '--model sd_xl_base_1.0.safetensors'; has '--image-size 1024x1024'; has '-
 pass 'NVIDIA, extra UI sources, a port, and a download that does not replace Klein in Open WebUI'
 
 plan COMFYUI_IMAGE_MODEL=another-klein.safetensors
-has '--model another-klein.safetensors'
-pass 'an explicit diffusion model override reaches Open WebUI'
+has '--model another-klein.safetensors'; has 'integrate-webui.py --webui-url'; lacks 'add-comfyui'
+has 'ComfyUI directly (its own workflow)'
+pass 'an explicit diffusion model override reaches Open WebUI, which then drives ComfyUI itself'
 
 plan COMFYUI_IMAGE_VARIANT=klein-4b
-has 'flux2-klein-4b-api.json'; has '--variant klein-4b'
-pass 'the selected 4B workflow reaches Open WebUI'
+has 'manage-model-servers add-comfyui http://192.0.2.86:8188 --apply --yes'
+has 'webui-images.py --webui-url'; has '--expect-model flux2-klein-4b-comfyui'; lacks '--variant klein-4b'
+has 'through the router (its image servers; the "image" alias)'
+pass 'by default the router draws with ComfyUI and Open WebUI asks the router for the selected variant'
+
+plan COMFYUI_WEBUI_ENGINE=comfyui
+has 'integrate-webui.py --webui-url'; has '--variant klein-4b'; lacks 'webui-images.py --webui'
+pass 'COMFYUI_WEBUI_ENGINE=comfyui keeps Open WebUI driving ComfyUI directly'
 
 plan --no-webui UI_ALLOW_CIDR=198.51.100.0/24
 lacks 'pct exec 280'; lacks 'pct push 280'; lacks 'Open WebUI on'; lacks 'integrate-webui'; lacks '<router-source-ip>'
@@ -138,6 +145,7 @@ refuse 'COMFYUI_MODEL_URL must be an https URL' "COMFYUI_MODEL_URL=https://examp
 refuse 'COMFYUI_MODEL_SHA256' COMFYUI_MODEL_SHA256=abc
 refuse 'COMFYUI_MODEL_NAME must be a plain file name' COMFYUI_MODEL_NAME=../../etc/passwd
 refuse 'COMFYUI_IMAGE_VARIANT' COMFYUI_IMAGE_VARIANT=sdxl
+refuse 'COMFYUI_WEBUI_ENGINE must be router or comfyui' COMFYUI_WEBUI_ENGINE=openai
 refuse 'COMFYUI_IMAGE_SIZE' COMFYUI_IMAGE_SIZE=big
 refuse 'COMFYUI_PORT' COMFYUI_PORT=70000
 refuse 'CT IDs must differ' ROUTER=286
@@ -230,6 +238,8 @@ stub pct 'case "$*" in
     "exec 280 -- ip -4 route get "*) echo "192.0.2.86 dev eth0 src 192.0.2.80 uid 0" ;;
     "exec 280 -- mktemp "*) echo /root/comfyui-integration.AbC123 ;;
     "exec 280 -- python3 /root/comfyui-integration.AbC123/integrate-webui.py "*) exit "${FAKE_INTEGRATE_RC:-0}" ;;
+    "exec 280 -- python3 /root/comfyui-integration.AbC123/webui-images.py "*) exit "${FAKE_INTEGRATE_RC:-0}" ;;
+    "exec 280 -- /usr/local/bin/manage-model-servers add-comfyui "*) exit "${FAKE_ADD_COMFYUI_RC:-0}" ;;
     "exec 286 -- sh -c expected="*)
         count=0; [[ ! -f "'"$tmp"'/ready-count" ]] || read -r count < "'"$tmp"'/ready-count"
         count=$((count + 1)); printf "%s\n" "$count" > "'"$tmp"'/ready-count"
@@ -281,8 +291,14 @@ purge_line=$(grep -n 'pct exec 286 -- sh -c set --; for package' "$log" | head -
 helper_line=$(grep -n 'pct exec 286 -- env DRIVER_VERSION=580.173.02 bash /root/comfyui-target-deploy/install-nvidia-driver.sh lxc' "$log" | head -n1 | cut -d: -f1)
 (( stop_line < purge_line && purge_line < helper_line )) || fail 'NVIDIA cleanup and install order'
 grep -q 'COMFYUI_DEVICE=gpu .*COMFYUI_MODEL_URL=https://huggingface.co/o/r/resolve/main/v1-5.safetensors' "$log" || fail 'guest install settings'
-grep -q -- '--comfyui-url http://192.0.2.86:8188 --admin-token-file /root/comfyui-integration.AbC123/admin-token' "$log" ||
+grep -q 'pct exec 280 -- /usr/local/bin/manage-model-servers add-comfyui http://192.0.2.86:8188 --apply --yes' "$log" ||
+    fail "the router was not given the ComfyUI CT: $(calls)"
+grep -q -- 'webui-images.py --webui-url http://127.0.0.1:8080 --admin-token-file /root/comfyui-integration.AbC123/admin-token --expect-model flux2-klein-4b-comfyui' "$log" ||
     fail "integration call: $(calls)"
+add_line=$(grep -n 'manage-model-servers add-comfyui' "$log" | cut -d: -f1)
+images_line=$(grep -n 'webui-images.py --webui-url' "$log" | cut -d: -f1)
+(( add_line < images_line )) || fail 'Open WebUI was set up before the router knew ComfyUI'
+! grep -q 'integrate-webui.py --webui-url' "$log" || fail 'Open WebUI was also set to drive ComfyUI directly'
 grep -q 'flux2-klein-9b-api.json' "$log" || fail 'the API workflow was not staged on the router'
 grep -q 'flux2-klein-4b-api.json' "$log" || fail 'the 4B API workflow was not staged on the router'
 [[ $(cat "$tmp/pushed-token") == owui-secret ]] || fail 'the admin token was not staged on the router'
@@ -290,12 +306,20 @@ grep -q 'flux2-klein-4b-api.json' "$log" || fail 'the 4B API workflow was not st
 grep -qx 'pct set 286 --tags ai;ai-model;osr-target;comfyui' "$log" ||
     fail "tags upgrade-all.sh finds the CT by were not re-applied after the community script: $(calls)"
 # Order: router checks and the token before the CT; firewall before the guest install.
-order=$(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|integrate-webui.py --webui' "$log" | cut -d: -f1 | paste -sd' ')
-[[ $order =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] || fail "unexpected steps ($order): $(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|integrate-webui.py --webui' "$log")"
+order=$(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|webui-images.py --webui' "$log" | cut -d: -f1 | paste -sd' ')
+[[ $order =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] || fail "unexpected steps ($order): $(grep -nE 'python3 -c |^community |pct set 286 --net0|install-target.sh$|webui-images.py --webui' "$log")"
 read -r a b c d e <<< "$order"
 (( a < b && b < c && c < d && d < e )) || fail "steps out of order ($order): $(calls)"
 grep -q 'pct exec 280 -- rm -rf -- /root/comfyui-integration.AbC123' "$log" || fail 'router staging not removed'
 pass 'a full run: Open WebUI checked, presets, firewall before adoption, NVIDIA helper, registration; token never in argv'
+
+real OPENWEBUI_ADMIN_TOKEN=t FAKE_ADD_COMFYUI_RC=2 || fail 'a router without add-comfyui failed the run'
+has 'could not add ComfyUI as an image server'
+grep -q -- 'integrate-webui.py --webui-url http://127.0.0.1:8080 --comfyui-url http://192.0.2.86:8188' "$log" ||
+    fail "the fallback did not set ComfyUI in Open WebUI directly: $(calls)"
+! grep -q 'webui-images.py --webui-url' "$log" || fail 'the fallback still pointed Open WebUI at the router'
+has 'Open WebUI on router CT 280 uses the klein-4b workflow'
+pass 'a router whose manager has no add-comfyui gets the direct ComfyUI engine, as before'
 
 real OPENWEBUI_ADMIN_TOKEN=t GPU=nvidia NVIDIA_DEVICE=/dev/null FAKE_NO_LIBCUDA=1 || fail 'missing libcuda run failed'
 grep -q 'pct exec 286 -- sh -c set --; for package in nvidia-smi' "$log" || fail 'missing libcuda did not trigger Debian cleanup'
@@ -363,7 +387,7 @@ pass 'a failed registration keeps the CT and says how to retry'
 
 real --integrate-only OPENWEBUI_ADMIN_TOKEN=t || fail "--integrate-only failed: $out"
 ! grep -qE '^community|pct set|install-target.sh' "$log" || fail "--integrate-only changed the CT: $(calls)"
-grep -q -- '--comfyui-url http://192.0.2.86:8191' "$log" || fail 'the CT'"'"'s configured port was not used'
+grep -q -- 'add-comfyui http://192.0.2.86:8191' "$log" || fail 'the CT'"'"'s configured port was not used'
 [[ ! -e $fw ]] || fail '--integrate-only wrote a firewall'
 pass "--integrate-only reads the CT's port and only registers it"
 
@@ -410,15 +434,16 @@ plan COMFYUI_IMAGE_VARIANT=klein-9b
 has '+ stage the Hugging Face token for klein-9b (gated: https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)'
 has '/hf-token /root/comfyui-target-deploy/hf-token --perms 0600'
 has 'COMFYUI_IMAGE_VARIANT=klein-9b HF_TOKEN_FILE=/root/comfyui-target-deploy/hf-token bash'
-has '+ pct exec 286 -- rm -f -- /root/comfyui-target-deploy/hf-token'; has '--variant klein-9b'
+has '+ pct exec 286 -- rm -f -- /root/comfyui-target-deploy/hf-token'; has '--expect-model flux2-klein-9b-comfyui'
 pass 'klein-9b: the token goes into the CT as a file for the guest step, and is removed after it'
 
 plan COMFYUI_DOWNLOAD_WEIGHTS=0
-has 'COMFYUI_IMAGE_VARIANT=none'; lacks 'answer on Hugging Face'; has 'No weights were downloaded'; has '--variant klein-4b'
+has 'COMFYUI_IMAGE_VARIANT=none'; lacks 'answer on Hugging Face'; has 'No weights were downloaded'
+has '--expect-model flux2-klein-4b-comfyui'
 plan --integrate-only
-has '--variant auto'; lacks 'answer on Hugging Face'
+lacks '--expect-model'; has 'webui-images.py --webui-url'; lacks 'answer on Hugging Face'
 refuse 'COMFYUI_DOWNLOAD_WEIGHTS' COMFYUI_DOWNLOAD_WEIGHTS=yes
-pass 'COMFYUI_DOWNLOAD_WEIGHTS=0 skips the download; --integrate-only downloads nothing and lets Open WebUI pick'
+pass 'COMFYUI_DOWNLOAD_WEIGHTS=0 skips the download; --integrate-only downloads nothing and takes any image model the router lists'
 
 hf_token='hf_Q1w2E3r4T5Q1w2E3r4T5Q1w2E3r4T5Q1w2E3r4T5'
 real OPENWEBUI_ADMIN_TOKEN=t COMFYUI_IMAGE_VARIANT=klein-9b HF_TOKEN="$hf_token" FAKE_HF_TOKEN="$hf_token" || fail "9B run failed: $out"

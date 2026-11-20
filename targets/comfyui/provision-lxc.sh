@@ -4,8 +4,10 @@
 # community script (ct/comfyui.sh), run with this target's settings preset.
 # install-target.sh then adopts that install (unprivileged account, hardening
 # drop-in, data under /var/lib/comfyui-target), the CT firewall admits only the
-# router (ComfyUI has no authentication), and integrate-webui.py makes it the
-# image generation engine of the router's Open WebUI.
+# router (ComfyUI has no authentication), the router draws pictures with it
+# (manage-model-servers add-comfyui), and tools/webui-images.py makes the
+# router Open WebUI's image engine (integrate-webui.py instead sets ComfyUI as
+# the engine directly, for a custom diffusion model or COMFYUI_WEBUI_ENGINE=comfyui).
 set -Eeuo pipefail
 umask 077
 
@@ -27,8 +29,13 @@ chosen GPU) on port 8188. This script then:
   2. runs install-target.sh in the CT: ComfyUI runs as the unprivileged
      `comfyui` account under a hardening drop-in, with models, outputs and
      settings under /var/lib/comfyui-target (and downloads COMFYUI_MODEL_URL);
-  3. sets ComfyUI as the image generation engine of the router's Open WebUI
-     (Admin Settings > Images), with the selected distilled FLUX.2 Klein API workflow.
+  3. adds it to the router's image servers (manage-model-servers add-comfyui):
+     the router answers POST /v1/images/generations with its FLUX.2 Klein
+     workflow, beside any Colibri image model, and makes the router (its
+     "image" alias) the image engine of the router's Open WebUI (Admin
+     Settings > Images, engine OpenAI). With COMFYUI_IMAGE_MODEL or
+     COMFYUI_WEBUI_ENGINE=comfyui, Open WebUI talks to ComfyUI directly with the
+     Klein workflow instead (a router whose manager has no add-comfyui does too).
 It asks for an Open WebUI admin API key unless OPENWEBUI_ADMIN_TOKEN is set.
 
 The community script still shows its own menu; pick "Default" (or "My
@@ -76,6 +83,8 @@ Settings (environment; all optional unless noted):
                                    (asked for when unset; passed to the CT as a file)
   COMFYUI_IMAGE_MODEL=<compatible Klein diffusion model> overrides the variant's file
   COMFYUI_IMAGE_SIZE=<WxH>  COMFYUI_IMAGE_STEPS=<n>   Open WebUI's image size/steps
+  COMFYUI_WEBUI_ENGINE=router|comfyui  router (default): Open WebUI draws through the
+                                   router; comfyui: Open WebUI drives ComfyUI itself
   ROUTER_IP                        the address the router uses to reach this CT
                                    (detected with "ip route get" on the router)
   OPENWEBUI_PORT                   read from the router's /app/openwebui/.env
@@ -475,9 +484,17 @@ fi
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deploy=/root/comfyui-target-deploy
 files=(install-target.sh comfyui-target.conf comfyui.env.example README.md klein-weights.txt)
-for file in "${files[@]}" integrate-webui.py flux2-klein-4b-api.json flux2-klein-9b-api.json; do
+for file in "${files[@]}" integrate-webui.py flux2-klein-4b-api.json flux2-klein-9b-api.json \
+            ../../tools/webui-images.py; do
     [[ -r $source_dir/$file ]] || die "Missing deployment file: $source_dir/$file"
 done
+COMFYUI_WEBUI_ENGINE=${COMFYUI_WEBUI_ENGINE:-router}
+[[ $COMFYUI_WEBUI_ENGINE == router || $COMFYUI_WEBUI_ENGINE == comfyui ]] ||
+    die 'COMFYUI_WEBUI_ENGINE must be router or comfyui.'
+# The router's workflow is the variant's own: a custom diffusion model needs
+# Open WebUI's ComfyUI engine, where the admin can edit the workflow.
+[[ -z $COMFYUI_IMAGE_MODEL ]] || COMFYUI_WEBUI_ENGINE=comfyui
+webui_engine=$COMFYUI_WEBUI_ENGINE
 verify_webui=$source_dir/../open-terminal/verify-webui.py
 (( ! webui )) || [[ -r $verify_webui ]] || die "Missing $verify_webui."
 nvidia_installer=''
@@ -606,7 +623,8 @@ weights_label=''
 pve_summary "ComfyUI: $plan_title"
 case $router_kind in
     none) pve_row 'Open WebUI' 'not registered (--no-webui)' ;;
-    *) pve_row 'Router (Open WebUI)' "$router_label" ;;
+    *) pve_row 'Router (Open WebUI)' "$router_label"
+       pve_row 'Open WebUI images' "$( [[ $webui_engine == router ]] && echo 'through the router (its image servers; the "image" alias)' || echo 'ComfyUI directly (its own workflow)')" ;;
 esac
 if [[ $mode == integrate ]]; then
     pve_row 'ComfyUI CT' "$CT_ID"
@@ -897,10 +915,27 @@ if (( webui )); then
     router_push "$source_dir/integrate-webui.py" "$router_stage/integrate-webui.py"
     router_push "$source_dir/flux2-klein-4b-api.json" "$router_stage/flux2-klein-4b-api.json"
     router_push "$source_dir/flux2-klein-9b-api.json" "$router_stage/flux2-klein-9b-api.json"
-    integrate=(python3 "$router_stage/integrate-webui.py"
-        --webui-url "http://127.0.0.1:${OPENWEBUI_PORT}" --comfyui-url "http://${comfyui_ip}:${COMFYUI_PORT}"
-        --admin-token-file "$router_stage/admin-token" --variant "$COMFYUI_IMAGE_VARIANT")
-    [[ -z $image_model ]] || integrate+=(--model "$image_model")
+    webui_engine=$COMFYUI_WEBUI_ENGINE
+    if [[ $webui_engine == router ]]; then
+        # The router's image servers: it discovers the Klein variants ComfyUI
+        # has the files of and draws with them (apply restarts it).
+        if ! router_run /usr/local/bin/manage-model-servers add-comfyui "http://${comfyui_ip}:${COMFYUI_PORT}" --apply --yes; then
+            note "The manager on ${router_label} could not add ComfyUI as an image server (an older router: update it"
+            note "with tools/update-router-services.sh); Open WebUI is set to use ComfyUI directly instead."
+            webui_engine=comfyui
+        fi
+    fi
+    if [[ $webui_engine == router ]]; then
+        router_push "$source_dir/../../tools/webui-images.py" "$router_stage/webui-images.py"
+        integrate=(python3 "$router_stage/webui-images.py"
+            --webui-url "http://127.0.0.1:${OPENWEBUI_PORT}" --admin-token-file "$router_stage/admin-token")
+        [[ $COMFYUI_IMAGE_VARIANT == auto ]] || integrate+=(--expect-model "flux2-${COMFYUI_IMAGE_VARIANT}-comfyui")
+    else
+        integrate=(python3 "$router_stage/integrate-webui.py"
+            --webui-url "http://127.0.0.1:${OPENWEBUI_PORT}" --comfyui-url "http://${comfyui_ip}:${COMFYUI_PORT}"
+            --admin-token-file "$router_stage/admin-token" --variant "$COMFYUI_IMAGE_VARIANT")
+        [[ -z $image_model ]] || integrate+=(--model "$image_model")
+    fi
     [[ -z $COMFYUI_IMAGE_SIZE ]] || integrate+=(--image-size "$COMFYUI_IMAGE_SIZE")
     [[ -z $COMFYUI_IMAGE_STEPS ]] || integrate+=(--image-steps "$COMFYUI_IMAGE_STEPS")
     router_run "${integrate[@]}"
@@ -918,7 +953,12 @@ elif [[ $mode != integrate ]]; then
     printf 'No weights were downloaded. To fetch them: pct exec %s -- env COMFYUI_IMAGE_VARIANT=%s bash %s/install-target.sh\n' \
         "$CT_ID" "$COMFYUI_IMAGE_VARIANT" "$deploy"
 fi
-if (( webui )); then
+if (( webui )) && [[ $webui_engine == router ]]; then
+    printf 'The router on %s draws with the %s workflow (POST /v1/images/generations; GET\n' "$router_label" "$COMFYUI_IMAGE_VARIANT"
+    printf '/v1/images/models lists its models), and Open WebUI asks it for the "image" alias:\n'
+    printf 'Admin Settings > Images. After changing the model files the router finds them at its\n'
+    printf 'next poll; to set Open WebUI up again: CT_ID=%s bash %s --integrate-only\n' "$CT_ID" "$0"
+elif (( webui )); then
     printf 'Open WebUI on %s uses the %s workflow: Admin Settings > Images. After changing the\n' "$router_label" "$COMFYUI_IMAGE_VARIANT"
     printf 'model files, rerun: CT_ID=%s COMFYUI_IMAGE_VARIANT=%s bash %s --integrate-only\n' "$CT_ID" "$COMFYUI_IMAGE_VARIANT" "$0"
 fi

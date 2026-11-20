@@ -206,6 +206,11 @@ reconfigure_model() {
         bash /root/colibri-target-deploy/install-target.sh --model
     if (( dry_run )); then printf 'Dry run: CT %s was only read.\n' "$CT_ID"
     else printf 'CT %s: %s.\n' "$CT_ID" "$( [[ $COLIBRI_MODEL_ID == remove ]] && echo 'the model was removed' || printf 'now serves %s' "$COLIBRI_MODEL_NAME")"; fi
+    if [[ $COLIBRI_MODEL_ID != remove && $COLIBRI_MODEL_TYPE == image ]]; then
+        printf 'It draws pictures: the router lists it as %s on POST /v1/images/generations (its\n' "$COLIBRI_MODEL_SERVED"
+        printf '"image" alias too). To have Open WebUI draw through the router:\n'
+        printf '  bash %s/tools/webui-images.sh --expect-model %s\n' "${source_dir%/*/*}" "$COLIBRI_MODEL_SERVED"
+    fi
 }
 if (( reconfigure )); then
     reconfigure_model
@@ -524,6 +529,11 @@ if [[ -n $COLIBRI_MODEL_ID ]]; then
         printf 'Selected model: %s (%s GB), to be downloaded into %s.\n' "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_DIR"
     else
         printf 'Selected model: %s (%s GB), downloaded into %s.\n' "$COLIBRI_MODEL_NAME" "$COLIBRI_MODEL_GB" "$COLIBRI_MODEL_DIR"
+    fi
+    if [[ $COLIBRI_MODEL_TYPE == image ]]; then
+        printf 'It draws pictures (POST /v1/images/generations); once OSR knows the CT, the router lists it\n'
+        printf 'as %s. For Open WebUI: bash %s/tools/webui-images.sh --expect-model %s\n' \
+            "$COLIBRI_MODEL_SERVED" "${source_dir%/*/*}" "$COLIBRI_MODEL_SERVED"
     fi
 else
     printf 'No model is downloaded: the service is parked until one is placed (README.md).\n'
