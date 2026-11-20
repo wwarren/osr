@@ -202,6 +202,47 @@ the router's image models instead: `POST /v1/images/generations` on the router
 sends it the request (its `image` alias too), and Open WebUI draws through the
 router ([README](../../README.md#image-generation)).
 
+## The dashboard
+
+colibri's own web UI (chat, pictures with an image model, the expert map) is
+served by `coli serve` at **`http://<CT address>:8080/`**, while a model is
+served (a parked CT serves nothing). Open it, paste the key from
+`pct exec <CT_ID> -- cat /etc/colibri-target/api-key` into its settings, and it
+talks to `http://<CT address>:8080/v1` with it. The key is not stored by the
+page; you paste it again on the next visit. The page itself needs no key (it
+holds no secret, like `/health`); every request it makes does.
+
+`COLIBRI_DASHBOARD=true` (the default for new installs) builds it: before
+`make install`, the installer makes sure the CT has Node.js 20.19+ or 22.12+
+(Vite 8's floor; Debian 13's own 20.19 is used, else NodeSource's signed
+`node_24.x` repository is added, as for DeepSeek Harness), then runs
+`npm ci && npm run build` in `/opt/colibri/web` as the `colibri` account from
+upstream's lockfile; `make install` copies `web/dist` to
+`/opt/colibri/libexec/colibri/web/dist`, next to `openai_server.py`. The
+build's `node_modules` (about 140 MB) and npm cache are removed afterwards. A
+failed build (no Node.js, npm registry unreachable) is a warning: the API is
+installed, any previous dashboard stays served (the summary says it is the
+previous build), and `/etc/colibri-target/dashboard-build-pending` has the next
+run retry. That retry, like a rerun that finds the installed dashboard
+missing, rebuilds **only the dashboard**: when Colibri is otherwise unchanged,
+the engines are not rebuilt and the service is not stopped, so a build that
+keeps failing costs one npm attempt per run. The new files replace the old in
+one rename while Colibri serves; colibri picks its dashboard folder when it
+starts, so a dashboard it did not have then gets one restart. A checkout
+without the dashboard source (`web/package-lock.json`, e.g. an explicit
+`COLIBRI_REF` to an older upstream) is installed without one and never retried.
+`COLIBRI_DASHBOARD=false` installs the API only and removes a dashboard at the
+next build. The setting is recorded with the others; an install from before it
+keeps running without the dashboard (and is not rebuilt for it) until you ask:
+
+```bash
+pct exec <CT_ID> -- env COLIBRI_DASHBOARD=true bash /root/colibri-target-deploy/install-target.sh
+```
+
+(push the current `install-target.sh`, `colibri.service` and `model-select.sh`
+first, as under [Upgrade](#upgrade), or let `tools/upgrade-all.sh` do it).
+That run rebuilds once with the dashboard, under the usual rollback.
+
 ## Downloading a catalog model
 
 `COLIBRI_MODEL_ID` names one of colibri's models in `model-select.sh`, each
@@ -351,7 +392,7 @@ fetched, moved or rewritten.
 
 | Path | What it holds |
 | --- | --- |
-| `/opt/colibri` | checkout, `bin/coli`, `libexec/colibri/` engines, `run-colibri.sh` |
+| `/opt/colibri` | checkout, `bin/coli`, `libexec/colibri/` engines (and `web/dist`, the dashboard), `run-colibri.sh` |
 | `/var/lib/colibri` | the model directory and the account's HOME |
 | `/etc/colibri-target/colibri.env` | `COLIBRI_RUN_SCRIPT` |
 | `/etc/colibri-target/secrets.env` | `COLI_API_KEY` (0600) |

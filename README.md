@@ -307,7 +307,7 @@ settings and recovery steps.
 | [Xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | NVIDIA 24 GB; ~372 GB of pinned weights |
 | [Avalon](targets/avalon/README.md) | `avalon://` | 8080 | AMD RX 7000 (ROCm) or NVIDIA, experts in RAM; ~90 GiB of pinned weights |
 | [Kindi](targets/kindi/README.md) | `kindi://` | 8093 | Old or small NVIDIA (from a 1 GB Kepler) or CPU; one request at a time |
-| [Colibri](targets/colibri/README.md) | `colibri://` | 8080 | Large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); a menu of colibri's 12 pinned models, grouped chat-from-RAM, chat-from-disk and images, with a suggestion per group from the CT's RAM, disk and GPU, changeable later with `provision-lxc.sh --reconfigure` |
+| [Colibri](targets/colibri/README.md) | `colibri://` | 8080 | Large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); a menu of colibri's 12 pinned models, grouped chat-from-RAM, chat-from-disk and images, with a suggestion per group from the CT's RAM, disk and GPU, changeable later with `provision-lxc.sh --reconfigure`; colibri's web dashboard at `http://<CT>:8080/` |
 
 Services and companions use separate CTs and stay out of the model pool:
 

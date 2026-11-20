@@ -218,6 +218,11 @@ has 'Colibri suggestion for 65536 MiB RAM'; has 'set COLIBRI_MODEL_ID=qwen36-35b
 plan COLIBRI_MODEL_ID=none
 lacks 'Colibri suggestion'; has 'COLIBRI_MODEL_ID= '; has 'none is downloaded'
 reject 'COLIBRI_MODEL_ID must be' COLIBRI_MODEL_ID=unknown
+plan
+has 'COLIBRI_DASHBOARD=true'; has 'Dashboard: http://<CT address>:8080/ while a model is served'
+plan COLIBRI_DASHBOARD=false
+has 'COLIBRI_DASHBOARD=false'; has 'none (API only)'; lacks 'Dashboard: http://'
+reject 'COLIBRI_DASHBOARD must be true or false' COLIBRI_DASHBOARD=yes
 plan COLIBRI_HOST=127.0.0.1 COLIBRI_ALLOWED_HOST=colibri.internal,192.0.2.80 COLIBRI_PORT=11434
 has 'COLIBRI_HOST=127.0.0.1'; has 'COLIBRI_ALLOWED_HOST=colibri.internal\,192.0.2.80'
 has 'COLIBRI_PORT=11434'; has 'host 127.0.0.1, port 11434'

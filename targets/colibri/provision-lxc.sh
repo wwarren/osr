@@ -69,6 +69,8 @@ Optional: CT_HOSTNAME=colibri-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536
                     DNS-rebinding guard accepts besides loopback; * because
                     clients reach a 0.0.0.0 bind by addresses the CT cannot
                     know. The API key is required either way),
+          COLIBRI_DASHBOARD=true (colibri's web dashboard at http://<CT>:<port>/,
+                    built in the CT with Node.js; false: API only),
           COLIBRI_READY_TIMEOUT=900.
 
 GPU passthrough is optional: a host without a usable GPU (or COLIBRI_BACKEND=cpu)
@@ -157,6 +159,7 @@ COLIBRI_HOST=${COLIBRI_HOST:-0.0.0.0}
 COLIBRI_PORT=${COLIBRI_PORT:-8080}
 COLIBRI_ALLOWED_HOST=${COLIBRI_ALLOWED_HOST:-}
 COLIBRI_READY_TIMEOUT=${COLIBRI_READY_TIMEOUT:-900}
+COLIBRI_DASHBOARD=${COLIBRI_DASHBOARD:-true}
 
 # --- --reconfigure: change the model of an existing Colibri CT ---------------
 # Reads the CT (read-only, so a dry run reads it too), asks, then runs the
@@ -260,6 +263,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ -z $COLIBRI_ALLOWED_HOST || ( ${#COLIBRI_ALLOWED_HOST} -le 255 && $COLIBRI_ALLOWED_HOST =~ ^[][A-Za-z0-9._:*,-]+$ ) ]] || die 'Invalid COLIBRI_ALLOWED_HOST.'
 [[ $COLIBRI_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( COLIBRI_PORT <= 65535 )) || die 'COLIBRI_PORT must be 1..65535.'
 [[ $COLIBRI_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'COLIBRI_READY_TIMEOUT must be a positive number of seconds.'
+[[ $COLIBRI_DASHBOARD == true || $COLIBRI_DASHBOARD == false ]] || die 'COLIBRI_DASHBOARD must be true or false.'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Where to send a host without a GPU driver (the router installer runs it too).
@@ -453,6 +457,7 @@ pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
 pve_row 'GPU' "$gpu_label"
 pve_row 'Server' "backend $COLIBRI_BACKEND, host $COLIBRI_HOST, port $COLIBRI_PORT"
+pve_row 'Dashboard' "$( [[ $COLIBRI_DASHBOARD == true ]] && echo "built in the CT (Node.js), at http://<CT>:$COLIBRI_PORT/" || echo 'none (API only)')"
 if [[ -n $COLIBRI_MODEL_ID ]]; then
     colibri_model_details "$COLIBRI_MODEL_ID"
     pve_row 'Model' "$COLIBRI_MODEL_NAME ($COLIBRI_MODEL_GB GB) from $COLIBRI_MODEL_REPO into $COLIBRI_MODEL_DIR"
@@ -516,7 +521,7 @@ run pct exec "$CT_ID" -- env "COLIBRI_REF=$COLIBRI_REF" "COLIBRI_COMMIT=$COLIBRI
     "COLIBRI_MODEL_DIR=$COLIBRI_MODEL_DIR" "COLIBRI_MODEL_ID=$COLIBRI_MODEL_ID" "COLIBRI_BACKEND=$COLIBRI_BACKEND" \
     "COLIBRI_HOST=$COLIBRI_HOST" "COLIBRI_PORT=$COLIBRI_PORT" \
     "COLIBRI_ALLOWED_HOST=$COLIBRI_ALLOWED_HOST" \
-    "COLIBRI_READY_TIMEOUT=$COLIBRI_READY_TIMEOUT" \
+    "COLIBRI_READY_TIMEOUT=$COLIBRI_READY_TIMEOUT" "COLIBRI_DASHBOARD=$COLIBRI_DASHBOARD" \
     bash /root/colibri-target-deploy/install-target.sh
 
 printf '\nColibri target CT %s: API port %s. Read its generated key with:\n' "$CT_ID" "$COLIBRI_PORT"
@@ -537,6 +542,10 @@ if [[ -n $COLIBRI_MODEL_ID ]]; then
     fi
 else
     printf 'No model is downloaded: the service is parked until one is placed (README.md).\n'
+fi
+if [[ $COLIBRI_DASHBOARD == true ]]; then
+    printf 'Dashboard: http://<CT address>:%s/ while a model is served (a parked CT serves nothing);\n' "$COLIBRI_PORT"
+    printf '  paste the API key into its settings.\n'
 fi
 printf 'Service logs: pct exec %s -- journalctl -u colibri -f\n' "$CT_ID"
 printf 'Change the model later: bash %s/provision-lxc.sh --reconfigure (CT_ID=%s)\n' "$source_dir" "$CT_ID"

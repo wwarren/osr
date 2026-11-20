@@ -80,6 +80,10 @@ case $url in
         [[ ${FAKE_HEALTHY:-1} == 1 ]] || exit 22 ;;
     *) echo "unexpected download: $url" >&2; exit 22 ;;
 esac'
+# Node.js 24 and an npm whose build writes web/dist (and node_modules, which the
+# installer removes). Each npm call is logged.
+printf '#!/bin/sh\ncase "$1" in -e) exit 0 ;; --version) echo v24.11.1 ;; esac\n' > "$bin/node"; chmod +x "$bin/node"
+stub npm 'case "$1" in ci) mkdir -p node_modules ;; run) [[ ${FAKE_NPM_FAIL:-0} == 1 ]] && exit 2; mkdir -p dist; echo "<html>" > dist/index.html ;; esac'
 # A CUDA toolkit's compiler, for the backend-change case.
 mkdir -p "$tmp_root/cuda/bin"; printf '#!/bin/sh\nexit 0\n' > "$tmp_root/cuda/bin/nvcc"; chmod +x "$tmp_root/cuda/bin/nvcc"
 mkdir -p "$tmp_root/gpus"; : > "$tmp_root/gpus/nvidia0"
@@ -102,7 +106,9 @@ case \$1 in
         grep -qx "\$want" "\$dir/.git/known" || { echo "fatal: reference is not a tree: \$want" >&2; exit 128; }
         echo "\$want" > "\$dir/.git/HEAD"
         # probe_build_env needs a C project in the checkout.
-        mkdir -p "\$dir/c"; printf 'all:\n' > "\$dir/c/Makefile" ;;
+        mkdir -p "\$dir/c"; printf 'all:\n' > "\$dir/c/Makefile"
+        # FAKE_WEB=1: a checkout with colibri's web dashboard source.
+        if [[ \${FAKE_WEB:-0} == 1 ]]; then mkdir -p "\$dir/web"; : > "\$dir/web/package-lock.json"; fi ;;
     rev-parse) if [[ \$2 == FETCH_HEAD* ]]; then cat "\$dir/.git/FETCH"; else cat "\$dir/.git/HEAD"; fi ;;
 esac
 STUB
@@ -121,6 +127,11 @@ printf '#!/bin/sh\necho coli %s\\n' "\$head" > "\$FAKE_COLIBRI_DIR/bin/coli"
 chmod 0755 "\$FAKE_COLIBRI_DIR/bin/coli"
 printf 'engine built from %s\\n' "\$head" > "\$FAKE_COLIBRI_DIR/libexec/colibri/engine"
 cp "$tmp_root/setup_download.py" "\$FAKE_COLIBRI_DIR/libexec/colibri/setup_download.py"
+# As c/Makefile's install does: the dashboard only when web/dist was built.
+if [[ -f "\$FAKE_COLIBRI_DIR/web/dist/index.html" ]]; then
+    mkdir -p "\$FAKE_COLIBRI_DIR/libexec/colibri/web/dist"
+    cp -R "\$FAKE_COLIBRI_DIR/web/dist/." "\$FAKE_COLIBRI_DIR/libexec/colibri/web/dist/"
+fi
 STUB
 chmod +x "$bin/make"
 # colibri's downloader as make install puts it in libexec, with the functions
@@ -698,5 +709,111 @@ if rt COLIBRI_MODEL_ID=inkling -- --model > "$tmp_root/out" 2>&1; then fail 'a m
 contains 'needs 120 GiB RAM' "$tmp_root/out"
 if rt COLIBRI_MODEL_ID=remove COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1; then fail 'remove was accepted without --model'; fi
 pass '--model refuses a model the RAM or disk cannot hold, and remove needs --model'
+
+# --- the dashboard ----------------------------------------------------------------
+reset_tree
+rt FAKE_WEB=1 COLIBRI_COMMIT=$good -- > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'an install with the dashboard'; }
+[[ -f $tree/opt/colibri/libexec/colibri/web/dist/index.html ]] || fail 'the dashboard was not installed beside openai_server.py'
+[[ ! -e $tree/opt/colibri/web/node_modules ]] || fail 'node_modules was left in the checkout'
+grep -q '^runuser .*npm ci --loglevel=error' "$log" || fail "npm did not run as the service account: $(grep npm "$log")"
+contains 'Dashboard: http://' "$tmp_root/out"
+contains 'COLIBRI_DASHBOARD=true' "$etc/installed-env"
+contains 'dashboard=true' "$etc/installed-settings"
+npm_line=$(grep -n '^npm run build' "$log" | cut -d: -f1); make_line=$(grep -n '^make ' "$log" | tail -1 | cut -d: -f1)
+(( npm_line < make_line )) || fail 'the dashboard was built after make install'
+pass 'a fresh install builds the dashboard as the service account before make install puts it in place'
+
+# A transient npm failure on upgrade keeps the old UI and leaves a retry
+# marker. A plain rerun must rebuild it even when the API itself is healthy.
+printf 'old-dashboard\n' > "$tree/opt/colibri/libexec/colibri/web/dist/index.html"
+: > "$log"
+rt FAKE_WEB=1 FAKE_NPM_FAIL=1 COLIBRI_COMMIT=$next -- --upgrade > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'an upgrade with a failed optional dashboard build'; }
+contains 'WARNING: the dashboard build failed' "$tmp_root/out"
+contains 'old-dashboard' "$tree/opt/colibri/libexec/colibri/web/dist/index.html"
+[[ -f $etc/dashboard-build-pending ]] || fail 'the failed dashboard build did not leave a retry marker'
+contains 'dashboard=true' "$etc/installed-settings"
+pass 'a failed dashboard build keeps the installed UI and records a retry'
+
+: > "$log"
+# npm keeps failing: each rerun retries the dashboard alone, never the engines,
+# and the healthy service is never stopped for it.
+for attempt in 1 2; do
+    : > "$log"
+    rt FAKE_WEB=1 FAKE_NPM_FAIL=1 "$(at_head)" -- --upgrade > "$tmp_root/out" 2>&1 ||
+        { cat "$tmp_root/out"; fail "a failing dashboard retry ($attempt)"; }
+    contains 'nothing to do' "$tmp_root/out"
+    contains 'this is the previous build' "$tmp_root/out"
+    grep -q '^npm ci' "$log" || fail 'the dashboard build was not retried'
+    grep -qE '^make |systemctl (stop|restart)' "$log" && fail "a failing dashboard retry rebuilt or stopped Colibri: $(grep -E '^make |systemctl' "$log")"
+    [[ -f $etc/dashboard-build-pending ]] || fail 'a failing retry dropped the marker'
+    contains 'old-dashboard' "$tree/opt/colibri/libexec/colibri/web/dist/index.html"
+done
+pass 'a dashboard build that keeps failing retries only the dashboard, with Colibri left running'
+
+: > "$log"
+rt FAKE_WEB=1 "$(at_head)" -- --upgrade > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'retrying the dashboard build'; }
+[[ ! -e $etc/dashboard-build-pending ]] || fail 'a successful dashboard retry left the marker'
+contains '<html>' "$tree/opt/colibri/libexec/colibri/web/dist/index.html"
+grep -q '^npm run build' "$log" || fail 'a plain rerun did not retry the dashboard build'
+grep -qE '^make |systemctl (stop|restart)' "$log" && fail 'replacing an installed dashboard rebuilt or restarted Colibri'
+[[ ! -e $tree/opt/colibri/libexec/colibri/web.new && ! -e $tree/opt/colibri/libexec/colibri/web.old ]] ||
+    fail 'the dashboard swap left a staging folder'
+pass 'a plain rerun retries and publishes the dashboard after npm recovers, without a rebuild or restart'
+
+# A missing installed dashboard is rebuilt alone; the running service did not
+# have one at its start, so it is restarted once to serve it.
+rm -rf -- "$tree/opt/colibri/libexec/colibri/web"
+: > "$log"
+rt FAKE_WEB=1 "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'restoring a missing dashboard asset'; }
+[[ -f $tree/opt/colibri/libexec/colibri/web/dist/index.html ]] || fail 'a missing dashboard asset was not restored'
+grep -q '^npm run build' "$log" || fail 'the missing dashboard was not built'
+grep -q '^make ' "$log" && fail 'a missing dashboard rebuilt the engines'
+[[ $(grep -c 'systemctl restart colibri.service' "$log") == 1 ]] || fail "the new dashboard did not get exactly one restart: $(grep systemctl "$log")"
+grep -q 'systemctl stop' "$log" && fail 'a missing dashboard stopped Colibri for a rebuild'
+pass 'a missing installed dashboard is built alone and served after one restart'
+
+# Not serving and the dashboard pending: built alone before the one restart.
+served_dir=$(sed -n 's/^COLIBRI_MODEL_DIR=//p' "$etc/installed-env")
+mkdir -p "$served_dir"; : > "$served_dir/config.json"
+: > "$etc/dashboard-build-pending"
+: > "$log"; rm -f -- "$tmp_root/healed"
+rt FAKE_WEB=1 FAKE_HEALTHY=0 FAKE_ACTIVE=inactive FAKE_RESTART_HEALS="$tmp_root/healed" "$(at_head)" -- > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a stopped CT with a pending dashboard'; }
+contains 'is back after a restart' "$tmp_root/out"
+grep -q '^make ' "$log" && fail 'a stopped CT with a pending dashboard rebuilt the engines'
+[[ $(grep -c 'systemctl restart colibri.service' "$log") == 1 ]] || fail 'a stopped CT was not restarted exactly once'
+npm_line=$(grep -n '^npm run build' "$log" | cut -d: -f1); restart_line=$(grep -n 'systemctl restart' "$log" | cut -d: -f1)
+(( npm_line < restart_line )) || fail 'the dashboard was built after the restart'
+[[ ! -e $etc/dashboard-build-pending ]] || fail 'the marker survived a good dashboard build'
+pass 'a stopped CT gets its pending dashboard before its one restart'
+rm -f -- "$served_dir/config.json"
+
+# A checkout with no dashboard source has nothing to retry: nothing to do.
+rm -f -- "$tree/opt/colibri/web/package-lock.json"
+: > "$log"
+rt "$(at_head)" -- > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'a checkout without web/'; }
+contains 'nothing to do' "$tmp_root/out"
+grep -qE '^(npm|make) ' "$log" && fail 'a checkout without dashboard source ran a build'
+[[ ! -e $etc/dashboard-build-pending ]] || fail 'a checkout without dashboard source left a retry marker'
+pass 'a checkout without dashboard source never retries one'
+
+: > "$log"
+rt FAKE_WEB=1 COLIBRI_DASHBOARD=false "$(at_head)" -- > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'turning the dashboard off'; }
+[[ ! -e $tree/opt/colibri/libexec/colibri/web ]] || fail 'COLIBRI_DASHBOARD=false left the dashboard installed'
+grep -q '^npm ' "$log" && fail 'COLIBRI_DASHBOARD=false ran npm'
+contains 'COLIBRI_DASHBOARD=false' "$etc/installed-env"
+grep -q dashboard "$etc/installed-settings" && fail 'the fingerprint still names the dashboard'
+pass 'COLIBRI_DASHBOARD=false removes the dashboard at its rebuild'
+
+# An install recorded before the setting: no dashboard, and nothing to rebuild.
+sed -i '/^COLIBRI_DASHBOARD=/d' "$etc/installed-env"
+: > "$log"
+rt FAKE_WEB=1 "$(at_head)" -- > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'a rerun of an older record'; }
+contains 'nothing to do' "$tmp_root/out"
+grep -qE '^(npm|make) ' "$log" && fail 'an older record was rebuilt for the dashboard'
+pass 'an install from before the setting keeps running without the dashboard and is not rebuilt'
 
 printf '%s Colibri upgrade cases passed. No system files, packages or services were touched.\n' "$passed"

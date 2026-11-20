@@ -121,6 +121,12 @@ Environment:
                                  accepts, comma-separated; * with a wildcard bind,
                                  since clients reach it by an address the CT cannot
                                  know. The API key is required either way)
+  COLIBRI_DASHBOARD=true        (build colibri's web dashboard, served by coli
+                                 serve at http://<CT>:<port>/: chat and image UI
+                                 that asks for the API key. Node.js 20.19+/22.12+
+                                 is installed for the build (NodeSource 24 when the
+                                 CT has none that new). false: API only. Installs
+                                 from before this setting keep false unless asked)
   COLIBRI_READY_TIMEOUT=900     (seconds; a model load is long)
   COLIBRI_OS_RELEASE=/etc/os-release (override used only to pick the CUDA distro)
 USAGE
@@ -217,6 +223,7 @@ validate_settings() {
     [[ $COLIBRI_HOST =~ ^[A-Za-z0-9._:-]{1,63}$ ]] || die 'Invalid COLIBRI_HOST.'
     [[ $COLIBRI_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( COLIBRI_PORT <= 65535 )) || die 'Invalid COLIBRI_PORT.'
     valid_allowed_hosts "$COLIBRI_ALLOWED_HOST" || die 'Invalid COLIBRI_ALLOWED_HOST.'
+    [[ $COLIBRI_DASHBOARD == true || $COLIBRI_DASHBOARD == false ]] || die 'COLIBRI_DASHBOARD must be true or false.'
 }
 
 # valid_allowed_hosts LIST: comma-separated Host names for coli serve's
@@ -259,6 +266,9 @@ settings_fingerprint() {
     printf 'model_dir=%s\nbackend=%s\nbuilt_backend=%s\nhost=%s\nport=%s\nallowed_host=%s\ndata_dir=%s\nkey_sha256=%s\n' \
         "$COLIBRI_MODEL_DIR" "$COLIBRI_BACKEND" "${colibri_backend:-}" "$COLIBRI_HOST" "$COLIBRI_PORT" \
         "$COLIBRI_ALLOWED_HOST" "$COLIBRI_DATA_DIR" "$key_hash" || return 1
+    # Only when on: an install without the dashboard keeps the fingerprint it
+    # had before the setting existed, so adding it rebuilds nothing.
+    [[ ${COLIBRI_DASHBOARD:-false} != true ]] || printf 'dashboard=true\n'
 }
 
 # The settings that decide how Colibri is built and launched. save_settings
@@ -266,10 +276,10 @@ settings_fingerprint() {
 # roll back to what last worked rather than relaunching with the settings that
 # failed (including another model). COLIBRI_READY_TIMEOUT and the CUDA distro
 # override are deliberately not here: they change no artefact.
-SETTING_KEYS=(COLIBRI_MODEL_DIR COLIBRI_BACKEND COLIBRI_HOST COLIBRI_PORT COLIBRI_ALLOWED_HOST)
+SETTING_KEYS=(COLIBRI_MODEL_DIR COLIBRI_BACKEND COLIBRI_HOST COLIBRI_PORT COLIBRI_ALLOWED_HOST COLIBRI_DASHBOARD)
 # Settings added after records existed, with the value those installs ran with.
-# A record without one of them is still complete. (None yet.)
-declare -gA SETTING_LEGACY_DEFAULTS=()
+# A record without one of them is still complete.
+declare -gA SETTING_LEGACY_DEFAULTS=([COLIBRI_DASHBOARD]=false)
 
 # required_setting_keys: the settings every record must hold.
 required_setting_keys() {
@@ -337,7 +347,8 @@ fingerprint_env() {
         -e 's/^backend=/COLIBRI_BACKEND=/p' \
         -e 's/^host=/COLIBRI_HOST=/p' \
         -e 's/^port=/COLIBRI_PORT=/p' \
-        -e 's/^allowed_host=/COLIBRI_ALLOWED_HOST=/p' "$1"
+        -e 's/^allowed_host=/COLIBRI_ALLOWED_HOST=/p' \
+        -e 's/^dashboard=/COLIBRI_DASHBOARD=/p' "$1"
 }
 
 # saved_settings: an existing installation keeps its settings on every rerun,
@@ -623,6 +634,21 @@ generate_run_script() {
 run_setup() {
     local build_log nvcc
     if (( dry_run )); then return 0; fi
+    build_dashboard
+    # Keep an installed dashboard if this optional build failed. Its pending
+    # marker has the next run retry the build (refresh_dashboard: the dashboard
+    # alone, not the engines). A checkout with no dashboard source gets none:
+    # nothing a rerun could build.
+    if [[ $COLIBRI_DASHBOARD == true && ! -f $COLIBRI_DIR/web/dist/index.html &&
+          -f $COLIBRI_DIR/web/package-lock.json ]]; then
+        : > "$COLIBRI_ETC_DIR/dashboard-build-pending"
+        sync -- "$COLIBRI_ETC_DIR/dashboard-build-pending" "$COLIBRI_ETC_DIR"
+    else
+        # A complete new build replaces old hashed assets; disabling, or a
+        # checkout without the source, removes them too. A failed build leaves
+        # the previous installed files intact.
+        rm -rf -- "$COLIBRI_DIR/libexec/colibri/web"
+    fi
     # The CUDA lane needs nvcc; install the toolkit as root only for it.
     if [[ $colibri_backend == cuda ]]; then
         nvcc=$(colibri_nvcc) || nvcc=''
@@ -647,7 +673,120 @@ run_setup() {
     # The contract every later step assumes: the launcher make install put there.
     [[ -x "$COLIBRI_DIR/bin/coli" ]] || \
         die "make install reported success but $COLIBRI_DIR/bin/coli is missing or not executable; check the BINDIR/PREFIX of the make output above (expected PREFIX=$COLIBRI_DIR, engines in $COLIBRI_DIR/libexec/colibri)."
+    if [[ $COLIBRI_DASHBOARD == false || ! -f $COLIBRI_DIR/web/package-lock.json ||
+          ( -f $COLIBRI_DIR/web/dist/index.html && -f $COLIBRI_DIR/libexec/colibri/web/dist/index.html ) ]]; then
+        rm -f -- "$COLIBRI_ETC_DIR/dashboard-build-pending"
+        sync -- "$COLIBRI_ETC_DIR"
+    fi
     generate_run_script
+}
+
+# node_ok: a Node.js that colibri's dashboard build takes (Vite 8, Rolldown and
+# the React plugin: ^20.19.0 || >=22.12.0).
+node_ok() {
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 &&
+        node -e 'const [a, b] = process.versions.node.split(".").map(Number);
+                 process.exit(a > 22 || (a === 22 && b >= 12) || (a === 20 && b >= 19) ? 0 : 1)' 2>/dev/null
+}
+
+# ensure_node: Node.js for the dashboard build, as root. The CT's own when it is
+# new enough (Debian 13's 20.19), else NodeSource's signed node_24.x repository
+# (the one the DeepSeek Harness target uses). World-readable keyring and list:
+# apt checks signatures as _apt.
+ensure_node() {
+    node_ok && return 0
+    local keyring=/usr/share/keyrings/nodesource.gpg list=/etc/apt/sources.list.d/nodesource.list
+    note 'Installing Node.js 24 from the NodeSource signed apt repository (for the dashboard build).'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg || return 1
+    install -d -m 0755 "${keyring%/*}" "${list%/*}"
+    ( umask 022
+      curl --fail --silent --show-error --location https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key |
+          gpg --batch --yes --dearmor -o "$keyring" &&
+      printf 'deb [signed-by=%s] https://deb.nodesource.com/node_24.x nodistro main\n' "$keyring" > "$list" ) || return 1
+    chmod 0644 -- "$keyring" "$list"
+    apt-get update && apt-get install -y --no-install-recommends nodejs || return 1
+    node_ok
+}
+
+# build_dashboard: colibri's web UI (web/, React and Vite), built as the service
+# account from the checkout's lockfile (npm ci), for make install to put in
+# libexec/colibri/web/dist, where coli serve serves it at / without a key (it
+# holds no secret; every request it makes needs the key typed into it). Optional:
+# a failed build is a warning and the API is installed without it.
+# node_modules and the npm cache are removed afterwards (hundreds of MB the
+# service never uses, and kept out of the rollback snapshot).
+build_dashboard() {
+    rm -rf -- "$COLIBRI_DIR/web/dist"
+    [[ $COLIBRI_DASHBOARD == true ]] || return 0
+    if [[ ! -f $COLIBRI_DIR/web/package-lock.json ]]; then
+        note "WARNING: this colibri checkout has no dashboard source (web/package-lock.json); it is installed without one."
+        return 0
+    fi
+    if ! ensure_node; then
+        note 'WARNING: no Node.js 20.19+ or 22.12+ for the dashboard (NodeSource unreachable?); keeping any installed dashboard. Rerun to retry.'
+        return 0
+    fi
+    printf '+ (as %s) npm ci && npm run build in %s/web (Node.js %s)\n' "$SERVICE_USER" "$COLIBRI_DIR" "$(node --version)"
+    if ! as_service env npm_config_cache="$COLIBRI_DATA_DIR/.npm" npm_config_update_notifier=false \
+            npm_config_fund=false npm_config_audit=false \
+            sh -c 'cd "$1/web" && npm ci --loglevel=error && npm run build' sh "$COLIBRI_DIR" ||
+            [[ ! -f $COLIBRI_DIR/web/dist/index.html ]]; then
+        rm -rf -- "$COLIBRI_DIR/web/dist"
+        note 'WARNING: the dashboard build failed (see above); keeping any installed dashboard. Rerun to retry.'
+    fi
+    rm -rf -- "$COLIBRI_DIR/web/node_modules" "$COLIBRI_DATA_DIR/.npm"
+}
+
+# dashboard_needed: the dashboard is asked for, this checkout has its source,
+# and it is not installed or its last build failed. Such a run rebuilds only
+# the dashboard (refresh_dashboard), never the engines: a build that keeps
+# failing (no route to npm) must not stop and rebuild Colibri on every run.
+dashboard_needed() {
+    [[ $COLIBRI_DASHBOARD == true && -f $COLIBRI_DIR/web/package-lock.json ]] || return 1
+    [[ -e $COLIBRI_ETC_DIR/dashboard-build-pending || ! -f $COLIBRI_DIR/libexec/colibri/web/dist/index.html ]]
+}
+
+# refresh_dashboard [restart|norestart]: build the dashboard and put it in
+# place beside the running service (a copy renamed over the old one; coli
+# serve reads the files per request). colibri picks its dashboard folder when
+# it starts, so a dashboard that was not installed then is served only after a
+# restart: with restart (the default) an active service is restarted once for
+# it. A failed build keeps the installed one and the retry marker.
+refresh_dashboard() {
+    local web=$COLIBRI_DIR/libexec/colibri/web had=0
+    [[ -f $web/dist/index.html ]] && had=1
+    printf 'Building the dashboard (the engines and the service are left as they are).\n'
+    build_dashboard
+    if [[ ! -f $COLIBRI_DIR/web/dist/index.html ]]; then
+        : > "$COLIBRI_ETC_DIR/dashboard-build-pending"
+        sync -- "$COLIBRI_ETC_DIR/dashboard-build-pending" "$COLIBRI_ETC_DIR"
+        return 0
+    fi
+    as_service rm -rf -- "$web.new" "$web.old"
+    as_service mkdir -p -- "$web.new/dist"
+    as_service cp -R -- "$COLIBRI_DIR/web/dist/." "$web.new/dist/"
+    if [[ -e $web ]]; then as_service mv -T -- "$web" "$web.old"; fi
+    as_service mv -T -- "$web.new" "$web"
+    as_service rm -rf -- "$web.old"
+    rm -f -- "$COLIBRI_ETC_DIR/dashboard-build-pending"
+    sync -- "$COLIBRI_ETC_DIR"
+    if (( ! had )) && [[ ${1:-restart} == restart ]] && systemctl is-active --quiet colibri.service; then
+        printf 'Restarting Colibri once so that it serves the new dashboard.\n'
+        systemctl restart colibri.service
+        wait_ready || die 'Colibri did not come back after the restart for its dashboard; see journalctl -u colibri.'
+    fi
+}
+
+# dashboard_url: where the dashboard answers, for the summary lines.
+dashboard_url() {
+    local host=$COLIBRI_HOST
+    if [[ $host == 0.0.0.0 || $host == :: ]]; then
+        host=$(hostname -I 2>/dev/null | awk '{ print $1 }')
+        [[ -n $host ]] || host='<CT address>'
+    fi
+    [[ $host != *:* ]] || host="[$host]"
+    printf 'http://%s:%s/\n' "$host" "$COLIBRI_PORT"
 }
 
 # Serialize real runs before reading saved settings. Keep the descriptor open
@@ -1293,6 +1432,7 @@ do_install() {
         printf '+ build backend: %s (COLIBRI_BACKEND=%s)%s\n' "$colibri_backend" "$COLIBRI_BACKEND" "$( [[ $colibri_backend == cuda ]] && printf '; installs the NVIDIA CUDA toolkit as root first if nvcc is missing')$( [[ $colibri_backend == vulkan ]] && printf '; checks with vulkaninfo that %s reaches the GPU' "$SERVICE_USER")"
         printf '+ (as %s) make -C %s/c install PREFIX=%s -j<nproc>%s\n' "$SERVICE_USER" "$COLIBRI_DIR" "$COLIBRI_DIR" "$( [[ $colibri_backend == cuda ]] && printf ' CUDA=1 CUDA_HOME=<toolkit>' )$( [[ $colibri_backend == vulkan ]] && printf ' VK=1' )"
         printf '+ one make call: c/Makefile install depends on every engine binary, so there is no separate build step (and c/setup.sh is not run; it would compile everything a second time)\n'
+        printf '+ %s\n' "$( [[ $COLIBRI_DASHBOARD == true ]] && printf 'dashboard: Node.js 20.19+/22.12+ (else NodeSource 24), then (as %s) npm ci && npm run build in %s/web before make install, which puts it in %s/libexec/colibri/web/dist; served at http://<CT>:%s/' "$SERVICE_USER" "$COLIBRI_DIR" "$COLIBRI_DIR" "$COLIBRI_PORT" || printf 'no dashboard (COLIBRI_DASHBOARD=false)')"
         printf '+ assert %s/bin/coli is executable (engines in %s/libexec/colibri)\n' "$COLIBRI_DIR" "$COLIBRI_DIR"
         printf '+ write %s/run-colibri.sh (0700, %s-owned): exec %s/bin/coli serve --host %s --port %s --allowed-host %s%s --auto-tier%s\n' \
             "$COLIBRI_DIR" "$SERVICE_USER" "$COLIBRI_DIR" "$COLIBRI_HOST" "$COLIBRI_PORT" "$COLIBRI_ALLOWED_HOST" \
@@ -1361,7 +1501,7 @@ apply_checkout() {
 snapshot_runtime() {
     install -d -m 0700 "$COLIBRI_STATE_DIR"
     (umask 077
-     tar -C "$COLIBRI_DIR" --exclude='./.git' -cpf "$COLIBRI_STATE_DIR/rollback-runtime.tar.new" . &&
+     tar -C "$COLIBRI_DIR" --exclude='./.git' --exclude='./web/node_modules' -cpf "$COLIBRI_STATE_DIR/rollback-runtime.tar.new" . &&
      mv -f -- "$COLIBRI_STATE_DIR/rollback-runtime.tar.new" "$COLIBRI_STATE_DIR/rollback-runtime.tar") || {
         rm -f -- "$COLIBRI_STATE_DIR/rollback-runtime.tar.new"
         return 1
@@ -1409,6 +1549,7 @@ do_upgrade() {
         printf '+ same commit, settings (model dir, backend as built, host, port, allowed hosts) and unit, and serving (or parked without a model): nothing to do\n'
         printf '+ the same, but not serving: restart it; rebuild only if that does not bring it back\n'
         printf '+ otherwise: record the current commit; systemctl stop colibri.service; checkout; make -C %s/c install PREFIX=%s %s; regenerate run-colibri.sh; restart; wait for /v1/models to answer 200\n' "$COLIBRI_DIR" "$COLIBRI_DIR" "${colibri_build_flags[*]-}"
+        printf '+ %s\n' "$( [[ $COLIBRI_DASHBOARD == true ]] && printf 'with the build: the dashboard (npm ci && npm run build in %s/web as %s; Node.js 20.19+/22.12+, else NodeSource 24), served at http://<CT>:%s/' "$COLIBRI_DIR" "$SERVICE_USER" "$COLIBRI_PORT" || printf 'no dashboard (COLIBRI_DASHBOARD=false; a previous one is removed at the next build)')"
         printf '+ on failure: check out the previous commit locally (no network) and restore its runnable checkout, launcher and unit without a build or downloads (%s/rollback-runtime.tar, removed afterwards)\n' "$COLIBRI_STATE_DIR"
         return 0
     fi
@@ -1449,6 +1590,7 @@ do_upgrade() {
         else
             printf 'Colibri is already at %s with these settings and is parked without a model; nothing to do.\n' "$previous"
         fi
+        if dashboard_needed; then refresh_dashboard restart; fi
         return 0
     fi
     # Built and configured as before but not serving (a model copied in since,
@@ -1456,6 +1598,8 @@ do_upgrade() {
     # every start, so a restart is all it may need. Rebuild only if it is not.
     if [[ $target == "$previous" ]] && installed_unchanged; then
         printf 'Colibri %s is built with these settings; restarting it.\n' "$previous"
+        # Before the restart, which then serves a dashboard new to it.
+        if dashboard_needed; then refresh_dashboard norestart; fi
         systemctl restart colibri.service
         if wait_ready; then
             printf 'Colibri %s is back after a restart (serving, or parked without a model); nothing to rebuild.\n' "$previous"
@@ -1546,6 +1690,7 @@ COLIBRI_REF=${COLIBRI_REF:-main}
 # COLIBRI_MODEL_ID. Otherwise the service parks until a model is placed.
 COLIBRI_MODEL_DIR=${COLIBRI_MODEL_DIR:-$COLIBRI_DATA_DIR/model}
 COLIBRI_BACKEND=${COLIBRI_BACKEND:-auto}
+COLIBRI_DASHBOARD=${COLIBRI_DASHBOARD:-true}
 COLIBRI_HOST=${COLIBRI_HOST:-0.0.0.0}
 COLIBRI_PORT=${COLIBRI_PORT:-8080}
 # Colibri's DNS-rebinding guard accepts loopback, the bind address and these
@@ -1604,3 +1749,14 @@ case $mode in
     *) do_install ;;
 esac
 printf 'Colibri is configured on %s:%s; API key: %s/api-key\n' "$COLIBRI_HOST" "$COLIBRI_PORT" "$COLIBRI_ETC_DIR"
+if (( ! dry_run )) && [[ $mode != model ]]; then
+    if [[ -f $COLIBRI_DIR/libexec/colibri/web/dist/index.html ]]; then
+        printf 'Dashboard: %s (paste the API key into its settings; it is not saved between visits)%s%s\n' "$(dashboard_url)" \
+            "$(model_placed || printf '; it answers once a model is served')" \
+            "$( [[ ! -e $COLIBRI_ETC_DIR/dashboard-build-pending ]] || printf "; this is the previous build: this run's build failed, and the next run retries it")"
+    elif [[ $COLIBRI_DASHBOARD == true && ! -f $COLIBRI_DIR/web/package-lock.json ]]; then
+        printf 'No dashboard: this colibri checkout has no dashboard source (web/package-lock.json).\n'
+    elif [[ $COLIBRI_DASHBOARD == true ]]; then
+        printf 'No dashboard was installed (see the warning above); the next run retries it.\n'
+    fi
+fi

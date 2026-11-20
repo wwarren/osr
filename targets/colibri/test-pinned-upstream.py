@@ -24,6 +24,7 @@ What install-target.sh, colibri.service and OSR rely on:
 
 import configparser
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -186,6 +187,26 @@ def main():
                   f"c/tools/{tool}.py imports beyond the standard library: {sorted(imported - set(sys.stdlib_module_names))}")
             check("sys.argv" in source or "argparse" in source, f"c/tools/{tool}.py no longer takes the model folder")
     check("$(LIBEXECDIR)/tools/" in install, "make install no longer installs tools/ (the post-download steps)")
+    # The dashboard (COLIBRI_DASHBOARD): built from web/ with npm ci (its
+    # lockfile), copied by make install next to openai_server.py, served by
+    # coli serve at / without a key, and talking to <origin>/v1 with the key
+    # typed into it. install-target.sh's node_ok accepts ^20.19.0 || >=22.12.0.
+    lock = json.loads(show("web/package-lock.json"))
+    wanted = {"^20.19.0 || >=22.12.0", "^20.0.0 || ^22.0.0 || >=24.0.0", ">=16.20.0", ">= 12.0.0", ">=18", ">=20", ">=14", None}
+    engines = {name: spec.get("engines", {}).get("node") if isinstance(spec.get("engines"), dict) else None
+               for name, spec in lock.get("packages", {}).items()
+               if name in ("node_modules/vite", "node_modules/rolldown", "node_modules/@vitejs/plugin-react",
+                           "node_modules/typescript", "node_modules/@tailwindcss/vite")}
+    check(engines.get("node_modules/vite") == "^20.19.0 || >=22.12.0" and set(engines.values()) <= wanted,
+          f"the dashboard build now needs another Node.js: {engines}; update node_ok in install-target.sh")
+    check('"build": "tsc -b && vite build"' in show("web/package.json"), "web/package.json's build script changed")
+    check("cp -R ../web/dist/. $(DESTDIR)$(LIBEXECDIR)/web/dist/" in install,
+          "make install no longer copies web/dist next to openai_server.py")
+    server_source = show("c/openai_server.py")
+    check('Path(__file__).resolve().parent / "web" / "dist"' in server_source and "def serve_static" in server_source
+          and 'path.startswith("/v1/")' in server_source, "coli serve no longer serves the dashboard beside it")
+    check("`${window.location.origin}/v1`" in show("web/src/App.tsx"),
+          "the dashboard no longer talks to the server that served it")
     # An image model is a diffusers pipeline (model_index.json at its root): the
     # launcher keys on that file to leave --gpu off, since the image family has
     # no accelerator lane and coli refuses --gpu for it.
