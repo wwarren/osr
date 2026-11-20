@@ -240,7 +240,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 |---|---|
 | CT | `CT_ID` (next free), `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_REF`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 with CPU-only torch) |
 | Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it with the firewall, or 8000/8080 may be dropped) |
-| Open WebUI | `OPENWEBUI_VERSION` (0.12.4), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
+| Open WebUI | `OPENWEBUI_VERSION` (latest; set a version to pin it), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` (1/20) |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
@@ -512,7 +512,7 @@ bash tools/webui-images.sh          # on the Proxmox host: make the router Open 
 The ComfyUI provisioner and the OSR installer (for a Colibri CT given an image
 model) set Open WebUI up with `tools/webui-images.py`; `tools/webui-images.sh`
 does it by hand (`--expect-model NAME` waits for a model, `--off` turns it
-off). The helper also patches the pinned Open WebUI 0.12.4 image picker to
+off). When Open WebUI 0.12.4 is installed, the helper patches its image picker to
 read `/v1/images/models` from the local router; the installer and version
 manager reapply that patch after pip replaces Open WebUI. Choosing a named
 image model in the picker keeps that live list available. An admin's own
@@ -887,8 +887,9 @@ manage-model-servers apply          # or --all to restart every service
 2. **Snapshots** the installed files to `/var/backups/open-smart-router/`
    (root-only; `APPLY_BACKUP_KEEP`, default 5). Snapshots from before the
    rename, in `/var/backups/ollama-smart-router/`, are moved there first.
-3. **Applies** the files, brings the LiteLLM and Open WebUI venvs in line with
-   their pins (backing up `webui.db` first) and restarts only affected services.
+3. **Applies** the files, brings the LiteLLM venv and any explicitly pinned
+   Open WebUI venv in line with their requirements (backing up `webui.db` before
+   a WebUI upgrade), and restarts only affected services.
 4. **Health-checks** router `/healthz`, LiteLLM `/health/liveliness`, Open
    WebUI `/health` and the monitor; on failure restores the snapshot and
    restarts the old files. Rebuilt venvs are not rolled back, except that a
@@ -1110,10 +1111,12 @@ manage-model-servers set-webui-version                 # pinned / installed / la
 manage-model-servers set-webui-version latest --apply  # or a specific version
 ```
 
-The pin is in `services/open-webui/requirements.txt`; the version is checked
+New installs get the latest available Open WebUI release. Set
+`OPENWEBUI_VERSION` to install a specific release; the resulting requirement is
+in `services/open-webui/requirements.txt`. The version manager checks releases
 against PyPI and the venv's Python first, and a failed health check restores
-the previous version and `webui.db`. New installs get 0.12.4; upgrade older
-routers with `set-webui-version 0.12.4 --apply`. Open WebUI 0.11.1, 0.12.0 and
+the previous version and `webui.db`. Upgrade an existing router with
+`set-webui-version latest --apply`. Open WebUI 0.11.1, 0.12.0 and
 0.12.1 migrate the database irreversibly; `apply` keeps a copy in
 `/var/backups/open-smart-router/<timestamp>/openwebui-data/`, but only the
 last `APPLY_BACKUP_KEEP` (5) snapshots are kept, so copy it elsewhere if you

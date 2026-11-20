@@ -63,6 +63,10 @@ refused; a failed new CT is kept for inspection.
 | `MAYA_PORT`, `MAYA_READY_TIMEOUT` | 8080, 900 | |
 | `MAYA_REF`, `MAYA_COMMIT` | `latest` (newest `vX.Y.Z` tag) | `main` follows the branch; a full commit pins it |
 
+Interactive provisioning offers the default and representative Maya model
+families by number or ID. Preset `MAYA_MODEL` skips the menu. The guest checks
+the selected name against that checkout's `setup.sh --help` before downloading.
+
 Setup gets `--yes --download-model --no-start`; the unit then runs the
 generated `run-maya-*.sh`. Models live in `/var/lib/maya/models`. The installer
 checks options, model and draft against the checkout before setup.

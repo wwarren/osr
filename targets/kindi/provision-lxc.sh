@@ -5,6 +5,7 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -121,7 +122,7 @@ default_commit=$(< "$source_dir/upstream-commit.txt")
 if [[ -z ${KINDI_REF:-} && -z ${KINDI_COMMIT:-} ]]; then KINDI_COMMIT=$default_commit; fi
 KINDI_REF=${KINDI_REF:-main}
 KINDI_COMMIT=${KINDI_COMMIT:-}
-KINDI_MODEL=${KINDI_MODEL:-auto}
+KINDI_MODEL=${KINDI_MODEL:-}
 KINDI_PROFILE=${KINDI_PROFILE:-auto}
 KINDI_PORT=${KINDI_PORT:-8093}
 KINDI_CONTEXT=${KINDI_CONTEXT:-auto}
@@ -161,6 +162,15 @@ pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 pve_suggest TEMPLATE 'Template (storage:vztmpl/...)' '' valid_template_volume 'Use a downloaded LXC template volume (storage:vztmpl/...).'
 pve_suggest STORAGE 'Root disk storage' '' valid_storage_id
 pve_ask_network Kindi dhcp
+valid_kindi_menu_model() {
+    [[ $1 =~ ^(auto|bonsai-(2b|4b|9b|27b)|nanbeige-33b)$ ]] || return 1
+    [[ $KINDI_BACKEND != cpu || $1 =~ ^(auto|bonsai-(2b|4b|9b))$ ]]
+}
+kindi_models=$'auto|let Kindi pick for the detected hardware\nbonsai-2b|0.4 GB GGUF\nbonsai-4b|0.9 GB GGUF\nbonsai-9b|2.0 GB GGUF'
+if [[ $KINDI_BACKEND == cuda ]]; then
+    kindi_models+=$'\nbonsai-27b|5.9 GB GGUF plus 2B draft\nnanbeige-33b|13.1 GB GGUF'
+fi
+target_model_select KINDI_MODEL Kindi auto valid_kindi_menu_model "$kindi_models" || die 'Model selection cancelled.'
 [[ $TEMPLATE =~ $template_re ]] || die "TEMPLATE must be a downloaded $template_names amd64 LXC template."
 [[ $STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'STORAGE must be a Proxmox rootdir storage ID.'
 valid_ip_cidr "$IP_CIDR" || die 'IP_CIDR must be dhcp or a valid IPv4 address/CIDR.'

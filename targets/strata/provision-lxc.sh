@@ -5,6 +5,7 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -198,9 +199,9 @@ STRATA_FAMILY=${STRATA_FAMILY:-qwen}
 # Default model per family (upstream offers IQ1_M only for coder and the
 # UD-* packs only for unsloth).
 case $STRATA_FAMILY in
-    coder) STRATA_MODEL=${STRATA_MODEL:-IQ1_M} ;;
-    unsloth) STRATA_MODEL=${STRATA_MODEL:-UD-IQ4_XS} ;;
-    *) STRATA_MODEL=${STRATA_MODEL:-IQ2_XS} ;;
+    coder) strata_model_default=IQ1_M; strata_models='IQ1_M|coder pack' ;;
+    unsloth) strata_model_default=UD-IQ4_XS; strata_models=$'UD-IQ4_XS|smaller Unsloth pack\nUD-Q4_K_XL|larger Unsloth pack' ;;
+    *) strata_model_default=IQ2_XS; strata_models=$'IQ2_XS|default pack\nQ2_0|alternative 2-bit pack\nIQ3_XXS|larger pack\nIQ3_S|largest listed pack' ;;
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
 STRATA_KV=${STRATA_KV:-}
@@ -221,6 +222,8 @@ pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 pve_suggest TEMPLATE 'Ubuntu 22.04/24.04 or Debian 12/13 amd64 template' '' valid_template_volume 'Use a downloaded LXC template volume (storage:vztmpl/...).'
 pve_suggest STORAGE 'Root disk storage' '' valid_storage_id
 pve_ask_network Strata dhcp
+valid_strata_menu_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+target_model_select STRATA_MODEL Strata "$strata_model_default" valid_strata_menu_model "$strata_models" || die 'Model selection cancelled.'
 
 [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] || die 'CT_ID must be an unused numeric ID of 100 or more.'
 [[ $TEMPLATE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || \

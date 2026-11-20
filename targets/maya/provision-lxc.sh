@@ -5,6 +5,7 @@ set -Eeuo pipefail
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 source "$(dirname -- "${BASH_SOURCE[0]}")/pve-select.sh"
 source "$(dirname -- "${BASH_SOURCE[0]}")/../nvidia-lxc.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/../model-select.sh"
 usage() {
     cat <<'USAGE'
 Usage: bash provision-lxc.sh [--dry-run]
@@ -108,7 +109,7 @@ GPU_GID=${GPU_GID:-44}
 NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION:-auto}
 MAYA_REF=${MAYA_REF:-latest}
 MAYA_COMMIT=${MAYA_COMMIT:-}
-MAYA_MODEL=${MAYA_MODEL:-Maya-S-v2-IQ2_XXS}
+MAYA_MODEL=${MAYA_MODEL:-}
 MAYA_CONTEXT=${MAYA_CONTEXT:-65536}
 MAYA_DRAFT=${MAYA_DRAFT:-mtp}
 MAYA_NO_VISION=${MAYA_NO_VISION:-false}
@@ -128,6 +129,9 @@ pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 pve_suggest TEMPLATE 'Template (storage:vztmpl/...)' '' valid_template_volume 'Use a downloaded LXC template volume (storage:vztmpl/...).'
 pve_suggest STORAGE 'Root disk storage' '' valid_storage_id
 pve_ask_network Maya dhcp
+valid_maya_menu_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+maya_models=$'Maya-S-v2-IQ2_XXS|default small pack\nMaya-S24|upstream model family\nMaya-M|upstream model family\nMaya-L|upstream model family'
+target_model_select MAYA_MODEL Maya Maya-S-v2-IQ2_XXS valid_maya_menu_model "$maya_models" || die 'Model selection cancelled.'
 [[ $TEMPLATE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*:vztmpl/(ubuntu-(22\.04|24\.04|26\.04)|debian-(12|13))-[A-Za-z0-9._-]+_amd64\.tar\.(zst|xz|gz)$ ]] || \
     die 'TEMPLATE must be a downloaded Ubuntu 22.04/24.04/26.04 or Debian 12/13 amd64 LXC template.'
 [[ $STORAGE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'STORAGE must be a Proxmox rootdir storage ID.'

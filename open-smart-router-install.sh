@@ -53,11 +53,10 @@ TORCH_CPU_ONLY="${TORCH_CPU_ONLY:-true}"
 OPENWEBUI_PORT="${OPENWEBUI_PORT:-8080}"
 # Open WebUI requires Python >=3.11,<3.13 (all releases). Debian 13 ships 3.13,
 # so a dedicated interpreter is provisioned for it. See ensure_openwebui_python.
-# Pinned deliberately; bump after testing. Every release so far requires
-# Python >=3.11,<3.13, which is why a dedicated 3.12 interpreter is provisioned.
-# Change it later on a running container with:
+# Install the latest available release by default. Set OPENWEBUI_VERSION to a
+# specific release to pin it. Change it later on a running container with:
 #   manage-model-servers set-webui-version <version|latest> --apply
-OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-0.12.4}"
+OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-latest}"
 OPENWEBUI_PY_VERSION="${OPENWEBUI_PY_VERSION:-3.12}"
 OPENWEBUI_PY_DIR="${OPENWEBUI_PY_DIR:-/opt/python}"
 TEMPLATE_STORAGE_EXPLICIT="${TEMPLATE_STORAGE+x}"
@@ -7647,9 +7646,11 @@ cat > "${REPO_DIR}/services/osr-monitor/requirements.txt" <<'REQEOF'
 httpx==0.28.1
 REQEOF
 
-cat > "${REPO_DIR}/services/open-webui/requirements.txt" <<EOF
-open-webui==${OPENWEBUI_VERSION}
-EOF
+if [[ "$OPENWEBUI_VERSION" == latest ]]; then
+  printf 'open-webui\n' > "${REPO_DIR}/services/open-webui/requirements.txt"
+else
+  printf 'open-webui==%s\n' "$OPENWEBUI_VERSION" > "${REPO_DIR}/services/open-webui/requirements.txt"
+fi
 
 # The hash lock for LiteLLM is too large to embed here. When the installer is
 # run from a checkout of this repo, carry it along so it is seeded and used.
@@ -9729,7 +9730,7 @@ cmd_set_model() {
   note "        so this does not by itself change discovery-mode routing."
 }
 
-# Install the pinned Open WebUI into its venv, CPU-only by default.
+# Install Open WebUI into its venv, CPU-only by default.
 #
 # This container never has a GPU, so the CUDA build of torch is ~4.5 GB of
 # wheels that can never be used. Installing CPU-only torch FIRST leaves pip with
@@ -10421,8 +10422,8 @@ cmd_apply() {
     fi
   fi
 
-  # If the pinned Open WebUI version no longer matches what is installed,
-  # bring the venv in line before restarting the unit.
+  # If a version is pinned and differs from the installed release, bring the
+  # venv in line before restarting the unit.
   local want_v have_v
   want_v="$(openwebui_current_version)"
   have_v="$(openwebui_installed_version)"
@@ -12065,7 +12066,7 @@ def main(argv=None):
     original = request(f"{base}/config", admin_token)
     if "IMAGES_OPENAI_API_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
         raise RuntimeError("This Open WebUI's image settings API is not supported "
-                           "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.12.4)")
+                           "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config)")
     if args.off:
         if original.get("IMAGE_GENERATION_ENGINE") == "openai" and \
                 str(original.get("IMAGES_OPENAI_API_BASE_URL", "")).rstrip("/") == f"{router}/v1":
@@ -12230,11 +12231,11 @@ if [[ "$TORCH_CPU_ONLY" == "true" ]]; then
     echo "         cannot use. Re-run with TORCH_CPU_ONLY=false to skip this." >&2
   fi
 fi
-# Pin a known-good release; bump deliberately after testing. This step pulls a
-# large dependency tree (torch, transformers, chromadb…) and takes a while.
+# Install the latest release, or OPENWEBUI_VERSION when specified. This step
+# pulls a large dependency tree (torch, transformers, chromadb…) and takes a while.
 run_ct /app/openwebui/venv/bin/pip install --no-cache-dir \
   -r "${CONFIG_REPO_DIR}/services/open-webui/requirements.txt"
-if [[ "$OPENWEBUI_VERSION" == 0.12.4 ]]; then
+if [[ "$(run_ct /app/openwebui/venv/bin/python -c 'import importlib.metadata as m; print(m.version("open-webui"))')" == 0.12.4 ]]; then
   run_ct /app/openwebui/venv/bin/python "${CONFIG_REPO_DIR}/tools/webui-images.py" --patch-only
 fi
 

@@ -244,7 +244,8 @@ WebUI's shared connection never see these credentials.
 
 Chat UI on `:8080`, pointed at the **router** (not LiteLLM) with
 `ROUTER_API_KEY` as `OPENAI_API_KEYS`. Python 3.12 in its own venv (§7);
-version pinned in `services/open-webui/requirements.txt`.
+latest available release by default, or a version pinned in
+`services/open-webui/requirements.txt`.
 
 ### 4.4 Health monitor (`osr-monitor.service`)
 
@@ -391,7 +392,7 @@ one picture. A configured cloud image model (`openai/gpt-image-1`,
 an unknown name also goes to LiteLLM, as before. Open WebUI's image engine is
 set by `tools/webui-images.py`: engine OpenAI, base
 `http://127.0.0.1:8000/v1`, the router key, model `image`. The helper patches
-the pinned Open WebUI 0.12.4 image picker to read the router's live
+Open WebUI 0.12.4's image picker, when installed, to read the router's live
 `/v1/images/models` list; the installer and manager reapply it after pip
 installs that version.
 
@@ -456,7 +457,7 @@ Seeded at `install/manage-model-servers.sh` and symlinked to
   is kept.
 * **`apply` validates, snapshots, applies, health-checks and restores on
   failure**, restarting only services whose inputs changed and syncing the
-  LiteLLM and Open WebUI venvs with their pins (backing up `webui.db`). The
+  LiteLLM and Open WebUI venvs with their requirements (backing up `webui.db`). The
   LiteLLM venv itself is not rolled back.
 * `commit` pushes with the deploy token through a temporary 0600 credential
   file in the remote's URL scheme (git will not match `https://` credentials to

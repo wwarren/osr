@@ -147,8 +147,11 @@ SWAP_MB=${SWAP_MB:-4096}
 ONBOOT=${ONBOOT:-0}
 SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
 GPU_DEVICES=${GPU_DEVICES:-}
-AIRLLM_MODEL_ID=${AIRLLM_MODEL_ID:-Qwen/Qwen2.5-72B-Instruct}
+AIRLLM_MODEL_ID=${AIRLLM_MODEL_ID:-}
 AIRLLM_MODEL_ALIAS=${AIRLLM_MODEL_ALIAS:-}
+airllm_menu_model() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+prompt_container_setting AIRLLM_MODEL_ID 'Hugging Face model (<org>/<repo>)' \
+    'Qwen/Qwen2.5-72B-Instruct' airllm_menu_model 'Use a Hugging Face <org>/<repo> ID.'
 min_disk=$(model_disk_gb "$AIRLLM_MODEL_ID")
 ROOTFS_GB=${ROOTFS_GB:-$min_disk}
 

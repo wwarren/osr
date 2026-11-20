@@ -32,7 +32,8 @@ OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b' bash provision-lxc.sh --install-target
 ```
 
 Interactive runs prompt for IP/CIDR (or `dhcp`), gateway and `rootdir`
-storage; preset `IP_CIDR`, `GATEWAY`, `TEMPLATE_STORAGE` and `STORAGE` to skip
+storage, then optionally for a space-separated list of models to pull; preset
+`IP_CIDR`, `GATEWAY`, `TEMPLATE_STORAGE`, `STORAGE` and `OLLAMA_PULL_MODELS` to skip
 them. No address is chosen automatically. The CT ID defaults to the cluster's next free ID (Enter, or an unattended run, takes it; preset `CT_ID` to choose another). The wrapper runs
 the community script with its `var_*` presets; the script still shows its
 menu, so choose **Default**. Defaults are larger than the community ones:

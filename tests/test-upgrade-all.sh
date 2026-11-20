@@ -508,11 +508,12 @@ assert_contains 'hcom in the agent' $'hcom\t282\tpve1\ttarget=hermes' "$out"
 [[ $(grep -n $'^hcom\t290' <<< "$out" | cut -d: -f1) -gt $(grep -n $'^hcom\t282' <<< "$out" | cut -d: -f1) ]] &&
     _pass 'observer after the agents' || _fail 'observer after the agents' 'observer last' "$out"
 run_tool '' --dry-run --skip router
-assert_contains 'Open WebUI moves to the pin' "set-webui-version $(sed -n 's/^open-webui==//p' "$ROOT/services/open-webui/requirements.txt")" "$out"
+assert_contains 'unpinned Open WebUI keeps its installed release' 'Open WebUI 0.11.0' "$out"
+assert_not_contains 'unpinned Open WebUI does not request a version change' 'set-webui-version' "$out"
 assert_contains 'hcom uses the one broker' 'broker CT 290' "$out"
 echo 99.0.0 > "$tmp/mock/280.webui"
 run_tool '' --dry-run --skip router
-assert_contains 'never downgrades Open WebUI' 'keeps Open WebUI 99.0.0' "$out"
+assert_contains 'unpinned Open WebUI keeps a newer installed release' 'Open WebUI 99.0.0' "$out"
 rm "$tmp/nodes/pve1/lxc/290.conf"
 run_tool '' --dry-run --skip router
 assert_contains 'hcom needs a broker' 'set MQTT_CT_ID' "$out"

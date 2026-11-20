@@ -246,6 +246,12 @@ if pve_interactive && (( ! dry_run )); then _pve_heading; fi
 pve_select_storage TEMPLATE_STORAGE vztmpl 0
 pve_select_storage STORAGE rootdir "$ROOTFS_GB"
 pve_ask_network Ollama dhcp
+if [[ -z $OLLAMA_PULL_MODELS ]] && pve_asks; then
+    pve_section 'Ollama models'
+    pve_note 'Names come from the Ollama library; one or more can be pulled after installation.'
+fi
+pve_offer OLLAMA_PULL_MODELS 'Models to pull (space separated; Enter skips)' '' valid_models \
+    'Use model names such as qwen3:8b, separated by spaces.'
 [[ -z $IP_CIDR ]] || valid_container_ip "$IP_CIDR" || die 'IP_CIDR must be a.b.c.d/nn or dhcp.'
 [[ $IP_CIDR == dhcp || -z $GATEWAY ]] || ipv4 "$GATEWAY" || die 'GATEWAY must be an IPv4 address.'
 gpu=$(gpu_vendor "$GPU") || die 'GPU must be auto, nvidia, amd, intel or none (yes means nvidia, no means none).'

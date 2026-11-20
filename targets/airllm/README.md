@@ -38,7 +38,8 @@ bash provision-lxc.sh --install-target
 ```
 
 On a terminal, missing settings are prompted for (IP/CIDR or `dhcp`, gateway,
-downloaded templates, `rootdir` storage with room for `ROOTFS_GB`); no address
+downloaded templates, `rootdir` storage with room for `ROOTFS_GB`, and the
+Hugging Face model ID); no address
 is chosen automatically. The CT ID defaults to the cluster's next free ID (Enter, or an unattended run, takes it; preset `CT_ID` to choose another). `--dry-run` prints the plan without
 Proxmox queries, so give `CT_ID`, `TEMPLATE` and `STORAGE` explicitly. Debian
 12/13 and Ubuntu 24.04/26.04 templates are accepted (Python 3.11+). No root

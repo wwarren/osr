@@ -246,7 +246,7 @@ def main(argv=None):
     original = request(f"{base}/config", admin_token)
     if "IMAGES_OPENAI_API_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
         raise RuntimeError("This Open WebUI's image settings API is not supported "
-                           "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.12.4)")
+                           "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config)")
     if args.off:
         if original.get("IMAGE_GENERATION_ENGINE") == "openai" and \
                 str(original.get("IMAGES_OPENAI_API_BASE_URL", "")).rstrip("/") == f"{router}/v1":

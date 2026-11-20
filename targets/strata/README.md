@@ -12,6 +12,11 @@ Defaults: model `IQ2_XS` (`IQ1_M` for the `coder` family, `UD-IQ4_XS` for
 gigabytes. Upstream requirements are in Strata's
 [installation guide](https://github.com/Niko1221/Strata/blob/main/docs/INSTALL.md).
 
+Interactive provisioning lists model packs for the selected `STRATA_FAMILY`;
+enter a number or model ID. Enter uses that family's default. Preset
+`STRATA_MODEL` skips the menu. The guest checks the choice against the pinned
+checkout's `setup.sh --help` before downloading.
+
 ## Source and setup options
 
 Runs fetch the tested commit

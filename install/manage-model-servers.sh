@@ -1740,7 +1740,7 @@ cmd_set_model() {
   note "        so this does not by itself change discovery-mode routing."
 }
 
-# Install the pinned Open WebUI into its venv, CPU-only by default.
+# Install Open WebUI into its venv, CPU-only by default.
 #
 # This container never has a GPU, so the CUDA build of torch is ~4.5 GB of
 # wheels that can never be used. Installing CPU-only torch FIRST leaves pip with
@@ -2432,8 +2432,8 @@ cmd_apply() {
     fi
   fi
 
-  # If the pinned Open WebUI version no longer matches what is installed,
-  # bring the venv in line before restarting the unit.
+  # If a version is pinned and differs from the installed release, bring the
+  # venv in line before restarting the unit.
   local want_v have_v
   want_v="$(openwebui_current_version)"
   have_v="$(openwebui_installed_version)"

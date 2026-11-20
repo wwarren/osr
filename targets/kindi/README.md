@@ -51,6 +51,11 @@ and runs `install-target.sh`, which installs Kindi natively as its
 
 ## Models and profiles
 
+Interactive provisioning lists the models Kindi can install and lets you enter
+a number or model ID. Enter keeps `auto`, which chooses from the detected
+hardware. Preset `KINDI_MODEL` skips the menu; the guest validates the final
+model and its memory requirements.
+
 `KINDI_MODEL=auto` and `KINDI_PROFILE=auto` read GPU 0 with `nvidia-smi` and
 pick what Kindi's own `install.sh` would for one server on that card (CI checks
 they match):

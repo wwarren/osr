@@ -144,7 +144,9 @@ ask() {
     }
     passed=$((passed + 1))
 }
-ask '\n\n' STRATA_CONTEXT=32768
+ask '\n\n\n' STRATA_CONTEXT=32768
+has '== Strata model =='
+has 'STRATA_MODEL=IQ2_XS'
 has '== Strata settings =='
 has 'Suggested: k8v4 for 12 GB and 16 GB cards, int8 for 24 GB and 32 GB cards;'
 has "int8 on any card when the cache fits in the CT's RAM (from a 64K context)."
@@ -152,9 +154,11 @@ has 'This CT: k8v4 (its 16311 MiB GPU'
 has 'KV cache (int8, k8v4 or q4_0) [k8v4]:'
 has 'Message cache for agents that rewrite their last message [y/N]:'
 has 'STRATA_KV=k8v4'; has 'STRATA_MESSAGE_CACHE=false'
-ask 'q8\nint8\ny\n' STRATA_CONTEXT=32768
+ask '\nq8\nint8\ny\n' STRATA_CONTEXT=32768
 has 'Choose int8, k8v4 or q4_0.'
 has 'STRATA_KV=int8'; has 'STRATA_MESSAGE_CACHE=true'
+ask '2\n\n\n' STRATA_CONTEXT=32768
+has 'STRATA_MODEL=Q2_0'
 ask '\n\n' STRATA_MODEL=IQ3_S STRATA_CONTEXT=262144 MEMORY_MB=90112
 has "This CT: int8 (at this context the cache is kept in the CT's RAM with only a 32K window on the GPU)."
 has 'KV cache (int8, k8v4 or q4_0) [int8]:'

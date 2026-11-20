@@ -61,6 +61,13 @@ pin=$(< "$here/upstream-commit.txt")
 has "KINDI_COMMIT=$pin"
 has 'KINDI_BACKEND=cpu'
 has 'KINDI_MODEL=auto'
+output=$(printf '3\n' | env -i "${hostenv[@]}" "${common[@]}" PVE_INTERACTIVE=true \
+    KINDI_BACKEND=cpu bash "$provision" --dry-run 2>&1) || {
+    printf 'FAIL interactive Kindi model selection\n%s\n' "$output" >&2; exit 1;
+}
+has '== Kindi model =='
+has 'KINDI_MODEL=bonsai-4b'
+passed=$((passed + 1))
 has 'KINDI_PORT=8093'
 has 'KINDI_CONTEXT=auto'
 has 'KINDI_HEAD=exact'
