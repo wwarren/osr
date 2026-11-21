@@ -3262,6 +3262,106 @@ def test_disconnected_image_client_cancels_comfyui_job(imaging):
     assert "/history/p1" not in paths
 
 
+def _asgi_image_post(router, payload):
+    """POST /v1/images/generations through the full app, the client gone after
+    sending the body. Returns the response status."""
+    async def run():
+        await router.refresh_inventory()
+        body = json.dumps(payload).encode()
+        messages = iter(({"type": "http.request", "body": body, "more_body": False},))
+
+        async def receive():
+            return next(messages, {"type": "http.disconnect"})
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "path": "/v1/images/generations",
+                 "raw_path": b"/v1/images/generations", "query_string": b"", "headers": [],
+                 "scheme": "http", "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000)}
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await router.app(scope, receive, send)
+        await asyncio.gather(*router._COMFYUI_CANCELS)
+        await router.http_client().aclose()
+        return next(message["status"] for message in sent if message["type"] == "http.response.start")
+
+    return asyncio.run(run())
+
+
+def test_a_gone_client_gets_no_more_colibri_images(imaging):
+    router, upstream = imaging(COMFYUI_SERVERS="")
+    status = _asgi_image_post(router, {"model": "image", "prompt": "a fox", "n": 3})
+    assert status == 499
+    assert sum(path == "/v1/images/generations" for _, path, _, _ in upstream.calls) == 1
+
+
+def test_a_disconnected_client_is_not_counted_against_the_image_server(imaging):
+    router, _ = imaging(COMFYUI_SERVERS="")
+    assert _asgi_image_post(router, {"model": "image", "prompt": "a fox", "n": 2}) == 499
+    failures = [key for key in router._COUNTERS if key[0] == "osr_upstream_failures_total"]
+    assert failures == []
+    assert router.INVENTORY.get("servers", {}).get(COLIBRI_IMG, {}).get("up", True) is not False
+
+
+def test_comfyui_disconnect_is_not_counted_either(imaging):
+    router, upstream = imaging(MODEL_SERVERS="")
+    assert _asgi_image_post(router, {"model": "image", "prompt": "a fox"}) == 499
+    assert not [key for key in router._COUNTERS if key[0] == "osr_upstream_failures_total"]
+    assert "/api/jobs/p1/cancel" in [path for _, path, _, _ in upstream.calls]
+
+
+def test_litellm_fallback_asks_for_the_list_and_the_modes_at_once(imaging, monkeypatch):
+    router, _ = imaging()
+    state = {"now": 0, "peak": 0}
+
+    class Client:
+        async def get(self, url, headers=None, timeout=None):
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            await asyncio.sleep(0.05)
+            state["now"] -= 1
+            request = httpx.Request("GET", url)
+            if url.endswith("/model/info"):
+                return httpx.Response(200, request=request, json={"data": [
+                    {"model_name": "custom/flux-image", "model_info": {"mode": "image_generation"}}]})
+            return httpx.Response(200, request=request,
+                                  json={"data": [{"id": "openai/gpt-4.1"}, {"id": "custom/flux-image"}]})
+
+    with TestClient(router.app) as client:
+        router.INVENTORY = dict(router.INVENTORY, models=[])
+        real = router.http_client
+        monkeypatch.setattr(router, "http_client", lambda: Client())
+        try:
+            models = [item["id"] for item in client.get("/v1/models").json()["data"]]
+        finally:
+            monkeypatch.setattr(router, "http_client", real)
+    assert state["peak"] == 2
+    assert "openai/gpt-4.1" in models and "custom/flux-image" not in models
+
+
+def test_litellm_fallback_lists_models_when_model_info_fails(imaging, monkeypatch):
+    router, _ = imaging()
+
+    class Client:
+        async def get(self, url, headers=None, timeout=None):
+            request = httpx.Request("GET", url)
+            if url.endswith("/model/info"):
+                raise httpx.ConnectError("refused", request=request)
+            return httpx.Response(200, request=request, json={"data": [{"id": "openai/gpt-4.1"}]})
+
+    with TestClient(router.app) as client:
+        router.INVENTORY = dict(router.INVENTORY, models=[])
+        real = router.http_client
+        monkeypatch.setattr(router, "http_client", lambda: Client())
+        try:
+            models = [item["id"] for item in client.get("/v1/models").json()["data"]]
+        finally:
+            monkeypatch.setattr(router, "http_client", real)
+    assert "openai/gpt-4.1" in models
+
+
 def test_cancelled_timeout_keeps_comfyui_cleanup(imaging, monkeypatch):
     router, _ = imaging(MODEL_SERVERS="")
     router.IMAGE_READ_TIMEOUT = -1  # force expiry even on coarse monotonic clocks

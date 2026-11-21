@@ -156,6 +156,37 @@ FAKE_INSTANCE = textwrap.dedent('''
                 return
             await websocket.send_text(f"{user}@{os.path.basename(WS_DIR)}: {message.get('text')}")
 
+    async def stream_ws(websocket):
+        # Open WebUI 0.13's streams (events, process list and output, desktop,
+        # agent sessions): first-message auth, as Open Terminal checks it.
+        await websocket.accept()
+        auth = json.loads(await websocket.receive_text())
+        if auth.get("token") != KEY:
+            await websocket.close(code=4001, reason="Invalid API key")
+            return
+        extra = {k: v for k, v in auth.items() if k not in ("type", "token")}
+        await websocket.send_text(json.dumps({
+            "path": websocket.url.path, "query": websocket.url.query,
+            "user": websocket.headers.get("x-user-id", ""),
+            "session": websocket.headers.get("x-session-id", ""),
+            "workspace": os.path.basename(WS_DIR), "extra": extra}))
+        await websocket.receive()
+
+    async def browser_ws(websocket):
+        # The Browser tab: a capability token in the path, no auth message.
+        if websocket.path_params["token"] != "cap" or \
+                websocket.headers.get("authorization") != f"Bearer {KEY}":
+            await websocket.close(code=4004)
+            return
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "path": websocket.url.path, "user": websocket.headers.get("x-user-id", ""),
+            "workspace": os.path.basename(WS_DIR)}))
+        message = await websocket.receive()
+        if message.get("text"):
+            await websocket.send_text("echo " + message["text"])
+            await websocket.receive()
+
     app = Starlette(routes=[
         Route("/health", health), Route("/openapi.json", openapi), Route("/api/config", config),
         Route("/system", system), Route("/files/cwd", cwd), Route("/files/write", write, methods=["POST"]),
@@ -163,6 +194,11 @@ FAKE_INSTANCE = textwrap.dedent('''
         Route("/files/upload", upload, methods=["POST"]),
         Route("/api/terminals", terminals, methods=["POST"]),
         WebSocketRoute("/api/terminals/{sid}", terminal_ws),
+        WebSocketRoute("/events", stream_ws), WebSocketRoute("/execute", stream_ws),
+        WebSocketRoute("/execute/{pid}/status", stream_ws),
+        WebSocketRoute("/desktop/stream", stream_ws), WebSocketRoute("/desktop/audio", stream_ws),
+        WebSocketRoute("/agents/sessions/{sid}/connect", stream_ws),
+        WebSocketRoute("/browser/view/{sid}/{token}/{kind}", browser_ws),
     ])
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 ''')
@@ -425,6 +461,54 @@ class GatewayTest(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 conn.recv(timeout=10)
             self.assertEqual(getattr(caught.exception, "rcvd", None).code, 4001)
+
+    def test_open_webui_0_13_streams_reach_the_users_workspace(self):
+        workspace = None
+        for path, extra in (("/events", {}), ("/execute", {}), ("/execute/p1/status?offset=5&tail=10", {}),
+                            ("/desktop/stream", {}), ("/desktop/audio", {}),
+                            ("/agents/sessions/a1/connect", {"cursor": 7})):
+            with ws_client.connect(f"ws://127.0.0.1:{self.h.port}{path}", proxy=None,
+                                   additional_headers={"X-User-Id": "user-streams", "X-Session-Id": "chat1"}) as conn:
+                conn.send(json.dumps({"type": "auth", "token": OWUI_KEY, **extra}))
+                seen = json.loads(conn.recv(timeout=10))
+            self.assertEqual(seen["path"], path.split("?")[0])
+            self.assertEqual(seen["query"], path.partition("?")[2])
+            self.assertEqual((seen["user"], seen["session"]), ("user-streams", "chat1"))
+            self.assertEqual(seen["extra"], extra)   # the cursor reaches the agent session
+            workspace = workspace or seen["workspace"]
+            self.assertEqual(seen["workspace"], workspace)   # one workspace for the user
+        with ws_client.connect(f"ws://127.0.0.1:{self.h.port}/events", proxy=None,
+                               additional_headers={"X-User-Id": "user-streams"}) as conn:
+            conn.send(json.dumps({"type": "auth", "token": "wrong"}))
+            with self.assertRaises(Exception) as caught:
+                conn.recv(timeout=10)
+            self.assertEqual(getattr(caught.exception, "rcvd", None).code, 4001)
+
+    def test_browser_view_sockets_authenticate_with_headers(self):
+        url = f"ws://127.0.0.1:{self.h.port}/browser/view/b1/cap/ws"
+        with ws_client.connect(url, proxy=None, additional_headers=owui("user-browser")) as conn:
+            seen = json.loads(conn.recv(timeout=10))   # no auth message was needed
+            self.assertEqual((seen["path"], seen["user"]), ("/browser/view/b1/cap/ws", "user-browser"))
+            conn.send("ping")
+            self.assertEqual(conn.recv(timeout=10), "echo ping")
+        for headers, code in (({"Authorization": "Bearer wrong", "X-User-Id": "user-browser"}, 4001),
+                              (owui(), 4000)):
+            with ws_client.connect(url, proxy=None, additional_headers=headers) as conn:
+                with self.assertRaises(Exception) as caught:
+                    conn.recv(timeout=10)
+                self.assertEqual(getattr(caught.exception, "rcvd", None).code, code)
+
+    def test_other_websocket_paths_are_refused(self):
+        for path in ("/files/read", "/browser/view/b1/cap/other", "/execute/p1/kill"):
+            with self.assertRaises(Exception) as caught:
+                with ws_client.connect(f"ws://127.0.0.1:{self.h.port}{path}", proxy=None,
+                                       additional_headers=owui("user-ws")) as conn:
+                    conn.recv(timeout=10)
+            # Closed before the handshake completes: an HTTP 403, never a relayed socket.
+            response = getattr(caught.exception, "response", None)
+            rcvd = getattr(caught.exception, "rcvd", None)
+            self.assertIn((getattr(response, "status_code", None), getattr(rcvd, "code", None)),
+                          ((403, None), (None, 4004)), path)
 
     def test_mcp(self):
         key = self.h.clients("issue", "deepseek-harness-281", "--default-user", "default")

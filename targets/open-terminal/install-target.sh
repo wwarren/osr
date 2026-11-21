@@ -53,8 +53,8 @@ trap 'on_signal 129' HUP
 # End signal rollback helper.
 
 OPEN_TERMINAL_URL=https://github.com/open-webui/open-terminal.git
-DEFAULT_VERSION=v0.14.0
-DEFAULT_COMMIT=b58442aa8599755525878f917b621e0145b0e8f7
+DEFAULT_VERSION=v0.17.20
+DEFAULT_COMMIT=772f638e2aaf43c154cdb3636cfac9c1acfa2f72
 # Paths and accounts are overridable for tests only; the units use the defaults.
 OT_ETC=${OT_ETC:-/etc/open-terminal}
 OT_OPT=${OT_OPT:-/opt/open-terminal}
@@ -83,7 +83,7 @@ with an isolated workspace per user: open-terminal-gateway.service on the
 public port, one open-terminal-ws@<id>.service per workspace.
 
 Environment (unset: the value recorded by the last run, else the default):
-  OPEN_TERMINAL_VERSION=v0.14.0   upstream tag (unset, a newer tag the last run
+  OPEN_TERMINAL_VERSION=v0.17.20  upstream tag (unset, a newer tag the last run
                                   installed is kept: no downgrade unless asked)
   OPEN_TERMINAL_COMMIT=<sha>      the commit that tag must resolve to (required
                                   for any tag other than the default)
@@ -109,23 +109,48 @@ USAGE
 
 # Install helpers (sourced by test-install.sh) -------------------------------
 
-# deps_mismatch PYPROJECT REQUIREMENTS_IN: print the dependency lines that
-# differ between the checkout's pyproject.toml and requirements.in (the lock's
-# inputs). Platform-specific Windows dependencies and hatchling are ignored.
-deps_mismatch() {
-    python3 - "$1" "$2" <<'PY'
+# The runtime dependencies of a checkout, as the lock sees them: those that
+# apply on Linux (environment markers naming another platform are dropped),
+# plus the "notebooks" extra (nbclient, ipykernel; built in before v0.15), less
+# OMITTED. Shared by deps_mismatch and checkout_deps.
+RUNTIME_DEPS_PY='
 import re
 import sys
 import tomllib
 
 def norm(spec):
-    spec = spec.split(";")[0].strip()
-    return re.sub(r"\s+", "", spec).lower()
+    return re.sub(r"\s+", "", spec.split(";")[0]).lower()
 
-with open(sys.argv[1], "rb") as f:
-    project = tomllib.load(f)["project"]
-wanted = {norm(d) for d in project.get("dependencies", [])
-          if "win32" not in d}
+def name(spec):
+    return re.split(r"[<>=!~\[;\s]", spec.strip(), maxsplit=1)[0].lower().replace("_", "-")
+
+def on_linux(spec):
+    if ";" not in spec:
+        return True
+    tests = re.findall(r"sys_platform\s*(==|!=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]", spec.split(";", 1)[1])
+    return not tests or any((op == "==") == (value == "linux") for op, value in tests)
+
+def runtime_deps(pyproject, omitted=()):
+    with open(pyproject, "rb") as f:
+        project = tomllib.load(f)["project"]
+    specs = list(project.get("dependencies", []))
+    specs += project.get("optional-dependencies", {}).get("notebooks", [])
+    return {norm(d) for d in specs if on_linux(d) and name(d) not in omitted}
+'
+
+# Dependencies of the checkout that requirements.lock leaves out on purpose.
+# pyautogui only drives the machine's own screen (host desktop mode, imported
+# lazily) and it and six of its dependencies ship as source only, which a
+# hash-checked install cannot build without fetching unhashed build tools. The
+# CT has no display and workspace_env turns the desktop off.
+OMITTED_DEPS=(pyautogui)
+
+# deps_mismatch PYPROJECT REQUIREMENTS_IN: print the dependency lines that
+# differ between the checkout's runtime dependencies (RUNTIME_DEPS_PY, less
+# OMITTED_DEPS) and requirements.in (the lock's inputs, hatchling aside).
+deps_mismatch() {
+    python3 -c "$RUNTIME_DEPS_PY"'
+wanted = runtime_deps(sys.argv[1], set(sys.argv[3].split()))
 locked = set()
 with open(sys.argv[2], encoding="utf-8") as f:
     for line in f:
@@ -136,23 +161,17 @@ for spec in sorted(wanted - locked):
     print(f"needed by the checkout, not in requirements.in: {spec}")
 for spec in sorted(locked - wanted):
     print(f"in requirements.in, not needed by the checkout: {spec}")
-PY
+' "$1" "$2" "${OMITTED_DEPS[*]}"
 }
 
-# checkout_deps PYPROJECT: the checkout's runtime dependencies, one per line,
-# normalized and sorted (Windows-only ones left out), for the resolved venv's name.
+# checkout_deps PYPROJECT: the checkout's runtime dependencies (RUNTIME_DEPS_PY;
+# a resolved install gets them all), one per line, normalized and sorted, for
+# the resolved venv's name.
 checkout_deps() {
-    python3 - "$1" <<'PY'
-import re
-import sys
-import tomllib
-
-with open(sys.argv[1], "rb") as f:
-    project = tomllib.load(f)["project"]
-for spec in sorted({re.sub(r"\s+", "", d.split(";")[0]).lower()
-                    for d in project.get("dependencies", []) if "win32" not in d}):
+    python3 -c "$RUNTIME_DEPS_PY"'
+for spec in sorted(runtime_deps(sys.argv[1])):
     print(spec)
-PY
+' "$1"
 }
 
 # What gateway.py and spawner.py import from the venv; a resolved install
@@ -181,6 +200,9 @@ workspace_env() {
     # Empty would mean "*"; Open WebUI and the gateway call server-side.
     printf 'OPEN_TERMINAL_CORS_ALLOWED_ORIGINS=http://127.0.0.1\n'
     printf 'OPEN_TERMINAL_FILE_BROWSER_ROOT=home\n'
+    # No display server in the CT, and its host desktop mode is not installed
+    # (OMITTED_DEPS): Open WebUI's Desktop tab says it is unavailable.
+    printf 'OPEN_TERMINAL_ENABLE_DESKTOP=false\n'
     printf 'OPEN_TERMINAL_SYSTEM_PROMPT="%s"\n' \
         'You have access to your own private workspace on a computer running {{os}} {{kernel}} ({{arch}}) with {{shell}}; Python {{python_version}} is available. The workspace is your home directory (~): it is separate from every other user, and files you keep there persist. There is no root access, so system packages cannot be installed, but pip install --user works. Use your tools to run commands, read and write files and search; verify the current state before changing it and check command output.'
 }
@@ -324,7 +346,7 @@ if (( dry_run )); then
     printf '+ git fetch --depth 1 %s refs/tags/%s; require commit %s\n' "$OPEN_TERMINAL_URL" "$VERSION" "$COMMIT"
     printf '+ check the checkout'\''s dependencies against requirements.in (OPEN_TERMINAL_DEPS=%s)\n' "$DEPS"
     if [[ $DEPS == resolve ]]; then
-        printf '+ python3 -m venv %s/venv-%s-resolved-<deps>; pip install %s %s (resolved from PyPI); save pip freeze\n' "$OT_OPT" "$COMMIT" "$src" "${GATEWAY_DEPS[*]}"
+        printf '+ python3 -m venv %s/venv-%s-resolved-<deps>; pip install %s[notebooks] %s (resolved from PyPI); save pip freeze\n' "$OT_OPT" "$COMMIT" "$src" "${GATEWAY_DEPS[*]}"
     else
         printf '+ python3 -m venv %s; pip install --require-hashes -r requirements.lock; pip install --no-deps --no-build-isolation %s\n' "$venv" "$src"
         [[ $DEPS == lock || $VERSION == "$DEFAULT_VERSION" ]] ||
@@ -453,7 +475,7 @@ if [[ ! -f $venv/.install-complete || ! -x $venv/bin/open-terminal ]]; then
          "$venv/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation "$src"
      else
          # The checkout and the gateway's own imports, resolved together.
-         "$venv/bin/python" -m pip install --no-cache-dir "$src" "${GATEWAY_DEPS[@]}"
+         "$venv/bin/python" -m pip install --no-cache-dir "${src}[notebooks]" "${GATEWAY_DEPS[@]}"
          "$venv/bin/python" -c 'import starlette, httpx, websockets, uvicorn'
          "$venv/bin/python" -m pip freeze --all > "$venv/requirements.resolved.txt"
      fi

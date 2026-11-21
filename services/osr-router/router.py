@@ -2778,20 +2778,22 @@ async def list_models(request: Request):
     # real model names are still offered. An alias already emitted is never
     # displaced by a stale entry of the same name.
     try:
-        response = await http_client().get(
-            f"{LITELLM_BASE}/v1/models",
-            headers=_forward_headers(request, drop_auth=True),
-            timeout=DISCOVERY_TIMEOUT)
-        entries = response.json().get("data") or []
         # /v1/models is often just OpenAI's id-only shape. LiteLLM's richer
         # /model/info gives the mode for image deployments with arbitrary
-        # public names (for example an admin's "art" alias).
+        # public names (for example an admin's "art" alias). Both are asked at
+        # once, so a slow LiteLLM costs one DISCOVERY_TIMEOUT, not two.
+        forward = _forward_headers(request, drop_auth=True)
+        response, details = await asyncio.gather(
+            http_client().get(f"{LITELLM_BASE}/v1/models", headers=forward, timeout=DISCOVERY_TIMEOUT),
+            http_client().get(f"{LITELLM_BASE}/model/info", headers=forward, timeout=DISCOVERY_TIMEOUT),
+            return_exceptions=True)
+        if isinstance(response, BaseException):
+            raise response
+        entries = response.json().get("data") or []
         image_names = set()
         try:
-            details = await http_client().get(
-                f"{LITELLM_BASE}/model/info",
-                headers=_forward_headers(request, drop_auth=True),
-                timeout=DISCOVERY_TIMEOUT)
+            if isinstance(details, BaseException):
+                raise details
             details.raise_for_status()
             for detail in details.json().get("data") or []:
                 info = detail.get("model_info") if isinstance(detail, dict) else None
@@ -2866,9 +2868,11 @@ def image_payload(images: list, extra: dict = None) -> dict:
             "data": [{"b64_json": b64, "revised_prompt": None} for b64 in images], **(extra or {})}
 
 
-async def openai_image(entry: dict, body: dict, n: int, request_headers: dict) -> Response:
+async def openai_image(entry: dict, body: dict, n: int, request_headers: dict,
+                       request: Request | None = None) -> Response:
     """Colibri (any /v1/models server that declares image_generation): its own
-    OpenAI images API, one image per request, b64_json."""
+    OpenAI images API, one image per request, b64_json. A client that has gone
+    gets no further images drawn for it."""
     server = entry["server"]
     url = f"{server_base(server)}/v1/images/generations"
     headers = dict(request_headers, **backend_headers(server))
@@ -2884,7 +2888,10 @@ async def openai_image(entry: dict, body: dict, n: int, request_headers: dict) -
         return await _stream_upstream("POST", url, headers, json_body=upstream,
                                       extra_headers=extra, read_timeout=IMAGE_READ_TIMEOUT)
     drawn, last = [], None
-    for _ in range(n):
+    for index in range(n):
+        if index and request is not None and await request.is_disconnected():
+            raise ImageFailure(499, "Client disconnected before the images were ready",
+                               "client_disconnected", retry=False)
         slot = InFlight(server)
         try:
             response = await http_client().post(
@@ -3064,8 +3071,12 @@ async def route_image_generation(request: Request):
         try:
             if entry["kind"] == "comfyui":
                 return await comfyui_image(entry, body, n, request)
-            return await openai_image(entry, body, n, headers)
+            return await openai_image(entry, body, n, headers, request)
         except ImageFailure as failure:
+            if failure.code == "client_disconnected":
+                # The client left; the server did nothing wrong, so it is not counted against it.
+                log.info("image: %s on %s: %s", entry["name"], entry["server"], failure.message)
+                return failure.response or _error(failure.status, failure.message, failure.code)
             count("osr_upstream_failures_total", server=entry["server"], reason=failure.code)
             log.warning("image: %s on %s failed (%s)", entry["name"], entry["server"], failure.message)
             if failure.down:

@@ -489,23 +489,40 @@ async def handle_http(scope, receive, send):
     await response(scope, receive, send)
 
 
+# WebSockets a workspace serves. Open Terminal checks the first message
+# ({"type": "auth", "token": ...}) on these: the terminal itself, and from
+# Open WebUI 0.13 the filesystem and port events, the process list and a
+# process's output, the desktop stream and sound, and coding-agent sessions.
+FIRST_MESSAGE_WS = re.compile(
+    r"/(?:api/terminals/[^/]+|events|execute|execute/[^/]+/status"
+    r"|desktop/(?:stream|audio)|agents/sessions/[^/]+/connect)")
+# The Browser tab's sockets carry a capability token in the path instead and
+# send no auth message; Open WebUI names the client and user in headers.
+HEADER_WS = re.compile(r"/browser/view/[^/]+/[^/]+/(?:ws|stream|vnc)")
+
+
 async def handle_ws(scope, receive, send):
     socket = WebSocket(scope, receive, send)
     path = scope.get("path", "")
-    if not re.fullmatch(r"/api/terminals/[^/]+", path):
+    first_message = FIRST_MESSAGE_WS.fullmatch(path) is not None
+    if not first_message and not HEADER_WS.fullmatch(path):
         await socket.close(code=4004)
         return
     await socket.accept()
-    try:
-        first = await asyncio.wait_for(socket.receive_text(), timeout=10.0)
-        payload = json.loads(first)
-        if not isinstance(payload, dict) or payload.get("type") != "auth":
-            raise ValueError
-    except (asyncio.TimeoutError, ValueError, KeyError, WebSocketDisconnect, RuntimeError):
-        await socket.close(code=4001, reason="Auth timeout or invalid payload")
-        return
-    try:
+    payload = None
+    if first_message:
+        try:
+            first = await asyncio.wait_for(socket.receive_text(), timeout=10.0)
+            payload = json.loads(first)
+            if not isinstance(payload, dict) or payload.get("type") != "auth":
+                raise ValueError
+        except (asyncio.TimeoutError, ValueError, KeyError, WebSocketDisconnect, RuntimeError):
+            await socket.close(code=4001, reason="Auth timeout or invalid payload")
+            return
         headers = {"authorization": f"Bearer {payload.get('token', '')}"}
+    else:
+        headers = {"authorization": socket.headers.get("authorization", "")}
+    try:
         user_id = socket.headers.get("x-user-id", "")
         if user_id:
             headers["x-user-id"] = user_id
@@ -530,6 +547,9 @@ async def handle_ws(scope, receive, send):
         session_id = socket.headers.get("x-session-id")
         if session_id:
             upstream_headers["X-Session-Id"] = session_id
+        if not first_message:
+            # The workspace's own key, never the client's.
+            upstream_headers["Authorization"] = f"Bearer {instance.key}"
         try:
             upstream = await websockets.connect(
                 url, additional_headers=upstream_headers, open_timeout=10,
@@ -538,8 +558,9 @@ async def handle_ws(scope, receive, send):
             await socket.close(code=1011, reason="Workspace terminal is not reachable")
             return
         async with upstream:
-            payload["token"] = instance.key
-            await upstream.send(json.dumps(payload))
+            if payload is not None:
+                payload["token"] = instance.key
+                await upstream.send(json.dumps(payload))
 
             async def client_to_upstream():
                 while True:

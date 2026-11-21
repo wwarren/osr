@@ -8,9 +8,15 @@ CT (Hermes, OpenClaw, DeepSeek Harness) connected to it, works in its own
 open-terminal process under its own Linux account, with its own files,
 processes, `/tmp`, key and resource limits.
 
-It installs upstream tag `v0.14.0`, verified against reviewed commit
-`b58442aa8599755525878f917b621e0145b0e8f7`, into a venv built from a
-hash-locked `requirements.lock`. The CT has no access to the Proxmox host or
+It installs upstream tag `v0.17.20`, verified against reviewed commit
+`772f638e2aaf43c154cdb3636cfac9c1acfa2f72`, into a venv built from a
+hash-locked `requirements.lock`. That is the release Open WebUI 0.13.4 (the
+router's pin) was published against: besides the terminal itself, Open
+WebUI's process list and live command output, file and port events, system
+info, notebooks and coding-agent chats reach each user's workspace through
+the gateway. The Linux desktop is off (the CT has no display server), and the
+Browser tab needs a Chrome the CT does not install, so Open WebUI shows both
+as unavailable. The CT has no access to the Proxmox host or
 the router's filesystem.
 
 ```
@@ -58,8 +64,8 @@ DeepSeek ──(key deepseek-harness-<ct>, MCP)─────────┘   
   them. Everything else needs a user.
 
 Upstream's own `OPEN_TERMINAL_MULTI_USER` mode is **not** used: upstream
-documents it as workspace separation without a security boundary, and in
-v0.14.0 its file API runs as one server account that belongs to every
+documents it as workspace separation without a security boundary, and (as
+reviewed at v0.14.0) its file API runs as one server account that belongs to every
 user's group (a symlink in one home reaches another user's files) and keeps
 the shared key in its environment.
 
@@ -72,8 +78,7 @@ internal API is plain HTTP, so keep the network trusted.
 ## Prerequisites
 
 - A running Open WebUI from this repository with the Open Terminal
-  integration (0.12.4 and the pinned 0.13.4 have it; 0.13's process-output,
-  events and desktop features need a newer Open Terminal than v0.14.0), either a CT on this Proxmox node or
+  integration (the pinned 0.13.4, or 0.12.4), either a CT on this Proxmox node or
   any LXC/VM `root` on this node can reach over SSH.
 - Root on the Proxmox node for the terminal CT, a free CT ID, a downloaded
   Debian 12/13 amd64 template, `rootdir` storage and a static IPv4 address
@@ -321,10 +326,15 @@ offers agents (`MCP_TOOLS` in `gateway.py`; missing ones are skipped).
 ### Updating the pin
 
 `requirements.lock` comes from `requirements.in` (the release's runtime
-dependencies plus `hatchling`, so the package builds offline from the verified
-checkout) and must resolve identically on Python 3.11 (Debian 12) and 3.13
-(Debian 13). The gateway uses only packages already in it (starlette, httpx,
-websockets, uvicorn).
+dependencies that apply on Linux, its `notebooks` extra, plus `hatchling`, so
+the package builds offline from the verified checkout) and must resolve
+identically on Python 3.11 (Debian 12) and 3.13 (Debian 13). The gateway uses
+only packages already in it (starlette, httpx, websockets, uvicorn). Every
+package must have a wheel: `pyautogui`, which only drives the machine's own
+screen and ships as source with six source-only dependencies, is left out
+(`OMITTED_DEPS` in `install-target.sh`; the workspaces run with the desktop
+off). The install compares the tag's `pyproject.toml` with `requirements.in`
+the same way, ignoring markers for other platforms.
 
 ```bash
 uv pip compile requirements.in --generate-hashes --no-header --no-annotate \
@@ -354,7 +364,9 @@ unpinned version, upgrade, rollback and the move from the shared workspace.
 The gateway suite runs the real gateway and spawner with stub `useradd` and
 `systemctl` that start fake workspaces: separate workspaces per user and per
 client, keys required and revocable, requests without a user, uploads, the
-WebSocket terminal, MCP, a workspace recorded for someone else, restarts, idle
+WebSocket terminal, Open WebUI 0.13's other sockets (events, process list and
+output, desktop, agent sessions with first-message auth; the Browser tab with
+header auth and the workspace's own key upstream; anything else refused), MCP, a workspace recorded for someone else, restarts, idle
 stops and the active limit. The integration suite runs `integrate-webui.py`
 against a mock Open WebUI and gateway. All run in `tests/run-tests.sh` and CI.
 None of them start upstream Open Terminal or systemd's sandbox: check a new

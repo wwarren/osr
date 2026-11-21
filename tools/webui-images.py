@@ -439,7 +439,7 @@ def main(argv=None):
                 break
             except (RuntimeError, urllib.error.URLError, OSError):
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("Open WebUI did not answer after the image picker patch")
+                    raise RuntimeError("Open WebUI did not answer after the image picker patch") from None
                 time.sleep(2)
     ready = args.alias in names and (not args.expect_model or args.expect_model in names)
     size = args.image_size or original.get("IMAGE_SIZE") or DEFAULT_SIZE

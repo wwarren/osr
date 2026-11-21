@@ -31,7 +31,7 @@ source <(awk '
     /^# End install helpers\./ { capture=0 }
     capture { print }
 ' "$target")
-for helper in deps_mismatch service_env workspace_env limits_conf env_get key_hash clients_has healthy; do
+for helper in deps_mismatch checkout_deps service_env workspace_env limits_conf env_get key_hash clients_has healthy; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
 
@@ -54,6 +54,30 @@ pyproject_from "$script_dir/requirements.in" 'rich>=13' > "$tmp_root/pyproject.t
 [[ $(deps_mismatch "$tmp_root/pyproject.toml" "$script_dir/requirements.in") == *'not in requirements.in: rich>=13'* ]] ||
     fail 'a new dependency was not reported'
 pass 'dependency drift between the tag and requirements.in is detected'
+
+# Upstream's own layout (v0.17.20): notebook support as an extra, a macOS-only
+# and a Linux-only dependency, and pyautogui, which the lock leaves out.
+{
+    printf '[project]\nname = "open-terminal"\ndependencies = [\n'
+    sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e '/^hatchling$/d' -e '/^nbclient/d' -e '/^ipykernel/d' \
+        -e '/^dbus-next/d' "$script_dir/requirements.in" |
+        while IFS= read -r dep; do printf '    "%s",\n' "$dep"; done
+    printf '    "pyautogui>=0.9.54",\n'
+    printf '    "dbus-next>=0.2.3; sys_platform == '\''linux'\''",\n'
+    printf '    "pyobjc-framework-ScreenCaptureKit>=11.0; sys_platform == '\''darwin'\''",\n'
+    printf '    "soundcard>=0.4.5; sys_platform == '\''win32'\''",\n]\n'
+    printf '[project.optional-dependencies]\nnotebooks = ["nbclient>=0.10.0", "ipykernel>=6.0.0"]\n'
+    printf 'mcp = ["fastmcp>=4.0.0"]\n'
+} > "$tmp_root/pyproject.toml"
+mismatch=$(deps_mismatch "$tmp_root/pyproject.toml" "$script_dir/requirements.in")
+[[ -z $mismatch ]] || fail "upstream's markers, extras or the omitted pyautogui reported as drift: $mismatch"
+[[ $(checkout_deps "$tmp_root/pyproject.toml") == *pyautogui* ]] ||
+    fail 'a resolved install must account for pyautogui (it installs it)'
+[[ $(checkout_deps "$tmp_root/pyproject.toml") != *pyobjc* ]] || fail 'a macOS-only dependency counted'
+sed -i '/^notebooks/d' "$tmp_root/pyproject.toml"
+[[ $(deps_mismatch "$tmp_root/pyproject.toml" "$script_dir/requirements.in") == *'not needed by the checkout: nbclient'* ]] ||
+    fail 'a release without the notebooks extra was not reported'
+pass 'markers for other platforms, the notebooks extra and OMITTED_DEPS are applied'
 
 # shellcheck disable=SC2034  # read by the sourced helpers
 PORT=8001 IDLE_MINUTES=30 MAX_ACTIVE=4 WS_MEMORY=2G WS_TASKS=256 WS_CPU=200%
@@ -155,8 +179,8 @@ fi
 exec "$real_python" "\$@"
 STUB
 chmod +x "$bin/python3"
-# git: the tag resolves to FAKE_TAG_COMMIT (default: the reviewed commit for
-# v0.14.0); checkout writes a pyproject.toml matching requirements.in, plus
+# git: the tag resolves to FAKE_TAG_COMMIT (default: the reviewed commit of
+# DEFAULT_VERSION); checkout writes a pyproject.toml matching requirements.in, plus
 # FAKE_EXTRA_DEP when set.
 default_commit=$(sed -n 's/^DEFAULT_COMMIT=//p' "$target")
 cat > "$bin/git" <<STUB
@@ -243,7 +267,8 @@ contains 'OPEN_TERMINAL_IDLE_MINUTES=120' "$envf"
 contains "\"key_sha256\": \"$owui_hash\"" "$clients"
 grep -q -- "$owui_key" "$envf" "$clients" && fail 'a key is stored in clear outside api-key'
 [[ $(readlink "$OT_OPT/venv") == "$default_venv" ]] || fail 'venv symlink'
-contains "fetch -q --depth 1 origin +refs/tags/v0.14.0:refs/tags/v0.14.0" "$log"
+default_version=$(sed -n 's/^DEFAULT_VERSION=//p' "$target")
+contains "fetch -q --depth 1 origin +refs/tags/$default_version:refs/tags/$default_version" "$log"
 [[ $(grep -c '^systemctl restart open-terminal-spawner.service open-terminal-gateway.service$' "$log") == 1 ]] ||
     fail 'the services must be started exactly once'
 contains 'systemctl enable open-terminal-spawner.service open-terminal-gateway.service' "$log"
@@ -392,29 +417,29 @@ pass 'a release whose dependencies differ from the lock is refused before pip ru
 # A newer release (what tools/upgrade-all.sh passes when the latest upstream is
 # chosen) whose dependencies differ: pip resolves them instead.
 new_commit=$(printf 'e%.0s' {1..40})
-newer() { OPEN_TERMINAL_VERSION=v0.17.8 OPEN_TERMINAL_COMMIT=$new_commit FAKE_TAG_COMMIT=$new_commit run_target; }
+newer() { OPEN_TERMINAL_VERSION=v0.99.0 OPEN_TERMINAL_COMMIT=$new_commit FAKE_TAG_COMMIT=$new_commit run_target; }
 reset_tree
-out=$(FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) || fail "a newer release with other dependencies failed: $out"
-[[ $out == *'not in requirements.in: pillow>=10.0.0'* && $out == *'Resolving them with pip'* ]] || fail "resolve message: $out"
+out=$(FAKE_EXTRA_DEP='humanize>=4.0' newer 2>&1) || fail "a newer release with other dependencies failed: $out"
+[[ $out == *'not in requirements.in: humanize>=4.0'* && $out == *'Resolving them with pip'* ]] || fail "resolve message: $out"
 active=$(readlink "$OT_OPT/venv")
 [[ $active == "$OT_OPT/venv-$new_commit-resolved-"* ]] || fail "resolved venv name: $active"
-contains "-m pip install --no-cache-dir $OT_OPT/source starlette httpx websockets uvicorn" "$log"
+contains "-m pip install --no-cache-dir $OT_OPT/source[notebooks] starlette httpx websockets uvicorn" "$log"
 contains "venv-python $active -c import starlette, httpx, websockets, uvicorn" "$log"
 grep -q -- '--require-hashes' "$log" && fail 'the lock was used for a release it does not fit'
 [[ $(cat "$active/requirements.resolved.txt") == *'fastapi==0.200.0'* ]] || fail 'the resolved set was not saved'
 [[ $out == *"not hash-checked: $active/requirements.resolved.txt"* ]] || fail "resolved report: $out"
 : > "$log"
-out=$(FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) || fail "unchanged rerun failed: $out"
+out=$(FAKE_EXTRA_DEP='humanize>=4.0' newer 2>&1) || fail "unchanged rerun failed: $out"
 [[ $out == *'nothing to do'* ]] && ! grep -q 'python3 -m venv' "$log" || fail "an unchanged rerun rebuilt the resolved venv: $out"
 pass 'a newer release with other dependencies has them resolved by pip, saved, and reused by a rerun'
 
 # The next run without OPEN_TERMINAL_VERSION (upgrade-all's pinned default)
 # keeps that newer release instead of downgrading it.
-[[ $(cat "$tree/etc/open-terminal/release") == *"OPEN_TERMINAL_VERSION=v0.17.8"*"OPEN_TERMINAL_COMMIT=$new_commit"* ]] ||
+[[ $(cat "$tree/etc/open-terminal/release") == *"OPEN_TERMINAL_VERSION=v0.99.0"*"OPEN_TERMINAL_COMMIT=$new_commit"* ]] ||
     fail "the installed release was not recorded: $(cat "$tree/etc/open-terminal/release" 2>&1)"
 : > "$log"
-out=$(FAKE_TAG_COMMIT=$new_commit FAKE_EXTRA_DEP='pillow>=10.0.0' run_target 2>&1) || fail "a run without a version failed: $out"
-[[ $out == *'Keeping Open Terminal v0.17.8, newer than the pinned'* && $out == *'nothing to do'* ]] || fail "newer release not kept: $out"
+out=$(FAKE_TAG_COMMIT=$new_commit FAKE_EXTRA_DEP='humanize>=4.0' run_target 2>&1) || fail "a run without a version failed: $out"
+[[ $out == *'Keeping Open Terminal v0.99.0, newer than the pinned'* && $out == *'nothing to do'* ]] || fail "newer release not kept: $out"
 [[ $(readlink "$OT_OPT/venv") == "$active" ]] || fail 'a run without a version left the newer release'
 out=$(OPEN_TERMINAL_VERSION=$(sed -n 's/^DEFAULT_VERSION=//p' "$target") run_target 2>&1) || fail "an asked-for downgrade failed: $out"
 [[ $(readlink "$OT_OPT/venv") == "$default_venv" ]] || fail 'OPEN_TERMINAL_VERSION did not move back to the pin'
@@ -431,7 +456,7 @@ contains "--require-hashes -r $deploy/requirements.lock" "$log"
 pass 'a newer release whose dependencies match requirements.in still uses the hash-checked lock'
 
 reset_tree
-out=$(OPEN_TERMINAL_DEPS=lock FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) && fail 'OPEN_TERMINAL_DEPS=lock installed other dependencies'
+out=$(OPEN_TERMINAL_DEPS=lock FAKE_EXTRA_DEP='humanize>=4.0' newer 2>&1) && fail 'OPEN_TERMINAL_DEPS=lock installed other dependencies'
 [[ $out == *'different Python dependencies'* ]] && ! grep -q 'python3 -m venv' "$log" || fail "lock-only refusal: $out"
 out=$(OPEN_TERMINAL_DEPS=maybe run_target 2>&1) && fail 'an unknown OPEN_TERMINAL_DEPS was accepted'
 [[ $out == *'OPEN_TERMINAL_DEPS must be auto, lock or resolve'* ]] || fail "OPEN_TERMINAL_DEPS check: $out"
@@ -443,7 +468,7 @@ pass 'OPEN_TERMINAL_DEPS=lock refuses other dependencies, resolve always resolve
 reset_tree
 run_target >/dev/null 2>&1 || fail 'setup install failed'
 before=$(readlink "$OT_OPT/venv")
-out=$(FAKE_RESOLVE_FAIL=1 FAKE_EXTRA_DEP='pillow>=10.0.0' newer 2>&1) && fail 'a failed resolve was installed'
+out=$(FAKE_RESOLVE_FAIL=1 FAKE_EXTRA_DEP='humanize>=4.0' newer 2>&1) && fail 'a failed resolve was installed'
 [[ $(readlink "$OT_OPT/venv") == "$before" ]] || fail 'a failed resolve switched the venv'
 for v in "$OT_OPT"/venv-"$new_commit"-resolved-*; do [[ ! -f $v/.install-complete ]] || fail "a failed resolve left a complete venv: $v"; done
 pass 'a failed resolve leaves the running release alone'

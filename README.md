@@ -1221,9 +1221,10 @@ the venv's Python first, and a failed health check restores the previous
 version and `webui.db`. Upgrade an existing router with
 `set-webui-version 0.13.4 --apply` (or let `tools/upgrade-all.sh` do it).
 0.13 keeps image engines as a list of connections and converts the 0.12
-settings at its first start (see [Image generation](#image-generation)); its new terminal
-features (process output, events, desktop) need a newer Open Terminal than
-the pinned v0.14.0, and plain terminal sessions work as before.
+settings at its first start (see [Image generation](#image-generation)). Its terminal
+features (process list and output, events, notebooks, coding agents) need
+Open Terminal v0.17.20, the pinned release: upgrade the terminal CT too
+(`tools/upgrade-all.sh` does both).
 Open WebUI 0.11.1, 0.12.0 and 0.12.1 migrate the database irreversibly; `apply` keeps a copy in
 `/var/backups/open-smart-router/<timestamp>/openwebui-data/`, but only the
 last `APPLY_BACKUP_KEEP` (5) snapshots are kept, so copy it elsewhere if you

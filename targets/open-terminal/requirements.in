@@ -1,13 +1,21 @@
 # Inputs for the hash-locked requirements.lock: the runtime dependencies of
-# open-terminal at OPEN_TERMINAL_VERSION (from its pyproject.toml) plus
-# hatchling, its build backend, so the verified checkout builds without
-# fetching anything unhashed. The one lock must resolve identically on Python
-# 3.11 (Debian 12) and 3.13 (Debian 13); regenerate and compare it as
-# targets/open-terminal/README.md describes ("Updating the pin").
+# open-terminal at OPEN_TERMINAL_VERSION (from its pyproject.toml) that apply
+# on Linux, its "notebooks" extra (nbclient, ipykernel: notebook support, which
+# v0.14.0 had built in), plus hatchling, its build backend, so the verified
+# checkout builds without fetching anything unhashed. Left out on purpose:
+# pyautogui, which only drives the machine's own screen (host desktop mode,
+# loaded lazily) and ships as source only, with six source-only dependencies;
+# the CT has no display and the workspaces run with the desktop off
+# (OMITTED_DEPS in install-target.sh). The one lock must resolve identically
+# on Python 3.11 (Debian 12) and 3.13 (Debian 13); regenerate and compare it
+# as targets/open-terminal/README.md describes ("Updating the pin").
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
+watchfiles>=1.1.1
+psutil>=7.2.2
 click>=8.1.0
 httpx>=0.27.0
+websockets>=14.0
 python-multipart>=0.0.22
 aiofiles>=25.1.0
 pypdf>=5.0.0
@@ -16,6 +24,10 @@ openpyxl>=3.1.0
 python-pptx>=1.0.0
 striprtf>=0.0.26
 xlrd>=2.0.0
+pillow>=10.0.0
+mss>=10.0.0
+pyperclip>=1.9.0
+dbus-next>=0.2.3
 nbclient>=0.10.0
 ipykernel>=6.0.0
 hatchling

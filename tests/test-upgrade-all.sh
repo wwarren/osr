@@ -530,7 +530,7 @@ printf 'target=hermes\nnative=false\n' > "$tmp/mock/282.hcom"
 conf 290 'ai;ai-tools;osr-target;mqtt'; state 290 mosquitto
 printf 'target=observer\nnative=false\n' > "$tmp/mock/290.hcom"
 run_tool '' --list
-assert_contains 'router first' $'router\t280' "$(head -n 3 <<< "$out")"
+assert_contains 'router first' $'router\t280' "$(grep -v '^Status: ' <<< "$out" | head -n 3)"   # progress lines go to stderr
 assert_contains 'hcom in the agent' $'hcom\t282\tpve1\ttarget=hermes' "$out"
 [[ $(grep -n $'^hcom\t290' <<< "$out" | cut -d: -f1) -gt $(grep -n $'^hcom\t282' <<< "$out" | cut -d: -f1) ]] &&
     _pass 'observer after the agents' || _fail 'observer after the agents' 'observer last' "$out"
