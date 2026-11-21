@@ -77,13 +77,14 @@ token; without it Open Terminal is still upgraded and its access is left alone.
 
 Before the plan it lists, for every CT it will upgrade, the version installed
 there now, the release pinned here (tested with this repository) and the
-newest upstream release (looked up on GitHub, PyPI or npm). Where the
-upstream one is newer, or a CT runs something the pin would change, a run on
-a terminal asks: the pin (p, the answer for --yes), the latest upstream (l,
-the default when offered), or keep what is installed (k, the default when
-already at the latest), which skips
-every CT of that component in this run (--skip does that unattended). (The router's row is its LiteLLM; it,
-AirLLM and hcom are listed but not offered: they install their pins.) A commit the installer must check
+newest upstream release (looked up on GitHub, PyPI or npm). On a terminal,
+each component in the version table asks before its upgrade: the pin (p,
+the answer for --yes), the latest upstream (l, when offered), or keep what
+is installed (k), which skips every CT of that component in this run (--skip
+does that unattended). Components without a repository pin ask whether to
+run their upgrade or reconfigure step (u) or keep them (k). (The router's
+row is its LiteLLM; it, AirLLM and hcom install their pins and do not offer
+the upstream release.) A commit the installer must check
 (ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
 names at that moment, not one reviewed here.
 
@@ -233,6 +234,7 @@ method_of() {
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 section() { printf '\n==== %s ====\n' "$*" >&2; }
+status() { printf 'Status: %s\n' "$*" >&2; }
 csort() { LC_ALL=C sort "$@"; }
 
 INTERACTIVE=false
@@ -318,6 +320,7 @@ node_usable() {
     local node
     node=$(node_of "$1")
     if [[ -z ${NODE_STATE[$node]:-} ]]; then
+        status "Checking cluster node $node ..."
         if [[ $node == '?' ]]; then NODE_STATE[$node]=unknown
         else NODE_STATE[$node]=$(pct --osr-node-state "$node" 2>/dev/null || echo unreachable); fi
     fi
@@ -625,6 +628,7 @@ discover() {
                                  sed 's/[, ][, ]*/\n/g' <<< "${HCOM_EXTRA_CTS:-}"; } | sed '/^$/d' | sort -nu)
     for id in "${candidates[@]}"; do
         on_listed_node "$id" "$NODES" && node_usable "$id" || continue
+        status "Checking CT $id for hcom ..."
         ct_running "$id" || continue
         info=$(pct exec "$id" -- sh -c "$HCOM_PROBE" 2>/dev/null) || continue
         [[ $info == target=* ]] || continue
@@ -1290,7 +1294,7 @@ declare -A UPSTREAM=(
     [opencode]='npm @opencode/cli'
     [freellmapi]='gh-release tashfeenahmed/freellmapi'
 )
-# Components that pull from a public repository with no pin here: shown, not asked.
+# Components without a pin here: their existing upgrade step can be run or skipped.
 declare -A UPSTREAM_UNPINNED=(
     [basalt]='follows the tip of main (github.com/jesdga95/basalt)'
     [maya]='follows its newest vX.Y.Z tag (github.com/mw00/project-maya)'
@@ -1516,6 +1520,18 @@ ask_release() {
     done
 }
 
+# ask_unpinned TEXT: run the component's usual upgrade/reconfigure step (u),
+# or keep all its CTs as they are (k).
+ask_unpinned() {
+    while true; do
+        ask "$1 [U/k] " u
+        case ${REPLY,,} in
+            u|upgrade|reconfigure) RELEASE_ANSWER=pinned; return 0 ;;
+            k|keep) RELEASE_ANSWER=keep; return 0 ;;
+        esac
+    done
+}
+
 # installed_list TARGET: what its CTs to upgrade run, for a question
 # ("0.33.1", or "0.33.1 in CT 210, 0.34.4 in CT 211").
 installed_list() {
@@ -1544,27 +1560,10 @@ installed_at_latest() {
     $found
 }
 
-# installed_differs TARGET: does a CT of TARGET run a known version other than
-# the pin (and not a newer one, which its installer keeps), so that installing
-# the pin would change it?
-installed_differs() {
-    local t=$1 i v pin
-    pin=$(pinned_label "$t")
-    [[ $pin != '?' ]] || return 1
-    for i in "${!I_TARGET[@]}"; do
-        [[ ${I_TARGET[$i]} == "$t" && -z ${I_RESULT[$i]} ]] || continue
-        v=${I_INSTALLED[$i]:-?}
-        [[ $v != '?'* && ${v#v} != "${pin#v}" ]] || continue
-        version_newer "$v" "$pin" && continue
-        return 0
-    done
-    return 1
-}
-
 # choose_release TARGET: REL_CHOICE pinned, latest or keep (for Hermes, latest
-# runs hermes update). Asked only on a terminal, and only when there is a
-# choice: a newer upstream release, or a CT that the pin would change. keep
-# leaves every CT of TARGET as it is: decide_releases marks them kept.
+# runs hermes update). Every selected, running component is asked on a
+# terminal. keep leaves every CT of TARGET as it is: decide_releases marks
+# them kept.
 # --latest and --pinned answer instead.
 choose_release() {
     local t=$1 offered=false text
@@ -1580,13 +1579,25 @@ choose_release() {
         return 0
     fi
     REL_CHOICE[$t]=pinned
-    [[ -n $(upstream_spec "$t") ]] || return 0
+    if [[ -z $(upstream_spec "$t") ]]; then
+        if $INTERACTIVE && ! $DRY_RUN && ! $PINNED_ONLY && ! in_release_list "$t" "$LATEST"; then
+            case $(method_of "$t") in
+                guest) text='run install-target.sh --upgrade' ;;
+                hcom) text='update its hcom installation' ;;
+                *) if unpinned_service "$t"; then text='re-apply its setup'
+                   else text='run its provisioner --reconfigure'; fi ;;
+            esac
+            ask_unpinned "$(component_label "$t"): $text (u), or keep $(installed_list "$t") and skip its upgrade (k)?"
+            REL_CHOICE[$t]=$RELEASE_ANSWER
+        fi
+        return 0
+    fi
     if [[ -n ${UPSTREAM[$t]:-} ]] && release_offered "$t"; then offered=true; fi
     if $offered && in_release_list "$t" "$LATEST"; then
         REL_CHOICE[$t]=latest
-    elif $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then
+    elif $PINNED_ONLY || in_release_list "$t" "$LATEST" || ! $INTERACTIVE || $DRY_RUN; then
         return 0
-    elif $offered || installed_differs "$t"; then
+    else
         text="$(component_label "$t"): install the pinned $(pinned_label "$t") (p)"
         if $offered; then text+=", the latest upstream $(latest_label "$t") (l)"; fi
         text+=", or keep $(installed_list "$t") and skip its upgrade (k)?"
@@ -1610,13 +1621,14 @@ release_pick() { [[ ${REL_CHOICE[$1]:-} == latest ]] && printf '%s\n' "${REL_LAT
 # the components with a newer upstream release, and give the installers of the
 # ones moving to the latest its version.
 decide_releases() {
-    local i t latest offered=false
+    local i t latest
     local -a targets=() rows=()
     local -A seen=() latest_of=() pinned_of=()
     for i in "${!I_TARGET[@]}"; do
         [[ -z ${I_RESULT[$i]} ]] || continue
         t=${I_TARGET[$i]}
         [[ -n $(upstream_spec "$t") || -n ${UPSTREAM_UNPINNED[$t]:-} || $t == hermes ]] || continue
+        status "Checking whether $t CT ${I_CT[$i]} is running ..."
         $INCLUDE_STOPPED || ct_running "${I_CT[$i]}" || continue
         rows+=("$i")
         [[ -z ${seen[$t]:-} ]] || continue
@@ -1628,6 +1640,7 @@ decide_releases() {
     note 'Installed: what the CT runs now. Pinned: tested with this repository. Latest: the newest upstream release, not tested here.'
     # The pin and the latest release of each component, looked up once.
     for t in "${targets[@]}"; do
+        status "Looking up pinned and latest releases for $t ..."
         if [[ -n $(upstream_spec "$t") ]]; then
             REL_PINNED[$t]=$(pinned_release "$t")
             pinned_of[$t]=$(pinned_label "$t")
@@ -1635,9 +1648,7 @@ decide_releases() {
                 latest=$(latest_label "$t")
                 if ! release_offered "$t"; then
                     latest+=' (the pin is current)'
-                elif [[ -n ${UPSTREAM[$t]:-} ]]; then
-                    offered=true
-                else
+                elif [[ -z ${UPSTREAM[$t]:-} ]]; then
                     latest+=' (not offered: this run installs the pin)'
                 fi
             elif $UPSTREAM_OFFLINE; then
@@ -1647,7 +1658,6 @@ decide_releases() {
             fi
             latest_of[$t]=$latest
         elif [[ $t == hermes ]]; then
-            offered=true
             pinned_of[$t]='-'
             latest_of[$t]='hermes update (never past a HERMES_COMMIT pin)'
         else
@@ -1659,17 +1669,13 @@ decide_releases() {
         printf '%-18s %-6s %-22s %-22s %s\n' COMPONENT CT INSTALLED PINNED 'LATEST UPSTREAM'
         for i in "${rows[@]}"; do
             t=${I_TARGET[$i]}
+            status "Reading installed release from $t CT ${I_CT[$i]} ..."
             I_INSTALLED[i]=$(installed_release "$i")
             printf '%-18s %-6s %-22s %-22s %s\n' "$(component_label "$t")" "${I_CT[$i]}" "${I_INSTALLED[$i]}" "${pinned_of[$t]}" "${latest_of[$t]}"
         done
     } >&2
-    if ! $offered; then
-        for t in "${targets[@]}"; do
-            if [[ -n $(upstream_spec "$t") ]] && installed_differs "$t"; then offered=true; break; fi
-        done
-    fi
-    if $offered && $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY; then
-        note 'Without --dry-run, a run asks for each component with a newer upstream release, or a CT the pin would change: pinned, latest (the default when offered), or keep it as installed and skip it (the default when already at the latest). This plan uses the pins.'
+    if $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY && ! in_release_list all "$LATEST"; then
+        note 'Without --dry-run, a run asks for each selected component not named by --latest: pinned (p), latest upstream (l) when offered, or keep (k); components without a pin ask to run their upgrade step (u) or keep (k). This plan proceeds with the repository choices.'
     fi
     for t in "${targets[@]}"; do choose_release "$t"; done
     for i in "${!I_TARGET[@]}"; do
@@ -1809,6 +1815,7 @@ prepare() {
     for i in "${!I_TARGET[@]}"; do
         [[ -z ${I_RESULT[$i]} ]] || continue
         t=${I_TARGET[$i]}; id=${I_CT[$i]}
+        status "Preparing $t CT $id ..."
         if ! ct_running "$id"; then
             if ! $INCLUDE_STOPPED; then I_RESULT[i]=not-run; I_NOTE[i]='CT is stopped (--include-stopped upgrades it)'; fi
             continue
@@ -2359,6 +2366,7 @@ main() {
     done
     [[ -d $PVE_NODES_DIR ]] || die "$PVE_NODES_DIR is missing: run this on a Proxmox node."
     [[ -f $REPO_ROOT/tools/pct-cluster.sh ]] || die "Missing $REPO_ROOT/tools/pct-cluster.sh."
+    status 'Checking repository files and line endings ...'
     check_repo
     setup_prompts
     if [[ -z $ON_FAILURE ]]; then
@@ -2378,13 +2386,22 @@ main() {
     fi
     trap cleanup EXIT
     trap on_interrupt INT TERM HUP
+    status 'Building the cluster CT inventory ...'
     setup_cluster
     validate_node_filter
-    if ! $DRY_RUN && ! $LIST_ONLY; then take_cluster_lock; fi
+    if ! $DRY_RUN && ! $LIST_ONLY; then
+        status 'Acquiring the cluster upgrade lock ...'
+        take_cluster_lock
+    fi
 
     note "Repository: $REPO_ROOT ($REPO_REV); running on node $LOCAL_NODE"
-    $LIST_ONLY || offer_cluster_ssh
+    if ! $LIST_ONLY; then
+        status 'Checking SSH access to nodes with OSR CTs ...'
+        offer_cluster_ssh
+    fi
+    status 'Discovering router, target and hcom CTs ...'
     discover
+    status 'Applying component and node filters ...'
     apply_filters
     if [[ -n $ONLY || -n $NODES ]]; then
         local matches=false
@@ -2401,9 +2418,13 @@ main() {
         exit 0
     fi
     (( ${#I_TARGET[@]} )) || die 'Nothing to upgrade: no router or target CTs found in the cluster.'
+    status 'Checking which selected CTs are reachable ...'
     check_nodes
+    status 'Checking whether an Open WebUI admin token is needed ...'
     ask_token_unattended
+    status 'Collecting installed, pinned and upstream releases ...'
     decide_releases
+    status 'Reading settings and preparing the upgrade plan ...'
     prepare
     section 'Plan'
     print_plan

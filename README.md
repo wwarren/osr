@@ -1089,13 +1089,15 @@ MQTT's row is the CT's Mosquitto package, which follows Debian.
 | FreeLLMAPI | the provisioner's tested release | highest `vX.Y.Z` GitHub release | `FREELLMAPI_VERSION` (its image tag) |
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
 
-Where the upstream release is newer (or a different commit), a run on a
-terminal asks `[p/L/k]` for each: the pin (`p`, the answer for `--yes`), the
-latest upstream (`l`, the default), or keep what is installed (`k`). When
-every CT of a component already runs the latest release, the prompt instead
-defaults to `k` and shows `[p/l/K]`. Where there is no newer upstream release
-but a CT runs a version the pin would change, it asks `[P/k]`. `k` skips every
-CT of that component for this run;
+On a terminal, the run asks about every selected component before the plan.
+Pinned components ask `[P/k]`: apply the repository pin (`p`, the answer for
+`--yes`) or keep what is installed (`k`), even when the pin is current. When a
+newer upstream release or commit is available, they ask `[p/L/k]` and default
+to the latest (`l`); when every CT already runs that release, the default is
+`k` and the prompt shows `[p/l/K]`. Components without a pin (Basalt, Maya,
+OpenClaw, Gitea, Mattermost and MQTT) ask `[U/k]`: run their existing upgrade
+or reconfigure step (`u`) or keep them (`k`). `k` skips every CT of that
+component for this run;
 the plan and summary show them as `kept` (not a failure). Hermes is asked the
 same way: `p` upgrades its integration, `l` also runs `hermes update`, `k`
 skips it. To keep one CT of several, or to keep a component unattended, use
@@ -1105,8 +1107,7 @@ installer checks is the one upstream names at that moment, not a reviewed one;
 the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
 newer release on later runs that take the pin; Ollama, llama.cpp, Strata,
 Xolotl, Avalon, Kindi and Colibri go back to the pin then. An unreachable upstream is reported
-and the pins are used. Basalt, Maya, OpenClaw, Gitea, Mattermost and MQTT follow
-upstream with no pin here; they are listed with their installed version, not asked about.
+and the pins are used.
 
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`, `OPENCODE_VERSION`) is offered the
 repository's pin in an interactive run; `--yes` accepts it and `--keep-pins`

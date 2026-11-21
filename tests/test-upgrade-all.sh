@@ -295,6 +295,8 @@ reset_mock
 conf 260 'ai;osr-target;something-new'; state 260 x
 run_tool '' --list
 assert_eq '--list exits 0' 0 "$rc"
+assert_contains 'shows repository check before discovery' 'Status: Checking repository files and line endings ...' "$out"
+assert_contains 'shows CT discovery progress' 'Status: Checking CT 251 for hcom ...' "$out"
 assert_contains 'finds ollama' $'ollama\t252' "$out"
 assert_contains 'finds strata' $'strata\t251' "$out"
 assert_contains 'leaves unknown targets alone' 'CT 260 is tagged osr-target but names no target' "$out"
@@ -308,6 +310,9 @@ describe 'dry run'
 reset_mock
 run_tool '' --dry-run
 assert_eq '--dry-run exits 0' 0 "$rc"
+assert_contains 'shows upstream lookup progress' 'Status: Looking up pinned and latest releases for ollama ...' "$out"
+assert_contains 'shows installed version progress' 'Status: Reading installed release from ollama CT 252 ...' "$out"
+assert_contains 'shows per-CT plan preparation' 'Status: Preparing strata CT 251 ...' "$out"
 plan=$(sed -n '/==== Plan ====/,$p' <<< "$out")
 assert_contains 'plans the upgrade' 'install-target.sh --upgrade' "$plan"
 [[ $(grep -n '^ollama' <<< "$plan" | cut -d: -f1) -lt $(grep -n '^strata' <<< "$plan" | cut -d: -f1) ]] &&
@@ -316,7 +321,7 @@ assert_eq 'changes nothing' '' "$(grep -E '^[^ ]+ (snapshot|push) | -- env ' "$t
 
 describe 'successful upgrade'
 reset_mock
-run_tool 'y\n' --only strata
+run_tool 'y\n' --only strata --pinned
 assert_eq 'exits 0' 0 "$rc"
 assert_eq 'strata upgraded' upgraded "$(summary_line strata 251)"
 assert_file_contains 'pushes the installer' "push 251 $ROOT/targets/strata/install-target.sh /root/strata-target-deploy/install-target.sh --perms 0755" "$tmp/mock/pct.log"
@@ -336,7 +341,7 @@ echo dashboard=missing > "$tmp/mock/253.dashboard"
 run_tool '' --dry-run --only llamacpp
 assert_contains 'the plan says it adds the dashboard' 'adds the llama.cpp monitor dashboard (TCP 8082)' "$out"
 llama_dashboard active http
-run_tool 'y\n' --only llamacpp
+run_tool 'y\n' --only llamacpp --pinned
 assert_eq 'upgraded' upgraded "$(summary_line llamacpp 253)"
 assert_file_contains 'pushes the dashboard service' "push 253 $ROOT/targets/llamacpp/dashboard.py /root/llama-target-deploy/dashboard.py --perms 0755" "$tmp/mock/pct.log"
 assert_file_contains 'its page' "push 253 $ROOT/targets/llamacpp/monitor.html /root/llama-target-deploy/monitor.html --perms 0644" "$tmp/mock/pct.log"
@@ -345,39 +350,39 @@ assert_file_contains 'through install-target.sh --upgrade' 'INSTALL 253 env bash
 assert_contains 'the summary gives its address' 'monitor dashboard added: http://10.0.0.3:8082/' "$(llama_note)"
 reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
 echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard inactive
-run_tool 'y\n' --only llamacpp
+run_tool 'y\n' --only llamacpp --pinned
 assert_contains 'stopped services: it starts with them' "monitor dashboard added (TCP 8082); it starts with the target's services" "$(llama_note)"
 reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
 echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard failed
-run_tool 'y\n' --only llamacpp
+run_tool 'y\n' --only llamacpp --pinned
 assert_eq 'a failing dashboard does not fail the upgrade' upgraded "$(summary_line llamacpp 253)"
 assert_contains 'but the summary says so' 'monitor dashboard added but not answering on TCP 8082 (failed); see journalctl -u llama-dashboard' "$(llama_note)"
 reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
 echo dashboard=missing > "$tmp/mock/253.dashboard"
-run_tool 'y\n' --only llamacpp
+run_tool 'y\n' --only llamacpp --pinned
 assert_contains 'still missing afterwards is reported' 'the monitor dashboard was not installed; see the log' "$(llama_note)"
 reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge llama-dashboard
 run_tool '' --dry-run --only llamacpp
 assert_not_contains 'one that has it is not announced' 'monitor dashboard' "$out"
-run_tool 'y\n' --only llamacpp
+run_tool 'y\n' --only llamacpp --pinned
 assert_not_contains 'nor noted in the summary' 'dashboard' "$(llama_note)"
 reset_mock; conf 253 'ai;ai-model;osr-target;llamacpp'; state 253 llama-server llama-ollama-bridge
 echo dashboard=missing > "$tmp/mock/253.dashboard"; llama_dashboard active http
 touch "$tmp/mock/253.stopped"
-run_tool 'y\n' --only llamacpp --include-stopped
+run_tool 'y\n' --only llamacpp --include-stopped --pinned
 assert_contains 'a CT started for the run is looked at too' 'monitor dashboard added: http://10.0.0.3:8082/' "$(llama_note)"
 unset -f llama_dashboard llama_note
 
 describe 'unchanged target'
 reset_mock
 echo nothing > "$tmp/mock/251.upgrade"
-run_tool 'y\n' --only strata
+run_tool 'y\n' --only strata --pinned
 assert_eq 'reported current' current "$(summary_line strata 251)"
 
 describe 'broken by the upgrade: roll back'
 reset_mock
 echo break > "$tmp/mock/252.upgrade"
-run_tool 'y\nb\n'
+run_tool 'y\nb\n' --pinned
 assert_eq 'exits 1' 1 "$rc"
 assert_contains 'names what broke' 'service ollama is no longer active' "$out"
 assert_file_contains 'rolls back' 'rollback 252 osr-upg-' "$tmp/mock/pct.log"
@@ -387,14 +392,14 @@ assert_eq 'continues with strata' upgraded "$(summary_line strata 251)"
 describe 'broken by the upgrade: skip'
 reset_mock
 echo break > "$tmp/mock/252.upgrade"
-run_tool 'y\ns\n'
+run_tool 'y\ns\n' --pinned
 assert_eq 'ollama left broken' broken "$(summary_line ollama 252)"
 assert_contains 'keeps the snapshot' 'snapshot osr-upg-' "$(grep '^ollama' "$tmp"/logs/*/summary.txt)"
 assert_eq 'snapshot not deleted' '' "$(grep 'delsnapshot 252' "$tmp/mock/pct.log")"
 assert_eq 'continues with strata' upgraded "$(summary_line strata 251)"
 reset_mock
 echo fail-break > "$tmp/mock/252.upgrade"
-run_tool 'y\ns\n'
+run_tool 'y\ns\n' --pinned
 line=$(grep '^ollama' "$tmp"/logs/*/summary.txt)
 assert_contains 'failed and broken: the exit status is in the summary' 'exit 1' "$line"
 assert_contains 'and the snapshot recovery command' 'pct rollback 252 osr-upg-' "$line"
@@ -403,7 +408,7 @@ assert_contains 'and the snapshot removal command' 'pct delsnapshot 252 osr-upg-
 describe 'failed upgrade that rolled itself back'
 reset_mock
 echo fail > "$tmp/mock/252.upgrade"
-run_tool 'y\n\n'
+run_tool 'y\n\n' --pinned
 assert_contains 'says the checks still pass' 'Everything that worked before still passes the checks' "$out"
 assert_eq 'default is skip' skipped "$(summary_line ollama 252)"
 assert_eq 'its snapshot is kept' '' "$(grep 'delsnapshot 252' "$tmp/mock/pct.log")"
@@ -416,13 +421,13 @@ assert_not_contains 'without claiming the old version runs' 'previous version st
 describe 'retry'
 reset_mock
 echo fail > "$tmp/mock/252.upgrade"
-run_tool 'y\nr\ns\n'
+run_tool 'y\nr\ns\n' --pinned
 assert_eq 'runs the upgrade twice' 2 "$(grep -c '^INSTALL 252' "$tmp/mock/installs.log")"
 
 describe 'abort'
 reset_mock
 echo fail-break > "$tmp/mock/252.upgrade"
-run_tool 'y\na\n'
+run_tool 'y\na\n' --pinned
 assert_eq 'ollama broken' broken "$(summary_line ollama 252)"
 assert_eq 'strata not run' not-run "$(summary_line strata 251)"
 assert_eq 'strata untouched' '' "$(grep '^INSTALL 251' "$tmp/mock/installs.log" 2>/dev/null)"
@@ -671,13 +676,14 @@ assert_eq '--pinned: no question either' '' "$(grep -E 'OLLAMA_VERSION|STRATA_CO
 assert_not_contains '--pinned asks nothing' '[p/' "$out"
 reset_mock
 upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
-run_tool 'y\n' --only ollama
+run_tool 'p\ny\n' --only ollama
 assert_contains 'a current pin is said so' '(the pin is current)' "$out"
-assert_not_contains 'and not asked about' '[P/' "$out"
+assert_contains 'and still asks before upgrading' "ollama: install the pinned $ollama_pin (p), or keep ? and skip its upgrade (k)? [P/k]" "$out"
 assert_eq 'ollama upgraded on its pin' upgraded "$(summary_line ollama 252)"
 echo "${ollama_pin#v}" > "$tmp/mock/252.installed"
-run_tool 'y\n' --only ollama
-assert_not_contains 'installed at the pin: nothing to ask either' '[P/' "$out"
+run_tool 'k\ny\n' --only ollama
+assert_contains 'installed at the pin can still be kept' "or keep ${ollama_pin#v} and skip its upgrade (k)? [P/k]" "$out"
+assert_eq 'k skips an already pinned CT' kept "$(summary_line ollama 252)"
 # k: keep what is installed, and skip every CT of that component.
 reset_mock; upstream_fixtures
 echo 0.30.0 > "$tmp/mock/252.installed"
@@ -717,12 +723,51 @@ assert_eq 'p upgrades it to the pin' upgraded "$(summary_line ollama 252)"
 run_tool '' --yes --only ollama
 assert_eq 'unattended: the pin, unasked' upgraded "$(summary_line ollama 252)"
 echo 99.0.0 > "$tmp/mock/252.installed"
-run_tool 'y\n' --only ollama
-assert_not_contains 'a newer installed release is not asked about' '[P/' "$out"
+run_tool 'k\ny\n' --only ollama
+assert_contains 'a newer installed release can be kept' 'or keep 99.0.0 and skip its upgrade (k)? [P/k]' "$out"
+assert_eq 'k skips a newer installed CT' kept "$(summary_line ollama 252)"
 echo 0.1.0 > "$tmp/mock/252.installed"
 run_tool 'k\n' --dry-run --only ollama
 assert_not_contains 'a dry run never asks' '[P/' "$out"
-assert_contains 'but says a run would' 'or keep it as installed and skip it' "$out"
+assert_contains 'but says a run would' 'a run asks for each selected component' "$out"
+
+describe 'every selected component can be kept before the plan'
+choice_case() {
+    INTERACTIVE=true DRY_RUN=${CHOICE_DRY_RUN:-false} PINNED_ONLY=${CHOICE_PINNED_ONLY:-false}
+    INCLUDE_STOPPED=false UPDATE_HERMES=false LATEST=${CHOICE_LATEST:-}
+    ct_running() { return 0; }
+    installed_release() { echo 1.0.0; }
+    latest_release() { return 1; }
+    ask() { printf '%s\n' "$1" >&2; REPLY=${CHOICE_ANSWER:-$2}; }
+    add_item "$1" 901
+    [[ $1 != hcom ]] || add_item hcom 902
+    decide_releases
+    printf 'choice=%s results=%s\n' "${REL_CHOICE[$1]:-}" "${I_RESULT[*]}"
+}
+for target in router open-webui gitea mattermost llamacpp colibri openclaw mqtt hcom; do
+    result=$(CHOICE_ANSWER=k tables choice_case "$target" 2>&1)
+    assert_contains "$target asks before its upgrade" "$(tables component_label "$target"): " "$result"
+    assert_contains "$target offers keep" 'skip its upgrade (k)?' "$result"
+    if [[ $target == hcom ]]; then
+        assert_contains 'k keeps every hcom CT' 'choice=keep results=kept kept' "$result"
+    else
+        assert_contains "$target: k skips its CT" 'choice=keep results=kept' "$result"
+    fi
+done
+for target in gitea mattermost openclaw mqtt; do
+    result=$(CHOICE_ANSWER=u tables choice_case "$target" 2>&1)
+    assert_contains "$target offers its existing upgrade step" '(u), or keep' "$result"
+    assert_contains "$target: u proceeds" 'choice=pinned results=' "$result"
+done
+result=$(CHOICE_ANSWER=p tables choice_case router 2>&1)
+assert_contains 'router p proceeds' 'choice=pinned results=' "$result"
+result=$(CHOICE_DRY_RUN=true CHOICE_ANSWER=k tables choice_case hcom 2>&1)
+assert_not_contains 'dry run does not ask hcom' 'skip its upgrade (k)?' "$result"
+result=$(CHOICE_PINNED_ONLY=true CHOICE_ANSWER=k tables choice_case hcom 2>&1)
+assert_not_contains '--pinned does not ask hcom' 'skip its upgrade (k)?' "$result"
+result=$(CHOICE_LATEST=all CHOICE_ANSWER=k tables choice_case gitea 2>&1)
+assert_not_contains '--latest all does not ask unpinned services' 'skip its upgrade (k)?' "$result"
+
 # Hermes: k skips it.
 hermes_keep_case() {
     # shellcheck disable=SC2034  # read by decide_releases
