@@ -12,6 +12,8 @@
 # pct --osr-node, --osr-local-node and --osr-on-node answer, a command run with
 # --osr-on-node gets FAKE_ON_NODE, and vzdump, pvesm and pct create/restore act
 # for the node they run on (vzdump skips a CT of another node and succeeds).
+# FAKE_VZDUMP_SKIPS makes vzdump skip the CT on its own node too, as it would
+# for a CT that moved after the lookup.
 set -euo pipefail
 : "${FAKE:?}" "${PVE_ETC:?}"
 name=${0##*/}
@@ -114,8 +116,20 @@ guest_exec() {
 }
 
 case $name in
-    # Archives here are plain tar: zstd passes the stream through.
-    zstd) [[ $* == -q ]] || exit 2; cat ;;
+    # Archives here are plain tar, which zstd passes through, except that, like
+    # the real zstd, empty input still gives a nonempty file (a 13-byte empty
+    # frame), and that frame decompresses to nothing.
+    zstd)
+        empty_frame='\x28\xb5\x2f\xfd\x24\x00\x01\x00\x00\x99\xe9\xd8\x51'
+        case $1 in
+            -q) [[ $# -eq 1 ]] || exit 2
+                stream=$(mktemp); cat > "$stream"
+                if [[ -s $stream ]]; then cat -- "$stream"; else printf "$empty_frame"; fi
+                rm -f -- "$stream" ;;
+            -dc) [[ ${2:-} == -- && -f ${3:-} ]] || exit 2
+                 cmp -s -- "$3" <(printf "$empty_frame") || cat -- "$3" ;;
+            *) exit 2 ;;
+        esac ;;
     pveversion) printf 'pve-manager/%s/0123abcd (running kernel: 6.17.2-1-pve)\n' "${FAKE_PVE_VERSION:-9.1.2}" ;;
     pvesh) [[ $1 == get && $2 == /cluster/nextid ]] || exit 2; ! exists "$4" ;;
     pvesm) [[ $1 == path ]] || exit 2; mkdir -p "$(template_dir)"; printf '%s/%s\n' "$(template_dir)" "${2##*/}" ;;
@@ -147,7 +161,7 @@ case $name in
             shift 2
         done
         # Like Proxmox's vzdump: a guest of another node is skipped, successfully.
-        if [[ -n ${FAKE_CT_NODE:-} && $FAKE_CT_NODE != "$(this_node)" ]]; then
+        if [[ -n ${FAKE_VZDUMP_SKIPS:-} || ( -n ${FAKE_CT_NODE:-} && $FAKE_CT_NODE != "$(this_node)" ) ]]; then
             printf 'INFO: skip external VMs: %s\n' "$id" >&2
             exit 0
         fi
@@ -175,14 +189,23 @@ case $name in
             done
         }
         cp "$(conf "$id")" "$FAKE/ct/$id/conf.saved"; cp "$PVE_ETC/firewall/$id.fw" "$FAKE/ct/$id/fw.saved"
-        if [[ -n $stdout ]]; then tar -C "$FAKE/ct" -cf - "$id"
-        else tar -C "$FAKE/ct" -cf "$dumpdir/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id"; fi ;;
+        backup_meta=$(mktemp -d "$FAKE/backup-meta.XXXXXX")
+        mkdir -p "$backup_meta/etc/vzdump"
+        cp "$(conf "$id")" "$backup_meta/etc/vzdump/pct.conf"
+        # FAKE_BARE_CONF: the configuration without the ./ that pct restore needs.
+        member=./etc/vzdump/pct.conf
+        [[ -z ${FAKE_BARE_CONF:-} ]] || member=etc/vzdump/pct.conf
+        if [[ -n $stdout ]]; then tar -C "$FAKE/ct" -cf - "$id" -C "$backup_meta" "$member"
+        else tar -C "$FAKE/ct" -cf "$dumpdir/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id" -C "$backup_meta" "$member"; fi
+        rm -rf -- "$backup_meta" ;;
     pct)
         command=$1 id=${2:-}; shift 2 || true
         case $command in
             --osr-node) [[ -n ${FAKE_CT_NODE:-} ]] || exit 99; exists "$id" && printf '%s\n' "$FAKE_CT_NODE"; exit 0 ;;
             --osr-local-node) [[ -n ${FAKE_CT_NODE:-} ]] || exit 99; echo pve1 ;;
             --osr-on-node) [[ -n ${FAKE_CT_NODE:-} && -n $id && $# -ge 1 ]] || exit 99
+                           # FAKE_NODE_LACKS=zstd: that command is not installed on the node.
+                           [[ -z ${FAKE_NODE_LACKS:-} || $* != *"command -v $FAKE_NODE_LACKS"* ]] || exit 1
                            FAKE_ON_NODE=$id exec "$@" ;;
             status) exists "$id" || exit 2; if running "$id"; then echo 'status: running'; else echo 'status: stopped'; fi ;;
             config) exists "$id" || exit 2; cat "$(conf "$id")" ;;
@@ -233,7 +256,7 @@ case $name in
                 rm -rf -- "$FAKE/ct/${id:?}" "$(conf "$id")" "$PVE_ETC/firewall/$id.fw" ;;
             restore)
                 ! exists "$id" && [[ -f $1 && $2 == --storage && -z ${FAKE_RESTORE_FAILS:-} ]] || exit 1
-                tar -C "$FAKE/ct" -xf "$1"
+                tar -C "$FAKE/ct" -xf "$1" "$id"
                 mv "$FAKE/ct/$id/conf.saved" "$(conf "$id")"; mv "$FAKE/ct/$id/fw.saved" "$PVE_ETC/firewall/$id.fw"
                 this_node > "$FAKE/ct/$id/node"
                 rm -f "$FAKE/ct/$id/running" "$FAKE/ct/$id/listening" ;;

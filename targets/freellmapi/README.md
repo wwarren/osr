@@ -195,12 +195,13 @@ succeeds without a backup for any other one ("skip external VMs"), and a
 acts on the node it runs on. So for a replacement the provisioner asks the
 wrapper which node holds the CT (`pct --osr-node`). It then copies the
 template to that node's `TEMPLATE_STORAGE` unless the node already has the
-same file. `vzdump --stdout` runs there, compressed there with `zstd`, and the archive streams into
-`/var/lib/osr-freellmapi/<CT>/` on the node running the provisioner. The new
+same file. `vzdump --stdout` runs there, compressed there with `zstd`, and the
+archive streams into `/var/lib/osr-freellmapi/<CT>/` on the provisioner's node. The new
 CT is created on the CT's node, and a rollback restores there from a copy of
-that backup streamed to `/var/tmp` (removed afterwards). The backup itself
-stays on the node running the provisioner. Run directly with Proxmox's own
-`pct`, the CT is always on this node.
+that backup streamed to `/var/tmp` (removed afterwards). A successful upgrade
+removes the backup; after a failed upgrade, it stays on the node running the
+provisioner for inspection. Run directly with Proxmox's own `pct`, the CT is
+always on this node.
 
 ## Troubleshooting
 
@@ -222,9 +223,44 @@ stays on the node running the provisioner. Run directly with Proxmox's own
   version.
 - **"an earlier replacement ... did not finish".** `/var/lib/osr-freellmapi/<CT>/`
   on the node that ran the provisioner holds the backup of the CT as it was
-  before (for a CT on another node, restore it on that node from a copy). If the CT works, delete the
-  directory; if not, `pct destroy <CT>` and
-  `pct restore <CT> /var/lib/osr-freellmapi/<CT>/vzdump-lxc-<CT>-*.tar.zst --storage <storage>`.
+  before. If the CT works, delete the directory. Otherwise, keep the archive
+  until the old CT is running again. Restore with `umask 022`: `pct restore`
+  creates the CT's root directory with the caller's umask, and an unprivileged
+  CT cannot use one made under 077. For a CT on this node, stop and destroy
+  any partial CT, then:
+
+  ```sh
+  (umask 022; pct restore <CT> <archive> --storage <storage>) && pct start <CT>
+  ```
+
+  For a CT on another node, run the following as root from the repository
+  checkout on the provisioner's node. Set `CT`, `NODE`, `STORAGE` and `BACKUP`
+  to the original CT ID and node, its root disk storage, and the archive in
+  the directory above. The archive is copied to `NODE` under its own name,
+  any partial CT there is stopped and destroyed, and the restore runs
+  explicitly on `NODE`: after `pct destroy`, the ordinary cluster wrapper no
+  longer knows which node held the CT and would restore it on this one.
+
+  ```sh
+  CT=280
+  NODE=pve2
+  STORAGE=local-lvm
+  BACKUP=/var/lib/osr-freellmapi/280/vzdump-lxc-280-YYYY_MM_DD-HH_MM_SS.tar.zst
+  COPY=/var/tmp/$(basename "$BACKUP")
+  on_node() { bash tools/pct-cluster.sh --osr-on-node "$NODE" "$@"; }
+  on_node sh -c 'umask 077; cat > "$1"' sh "$COPY" < "$BACKUP"
+  if on_node pct status "$CT" >/dev/null 2>&1; then
+      on_node pct stop "$CT" 2>/dev/null
+      on_node pct destroy "$CT"
+  fi
+  on_node sh -c 'umask 022; exec pct restore "$@"' sh "$CT" "$COPY" --storage "$STORAGE"
+  on_node pct start "$CT"
+  ```
+
+  Once the restored CT is healthy, remove the copy on `NODE`
+  (`on_node rm -f -- "$COPY"`). Keep the original archive on the provisioner's
+  node until recovery is confirmed.
+
 - **Every model fails.** No provider key, or all are rate-limited: see the
   dashboard's Keys and Analytics pages.
 - **The key is lost.** It is in the database, encrypted with `ENCRYPTION_KEY`.

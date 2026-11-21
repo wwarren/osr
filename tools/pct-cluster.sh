@@ -90,7 +90,7 @@ if value is not None:
 PY
 }
 
-quote() { printf '%q ' "$@"; }
+quote() { (( $# )) || return 0; printf '%q ' "$@"; }
 
 node_addr() {  # node_addr NODE: its cluster address, or its name when unlisted
     local addr
@@ -116,7 +116,7 @@ pve_ssh_opts() {
 # loop reading its own stdin around a pct call keeps it).
 on_node() {
     local node=$1 tty=$2 cmd=$3 addr status socket
-    local -a opts
+    local -a opts probe_opts
     pve_ssh_opts "$node"
     opts=("${PVE_SSH_OPTS[@]}")
     addr=$(node_addr "$node")
@@ -130,6 +130,7 @@ on_node() {
         fi
         opts+=(-o ControlMaster=no -o "ControlPath=$socket")
     fi
+    probe_opts=("${opts[@]}" -T -n)
     case $tty in
         tty) opts+=(-tt) ;;
         none) opts+=(-T -n) ;;
@@ -139,7 +140,10 @@ on_node() {
     # destination: it is not sent, and a command can never be read as an option.
     ssh "${opts[@]}" "root@$addr" -- "$cmd"
     status=$?
-    (( status != 255 )) || printf 'pct-cluster: cannot reach node %s (%s) as root over SSH.\n' "$node" "$addr" >&2
+    # A remote command can also exit 255; check SSH itself before blaming the link.
+    if (( status == 255 )) && ! ssh "${probe_opts[@]}" "root@$addr" -- true </dev/null >/dev/null 2>&1; then
+        printf 'pct-cluster: cannot reach node %s (%s) as root over SSH.\n' "$node" "$addr" >&2
+    fi
     return "$status"
 }
 

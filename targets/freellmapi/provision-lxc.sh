@@ -441,7 +441,8 @@ registered=0 ct_ip='' router_ip='' old_version='' old_entrypoint=''
 require_host() {
     local command_name version
     [[ $EUID -eq 0 ]] || die 'Run as root on the PVE host.'
-    for command_name in pveversion pct pvesh pvesm skopeo; do
+    # zstd checks a release replacement's backup before the old CT is destroyed.
+    for command_name in pveversion pct pvesh pvesm skopeo zstd; do
         command -v "$command_name" >/dev/null ||
             die "Missing command: $command_name$([[ $command_name != skopeo ]] || printf ' (apt install skopeo; Proxmox VE 9.1 uses it to pull OCI images)')"
     done
@@ -813,7 +814,16 @@ rollback() {
             sh "$CT_ID" "${dump##*/}" "$ct_storage" < "$dump"
     else
         (umask 022; pct restore "$CT_ID" "$dump" --storage "$ct_storage")
-    fi || { note "pct restore failed. The backup is kept: $dump (on node ${ct_node:-$(hostname -s)}: pct restore $CT_ID <that file> --storage $ct_storage)"; return 1; }
+    fi || {
+        if [[ -n $ct_node ]]; then
+            note "pct restore failed on node $ct_node. The backup is kept on this node: $dump"
+            note "Copy it to node $ct_node and restore it there, as targets/freellmapi/README.md (Troubleshooting) shows:"
+            note "after pct destroy, the cluster wrapper no longer knows CT $CT_ID belongs on $ct_node and would restore it here."
+        else
+            note "pct restore failed. The backup is kept: $dump (umask 022; pct restore $CT_ID $dump --storage $ct_storage)"
+        fi
+        return 1
+    }
     pct start "$CT_ID" || { note "The restored CT $CT_ID did not start. The backup is kept: $dump"; return 1; }
     FREELLMAPI_PORT=$old_port
     ROUTER_CT_ID=$old_router
@@ -919,7 +929,11 @@ else
 fi
 [[ -r $firewall_file || $dry_run == 1 ]] || die "Missing firewall file: $firewall_file"
 (( dry_run )) || find_ct_node
-[[ -z $ct_node ]] || pve_row 'Node' "$ct_node (backup, template and new CT handled there; the backup is kept on this node)"
+if [[ -n $ct_node ]]; then
+    pve_row 'Node' "$ct_node (backup, template and new CT handled there; the backup is kept on this node)"
+    on_ct_node sh -c 'command -v vzdump && command -v zstd && command -v pvesm' </dev/null >/dev/null ||
+        die "Node $ct_node, which holds CT $CT_ID, lacks vzdump, zstd or pvesm (or cannot be reached); nothing was changed."
+fi
 
 pve_row 'Change' "replace the CT with one made from the new image; data, ID and address stay"
 note '  Options set on the CT by hand (other than cores, memory, swap, start order,'
@@ -967,6 +981,15 @@ else
     [[ ${#dumps[@]} -eq 1 && -s ${dumps[0]} ]] ||
         { note "vzdump left no backup in $stage (a CT on another node is skipped by this node's vzdump)."; false; }
     dump=${dumps[0]}
+    # A skipped --stdout backup still leaves a nonempty zstd frame. Read the
+    # complete archive and require the CT configuration, under the name pct
+    # restore looks for (./etc/vzdump/pct.conf), before destroying the CT.
+    # awk consumes the whole file list so pipefail also catches a truncated
+    # compressed stream or tar archive.
+    zstd -dc -- "$dump" | tar -tf - | awk '
+        $0 == "./etc/vzdump/pct.conf" { found = 1 }
+        END { exit !found }
+    ' || { note "The backup of CT $CT_ID is unreadable or lacks its CT configuration; leaving the old CT in place."; false; }
     maintenance_boot
     export_data || { note "Could not save the data directory of CT $CT_ID."; false; }
     pct stop "$CT_ID"

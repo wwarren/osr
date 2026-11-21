@@ -16,7 +16,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/shim" "$tmp/mock" "$tmp/remote-tmp"
 mkdir -p "$tmp/nodes/pve1/lxc" "$tmp/nodes/pve2/lxc" "$tmp/nodes/pve3/lxc" "$tmp/nodes/pve4/lxc"
 for id in 101 102; do : > "$tmp/nodes/pve1/lxc/$id.conf"; done
-for id in 201 202 998 999; do : > "$tmp/nodes/pve2/lxc/$id.conf"; done
+for id in 201 202 997 998 999; do : > "$tmp/nodes/pve2/lxc/$id.conf"; done
 : > "$tmp/nodes/pve3/lxc/301.conf"
 : > "$tmp/nodes/pve4/lxc/401.conf"
 cat > "$tmp/members" <<'JSON'
@@ -34,10 +34,13 @@ printf '%s %s\n' "$node" "$*" >> "$MOCK/pct.log"
 sub=$1 id=${2:-}
 case $sub in
     status) [[ $id != 999 ]] || { echo 'CT 999 is broken' >&2; exit 7; }
+            [[ $id != 997 ]] || { echo 'pct usage error' >&2; exit 255; }
             echo 'status: running' ;;
     exec) shift 3; exec "$@" ;;
-    push) cat -- "$3" > "$MOCK/pushed-$id"; printf '%s\n' "$3" > "$MOCK/pushed-from-$id" ;;
+    push) for arg; do [[ -n $arg ]] || { echo 'empty pct argument' >&2; exit 9; }; done
+          cat -- "$3" > "$MOCK/pushed-$id"; printf '%s\n' "$3" > "$MOCK/pushed-from-$id" ;;
     pull) [[ $id != 998 ]] || { echo 'no such file' >&2; exit 5; }
+          for arg; do [[ -n $arg ]] || { echo 'empty pct argument' >&2; exit 9; }; done
           printf 'from %s on %s\n' "$3" "$node" > "$4" ;;
     list) printf 'VMID       Status     Lock         Name\n'
           for conf in "$MOCK_NODES/$node"/lxc/*.conf; do id=${conf##*/}; printf '%-10s running                 ct%s\n' "${id%.conf}" "${id%.conf}"; done ;;
@@ -99,6 +102,9 @@ assert_file_contains 'that node runs it' 'pve2 status 201' "$tmp/mock/pct.log"
 assert_file_contains 'as root, at its cluster address, keyed by node name' 'pve2 root@10.0.0.2' "$tmp/mock/ssh.log"
 assert_status 'its exit status comes back' 7 pct status 999
 assert_contains 'with its error' 'CT 999 is broken' "$(pct status 999 2>&1)"
+assert_status 'a remote pct usage error keeps exit 255' 255 pct status 997
+assert_contains 'the remote pct error is shown' 'pct usage error' "$(pct status 997 2>&1)"
+assert_not_contains 'a reachable node is not called unreachable' 'cannot reach node' "$(pct status 997 2>&1)"
 assert_eq 'the node holding a CT' pve2 "$(pct --osr-node 201)"
 
 describe 'exec keeps every argument as given'
@@ -137,6 +143,8 @@ assert_file_contains 'with its destination and options' '/root/deploy/x.sh --per
 remote_copy=$(cat "$tmp/mock/pushed-from-201")
 assert_ne 'from a copy on that node, not this path' "$tmp/src" "$remote_copy"
 assert_eq 'and the copy is removed' '' "$(ls -A "$tmp/remote-tmp")"
+assert_ok 'pushes without options' pct push 201 "$tmp/src" /root/deploy/plain.sh
+assert_eq 'the optionless push has no empty argument' "$(od -c "$tmp/src")" "$(od -c "$tmp/mock/pushed-201")"
 assert_status 'an unreadable file is refused' 2 pct push 201 "$tmp/missing" /root/x
 
 describe 'pull streams a file back from the other node'
@@ -148,6 +156,8 @@ case $(uname -s) in
     *) assert_file_mode 'and the mode asked for' 640 "$tmp/out.json" ;;
 esac
 assert_eq 'leaving nothing on that node' '' "$(ls -A "$tmp/remote-tmp")"
+assert_ok 'pulls without options' pct pull 201 /etc/hermes-target/api-key "$tmp/hermes-api-key"
+assert_eq 'the optionless pull has no empty argument' 'from /etc/hermes-target/api-key on pve2' "$(cat "$tmp/hermes-api-key")"
 rm -f "$tmp/out2"
 assert_status 'a failed pull returns its status' 5 pct pull 998 /nope "$tmp/out2"
 assert_eq 'and writes nothing here' '' "$(find "$tmp" -maxdepth 1 \( -name out2 -o -name '.pct-pull.*' \))"

@@ -342,6 +342,37 @@ host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_CT_NODE=pve2 FAKE_VZDUMP_FAILS=1 
 pass 'a backup that fails on another node leaves the CT as it was'
 
 upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_CT_NODE=pve2 FAKE_VZDUMP_SKIPS=1 --reconfigure; bad 'a skipped backup on another node'
+has 'lacks its CT configuration'
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(calls) != *'pct destroy'* ]] ||
+    fail 'the CT was changed after vzdump returned an empty stream'
+[[ -z $(ls -A "$tmp/host/state") ]] || fail 'the rejected backup was left behind'
+pass 'a successful but empty remote backup is rejected before the CT is destroyed'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_BARE_CONF=1 --reconfigure; bad 'a backup whose configuration pct restore would not find'
+has 'lacks its CT configuration'
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(calls) != *'pct destroy'* ]] ||
+    fail 'the CT was replaced with a backup pct restore cannot read'
+pass 'the backup must hold ./etc/vzdump/pct.conf, the name pct restore looks for'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_CT_NODE=pve2 FAKE_NODE_LACKS=zstd --reconfigure; bad 'a node without zstd'
+has 'Node pve2, which holds CT 280, lacks vzdump, zstd or pvesm'
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running ]] || fail 'the CT was changed on a node without zstd'
+[[ $(calls) != *'pct stop'* && $(calls) != *'skopeo copy'* && -z $(ls -A "$tmp/host/state") ]] ||
+    fail 'the run went on before finding the node unready'
+pass 'a node that lacks a needed command is found before anything changes'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_UNHEALTHY=v0.99.2 FAKE_CT_NODE=pve2 FAKE_RESTORE_FAILS=1 --reconfigure
+bad 'a failed restore on another node'
+has 'pct restore failed on node pve2. The backup is kept on this node:'; has 'Copy it to node pve2 and restore it there'
+lacks '(umask 022; pct restore 280'
+[[ -s $(echo "$tmp"/host/state/280/vzdump-lxc-280-*.tar.zst) ]] || fail 'the backup was not kept after a failed remote restore'
+pass 'a failed restore on another node says to copy the backup there first'
+
+upgrade_ready
 host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_REKEY=v0.99.2 --reconfigure; bad 'a release with another key'
 has 'the unified API key is not the one the router has'
 [[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(cat "$data/freeapi.db") == "$key" ]] || fail 'no rollback after the key changed'
