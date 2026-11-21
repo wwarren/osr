@@ -446,7 +446,7 @@ for key in LITELLM_HEALTH_URL LITELLM_URL MODEL_SERVER_COUNT MONITOR_INTERVAL_SE
 done
 assert_fail "a comment in the template cannot expand anything" grep -Eq '^#.*[$`]' <<< "$template"
 for name in $(sed -n '/^ENV_OVERRIDES = (/,/^)/p' "${ROOT}/services/osr-monitor/monitor.py" | grep -oE '"(MONITOR|KEEP)_[A-Z_]+"' | tr -d '"'); do
-  assert_ok "README names the monitor override ${name}" grep -q "$name" "${ROOT}/README.md"
+  assert_ok "configuration guide names the monitor override ${name}" grep -q "$name" "${ROOT}/CONFIGURATION.md"
 done
 
 describe router_requirements
@@ -472,11 +472,11 @@ assert_file_contains "CI installs Node.js for configure.test.mjs" "actions/setup
 assert_file_contains "CI runs the suites strictly" "tests/run-tests.sh --strict" "${ROOT}/.gitea/workflows/tests.yml"
 
 # Every companion in the installer's target table waits for the Open WebUI
-# admin key (provision_selected_targets), so README's Install section must
+# admin key (provision_selected_targets), so the installation guide must
 # name each of them. A new companion needs a name here and in that sentence.
 describe readme_admin_key_companions
-sentence="$(tr '\n' ' ' < "${ROOT}/README.md" | grep -oE 'Companions that register with Open +WebUI +\([^)]*\) +need an Open WebUI +admin API key' | tr -s ' ')"
-assert_ok "README names the companions that need the admin key" test -n "$sentence"
+sentence="$(tr '\n' ' ' < "${ROOT}/INSTALLATION.md" | grep -oE 'Companions that register with Open +WebUI +\([^)]*\) +need an Open WebUI +admin API key' | tr -s ' ')"
+assert_ok "installation guide names the companions that need the admin key" test -n "$sentence"
 companions="$(sed -n "/^target_table() {/,/^}/p" "$INSTALLER" | grep -oE "'[a-z-]+\|companion\|" | sed -E "s/^'([a-z-]+)\|.*/\1/")"
 assert_ok "the installer's target table lists companions" test -n "$companions"
 listed="${sentence#*(}"; listed=", ${listed%%)*},"
@@ -485,9 +485,9 @@ for name in $companions; do
     honcho) label='Honcho' ;; hermes) label='Hermes' ;; openclaw) label='OpenClaw' ;;
     deepseek-harness) label='DeepSeek Harness' ;; opencode) label='OpenCode' ;;
     open-terminal) label='Open Terminal' ;; comfyui) label='ComfyUI' ;;
-    *) label="(no README name for ${name})" ;;
+    *) label="(no installation guide name for ${name})" ;;
   esac
-  assert_contains "README lists ${name} among the admin-key companions" ", ${label}," "$listed"
+  assert_contains "installation guide lists ${name} among the admin-key companions" ", ${label}," "$listed"
 done
 count="$(grep -o ',' <<< "${listed#, }" | wc -l)"
 assert_eq "and no target that is not a companion" "$(wc -w <<< "$companions" | tr -d ' ')" "$count"
@@ -514,7 +514,7 @@ assert_file_contains "the installer's summary shows the Grafana login" 'install/
 assert_file_contains "upgrade-all shows it too" 'setup-metrics.sh login' "${ROOT}/tools/upgrade-all.sh"
 assert_ok "and only after its summary, which is what gets logged" bash -c \
   '! sed -n "/^print_summary() {/,/^}/p" "$1" | grep -q grafana' _ "${ROOT}/tools/upgrade-all.sh"
-assert_file_contains "the README says how to see the login again" 'setup-metrics.sh login' "${ROOT}/README.md"
+assert_file_contains "the routing guide says how to see the login again" 'setup-metrics.sh login' "${ROOT}/ROUTING.md"
 assert_ok "provisioned dashboard is valid JSON with all metric families" python3 - "$metrics_setup" <<'PY'
 import json
 import pathlib

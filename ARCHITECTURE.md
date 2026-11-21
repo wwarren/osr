@@ -19,8 +19,8 @@ targets coordinate the agent CTs, with optional Mattermost handoffs (§17.7).
 
 GPU workloads stay out of the router CT, configuration lives in a Gitea
 repository when available, and changes are applied with validation and
-rollback. [README.md](README.md) covers installation and operation; the
-[target READMEs](README.md#inference-targets) cover each engine.
+rollback. [README.md](README.md) links to installation and operation guides; the
+[inference target guide](INFERENCE_TARGETS.md#inference-targets) links to each engine.
 
 ## 2. System context
 
@@ -275,7 +275,7 @@ tier's hosts). If loading one unloads another (`/api/ps` no
 longer lists it), the host cannot hold its tiers together: from then on only
 its resident tier models are refreshed (the first is loaded when none is),
 instead of reloading each on every pass; see
-[Keeping models loaded](README.md#keeping-models-loaded).
+[Keeping models loaded](MODEL_SERVERS.md#keeping-models-loaded).
 
 ---
 
@@ -447,7 +447,7 @@ apply`.
 ### 6.1 `manage-model-servers`
 
 Seeded at `install/manage-model-servers.sh` and symlinked to
-`/usr/local/bin/manage-model-servers` (commands in the README). It rewrites
+`/usr/local/bin/manage-model-servers` (commands in the [model server guide](MODEL_SERVERS.md)). It rewrites
 `MODEL_SERVERS` and `BACKEND_*` in `env/router.env` and regenerates
 `litellm_config.yaml`.
 
@@ -484,12 +484,12 @@ Seeded at `install/manage-model-servers.sh` and symlinked to
 files in `INSTALLER_OWNED_CODE`, checks LF endings and bash/Python syntax before
 committing, and runs `apply --all` after a venv rebuild.
 `tools/update-router-services.sh` drives it from the host or a second clone
-([README](README.md#router-components)).
+([updating guide](UPDATING.md#router-components)).
 `tools/upgrade-all.sh` upgrades the router and every target in a Proxmox
 cluster in dependency order through their own update paths (§16), with a
 before/after functional check and a Proxmox snapshot around each, then prompts
 or follows `--on-failure` when one fails
-([README](README.md#everything-at-once)). Before the plan it shows, per CT, the
+([updating guide](UPDATING.md#everything-at-once)). Before the plan it shows, per CT, the
 version installed there (one probe per CT, `INSTALLED_PROBE`) beside the pin and the newest upstream release (GitHub,
 PyPI, npm) and asks which to install (pin by default; `--latest`, `--pinned`);
 a chosen latest reaches the installer through its own version variables. Snapshots are deleted after success
@@ -698,7 +698,7 @@ LiteLLM's static tiers, then errors if those fail. An empty `/v1/models` on a
 Strata-style server or a rejected token removes its models from the inventory.
 A failed `apply` restores the previous files and restarts affected services.
 Target upgrades restore their previous runtime and report whether it runs
-again. See the [troubleshooting table](README.md#troubleshooting).
+again. See the [troubleshooting table](TROUBLESHOOTING.md#troubleshooting).
 
 A broker outage pauses cross-CT coordination only. MQTT retains a bounded
 recent tail, not an unlimited offline queue. The Mattermost observer retries
@@ -733,7 +733,7 @@ post: delivery is at least once (§17.7).
 The router exposes inventory, scored explanations and per-decision response
 headers; the monitor logs failed webhook deliveries and posts host and
 local-service transitions to Mattermost; the
-[README](README.md#troubleshooting) lists the commands.
+[troubleshooting guide](TROUBLESHOOTING.md#troubleshooting) lists the commands.
 
 Each request has an ID (`RequestMiddleware`, plain ASGI and outermost, so a
 refused request has one too): the caller's `X-Request-ID` when it is a plain
@@ -776,7 +776,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
 | Image generation through the router (`/v1/images/generations`, an `image` alias), Open WebUI's engine (0.13: its default image connection) set to it | ComfyUI as Open WebUI's engine | Open WebUI 0.12 had one image engine, and 0.13's connections still pick one default; through the router it reaches ComfyUI and Colibri alike with fail-forward, API clients get the same endpoint, and ComfyUI's newer COMBO model lists (which Open WebUI 0.12.4's picker cannot read) are read by the router. An admin's custom ComfyUI workflow keeps Open WebUI's ComfyUI engine |
 | Affinity and load only reorder or nudge near-equal candidates | Pin a conversation to its server, or always pick the idle one | Fit and residency must still decide: a pinned conversation would stay on a model too small for a later turn, and "always idle" would load a model on every server |
-| New installs use only `osr-*` names (units, `services/` directories, service account, Gitea router account, Mattermost team, channel and posting name); existing installs are migrated or keep what they recorded | Keep the `ollama-*` names; keep them on existing installs with drop-ins | The router routes to every kind of model server, so `ollama-*` misnamed it. `update-router.sh` moves the config repo's directories (`git mv`, keeping tuned `.ini` files), installer seeding moves them in an existing Gitea repo, and `apply` replaces the old units and renames the service account in place (same UID, so ownership is unchanged); `apply-config.sh` never installs a leftover old unit beside the new one. Gitea and Mattermost keep the accounts, team and channel they recorded, since renaming a login or moving a webhook would break running installs. Other renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
+| New installs use only `osr-*` names (units, `services/` directories, service account, Gitea router account, Mattermost team, channel and posting name); existing installs are migrated or keep what they recorded | Keep the `ollama-*` names; keep them on existing installs with drop-ins | The router routes to every kind of model server, so `ollama-*` misnamed it. `update-router.sh` moves the config repo's directories (`git mv`, keeping tuned `.ini` files), installer seeding moves them in an existing Gitea repo, and `apply` replaces the old units and renames the service account in place (same UID, so ownership is unchanged); `apply-config.sh` never installs a leftover old unit beside the new one. Gitea and Mattermost keep the accounts, team and channel they recorded, since renaming a login or moving a webhook would break running installs. Other renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([migration guide](UPDATING.md#upgrading-from-ollama-smart-router)) |
 
 ---
 
@@ -842,7 +842,7 @@ uses its own idle TTL).
 * **Discovery:** model ID, image support (`input_modalities` or
   `architecture.input_modalities`), residency (`status`), `parameter_size` if
   given; otherwise `[model_sizes]` sizes exact IDs
-  ([README](README.md#model-sizes-for-unsized-ids)). An entry whose
+  ([model server guide](MODEL_SERVERS.md#model-sizes-for-unsized-ids)). An entry whose
   `capabilities` mark an image generator or a decision model and no chat
   (Colibri's Qwen-Image, Laya, GLiNER) is not offered for chat; an image
   generator is an image model of `/v1/images/generations` (§5.4).
@@ -883,7 +883,7 @@ creates an unprivileged CT and passes GPU devices through, and a guest-side
 Target units run as their own accounts with limited writable paths and no
 capabilities; GPU nodes are group-accessible, not root-owned; Strata-style
 keys are generated in the CT and kept out of unit files. Supported CT releases
-are in the [README's table](README.md#lxc-distribution-support).
+are in the [installation guide's table](INSTALLATION.md#lxc-distribution-support).
 
 **GPUs.** Driver setup precedes CT creation. The installer asks each target
 that also runs on AMD Radeon or Intel Arc (Ollama, llama.cpp, Avalon, Colibri, ComfyUI),
@@ -1296,7 +1296,7 @@ Router CT:
 Target paths vary by engine; Strata-style CTs use `/opt/<target>/` for code,
 `/var/lib/<target>/` for models, `/etc/<target>-target/` for private settings
 and keys and `/var/lib/<target>-target/` for upgrade snapshots. Each
-[target README](README.md#inference-targets) lists its paths.
+[inference target guide](INFERENCE_TARGETS.md#inference-targets) lists its paths.
 
 Coordination paths (§17.7):
 

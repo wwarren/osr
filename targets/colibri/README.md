@@ -201,7 +201,7 @@ offer an image or decision model (Qwen-Image, Laya, GLiNER) for chat. An image
 model (Qwen-Image, listed with `capabilities: ["image_generation"]`) is one of
 the router's image models instead: `POST /v1/images/generations` on the router
 sends it the request (its `image` alias too), and Open WebUI draws through the
-router ([README](../../README.md#image-generation)).
+router ([README](../../IMAGE_GENERATION.md#image-generation)).
 
 ## The dashboard
 

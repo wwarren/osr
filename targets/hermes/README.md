@@ -95,7 +95,7 @@ LXC/VM reachable as root over SSH, as for Open Terminal), then the new Hermes
 CT's ID (default: the cluster's next free ID, which an unattended run takes;
 preset `CT_ID` to choose another), template and storage menus, static IP/CIDR
 and gateway (no address is chosen automatically), then Hermes settings; see the root README's
-[Provisioner questions](../../README.md#provisioner-questions). Before creating
+[Provisioner questions](../../INFERENCE_TARGETS.md#provisioner-questions). Before creating
 anything, the provisioner:
 
 1. Copies `ROUTER_API_KEY` and the backend keys from the router's

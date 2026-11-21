@@ -142,7 +142,7 @@ router discovers it from ComfyUI's loaders (the diffusion model, Qwen text
 encoder and Flux.2 VAE must all be there), which also proves the router
 reaches ComfyUI through the firewall. The router reads both of ComfyUI's
 model-list formats. A Colibri image model joins the same `image` alias, and the
-router fails forward between them ([README](../../README.md#image-generation)).
+router fails forward between them ([README](../../IMAGE_GENERATION.md#image-generation)).
 An admin's custom ComfyUI workflow in Open WebUI is kept (rerun
 `tools/webui-images.sh --replace-custom` to replace it).
 

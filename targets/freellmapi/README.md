@@ -8,7 +8,7 @@ offers its models through the router as `freellmapi/<id>`.
 
 **Prompts sent to these models leave your network** for whichever provider
 answers, under that provider's terms. OSR therefore treats FreeLLMAPI like its
-[cloud API models](../../README.md#cloud-api-models): a model is used only when
+[cloud API models](../../CLOUD_MODELS.md#cloud-api-models): a model is used only when
 a request names it. `auto`, the tier aliases and LiteLLM's fallbacks never pick
 one, and FreeLLMAPI is not part of the model pool.
 
