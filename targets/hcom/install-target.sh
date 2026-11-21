@@ -181,7 +181,10 @@ trap 'exit 129' HUP
 systemctl stop osr-hcom-mattermost.service osr-hcom-relay.service 2>/dev/null || true
 stop_worker() {  # USER HOME STATE: a worker, even one an agent started itself.
   [[ -d $3 ]] || return 0
-  runuser -u "$1" -- env HOME="$2" HCOM_DIR="$3" "$stage/hcom-$triple/hcom" relay daemon stop >/dev/null
+  local workdir=/
+  [[ ! -d $2 ]] || workdir=$2
+  ( cd -- "$workdir" && runuser -u "$1" -- env HOME="$2" HCOM_DIR="$3" \
+      "$stage/hcom-$triple/hcom" relay daemon stop >/dev/null )
 }
 stop_worker "$relay_user" "$relay_home" "$state"
 if $migrate; then
@@ -223,11 +226,11 @@ chown "$relay_user:$relay_group" "$state/config.toml"
 if [[ $target == hermes ]]; then
   hermes_env=(env HOME=/home/hermes HERMES_HOME="$hermes_home" PATH="/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin")
   if [[ $native == true ]]; then
-    runuser -u hermes -- "${hermes_env[@]}" HCOM_DIR="$state" /usr/local/bin/hcom hooks add hermes
+    ( cd /home/hermes && runuser -u hermes -- "${hermes_env[@]}" HCOM_DIR="$state" /usr/local/bin/hcom hooks add hermes )
   elif [[ -d $hermes_home/plugins/hcom ]]; then
     # Leaving native mode: the plugin would need the key it no longer has.
     scratch=$(runuser -u hermes -- mktemp -d /home/hermes/.osr-hcom-remove.XXXXXX)
-    runuser -u hermes -- "${hermes_env[@]}" HCOM_DIR="$scratch" /usr/local/bin/hcom hooks remove hermes >/dev/null
+    ( cd /home/hermes && runuser -u hermes -- "${hermes_env[@]}" HCOM_DIR="$scratch" /usr/local/bin/hcom hooks remove hermes >/dev/null )
     rm -rf -- "$scratch"
     restart_agent=true
   fi
@@ -347,7 +350,8 @@ fi
 sleep 2
 systemctl is-active --quiet osr-hcom-relay.service || die 'hcom relay did not stay active (journalctl -u osr-hcom-relay).'
 relay_check=$stage/relay-status
-if ! runuser -u "$relay_user" -- env HOME="$relay_home" HCOM_DIR="$state" /usr/local/bin/hcom relay on > "$relay_check" 2>&1; then
+if ! ( cd -- "$relay_home" && runuser -u "$relay_user" -- env HOME="$relay_home" HCOM_DIR="$state" \
+    /usr/local/bin/hcom relay on > "$relay_check" 2>&1 ); then
   grep -E '^(Status|Broker):' "$relay_check" >&2 || true
   broker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["broker"])' "$bundle")
   die "hcom could not connect to $broker. Check that the broker CT is running, that MQTT_CLIENT_CIDR admits this CT, and this CT's outbound firewall (hcom's provisioner adds the rule)."

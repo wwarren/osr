@@ -1231,4 +1231,4 @@ if [[ $mode != integrate && $HERMES_DASHBOARD == true ]]; then
   printf 'Read the configured username and password, if using the generated login, with:\n'
   printf "pct exec %s -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env\n" "$CT_ID"
 fi
-printf 'CLI: pct exec %s -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes\n' "$CT_ID"
+printf 'CLI: pct exec %s -- runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes\n' "$CT_ID"

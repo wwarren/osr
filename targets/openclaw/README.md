@@ -152,9 +152,8 @@ then approve the browser pairing from the host:
 ```bash
 pct exec 283 -- cat /etc/openclaw-target/api-key
 oc() {
-  pct exec 283 -- runuser -u openclaw -- env HOME=/home/openclaw \
-    PATH=/home/openclaw/.local/bin:/usr/bin:/bin \
-    bash -c 'cd /home/openclaw && exec openclaw "$@"' bash "$@"
+  pct exec 283 -- runuser -u openclaw -- env -C /home/openclaw HOME=/home/openclaw \
+    PATH=/home/openclaw/.local/bin:/usr/bin:/bin openclaw "$@"
 }
 oc devices list
 oc devices approve <requestId>

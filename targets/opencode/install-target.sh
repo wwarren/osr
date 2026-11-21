@@ -809,8 +809,9 @@ fi
 
 # --- health checks and the commands they need ---------------------------------
 run_as_oc() {
-  runuser -u "$OC_USER" -- env HOME="$OC_USER_HOME" USER="$OC_USER" \
-    PATH="/usr/local/bin:/usr/bin:/bin" OPENCODE_DISABLE_AUTOUPDATE=1 "$@"
+  ( cd -- "$OC_USER_HOME" &&
+    runuser -u "$OC_USER" -- env HOME="$OC_USER_HOME" USER="$OC_USER" \
+      PATH="/usr/local/bin:/usr/bin:/bin" OPENCODE_DISABLE_AUTOUPDATE=1 "$@" )
 }
 # release_version DIR: the version the binary in a release directory reports.
 release_version() {
@@ -1253,4 +1254,4 @@ if [[ $OPENCODE_API == true ]]; then
   note "Chat endpoint: http://<CT IPv4>:$OPENCODE_API_PORT/v1, model $API_MODEL (bearer key in $API_KEY; tool permissions: $OPENCODE_API_PERMISSIONS)."
 fi
 [[ -z $HONCHO_URL ]] || note "Honcho memory: plugin $honcho_spec, workspace $honcho_workspace (OpenCode installs the plugin in the background on its first start; check with /honcho:status)."
-note "Run the CLI with: runuser -u $OC_USER -- env HOME=$OC_USER_HOME OPENCODE_PASSWORD=\$(cat $OC_ETC/password) opencode --server http://127.0.0.1:$OPENCODE_PORT"
+note "Run the CLI with: runuser -u $OC_USER -- env -C $OC_WORKSPACE HOME=$OC_USER_HOME OPENCODE_PASSWORD=\$(cat $OC_ETC/password) opencode --server http://127.0.0.1:$OPENCODE_PORT"

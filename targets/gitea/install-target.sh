@@ -184,9 +184,15 @@ fi
 id "$GITEA_SERVICE_USER" >/dev/null 2>&1 || die "The $GITEA_SERVICE_USER account is missing; this is not a community-script Gitea CT."
 command -v openssl >/dev/null || { apt-get update && apt-get install -y --no-install-recommends openssl; }
 
+# runuser keeps the caller's cwd (often /root, which gitea cannot enter). Start
+# in the work directory, or in / when it does not exist (an installation
+# finished in the browser may keep its paths elsewhere: app.ini names them).
 as_gitea() {
-  runuser -u "$GITEA_SERVICE_USER" -- env HOME="$GITEA_WORK_DIR/data" USER="$GITEA_SERVICE_USER" \
-    GITEA_WORK_DIR="$GITEA_WORK_DIR" "$GITEA_BIN" --config "$conf" --work-path "$GITEA_WORK_DIR" "$@"
+  local dir=/
+  [[ ! -d $GITEA_WORK_DIR ]] || dir=$GITEA_WORK_DIR
+  ( cd -- "$dir" &&
+    runuser -u "$GITEA_SERVICE_USER" -- env HOME="$GITEA_WORK_DIR/data" USER="$GITEA_SERVICE_USER" \
+      GITEA_WORK_DIR="$GITEA_WORK_DIR" "$GITEA_BIN" --config "$conf" --work-path "$GITEA_WORK_DIR" "$@" )
 }
 # /api/healthz needs no sign-in (it checks the database and cache). The
 # /api/v1 routes, /api/v1/version included, answer 401 to anonymous callers

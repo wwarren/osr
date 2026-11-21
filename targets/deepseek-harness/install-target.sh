@@ -357,7 +357,10 @@ fi
 install -d -m 0755 "$OPT_DIR" "$OPT_DIR/releases"
 install -d -m 0700 "$(dirname -- "$ROLLBACK_DIR")"
 chown "root:$SERVICE_USER" "$ETC_DIR"
-as_service() { runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR" npm_config_cache="$STATE_DIR/npm-cache" "$@"; }
+as_service() {
+  ( cd -- "$STATE_DIR/workspace" && runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" \
+      DSH_HOME="$DSH_HOME_DIR" npm_config_cache="$STATE_DIR/npm-cache" "$@" )
+}
 
 if [[ $VERSION == latest ]]; then
   resolved=$(as_service npm view "$PACKAGE@latest" version 2>/dev/null | tail -n1) ||
@@ -548,8 +551,8 @@ profiles=("--profile web --patch $ETC_DIR/osr.patch.yml")
 [[ $API != true ]] || profiles+=("--profile acp --patch $ETC_DIR/osr.patch.yml --patch $ACP_PATCH")
 for profile in "${profiles[@]}"; do
   read -r -a args <<< "$profile"
-  if ! runuser -u "$SERVICE_USER" -- env HOME="$STATE_DIR" DSH_HOME="$DSH_HOME_DIR" \
-      node "$release/node_modules/@deepseek-ai/dsh/lib/bin.js" "${args[@]}" --dump-config > "$dump" 2>&1; then
+  if ! as_service node "$release/node_modules/@deepseek-ai/dsh/lib/bin.js" \
+      "${args[@]}" --dump-config > "$dump" 2>&1; then
     tail -n 40 "$dump" >&2
     rm -f -- "$dump"
     die "DeepSeek rejected the generated patch (${args[1]} profile)."

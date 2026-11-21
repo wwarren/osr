@@ -185,7 +185,7 @@ server speaks plain HTTP: use a trusted LAN or VPN, and keep
 The terminal UI connects to the same server from inside the CT:
 
 ```bash
-pct exec 284 -- sh -c 'runuser -u opencode -- env HOME=/home/opencode OPENCODE_PASSWORD="$(cat /etc/opencode-target/password)" opencode --server http://127.0.0.1:4096'
+pct exec 284 -- sh -c 'runuser -u opencode -- env -C /home/opencode/workspace HOME=/home/opencode OPENCODE_PASSWORD="$(cat /etc/opencode-target/password)" opencode --server http://127.0.0.1:4096'
 ```
 
 **Trust.** OpenCode's shell tool inherits the server's environment, so the

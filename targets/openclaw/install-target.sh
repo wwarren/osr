@@ -786,7 +786,8 @@ RUNTIME
   # stage (which holds the router key, mode 0600).
   chmod 0711 "$stage"
   note "Installing for $OC_USER:$( (( need_nvm )) && printf ' nvm %s,' "$NVM_VERSION")$( (( need_node )) && printf ' Node %s,' "$OPENCLAW_NODE_VERSION") openclaw@$OPENCLAW_VERSION."
-  ( cd "$stage/installer" && run_as_oc env NEED_NVM="$need_nvm" NEED_NODE="$need_node" NEED_OPENCLAW="$need_openclaw" \
+  # run_as_oc starts it in the agent home; every path it gets is absolute.
+  ( run_as_oc env NEED_NVM="$need_nvm" NEED_NODE="$need_node" NEED_OPENCLAW="$need_openclaw" \
       NVM_INSTALLER="$stage/installer/nvm-install.sh" NODE_SPEC="$OPENCLAW_NODE_VERSION" \
       OPENCLAW_SPEC="$OPENCLAW_VERSION" bash "$stage/installer/runtime.sh" {install_lock_fd}>&- )
   chmod 0700 "$stage"
@@ -1029,4 +1030,4 @@ exact_version "$OPENCLAW_VERSION" || note "Pin this version with OPENCLAW_VERSIO
 if [[ $OPENCLAW_DASHBOARD == true ]]; then
   note "Control UI: http://${ct_addresses[0]}:$OPENCLAW_PORT/ (the Gateway token from $OC_ETC/api-key, then approve the browser with: openclaw devices approve <id>)."
 fi
-note "Run the CLI with: runuser -u $OC_USER -- env HOME=$OC_USER_HOME PATH=$OC_USER_HOME/.local/bin:/usr/bin:/bin openclaw"
+note "Run the CLI with: runuser -u $OC_USER -- env -C $OC_USER_HOME HOME=$OC_USER_HOME PATH=$OC_USER_HOME/.local/bin:/usr/bin:/bin openclaw"

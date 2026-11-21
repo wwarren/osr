@@ -25,7 +25,13 @@ fi
 [[ $EUID == 0 && -x $mmctl && -s $etc/admin-user && -s $etc/url ]] || die 'Configure the Mattermost target first.'
 exec {lock_fd}>"$etc/agent-handoffs.lock"
 flock -n "$lock_fd" || die 'Another handoff setup is running.'
-mm() { runuser -u "$service_user" -- "$mmctl" --local --suppress-warnings "$@"; }
+# As in install-target.sh: start in MM_HOME, or in / when it does not exist,
+# not in the caller's cwd (often /root), which runuser would keep.
+mm() {
+  local dir=/ home=${MM_HOME:-/opt/mattermost}
+  [[ ! -d $home ]] || dir=$home
+  ( cd -- "$dir" && runuser -u "$service_user" -- "$mmctl" --local --suppress-warnings "$@" )
+}
 # find_field FIELD VALUE RESULT: from mmctl --json output on stdin (an object, a
 # list, or one per line), RESULT of the first object whose FIELD is VALUE.
 # Exit 1 when none matches or the output is not JSON (an mmctl error or usage text).

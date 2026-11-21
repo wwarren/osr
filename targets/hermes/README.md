@@ -234,9 +234,9 @@ and is kept.
 ## Use and maintain
 
 ```bash
-pct exec 282 -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes          # CLI
+pct exec 282 -- runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes          # CLI
 pct exec 282 -- grep -E '^HERMES_DASHBOARD_BASIC_AUTH_(USERNAME|PASSWORD)=' /home/hermes/.hermes/.env
-pct exec 282 -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update --no-gateway-restart
+pct exec 282 -- runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes update --no-gateway-restart
 pct exec 282 -- systemctl try-restart hermes-gateway.service hermes-dashboard.service
 journalctl -u hermes-direct -f     # in the CT: "direct dispatch MODEL -> SERVER"
 ```

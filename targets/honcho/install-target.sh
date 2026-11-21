@@ -173,13 +173,16 @@ if [[ $context_tokens == auto ]]; then
   printf 'RESOLVED_CONTEXT=%s\n' "$served_context" >> "$deploy/proxy.settings"
 fi
 systemctl enable --now postgresql
-db_encoding=$(runuser -u postgres -- psql -Atqc \
+# runuser keeps the caller's cwd (often /root): psql and pg_dump warn that they
+# cannot change back to it. postgres starts in /, which every account can enter.
+as_postgres() { ( cd / && runuser -u postgres -- "$@" ); }
+db_encoding=$(as_postgres psql -Atqc \
   "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='honcho'") ||
   die 'Cannot read the Honcho database encoding.'
 if [[ -n $db_encoding && $db_encoding != UTF8 ]]; then
   die "Honcho database uses $db_encoding, but Honcho needs UTF8. No database was changed. If this is a failed first install with no data, drop only the empty honcho database as described in targets/honcho/README.md, then rerun the provisioner with --reconfigure. Do not drop a database that contains Honcho data."
 fi
-pg_major=$(runuser -u postgres -- psql -Atqc 'SHOW server_version_num' 2>/dev/null | cut -c1-2)
+pg_major=$(as_postgres psql -Atqc 'SHOW server_version_num' 2>/dev/null | cut -c1-2)
 [[ $pg_major =~ ^[0-9]{2}$ ]] || die 'PostgreSQL did not start.'
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "postgresql-${pg_major}-pgvector" ||
   die "The template has no postgresql-${pg_major}-pgvector package. Choose a Debian template with matching pgvector."
@@ -203,7 +206,9 @@ as_honcho() { runuser -u honcho -- env HOME="$home" "$@"; }
 # ("detected dubious ownership") unless it is named safe; command-line scope
 # counts, so nothing is written to root's git config.
 opt_git() { git -c safe.directory="$opt" -C "$opt" "$@"; }
-honcho_run() { as_honcho "$uv" --directory "$opt" run --frozen --no-dev --env-file "$etc/honcho.env" "$@"; }
+honcho_run() {
+  ( cd -- "$opt" && as_honcho "$uv" --directory "$opt" run --frozen --no-dev --env-file "$etc/honcho.env" "$@" )
+}
 proxy_expected=true embedding_expected=true
 healthy() {
   local _
@@ -287,13 +292,13 @@ rollback() {
   if [[ -f $backup/build-info ]]; then cp -a -- "$backup/build-info" "$llama_dir/build-info"; fi
   if [[ $(opt_git rev-parse HEAD 2>/dev/null) != "$prev_commit" ]]; then
     { opt_git checkout --detach "$prev_commit" && chown -R honcho:honcho "$opt" &&
-      as_honcho "$uv" --directory "$opt" sync --frozen --no-dev --python 3.13 &&
+      (cd -- "$opt" && as_honcho "$uv" --directory "$opt" sync --frozen --no-dev --python 3.13) &&
       (cd "$opt/mcp" && as_honcho "$bun" install --frozen-lockfile); } || ok=false
   fi
   if $dump_taken; then
-    { runuser -u postgres -- dropdb --if-exists honcho &&
-      runuser -u postgres -- createdb -O honcho --encoding=UTF8 --template=template0 honcho &&
-      runuser -u postgres -- pg_restore --exit-on-error -d honcho < "$backup/honcho.dump"; } || ok=false
+    { as_postgres dropdb --if-exists honcho &&
+      as_postgres createdb -O honcho --encoding=UTF8 --template=template0 honcho &&
+      as_postgres pg_restore --exit-on-error -d honcho < "$backup/honcho.dump"; } || ok=false
   fi
   systemctl daemon-reload || ok=false
   # The units the previous installation had (an older one had no proxy,
@@ -413,7 +418,7 @@ if $existing; then
   # Even the same commit can change vector dimensions during reconfigure.
   note "Reconfiguring Honcho from ${prev_commit:0:12} to ${new_commit:0:12}; the database is dumped first."
   systemctl stop "${units[@]/%/.service}"
-  runuser -u postgres -- pg_dump -Fc honcho > "$backup/honcho.dump"
+  as_postgres pg_dump -Fc honcho > "$backup/honcho.dump"
   dump_taken=true
 fi
 install -d -m 0711 -o root -g root "$etc"
@@ -436,20 +441,20 @@ if [[ ! -x $uv ]]; then
   (umask 022; python3 -m venv "$uv_dir" && "$uv_dir/bin/pip" install --no-cache-dir uv)
 fi
 chmod -R go+rX,go-w -- "$uv_dir"
-as_honcho "$uv" --directory "$opt" sync --frozen --no-dev --python 3.13
+(cd -- "$opt" && as_honcho "$uv" --directory "$opt" sync --frozen --no-dev --python 3.13)
 
 if [[ ! -s $etc/db-password ]]; then openssl rand -hex 32 > "$etc/db-password"; fi
 db_password=$(<"$etc/db-password")
-if ! runuser -u postgres -- psql -Atqc "SELECT 1 FROM pg_roles WHERE rolname='honcho'" | grep -qx 1; then
-  runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "CREATE ROLE honcho LOGIN PASSWORD '$db_password'"
+if ! as_postgres psql -Atqc "SELECT 1 FROM pg_roles WHERE rolname='honcho'" | grep -qx 1; then
+  as_postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE honcho LOGIN PASSWORD '$db_password'"
 else
-  runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE honcho PASSWORD '$db_password'"
+  as_postgres psql -v ON_ERROR_STOP=1 -c "ALTER ROLE honcho PASSWORD '$db_password'"
 fi
-if ! runuser -u postgres -- psql -Atqc "SELECT 1 FROM pg_database WHERE datname='honcho'" | grep -qx 1; then
-  runuser -u postgres -- createdb -O honcho --encoding=UTF8 --template=template0 honcho
+if ! as_postgres psql -Atqc "SELECT 1 FROM pg_database WHERE datname='honcho'" | grep -qx 1; then
+  as_postgres createdb -O honcho --encoding=UTF8 --template=template0 honcho
 fi
 for extension in vector pg_trgm btree_gin; do
-  runuser -u postgres -- psql -d honcho -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS $extension"
+  as_postgres psql -d honcho -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS $extension"
 done
 
 # --rotate-keys: a new JWT secret invalidates every Honcho key made with the
@@ -521,11 +526,11 @@ install -m 0600 "$deploy/settings.record" "$etc/settings.env"
 # with the real size, so a migration that touches those columns keeps it.
 # An existing deployment with another model is rejected before the backup:
 # Honcho does not provide a verified in-place rebuild of all stored vectors.
-if [[ $(runuser -u postgres -- psql -d honcho -Atqc "SELECT to_regclass('public.alembic_version') IS NOT NULL") == t ]]; then
+if [[ $(as_postgres psql -d honcho -Atqc "SELECT to_regclass('public.alembic_version') IS NOT NULL") == t ]]; then
   honcho_run alembic upgrade head
 else
-  as_honcho EMBEDDING_VECTOR_DIMENSIONS=1536 \
-    "$uv" --directory "$opt" run --frozen --no-dev --env-file "$etc/honcho.env" alembic upgrade head
+  ( cd -- "$opt" && as_honcho EMBEDDING_VECTOR_DIMENSIONS=1536 \
+      "$uv" --directory "$opt" run --frozen --no-dev --env-file "$etc/honcho.env" alembic upgrade head )
 fi
 honcho_run python scripts/configure_embeddings.py --yes
 

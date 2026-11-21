@@ -1121,12 +1121,12 @@ update_hermes() {
     # the dashboard and reports the update as incomplete. A Hermes that has
     # --no-gateway-restart only updates the code; root restarts both units below.
     local -a update_args=()
-    if pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update --help </dev/null 2>/dev/null |
+    if pct exec "$id" -- runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes update --help </dev/null 2>/dev/null |
             grep -q -- '--no-gateway-restart'; then
         update_args=(--no-gateway-restart)
     fi
     note "Updating Hermes itself (--update-hermes): hermes update ${update_args[*]:+${update_args[*]} }as the hermes user; root then restarts its gateway and dashboard."
-    if ! pct exec "$id" -- runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update ${update_args[@]+"${update_args[@]}"} </dev/null; then
+    if ! pct exec "$id" -- runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes update ${update_args[@]+"${update_args[@]}"} </dev/null; then
         note 'hermes update failed.'
         return 1
     fi

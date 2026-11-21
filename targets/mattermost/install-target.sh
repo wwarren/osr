@@ -162,7 +162,13 @@ id "$MM_SERVICE_USER" >/dev/null 2>&1 || die "The $MM_SERVICE_USER account is mi
 command -v python3 >/dev/null || die 'python3 is required (the community script installs it).'
 command -v openssl >/dev/null || die 'openssl is required.'
 
-mm() { runuser -u "$MM_SERVICE_USER" -- "$MMCTL" --local --suppress-warnings "$@"; }
+# runuser keeps the caller's cwd (often /root, which the service account cannot
+# enter). Start in MM_HOME, or in / when it does not exist (MMCTL set elsewhere).
+mm() {
+  local dir=/
+  [[ ! -d $MM_HOME ]] || dir=$MM_HOME
+  ( cd -- "$dir" && runuser -u "$MM_SERVICE_USER" -- "$MMCTL" --local --suppress-warnings "$@" )
+}
 mm_json() { mm --json "$@"; }
 mm_ready() {
   local deadline=$(( SECONDS + HEALTH_TIMEOUT ))

@@ -1257,7 +1257,7 @@ fi
 # --- register the chat endpoint with Open WebUI on the router ------------------------
 register_webui
 
-oc_cli="pct exec $CT_ID -- sh -c 'runuser -u opencode -- env HOME=/home/opencode OPENCODE_PASSWORD=\"\$(cat /etc/opencode-target/password)\" opencode --server http://127.0.0.1:$OPENCODE_PORT'"
+oc_cli="pct exec $CT_ID -- sh -c 'runuser -u opencode -- env -C /home/opencode/workspace HOME=/home/opencode OPENCODE_PASSWORD=\"\$(cat /etc/opencode-target/password)\" opencode --server http://127.0.0.1:$OPENCODE_PORT'"
 printf 'OpenCode CT %s discovers via %s and dispatches model osr/%s directly.\n' "$CT_ID" "$ROUTER_URL" "$OPENCODE_MODEL"
 if [[ $OPENCODE_WEB == true ]]; then
   printf 'Web UI: http://%s:%s/ (user opencode). The password, read on this host with:\n' "$OPENCODE_IP" "$OPENCODE_PORT"

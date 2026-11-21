@@ -545,8 +545,9 @@ wait_direct() {
   return 1
 }
 run_hermes() {
-  runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
-    PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$HERMES_BIN" "$@"
+  ( cd -- "$HERMES_USER_HOME" &&
+    runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+      PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$HERMES_BIN" "$@" )
 }
 dashboard_config_value() {
   local value
@@ -623,7 +624,7 @@ if [[ ! -x $HERMES_BIN ]] || { [[ -n $HERMES_COMMIT ]] && [[ $(installed_commit)
 fi
 if [[ ! -x $HERMES_BIN ]]; then
   # The launcher's location is upstream's choice; the unit expects this path.
-  found=$(runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" \
+  found=$(cd -- "$HERMES_USER_HOME" && runuser -u "$HERMES_USER" -- env HOME="$HERMES_USER_HOME" \
     PATH="$HERMES_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" sh -c 'command -v hermes' 2>/dev/null || true)
   [[ -n $found && -x $found ]] || die "The Hermes launcher was not found at $HERMES_BIN or on the hermes PATH."
   install -d -m 0755 -o "$HERMES_USER" -g "$HERMES_USER" "$HERMES_USER_HOME/.local" "$HERMES_USER_HOME/.local/bin"
@@ -917,4 +918,4 @@ rm -f -- "$ROUTER_API_KEY_FILE"
 commit=$(installed_commit)
 note "Hermes${commit:+ $commit} discovers via $ROUTER_URL and calls model servers directly with model $HERMES_MODEL (context $(context_label))."
 [[ -n $HERMES_COMMIT || -z $commit ]] || note "Pin this version with HERMES_COMMIT=$commit."
-note "Start a shell with: runuser -u $HERMES_USER -- env HOME=$HERMES_USER_HOME $HERMES_BIN"
+note "Start a shell with: runuser -u $HERMES_USER -- env -C $HERMES_USER_HOME HOME=$HERMES_USER_HOME $HERMES_BIN"

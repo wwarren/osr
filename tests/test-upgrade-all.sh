@@ -1189,7 +1189,7 @@ out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
 assert_eq '--update-hermes: a moved checkout is an upgrade' \
     "upgraded|Hermes updated: aaaaaaaaaaaa to bbbbbbbbbbbb" "$out"
 assert_file_contains 'runs hermes update as the hermes user' \
-    'RUNUSER 282 runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update' "$tmp/mock/installs.log"
+    'RUNUSER 282 runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes update' "$tmp/mock/installs.log"
 assert_file_contains 'restarts the gateway and dashboard' \
     'SYSTEMCTL 282 systemctl try-restart hermes-gateway.service hermes-dashboard.service' "$tmp/mock/installs.log"
 assert_eq 'an older Hermes gets no flag it does not know' '' "$(grep -- '--no-gateway-restart' "$tmp/mock/installs.log")"
@@ -1198,7 +1198,7 @@ touch "$tmp/mock/282.hermes-no-restart-flag"
 printf '%040d\n' 0 | tr 0 b > "$tmp/mock/282.hermes-next"
 out=$(in_tool hermes_case true 'settings unchanged; nothing to do')
 assert_file_contains 'a Hermes that can leaves the restarts to root' \
-    'RUNUSER 282 runuser -u hermes -- env HOME=/home/hermes /home/hermes/.local/bin/hermes update --no-gateway-restart' "$tmp/mock/installs.log"
+    'RUNUSER 282 runuser -u hermes -- env -C /home/hermes HOME=/home/hermes /home/hermes/.local/bin/hermes update --no-gateway-restart' "$tmp/mock/installs.log"
 assert_file_contains 'which restarts both units' \
     'SYSTEMCTL 282 systemctl try-restart hermes-gateway.service hermes-dashboard.service' "$tmp/mock/installs.log"
 assert_contains 'and it is still an upgrade' 'upgraded|Hermes updated' "$out"
