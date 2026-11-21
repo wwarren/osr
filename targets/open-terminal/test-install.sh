@@ -55,7 +55,7 @@ pyproject_from "$script_dir/requirements.in" 'rich>=13' > "$tmp_root/pyproject.t
     fail 'a new dependency was not reported'
 pass 'dependency drift between the tag and requirements.in is detected'
 
-# Upstream's own layout (v0.17.20): notebook support as an extra, a macOS-only
+# Upstream's own layout (v0.17.20 and later): notebook support as an extra, a macOS-only
 # and a Linux-only dependency, and pyautogui, which the lock leaves out.
 {
     printf '[project]\nname = "open-terminal"\ndependencies = [\n'

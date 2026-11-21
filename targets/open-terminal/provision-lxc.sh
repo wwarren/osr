@@ -13,7 +13,7 @@ usage() {
 Usage: bash provision-lxc.sh [--dry-run] [--integrate-only]
 
 Creates a dedicated unprivileged Debian 12/13 LXC, installs Open Terminal from
-the open-webui/open-terminal v0.17.20 GitHub tag behind a workspace gateway
+the open-webui/open-terminal v0.17.21 GitHub tag behind a workspace gateway
 (every Open WebUI user, and every agent CT connected later, gets an isolated
 workspace), and registers a system terminal in an existing open-smart-router
 Open WebUI, enabled for all of its users (OPEN_TERMINAL_WEBUI_ACCESS=keep
@@ -40,7 +40,7 @@ Optional: BRIDGE=vmbr0, CT_HOSTNAME=open-terminal, CORES=2, MEMORY_MB=4096,
           ROUTER_IP (the address the router uses to reach the terminal; detected
           with "ip route get" on the router), OPENWEBUI_PORT (read from the
           router's /app/openwebui/.env, default 8080), OPEN_TERMINAL_PORT=8000,
-          OPEN_TERMINAL_VERSION=v0.17.20, OPEN_TERMINAL_COMMIT=<reviewed SHA-1;
+          OPEN_TERMINAL_VERSION=v0.17.21, OPEN_TERMINAL_COMMIT=<reviewed SHA-1;
           required for a non-default version>, CONNECTION_NAME='Open Terminal LXC',
           OPEN_TERMINAL_IDLE_MINUTES=120, OPEN_TERMINAL_MAX_ACTIVE=8,
           OPEN_TERMINAL_WS_MEMORY=1G, OPEN_TERMINAL_WS_TASKS=512,
@@ -286,7 +286,7 @@ VLAN_TAG=${VLAN_TAG:-}
 ROUTER_IP=${ROUTER_IP:-}
 OPENWEBUI_PORT=${OPENWEBUI_PORT:-}
 OPEN_TERMINAL_PORT=${OPEN_TERMINAL_PORT:-}
-OPEN_TERMINAL_VERSION=${OPEN_TERMINAL_VERSION:-v0.17.20}
+OPEN_TERMINAL_VERSION=${OPEN_TERMINAL_VERSION:-v0.17.21}
 OPEN_TERMINAL_COMMIT=${OPEN_TERMINAL_COMMIT:-}
 CONNECTION_NAME=${CONNECTION_NAME:-Open Terminal LXC}
 OPEN_TERMINAL_WEBUI_ACCESS=${OPEN_TERMINAL_WEBUI_ACCESS:-}
@@ -374,7 +374,7 @@ for name in CORES MEMORY_MB ROOTFS_GB OPEN_TERMINAL_PORT; do positive "$name" "$
 [[ $OPEN_TERMINAL_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid OPEN_TERMINAL_VERSION.'
 [[ -z $OPEN_TERMINAL_COMMIT || $OPEN_TERMINAL_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
   die 'OPEN_TERMINAL_COMMIT must be a full 40-digit lowercase SHA-1.'
-[[ $OPEN_TERMINAL_VERSION == v0.17.20 || -n $OPEN_TERMINAL_COMMIT ]] ||
+[[ $OPEN_TERMINAL_VERSION == v0.17.21 || -n $OPEN_TERMINAL_COMMIT ]] ||
   die "Set OPEN_TERMINAL_COMMIT to the reviewed commit of ${OPEN_TERMINAL_VERSION} (tags can be moved upstream)."
 [[ $OPEN_TERMINAL_WEBUI_ACCESS =~ ^(|all|keep)$ ]] || die 'OPEN_TERMINAL_WEBUI_ACCESS must be all or keep.'
 [[ -z $ROUTER_IP ]] || ipv4 "$ROUTER_IP" || die 'ROUTER_IP must be IPv4.'

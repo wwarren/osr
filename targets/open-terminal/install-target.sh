@@ -53,8 +53,8 @@ trap 'on_signal 129' HUP
 # End signal rollback helper.
 
 OPEN_TERMINAL_URL=https://github.com/open-webui/open-terminal.git
-DEFAULT_VERSION=v0.17.20
-DEFAULT_COMMIT=772f638e2aaf43c154cdb3636cfac9c1acfa2f72
+DEFAULT_VERSION=v0.17.21
+DEFAULT_COMMIT=94dc0047adc924eb73cbd367afba7f8d6b41a549
 # Paths and accounts are overridable for tests only; the units use the defaults.
 OT_ETC=${OT_ETC:-/etc/open-terminal}
 OT_OPT=${OT_OPT:-/opt/open-terminal}
@@ -83,7 +83,7 @@ with an isolated workspace per user: open-terminal-gateway.service on the
 public port, one open-terminal-ws@<id>.service per workspace.
 
 Environment (unset: the value recorded by the last run, else the default):
-  OPEN_TERMINAL_VERSION=v0.17.20  upstream tag (unset, a newer tag the last run
+  OPEN_TERMINAL_VERSION=v0.17.21  upstream tag (unset, a newer tag the last run
                                   installed is kept: no downgrade unless asked)
   OPEN_TERMINAL_COMMIT=<sha>      the commit that tag must resolve to (required
                                   for any tag other than the default)

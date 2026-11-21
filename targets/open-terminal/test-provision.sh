@@ -163,7 +163,7 @@ has '--memory 4096'
 lacks 'open-terminal.service'
 lacks 'OPEN_TERMINAL_IDLE_MINUTES='   # unset settings keep the guest's recorded values
 has '/etc/open-terminal/api-key --perms 0600'
-has 'OPEN_TERMINAL_VERSION=v0.17.20 OPEN_TERMINAL_COMMIT= bash /root/open-terminal-deploy/install-target.sh'
+has 'OPEN_TERMINAL_VERSION=v0.17.21 OPEN_TERMINAL_COMMIT= bash /root/open-terminal-deploy/install-target.sh'
 has 'integrate-webui.py --webui-url http://127.0.0.1:\<router-webui-port\> --terminal-url http://192.0.2.81:8000'
 has '--id open-terminal-lxc-281'
 # Enabled for every Open WebUI user by default, and the choice is recorded.

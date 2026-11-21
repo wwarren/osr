@@ -1223,7 +1223,7 @@ version and `webui.db`. Upgrade an existing router with
 0.13 keeps image engines as a list of connections and converts the 0.12
 settings at its first start (see [Image generation](#image-generation)). Its terminal
 features (process list and output, events, notebooks, coding agents) need
-Open Terminal v0.17.20, the pinned release: upgrade the terminal CT too
+Open Terminal v0.17.21, the pinned release: upgrade the terminal CT too
 (`tools/upgrade-all.sh` does both).
 Open WebUI 0.11.1, 0.12.0 and 0.12.1 migrate the database irreversibly; `apply` keeps a copy in
 `/var/backups/open-smart-router/<timestamp>/openwebui-data/`, but only the

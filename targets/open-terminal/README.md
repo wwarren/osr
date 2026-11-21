@@ -8,12 +8,16 @@ CT (Hermes, OpenClaw, DeepSeek Harness) connected to it, works in its own
 open-terminal process under its own Linux account, with its own files,
 processes, `/tmp`, key and resource limits.
 
-It installs upstream tag `v0.17.20`, verified against reviewed commit
-`772f638e2aaf43c154cdb3636cfac9c1acfa2f72`, into a venv built from a
-hash-locked `requirements.lock`. That is the release Open WebUI 0.13.4 (the
-router's pin) was published against: besides the terminal itself, Open
-WebUI's process list and live command output, file and port events, system
-info, notebooks and coding-agent chats reach each user's workspace through
+It installs upstream tag `v0.17.21`, verified against reviewed commit
+`94dc0047adc924eb73cbd367afba7f8d6b41a549`, into a venv built from a
+hash-locked `requirements.lock`. That is the first release with everything
+Open WebUI 0.13.4 (the router's pin) asks of a terminal: v0.17.21 lets a
+Claude Code chat continue from an earlier reply, which 0.13.4 needs to
+regenerate or edit an earlier message there (with v0.17.20 it stops with
+"Update Open Terminal to regenerate or edit earlier messages in this chat").
+Besides the terminal itself, Open WebUI's process list and live command
+output, file and port events, system info, notebooks and coding-agent chats
+reach each user's workspace through
 the gateway. The Linux desktop is off (the CT has no display server), and the
 Browser tab needs a Chrome the CT does not install, so Open WebUI shows both
 as unavailable. The CT has no access to the Proxmox host or
