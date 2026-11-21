@@ -373,25 +373,43 @@ case \$1 in
         [[ \$want == FETCH_HEAD ]] && want=\$(< "\$dir/.git/FETCH")
         grep -qx "\$want" "\$dir/.git/known" || { echo "fatal: reference is not a tree: \$want" >&2; exit 128; }
         echo "\$want" > "\$dir/.git/HEAD"
-        cp "$tmp_root/setup.sh" "\$dir/setup.sh" ;;
+        cp "$tmp_root/setup.sh" "\$dir/setup.sh"
+        # FAKE_TERMINAL_COMMIT: a commit with Strata 0.2.16's layout (terminal/setup.py).
+        if [[ \$want == "\${FAKE_TERMINAL_COMMIT:-none}" ]]; then mkdir -p "\$dir/terminal"; : > "\$dir/terminal/setup.py"
+        else rm -f "\$dir/terminal/setup.py"; fi ;;
     rev-parse) if [[ \$2 == FETCH_HEAD ]]; then cat "\$dir/.git/FETCH"; else cat "\$dir/.git/HEAD"; fi ;;
 esac
 STUB
 chmod +x "$bin/git"
 # setup.sh: prints FAKE_HELP for --help; otherwise records its arguments and
-# fails when the checkout is FAKE_BAD_COMMIT.
+# fails when the checkout is FAKE_BAD_COMMIT. In a checkout with terminal/setup.py
+# it does what Strata 0.2.16's does: moves .venv into terminal/ (even for
+# --help) and writes there. A moved .venv (old-venv inside) has launchers that
+# name the old path, so its cmake does not run and setup stops, as upstream's does.
 cat > "$tmp_root/setup.sh" <<STUB
 #!/usr/bin/env bash
+home=.
+if [[ -f terminal/setup.py ]]; then
+    [[ -e terminal/.venv ]] || { [[ -d .venv ]] && mv .venv terminal/.venv; }
+    home=terminal
+fi
 [[ \$1 == --help ]] && { cat "\$FAKE_HELP"; exit 0; }
-echo "setup.sh \$* @\$(< .git/HEAD)" >> "$log"
+echo "setup.sh \$* @\$(< .git/HEAD) home=\$home" >> "$log"
 if [[ \$(< .git/HEAD) == "\${FAKE_BAD_COMMIT:-none}" ]]; then
     rm -f .venv/rollback-marker
     echo broken > runtime-from-failed-upgrade
     exit 1
 fi
+if [[ \$home == terminal ]]; then
+    if [[ -e terminal/.venv/old-venv ]]; then
+        echo '  [X]  cmake / ninja not found after installing them'
+        exit 1
+    fi
+    mkdir -p terminal/.venv; : > terminal/.venv/new-venv
+fi
 if [[ \${FAKE_NO_RUN_SCRIPT:-0} != 1 ]]; then
-    printf '#!/bin/sh\nexit 0\n' > run-iq2_xs.sh
-    chmod +x run-iq2_xs.sh
+    printf '#!/bin/sh\nexit 0\n' > "\$home/run-iq2_xs.sh"
+    chmod +x "\$home/run-iq2_xs.sh"
 fi
 [[ \${FAKE_NO_START_LINE:-0} == 1 ]] || echo '  [ok] start script: run-iq2_xs.sh'
 STUB
@@ -875,6 +893,44 @@ saved_rerun > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'rerun after a
 contains 'STRATA_PORT=8124' "$record"
 grep -q '^port=8124$' "$tree/etc/strata-target/installed-settings" || fail 'the rerun reverted the upgraded settings'
 pass 'an upgrade interrupted between the renames is completed, not reverted, by the next rerun'
+
+# Strata 0.2.16 moved everything setup writes into terminal/, and its setup.sh
+# moves an older checkout's .venv there, which breaks the venv's launchers. The
+# upgrade lets setup make a new .venv in terminal/ and runs the launcher setup
+# writes there; a failed one gets the old checkout and .venv back.
+reset_tree
+old_layout=1111111111111111111111111111111111111111
+new_layout=2222222222222222222222222222222222222222
+STRATA_COMMIT=$old_layout run_target > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'install before the layout move'; }
+mkdir -p "$tree/opt/strata/.venv"; : > "$tree/opt/strata/.venv/old-venv"
+: > "$log"
+if FAKE_BAD_COMMIT=$new_layout FAKE_TERMINAL_COMMIT=$new_layout STRATA_COMMIT=$new_layout \
+        run_target --upgrade > "$tmp_root/out" 2>&1; then
+    fail 'a failed upgrade to the terminal/ layout reported success'
+fi
+[[ -e $tree/opt/strata/.venv/old-venv && ! -e $tree/opt/strata/terminal ]] ||
+    fail 'the rollback did not bring back the old layout and its .venv'
+contains "STRATA_RUN_SCRIPT=$tree/opt/strata/run-iq2_xs.sh" "$tree/etc/strata-target/strata.env"
+: > "$log"
+FAKE_TERMINAL_COMMIT=$new_layout STRATA_COMMIT=$new_layout run_target --upgrade > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'upgrade to the terminal/ layout'; }
+contains 'a virtualenv cannot be moved there, so setup makes a new one' "$tmp_root/out"
+[[ -e $tree/opt/strata/terminal/.venv/new-venv && ! -e $tree/opt/strata/terminal/.venv/old-venv && ! -e $tree/opt/strata/.venv ]] ||
+    fail 'the old .venv was moved into terminal/ instead of being made again'
+contains "@$new_layout home=terminal" "$log"
+contains "STRATA_RUN_SCRIPT=$tree/opt/strata/terminal/run-iq2_xs.sh" "$tree/etc/strata-target/strata.env"
+: > "$log"
+FAKE_TERMINAL_COMMIT=$new_layout STRATA_COMMIT=$new_layout STRATA_PORT=8125 run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'a settings change on the terminal/ layout'; }
+[[ -e $tree/opt/strata/terminal/.venv/new-venv ]] || fail 'a rerun on the terminal/ layout dropped its .venv'
+grep -q 'a virtualenv cannot be moved' "$tmp_root/out" && fail 'a rerun on the terminal/ layout made a new .venv again'
+contains "STRATA_RUN_SCRIPT=$tree/opt/strata/terminal/run-iq2_xs.sh" "$tree/etc/strata-target/strata.env"
+pass 'the terminal/ layout: a new .venv instead of a moved one, its launcher in terminal/, rollback to the old layout'
+
+FAKE_NO_START_LINE=1 FAKE_TERMINAL_COMMIT=$new_layout STRATA_COMMIT=$new_layout STRATA_PORT=8126 run_target > "$tmp_root/out" 2>&1 ||
+    { cat "$tmp_root/out"; fail 'an unnamed launcher in terminal/'; }
+contains "STRATA_RUN_SCRIPT=$tree/opt/strata/terminal/run-iq2_xs.sh" "$tree/etc/strata-target/strata.env"
+pass 'an unnamed launcher is also looked for in terminal/'
 
 bash "$script_dir/../../tests/lib/check-target-records.sh" "$script_dir/install-target.sh" "$tmp_root/record-failures" ||
     fail 'atomic settings record failure tests'

@@ -155,14 +155,24 @@ setup_args() {
     fi
 }
 
+# setup_home: where setup.py writes its run scripts, configs and .venv. From
+# Strata 0.2.16 that is terminal/ (its "0.2.16 layout": setup.sh runs
+# terminal/setup.py, which moves an older checkout's run scripts there);
+# earlier checkouts write in the checkout itself.
+setup_home() {
+    if [[ -f $STRATA_DIR/terminal/setup.py ]]; then printf '%s\n' "$STRATA_DIR/terminal"
+    else printf '%s\n' "$STRATA_DIR"; fi
+}
+
 # select_run_script LOG MARKER: the launcher setup.py just generated. Setup
-# prints "start script: run-<model>.sh"; when that line is missing (reworded in
-# another release), fall back to the one run-*.sh written after MARKER was
-# touched. Refuse an ambiguous or missing launcher rather than starting an
-# older model's script.
+# prints "start script: run-<model>.sh" (the name only, in setup_home); when
+# that line is missing (reworded in another release), fall back to the one
+# run-*.sh written after MARKER was touched. Refuse an ambiguous or missing
+# launcher rather than starting an older model's script.
 select_run_script() {
-    local log_file=$1 marker=${2:-} line name candidate found=''
+    local log_file=$1 marker=${2:-} line name candidate found='' home
     local -a fresh=()
+    home=$(setup_home)
     while IFS= read -r line; do
         [[ $line =~ start[[:space:]]script:[[:space:]]*(run-[a-z0-9._-]+\.sh) ]] || continue
         name=${BASH_REMATCH[1]}
@@ -173,7 +183,7 @@ select_run_script() {
         found=$name
     done < "$log_file"
     if [[ -z $found && -n $marker && -e $marker ]]; then
-        mapfile -t fresh < <(find "$STRATA_DIR" -maxdepth 1 -type f -name 'run-*.sh' -newer "$marker" -printf '%f\n')
+        mapfile -t fresh < <(find "$home" -maxdepth 1 -type f -name 'run-*.sh' -newer "$marker" -printf '%f\n')
         if (( ${#fresh[@]} == 1 )); then
             found=${fresh[0]}
             printf 'Note: setup did not name its start script; using %s, the launcher it just wrote.\n' "$found" >&2
@@ -186,7 +196,7 @@ select_run_script() {
         printf 'Error: Strata setup did not report or write a run-<model>.sh script.\n' >&2
         return 1
     fi
-    candidate=$STRATA_DIR/$found
+    candidate=$home/$found
     if [[ ! -f $candidate || ! -x $candidate || -L $candidate ]]; then
         printf 'Error: Strata did not generate an executable %s.\n' "$candidate" >&2
         return 1
@@ -384,10 +394,26 @@ fetch_target() {
     printf '%s\n' "$fetched"
 }
 
+# drop_venv_before_layout_move: Strata 0.2.16's setup.sh moves an older
+# checkout's .venv into terminal/ (mv .venv terminal/.venv) before it runs
+# setup.py. A virtualenv cannot be moved: the launchers pip wrote in it, such
+# as cmake, still start with #!<checkout>/.venv/bin/python and no longer run,
+# while its record of installed packages says they are there, so setup stops
+# with "cmake / ninja not found after installing them". A checkout that brings
+# that layout therefore lets setup.sh make a new .venv in terminal/ (it
+# reinstalls the Python packages). An upgrade's rollback snapshot, taken
+# before the checkout, still holds the old .venv.
+drop_venv_before_layout_move() {
+    [[ -f $STRATA_DIR/terminal/setup.py && ! -e $STRATA_DIR/terminal/.venv && -e $STRATA_DIR/.venv ]] || return 0
+    note "This Strata keeps its Python environment in terminal/; a virtualenv cannot be moved there, so setup makes a new one (the Python packages are installed again)."
+    rm -rf -- "$STRATA_DIR/.venv"
+}
+
 # Check out a commit that is already in the local repository (no network).
 checkout_local() {
     as_service git -C "$STRATA_DIR" checkout -q --detach "$1"
     printf 'Strata source commit: %s\n' "$(git_root rev-parse HEAD)"
+    drop_venv_before_layout_move
 }
 
 probe_setup_help() {

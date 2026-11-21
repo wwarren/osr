@@ -133,10 +133,12 @@ CT, run `pct exec <id> -- bash /root/strata-target-deploy/install-target.sh`
 (see [Upgrade](#upgrade)).
 
 Strata keeps its venv, engine and configs in `/opt/strata` and models in
-`/var/lib/strata`, the only paths the `strata` account can write. Setup prints
-the generated `run-<model>.sh`; the installer checks it (or, if not printed,
-the single new `run-*.sh`), writes its path to `/etc/strata-target/strata.env`,
-and the unit runs it directly. The key is passed to `setup.sh --setup` once
+`/var/lib/strata`, the only paths the `strata` account can write. From Strata
+0.2.16 (the "0.2.16 layout") setup writes them in `/opt/strata/terminal/`
+instead. Setup prints the generated `run-<model>.sh`; the installer checks it
+(or, if not printed, the single new `run-*.sh`) where that release's setup
+writes, writes its path to `/etc/strata-target/strata.env`, and the unit runs it
+directly. The key is passed to `setup.sh --setup` once
 and stored by Strata in its model config, never in the unit, env file or
 output.
 
@@ -193,7 +195,8 @@ sends the key to an unidentified host.
 
 Without a key (`STRATA_ALLOW_NO_KEY=true`), Strata answers only requests whose
 `Host` is an IP, `localhost` or listed in `allowed_hosts` in
-`/opt/strata/strata-<model>.json` (or `STRATA_ALLOWED_HOSTS`), so register it
+`/opt/strata/strata-<model>.json` (`/opt/strata/terminal/` from 0.2.16; or
+`STRATA_ALLOWED_HOSTS`), so register it
 by IP; a hostname gets 403. With a key that check is off.
 
 The CT is created with its firewall flag on but no rules: restrict the API port
@@ -238,6 +241,15 @@ rollback. If the rollback also fails, it is kept beside a `rollback-failed`
 marker and every later run stops there: inspect or restore it, then delete the
 marker. Leave disk for one copy of the checkout; `/var/lib/strata` is not
 copied (weights inside `/opt/strata` are).
+
+The first upgrade to the 0.2.16 layout gets a new Python environment.
+Upstream's `setup.sh` moves the old `/opt/strata/.venv` into `terminal/`, but a
+virtualenv cannot be moved: the `cmake` launcher pip wrote in it still names
+`/opt/strata/.venv/bin/python`, and setup stops with "cmake / ninja not found
+after installing them". So the installer removes the old `.venv` after the
+checkout (the snapshot still has it). Setup then makes a new one and installs
+the Python packages again, which takes longer and needs PyPI. It also compiles
+the engine afresh, in `terminal/engine/`.
 
 ## Checks
 
