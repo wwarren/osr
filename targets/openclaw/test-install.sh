@@ -73,6 +73,20 @@ msg=$(dry ROUTER_URL=http://router:8000 2>&1 || true)
 [[ $msg == *'Missing the OpenClaw units or direct dispatcher'* ]] || fail "missing dispatcher: $msg"
 pass 'invalid endpoint, model, context, output budget, versions, Node lines, ports and a missing dispatcher are refused'
 
+# A user switch retains cwd; OpenClaw's SQLite reader reuses it when spawning
+# Node. Starting the installer in /root would otherwise fail with EACCES.
+(
+  source <(sed -n '/^run_as_oc() {/,/^}/p' "$script")
+  OC_USER=openclaw
+  OC_USER_HOME=$tmp_root/oc-home
+  NVM_DIR=$OC_USER_HOME/.nvm
+  mkdir -p "$OC_USER_HOME"
+  runuser() { [[ $PWD == "$OC_USER_HOME" ]] || return 91; }
+  cd "$tmp_root"
+  run_as_oc true
+) || fail 'run_as_oc retained the provisioner working directory'
+pass 'OpenClaw commands start in the agent home, so child Node processes can enter cwd'
+
 # --- helpers in isolation ----------------------------------------------------------
 # shellcheck disable=SC1090
 source <(awk '/^# Install helpers/{c=1;next} /^# End install helpers\./{c=0} c' "$script")

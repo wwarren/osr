@@ -151,9 +151,13 @@ then approve the browser pairing from the host:
 
 ```bash
 pct exec 283 -- cat /etc/openclaw-target/api-key
-oc="pct exec 283 -- runuser -u openclaw -- env HOME=/home/openclaw PATH=/home/openclaw/.local/bin:/usr/bin:/bin openclaw"
-$oc devices list
-$oc devices approve <requestId>
+oc() {
+  pct exec 283 -- runuser -u openclaw -- env HOME=/home/openclaw \
+    PATH=/home/openclaw/.local/bin:/usr/bin:/bin \
+    bash -c 'cd /home/openclaw && exec openclaw "$@"' bash "$@"
+}
+oc devices list
+oc devices approve <requestId>
 ```
 
 Origins `http://<each CT IPv4>:<port>` are allowed
@@ -204,8 +208,8 @@ the firewall lock, stopping if the file changed meanwhile.
 ## Use and maintain
 
 ```bash
-$oc status                                     # with $oc as above
-$oc update && pct exec 283 -- systemctl restart openclaw-gateway
+oc status                                     # with oc() as above
+oc update && pct exec 283 -- systemctl restart openclaw-gateway
 journalctl -u openclaw-direct -f               # in the CT: dispatch decisions
 ```
 

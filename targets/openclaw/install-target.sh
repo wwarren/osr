@@ -614,8 +614,11 @@ fi
 
 # --- health checks and the commands they need ---------------------------------
 run_as_oc() {
-  runuser -u "$OC_USER" -- env HOME="$OC_USER_HOME" USER="$OC_USER" NVM_DIR="$NVM_DIR" \
-    PATH="$OC_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@"
+  # runuser preserves cwd. The caller may be in /root, which this account
+  # cannot enter when OpenClaw spawns a Node worker with its current cwd.
+  ( cd -- "$OC_USER_HOME" &&
+    runuser -u "$OC_USER" -- env HOME="$OC_USER_HOME" USER="$OC_USER" NVM_DIR="$NVM_DIR" \
+      PATH="$OC_USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@" )
 }
 run_oc() { run_as_oc "$OC_BIN" "$@"; }
 installed_openclaw() { { run_oc --version 2>/dev/null || true; } | version_of; }

@@ -1149,7 +1149,7 @@ if [[ $OPENWEBUI == true ]]; then
   (( dry_run )) && router_stage=''
 fi
 
-oc_shell="pct exec $CT_ID -- runuser -u openclaw -- env HOME=/home/openclaw PATH=/home/openclaw/.local/bin:/usr/bin:/bin openclaw"
+oc_shell="pct exec $CT_ID -- runuser -u openclaw -- env HOME=/home/openclaw PATH=/home/openclaw/.local/bin:/usr/bin:/bin bash -c 'cd /home/openclaw && exec openclaw \"\$@\"' bash"
 printf 'OpenClaw CT %s discovers via %s and dispatches model osr/%s directly.\n' "$CT_ID" "$ROUTER_URL" "$OPENCLAW_MODEL"
 if [[ $OPENWEBUI == true ]]; then
   printf 'Open WebUI: choose "openclaw" in the model list. Check its visibility under Admin Settings > Models before sharing it:\n'
