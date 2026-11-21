@@ -74,11 +74,12 @@ recorded for them: HONCHO_WEBUI_ACCESS=keep or OPEN_TERMINAL_WEBUI_ACCESS=keep,
 given to their provisioner or to this run. That needs the Open WebUI admin
 token; without it Open Terminal is still upgraded and its access is left alone.
 
-Before the plan it lists, for every component it will upgrade that comes from
-a public repository, the release pinned here (tested with this repository)
-and the newest upstream release (looked up on GitHub, PyPI or npm). Where the
+Before the plan it lists, for every CT it will upgrade, the version installed
+there now, the release pinned here (tested with this repository) and the
+newest upstream release (looked up on GitHub, PyPI or npm). Where the
 upstream one is newer, a run on a terminal asks which to install; the pin is
-the default, and the answer for --yes. A commit the installer must check
+the default, and the answer for --yes. (The router's row is its LiteLLM; it,
+AirLLM and hcom are listed but not offered: they install their pins.) A commit the installer must check
 (ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
 names at that moment, not one reviewed here.
 
@@ -1286,6 +1287,14 @@ declare -A UPSTREAM_UNPINNED=(
     [openclaw]='follows npm latest (openclaw)'
     [gitea]="the community script's newest at install; kept on upgrade"
     [mattermost]="the community script's newest at install; kept on upgrade"
+    [mqtt]="the CT's Debian package (apt, at each reconfigure)"
+)
+# Components with a pin here whose upstream release is shown beside it but not
+# offered: their installers take no other version (same kinds as UPSTREAM).
+declare -A UPSTREAM_SHOWN=(
+    [router]='pypi litellm'
+    [airllm]='pypi airllm'
+    [hcom]='gh-release aannoo/hcom'
 )
 GITHUB_API=https://api.github.com
 UPSTREAM_OFFLINE=false
@@ -1306,7 +1315,82 @@ pinned_release() {
         xolotl|avalon|kindi) cat -- "$REPO_ROOT/targets/$1/upstream-commit.txt" ;;
         honcho|opencode|freellmapi) repo_default "$1" ;;
         deepseek-harness) repo_default dsh ;;
+        router) sed -n 's/^litellm\[proxy\]==//p' "$REPO_ROOT/services/litellm-proxy/requirements.txt" ;;
+        airllm) sed -n 's/^airllm==//p' "$REPO_ROOT/targets/airllm/requirements.txt" ;;
+        hcom) sed -n "s/.*== 'hcom \([^']*\)'.*/\1/p" "$REPO_ROOT/targets/hcom/install-target.sh" ;;
     esac 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+# upstream_spec TARGET: its UPSTREAM (offered) or UPSTREAM_SHOWN (shown) entry.
+upstream_spec() { printf '%s\n' "${UPSTREAM[$1]:-${UPSTREAM_SHOWN[$1]:-}}"; }
+
+# component_label TARGET: its name in the versions table (what the row is the version of).
+component_label() {
+    case $1 in
+        router) echo 'router (LiteLLM)' ;;
+        mqtt) echo 'mqtt (Mosquitto)' ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Run in a CT with the target's name as $1: prints the version of it this CT
+# runs now, on one line, or nothing when it cannot tell. It reads what each
+# installer records or reports (see the installed_version, release_version and
+# release_record functions of the target installers); a full commit is printed
+# whole and shortened by installed_release.
+read -r -d '' INSTALLED_PROBE <<'PROBE'
+# osr-installed-version
+rev() { git -c safe.directory="$1" -C "$1" rev-parse HEAD 2>/dev/null; }
+tag() { git -c safe.directory="$1" -C "$1" describe --tags --exact-match HEAD 2>/dev/null || rev "$1"; }
+kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1 | tr -d "\"' \r"; }
+pyver() { [ -x "$1" ] && "$1" -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "$2" 2>/dev/null; }
+json_version() {
+    grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+case $1 in
+    router) pyver /app/litellm/venv/bin/python litellm ;;
+    open-webui) pyver /app/openwebui/venv/bin/python open-webui ;;
+    ollama) /usr/local/lib/ollama/bin/ollama --version 2>/dev/null | awk '{ print $NF }' | tail -n 1 ;;
+    llamacpp)
+        v=$(kv /opt/llama-target/build-info.txt requested_ref)
+        [ -n "$v" ] || v=$(kv /opt/llama-target/build-info.txt resolved_commit)
+        echo "$v" ;;
+    airllm) pyver /opt/airllm-target/venv/bin/python airllm || pyver /opt/airllm-ollama-api/venv/bin/python airllm ;;
+    comfyui)
+        sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /opt/comfyui-target/current/comfyui_version.py 2>/dev/null |
+            head -n 1 ;;
+    open-terminal) kv /etc/open-terminal/release OPEN_TERMINAL_VERSION ;;
+    strata|basalt|xolotl|avalon|kindi|colibri) rev "/opt/$1" ;;
+    maya|honcho) tag "/opt/$1" ;;
+    hermes) rev /home/hermes/.hermes/hermes-agent ;;
+    deepseek-harness) json_version /opt/deepseek-harness/current/node_modules/@deepseek-ai/dsh/package.json ;;
+    # releases/<version>-<platform>, the platform being linux-<arch>[-variant].
+    opencode) n=$(readlink /opt/opencode/current 2>/dev/null) && n=${n##*/} && echo "${n%%-linux*}" ;;
+    # ~/.local/bin/openclaw links into nvm's node_modules/openclaw.
+    openclaw)
+        d=$(readlink -f /home/openclaw/.local/bin/openclaw 2>/dev/null) || exit 0
+        n=0
+        while [ -n "$d" ] && [ "${d%/node_modules/openclaw}" = "$d" ] && [ $n -lt 4 ]; do d=${d%/*}; n=$((n + 1)); done
+        [ "${d%/node_modules/openclaw}" = "$d" ] || json_version "$d/package.json" ;;
+    freellmapi) kv /app/server/data/osr-target/settings FREELLMAPI_VERSION ;;
+    gitea) /usr/local/bin/gitea --version 2>/dev/null | awk '{ print $3; exit }' ;;
+    mattermost) /opt/mattermost/bin/mmctl version 2>/dev/null | sed -n 's/^Version:[[:space:]]*//p' | head -n 1 ;;
+    mqtt) mosquitto -h 2>&1 | sed -n 's/^mosquitto version \([^ ]*\).*/\1/p' | head -n 1 ;;
+    hcom) /usr/local/bin/hcom --version 2>/dev/null | awk '{ print $2; exit }' ;;
+esac
+exit 0
+PROBE
+
+# installed_release ITEM: the version its CT runs now (a commit as 12 digits),
+# or ? when the CT does not say.
+installed_release() {
+    local i=$1 id=${I_CT[$1]} v
+    if $INCLUDE_STOPPED && ! ct_running "$id"; then echo '? (CT stopped)'; return 0; fi
+    v=$(pct exec "$id" -- sh -c "$INSTALLED_PROBE" osr-installed-version "${I_TARGET[$i]}" </dev/null 2>/dev/null |
+        head -n 1 | tr -d '\r')
+    if [[ ! $v =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$ ]]; then echo '?'
+    elif [[ $v =~ ^[0-9a-f]{40}$ ]]; then echo "${v:0:12}"
+    else echo "$v"; fi
 }
 
 # upstream_get URL [ACCEPT]: the body in UPSTREAM_BODY, over HTTPS only. GitHub
@@ -1335,7 +1419,7 @@ upstream_get() {
 # commit-checked kinds, its commit (REL_COMMIT). Fails when it cannot tell.
 latest_release() {
     local t=$1 kind repo ref v='' c=''
-    read -r kind repo ref <<< "${UPSTREAM[$t]}"
+    read -r kind repo ref <<< "$(upstream_spec "$t")"
     case $kind in
         pypi)
             upstream_get "https://pypi.org/pypi/$repo/json" &&
@@ -1369,7 +1453,9 @@ pinned_label() {
     if [[ $p =~ ^[0-9a-f]{40}$ ]]; then echo "${p:0:12}"; else echo "${p:-?}"; fi
 }
 latest_label() {
-    case ${UPSTREAM[$1]%% *} in
+    local spec
+    spec=$(upstream_spec "$1")
+    case ${spec%% *} in
         gh-branch) echo "${REL_LATEST[$1]} @ ${REL_COMMIT[$1]:0:12}" ;;
         gh-tag-commit) echo "${REL_LATEST[$1]} (${REL_COMMIT[$1]:0:12})" ;;
         *) echo "${REL_LATEST[$1]}" ;;
@@ -1381,7 +1467,7 @@ latest_label() {
 release_offered() {
     local t=$1 pinned=${REL_PINNED[$1]:-} latest=${REL_LATEST[$1]:-}
     [[ -n $pinned && -n $latest ]] || return 1
-    if [[ ${UPSTREAM[$t]%% *} == gh-branch ]]; then
+    if [[ $(upstream_spec "$t") == gh-branch* ]]; then
         [[ ${REL_COMMIT[$t]} != "$pinned" ]]
         return
     fi
@@ -1438,45 +1524,63 @@ choose_release() {
 # release_pick TARGET: the upstream release chosen instead of the pin, or nothing.
 release_pick() { [[ ${REL_CHOICE[$1]:-} == latest ]] && printf '%s\n' "${REL_LATEST[$1]}"; }
 
-# decide_releases: show the pinned and the latest upstream release of every
-# component to upgrade that comes from a public repository, ask which to
-# install, and give the installers of the ones moving to the latest its version.
+# decide_releases: show, for every CT to upgrade, the version installed there,
+# the one pinned here and the latest upstream release; ask which to install of
+# the components with a newer upstream release, and give the installers of the
+# ones moving to the latest its version.
 decide_releases() {
     local i t latest offered=false
-    local -a targets=()
-    local -A seen=()
+    local -a targets=() rows=()
+    local -A seen=() latest_of=() pinned_of=()
     for i in "${!I_TARGET[@]}"; do
         [[ -z ${I_RESULT[$i]} ]] || continue
         t=${I_TARGET[$i]}
-        [[ -n ${UPSTREAM[$t]:-} || -n ${UPSTREAM_UNPINNED[$t]:-} || $t == hermes ]] || continue
+        [[ -n $(upstream_spec "$t") || -n ${UPSTREAM_UNPINNED[$t]:-} || $t == hermes ]] || continue
         $INCLUDE_STOPPED || ct_running "${I_CT[$i]}" || continue
+        rows+=("$i")
         [[ -z ${seen[$t]:-} ]] || continue
         seen[$t]=1
         targets+=("$t")
     done
-    (( ${#targets[@]} )) || return 0
-    section 'Upstream releases'
-    note 'Pinned: tested with this repository. Latest: the newest upstream release, not tested here.'
-    printf '%-18s %-24s %s\n' COMPONENT PINNED 'LATEST UPSTREAM' >&2
+    (( ${#rows[@]} )) || return 0
+    section 'Versions'
+    note 'Installed: what the CT runs now. Pinned: tested with this repository. Latest: the newest upstream release, not tested here.'
+    # The pin and the latest release of each component, looked up once.
     for t in "${targets[@]}"; do
-        if [[ -n ${UPSTREAM[$t]:-} ]]; then
+        if [[ -n $(upstream_spec "$t") ]]; then
             REL_PINNED[$t]=$(pinned_release "$t")
+            pinned_of[$t]=$(pinned_label "$t")
             if latest_release "$t"; then
                 latest=$(latest_label "$t")
-                if release_offered "$t"; then offered=true; else latest+=' (the pin is current)'; fi
+                if ! release_offered "$t"; then
+                    latest+=' (the pin is current)'
+                elif [[ -n ${UPSTREAM[$t]:-} ]]; then
+                    offered=true
+                else
+                    latest+=' (not offered: this run installs the pin)'
+                fi
             elif $UPSTREAM_OFFLINE; then
                 latest='unknown: upstream not reachable'
             else
                 latest='unknown: the lookup failed'
             fi
-            printf '%-18s %-24s %s\n' "$t" "$(pinned_label "$t")" "$latest" >&2
+            latest_of[$t]=$latest
         elif [[ $t == hermes ]]; then
             offered=true
-            printf '%-18s %-24s %s\n' hermes 'none: installed commit' 'hermes update (never past a HERMES_COMMIT pin)' >&2
+            pinned_of[$t]='-'
+            latest_of[$t]='hermes update (never past a HERMES_COMMIT pin)'
         else
-            printf '%-18s %-24s %s\n' "$t" '-' "${UPSTREAM_UNPINNED[$t]}" >&2
+            pinned_of[$t]='-'
+            latest_of[$t]=${UPSTREAM_UNPINNED[$t]}
         fi
     done
+    {
+        printf '%-18s %-6s %-22s %-22s %s\n' COMPONENT CT INSTALLED PINNED 'LATEST UPSTREAM'
+        for i in "${rows[@]}"; do
+            t=${I_TARGET[$i]}
+            printf '%-18s %-6s %-22s %-22s %s\n' "$(component_label "$t")" "${I_CT[$i]}" "$(installed_release "$i")" "${pinned_of[$t]}" "${latest_of[$t]}"
+        done
+    } >&2
     if $offered && $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY; then
         note 'Without --dry-run, a run asks for each component with a newer upstream release (pinned is the default); this plan uses the pins.'
     fi

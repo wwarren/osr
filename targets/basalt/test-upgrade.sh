@@ -137,6 +137,7 @@ contains 'nothing to do' "$tmp_root/out"
 grep -q 'systemctl stop' "$log" && fail 'a legacy record without KV settings restarted the service'
 contains 'BASALT_KV=fp16' "$etc/installed-env"
 contains 'BASALT_KV_RESIDENT=0' "$etc/installed-env"
+contains 'BASALT_VRAM_RESERVE_MIB=700' "$etc/installed-env"
 pass 'an older settings record retains the original KV defaults without a restart'
 
 : > "$log"
@@ -263,12 +264,14 @@ saved_upgrade() {
         "$@" bash "$target" --upgrade
 }
 reset_tree
-BASALT_PORT=8123 BASALT_MODEL=new.basalt BASALT_CONTEXT=65536 BASALT_KV=int8 BASALT_KV_RESIDENT=32768 BASALT_ALIAS=custom CUDA_VERSION=13.1 run_target > "$tmp_root/out" 2>&1 ||
+BASALT_PORT=8123 BASALT_MODEL=new.basalt BASALT_CONTEXT=65536 BASALT_KV=int8 BASALT_KV_RESIDENT=32768 BASALT_VRAM_RESERVE_MIB=2048 BASALT_ALIAS=custom CUDA_VERSION=13.1 run_target > "$tmp_root/out" 2>&1 ||
     { cat "$tmp_root/out"; fail 'custom install before saved-settings upgrade'; }
 record=$tree/etc/basalt-target/installed-env
 contains 'BASALT_KV=int8' "$record"
 contains 'BASALT_KV_RESIDENT=32768' "$record"
+contains 'BASALT_VRAM_RESERVE_MIB=2048' "$record"
 contains '--kv int8 --kv-resident 32768' "$launcher"
+contains '--vram-reserve-mib 2048' "$launcher"
 cp "$record" "$tmp_root/custom-settings"
 : > "$log"
 saved_upgrade > "$tmp_root/out" 2>&1 || { cat "$tmp_root/out"; fail 'bare upgrade with saved settings'; }

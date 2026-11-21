@@ -110,6 +110,7 @@ the next run.
 Settings: `BASALT_PORT`, `BASALT_MODEL`, `BASALT_HF_REPO`, `BASALT_ALIAS`,
 `BASALT_GPUS` (for `0,1` also add `/dev/nvidia1` to `GPU_DEVICES`),
 `BASALT_CONTEXT` (at most 999999), `BASALT_KV`, `BASALT_KV_RESIDENT`,
+`BASALT_VRAM_RESERVE_MIB`,
 `CUDA_VERSION`, and `BASALT_ALLOW_NO_KEY=true` for an unauthenticated API. `BASALT_URL` and `BASALT_REF` (default `main`) select the
 source; pin a tested commit with `BASALT_COMMIT` for production.
 
@@ -120,6 +121,14 @@ greater than `BASALT_CONTEXT`. The defaults are `fp16` and `0` (all KV in
 VRAM). Basalt also supports `q4_0` and `k8v4`, but `k8v4` cannot use
 `BASALT_KV_RESIDENT`. These settings are saved across reruns, and an existing
 install with the defaults is not restarted by an installer that adds them.
+
+`BASALT_VRAM_RESERVE_MIB` controls how much GPU memory Basalt's automatic
+expert cache leaves for other allocations. Its default is 700 MiB; the Linux
+minimum is 128 MiB. A larger value reduces the expert cache and can help a
+new engine version start on a nearly full GPU, at a possible speed cost. For
+example, set `BASALT_VRAM_RESERVE_MIB=2048` on a 16 GiB card that has less
+than 1 GiB free after the model loads. The installer saves this setting and
+restores the previous value if the new configuration fails its health check.
 
 The pinned RAM copy holds the whole context, not only the cells beyond the
 resident count: about 26 KiB per token for `fp16`, 13.4 KiB for `int8` and

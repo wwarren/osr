@@ -989,11 +989,26 @@ without quorum usually has a read-only cluster filesystem. The wrapper also
 works directly, for example
 `bash tools/pct-cluster.sh exec 205 -- uptime` on any node.
 
-**Pinned or latest upstream.** Before the plan the run lists, for each component
-it will upgrade that comes from a public repository, the release pinned here
+**Installed, pinned or latest upstream.** Before the plan the run lists a
+versions table with one row per CT it will upgrade: the version installed in
+that CT now (read from what its installer records or reports: a release, or a
+12-digit commit; `?` when the CT does not say), the release pinned here
 (tested with this repository) and the newest upstream release, looked up on
 GitHub, PyPI or npm (`GITHUB_TOKEN` raises GitHub's rate limit; it goes in a
 header file, never on a command line):
+
+```
+COMPONENT          CT     INSTALLED              PINNED                 LATEST UPSTREAM
+router (LiteLLM)   200    1.75.5.post1           1.75.5.post1           1.79.0 (not offered: this run installs the pin)
+open-webui         200    0.11.0                 0.12.4                 0.12.4 (the pin is current)
+ollama             210    0.33.1                 v0.34.4                v0.35.0
+strata             211    0123456789ab           0123456789ab           main @ 89abcdef0123
+hcom               220    0.7.31                 0.7.31                 v0.7.31 (the pin is current)
+```
+
+The router's row is its LiteLLM; it, AirLLM and hcom show their latest
+upstream release but are not offered it (their installers take only the pin).
+MQTT's row is the CT's Mosquitto package, which follows Debian.
 
 | Component | Pin | Latest upstream | Given to its installer |
 |---|---|---|---|
@@ -1013,8 +1028,8 @@ installer checks is the one upstream names at that moment, not a reviewed one;
 the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
 newer release on later runs that take the pin; Ollama, llama.cpp, Strata,
 Xolotl, Avalon, Kindi and Colibri go back to the pin then. An unreachable upstream is reported
-and the pins are used. Basalt, Maya, OpenClaw, Gitea and Mattermost follow
-upstream with no pin here; they are listed, not asked about.
+and the pins are used. Basalt, Maya, OpenClaw, Gitea, Mattermost and MQTT follow
+upstream with no pin here; they are listed with their installed version, not asked about.
 
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`, `OPENCODE_VERSION`) is offered the
 repository's pin in an interactive run; `--yes` accepts it and `--keep-pins`

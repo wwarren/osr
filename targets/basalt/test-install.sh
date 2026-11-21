@@ -36,7 +36,7 @@ dry_run=0
 mkdir -p "$BASALT_DATA_DIR/models" "$tmp/bin"
 BASALT_DIR=$tmp/source
 BASALT_PORT=8080 BASALT_ALIAS=qwen3.8-flash-next BASALT_GPUS=0
-BASALT_CONTEXT=32768 BASALT_KV=fp16 BASALT_KV_RESIDENT=0 BASALT_ALLOW_NO_KEY=false api_key=secret-for-test
+BASALT_CONTEXT=32768 BASALT_KV=fp16 BASALT_KV_RESIDENT=0 BASALT_VRAM_RESERVE_MIB=700 BASALT_ALLOW_NO_KEY=false api_key=secret-for-test
 
 # A root-group device is usable when the service account can open it. Reject
 # an inaccessible node and verify that the service account can use the GPU.
@@ -75,10 +75,12 @@ sh -n "$run_script"
 grep -q -- '--max-context 32768' "$run_script"
 ! grep -q -- '--kv ' "$run_script"
 ! grep -q -- '--kv-resident' "$run_script"
+! grep -q -- '--vram-reserve-mib' "$run_script"
 grep -q -- '--api-key secret-for-test' "$run_script"
-BASALT_KV=int8 BASALT_KV_RESIDENT=32768
+BASALT_KV=int8 BASALT_KV_RESIDENT=32768 BASALT_VRAM_RESERVE_MIB=2048
 generate_run_script
 grep -q -- '--kv int8 --kv-resident 32768' "$run_script"
+grep -q -- '--vram-reserve-mib 2048' "$run_script"
 if [[ $(uname -s) == Linux ]]; then
     [[ $(stat -c %a "$run_script") == 700 ]] || { echo 'FAIL launcher permissions' >&2; exit 1; }
 fi

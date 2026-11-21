@@ -54,6 +54,7 @@ Optional: CT_HOSTNAME=basalt-target, BRIDGE=vmbr0, CORES=8,
           BASALT_MODEL=<pack file; overrides the recommended model>,
           BASALT_ALIAS=qwen3.8-flash-next, BASALT_GPUS=0 (or "0,1"),
           BASALT_CONTEXT=65536, BASALT_KV=fp16, BASALT_KV_RESIDENT=0,
+          BASALT_VRAM_RESERVE_MIB=700,
           BASALT_PORT=8080, BASALT_READY_TIMEOUT=3600,
           BASALT_ALLOW_NO_KEY=false.
 
@@ -132,6 +133,7 @@ BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
 BASALT_KV=${BASALT_KV:-fp16}
 BASALT_KV_RESIDENT=${BASALT_KV_RESIDENT:-0}
+BASALT_VRAM_RESERVE_MIB=${BASALT_VRAM_RESERVE_MIB:-700}
 BASALT_PORT=${BASALT_PORT:-8080}
 BASALT_READY_TIMEOUT=${BASALT_READY_TIMEOUT:-3600}
 BASALT_ALLOW_NO_KEY=${BASALT_ALLOW_NO_KEY:-false}
@@ -182,6 +184,8 @@ if (( BASALT_KV_RESIDENT > 0 )); then
         die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than BASALT_CONTEXT.'
     [[ $BASALT_KV != k8v4 ]] || die 'BASALT_KV=k8v4 cannot be combined with BASALT_KV_RESIDENT.'
 fi
+[[ $BASALT_VRAM_RESERVE_MIB =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_VRAM_RESERVE_MIB >= 128 )) ||
+    die 'BASALT_VRAM_RESERVE_MIB must be at least 128 MiB (Linux minimum).'
 [[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'BASALT_PORT must be 1..65535.'
 # Pinned RAM for a streamed KV cache (0 when it all stays in VRAM): the model
 # suggestion sets it aside, and the plan warns when the CT or host lacks it.
@@ -306,7 +310,7 @@ pve_summary "Basalt: create"
 pve_row 'Basalt CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Model' "${BASALT_MODEL} (context ${BASALT_CONTEXT}, KV ${BASALT_KV}, resident ${BASALT_KV_RESIDENT}, port ${BASALT_PORT})"
+pve_row 'Model' "${BASALT_MODEL} (context ${BASALT_CONTEXT}, KV ${BASALT_KV}, resident ${BASALT_KV_RESIDENT}, VRAM reserve ${BASALT_VRAM_RESERVE_MIB} MiB, port ${BASALT_PORT})"
 if (( kv_host_mib > 0 )); then
     pve_row 'KV streaming' "$BASALT_KV_RESIDENT of $BASALT_CONTEXT cells in VRAM; about $(basalt_gib "$kv_host_mib") GiB pinned RAM"
     kv_experts_mib=$(basalt_model_experts_mib "$BASALT_MODEL")
@@ -358,7 +362,8 @@ run pct exec "$CT_ID" -- env \
     "BASALT_URL=$BASALT_URL" "BASALT_REF=$BASALT_REF" "BASALT_COMMIT=$BASALT_COMMIT" \
     "BASALT_HF_REPO=$BASALT_HF_REPO" "BASALT_MODEL=$BASALT_MODEL" "BASALT_ALIAS=$BASALT_ALIAS" \
     "BASALT_GPUS=$BASALT_GPUS" "BASALT_CONTEXT=$BASALT_CONTEXT" \
-    "BASALT_KV=$BASALT_KV" "BASALT_KV_RESIDENT=$BASALT_KV_RESIDENT" "BASALT_PORT=$BASALT_PORT" \
+    "BASALT_KV=$BASALT_KV" "BASALT_KV_RESIDENT=$BASALT_KV_RESIDENT" \
+    "BASALT_VRAM_RESERVE_MIB=$BASALT_VRAM_RESERVE_MIB" "BASALT_PORT=$BASALT_PORT" \
     "BASALT_READY_TIMEOUT=$BASALT_READY_TIMEOUT" "BASALT_ALLOW_NO_KEY=$BASALT_ALLOW_NO_KEY" \
     "CUDA_VERSION=$CUDA_VERSION" \
     bash /root/basalt-target-deploy/install-target.sh

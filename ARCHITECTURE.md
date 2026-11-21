@@ -474,8 +474,8 @@ committing, and runs `apply --all` after a venv rebuild.
 cluster in dependency order through their own update paths (§16), with a
 before/after functional check and a Proxmox snapshot around each, then prompts
 or follows `--on-failure` when one fails
-([README](README.md#everything-at-once)). Before the plan it shows each
-public-repository component's pin beside the newest upstream release (GitHub,
+([README](README.md#everything-at-once)). Before the plan it shows, per CT, the
+version installed there (one probe per CT, `INSTALLED_PROBE`) beside the pin and the newest upstream release (GitHub,
 PyPI, npm) and asks which to install (pin by default; `--latest`, `--pinned`);
 a chosen latest reaches the installer through its own version variables. Snapshots are deleted after success
 or a verified rollback; any other failure keeps its snapshot for recovery. A provisioner's

@@ -91,6 +91,7 @@ Environment:
   BASALT_CONTEXT=65536              (maximum context tokens, up to 999999)
   BASALT_KV=fp16                    (fp16, int8, q4_0 or k8v4)
   BASALT_KV_RESIDENT=0              (KV cells kept in VRAM; 0 disables RAM streaming)
+  BASALT_VRAM_RESERVE_MIB=700        (VRAM left for graphs and other allocations)
   BASALT_PORT=8080
   BASALT_READY_TIMEOUT=3600         (seconds; the model load is long)
   BASALT_ALLOW_NO_KEY=false         (true: accept an unauthenticated API)
@@ -112,6 +113,7 @@ generate_run_script() {
     args+=( --gpu "$BASALT_GPUS" )
     [[ $BASALT_KV == fp16 ]] || args+=( --kv "$BASALT_KV" )
     (( BASALT_KV_RESIDENT == 0 )) || args+=( --kv-resident "$BASALT_KV_RESIDENT" )
+    [[ $BASALT_VRAM_RESERVE_MIB == 700 ]] || args+=( --vram-reserve-mib "$BASALT_VRAM_RESERVE_MIB" )
     if [[ $BASALT_ALLOW_NO_KEY != true ]]; then args+=( --api-key "$api_key" ); fi
     local part
     {
@@ -147,13 +149,14 @@ settings_fingerprint() {
     # unchanged rerun stays a no-op instead of rebuilding and reloading.
     if [[ $BASALT_KV != fp16 ]]; then printf 'kv=%s\n' "$BASALT_KV"; fi
     if [[ $BASALT_KV_RESIDENT != 0 ]]; then printf 'kv_resident=%s\n' "$BASALT_KV_RESIDENT"; fi
+    if [[ $BASALT_VRAM_RESERVE_MIB != 700 ]]; then printf 'vram_reserve_mib=%s\n' "$BASALT_VRAM_RESERVE_MIB"; fi
 }
 
 # The settings that decide how Basalt is built and launched. save_settings
 # records them after every successful install or upgrade, so a failed upgrade
 # can roll back to what last worked rather than relaunching with the settings
 # that failed (including another model).
-SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_KV BASALT_KV_RESIDENT BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
+SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_KV BASALT_KV_RESIDENT BASALT_VRAM_RESERVE_MIB BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
@@ -169,6 +172,8 @@ validate_settings() {
             die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than BASALT_CONTEXT.'
         [[ $BASALT_KV != k8v4 ]] || die 'BASALT_KV=k8v4 cannot be combined with BASALT_KV_RESIDENT.'
     fi
+    [[ $BASALT_VRAM_RESERVE_MIB =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_VRAM_RESERVE_MIB >= 128 )) ||
+        die 'BASALT_VRAM_RESERVE_MIB must be at least 128 MiB (Linux minimum).'
     [[ $BASALT_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_PORT <= 65535 )) || die 'Invalid BASALT_PORT.'
     [[ $BASALT_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'BASALT_ALLOW_NO_KEY must be true or false.'
     [[ $CUDA_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || die 'Invalid CUDA_VERSION.'
@@ -197,6 +202,7 @@ load_settings() {
     # fp16, all-VRAM behavior when reading either saved record format.
     [[ -v found[BASALT_KV] ]] || found[BASALT_KV]=fp16
     [[ -v found[BASALT_KV_RESIDENT] ]] || found[BASALT_KV_RESIDENT]=0
+    [[ -v found[BASALT_VRAM_RESERVE_MIB] ]] || found[BASALT_VRAM_RESERVE_MIB]=700
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -218,6 +224,7 @@ fingerprint_env() {
         -e 's/^context=/BASALT_CONTEXT=/p' \
         -e 's/^kv=/BASALT_KV=/p' \
         -e 's/^kv_resident=/BASALT_KV_RESIDENT=/p' \
+        -e 's/^vram_reserve_mib=/BASALT_VRAM_RESERVE_MIB=/p' \
         -e 's/^port=/BASALT_PORT=/p' \
         -e 's/^cuda_version=/CUDA_VERSION=/p' \
         -e 's/^allow_no_key=/BASALT_ALLOW_NO_KEY=/p' "$1"
@@ -924,6 +931,7 @@ BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
 BASALT_KV=${BASALT_KV:-fp16}
 BASALT_KV_RESIDENT=${BASALT_KV_RESIDENT:-0}
+BASALT_VRAM_RESERVE_MIB=${BASALT_VRAM_RESERVE_MIB:-700}
 BASALT_PORT=${BASALT_PORT:-8080}
 BASALT_READY_TIMEOUT=${BASALT_READY_TIMEOUT:-3600}
 BASALT_ALLOW_NO_KEY=${BASALT_ALLOW_NO_KEY:-false}

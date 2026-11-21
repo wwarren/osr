@@ -72,6 +72,13 @@ describe 'repository pins are found'
 assert_ne 'DeepSeek Harness pin' '' "$(tables repo_default dsh)"
 assert_ne 'Honcho pin' '' "$(tables repo_default honcho)"
 assert_eq 'OpenCode pin' "$(sed -n 's/^DEFAULT_OPENCODE_VERSION=//p' "$ROOT/targets/opencode/install-target.sh")" "$(tables repo_default opencode)"
+assert_ne 'LiteLLM pin (the router row)' '' "$(tables pinned_release router)"
+assert_ne 'AirLLM pin' '' "$(tables pinned_release airllm)"
+assert_ne 'hcom pin' '' "$(tables pinned_release hcom)"
+for target in $(tables eval 'printf "%s\n" "${TARGET_ORDER[@]}"') router open-webui hcom; do
+    [[ -n $(tables upstream_spec "$target") || -n $(tables eval "printf '%s' \"\${UPSTREAM_UNPINNED[$target]:-}\"") ||
+       $target == hermes ]] && _pass "$target is in the versions table" || _fail "$target is in the versions table" 'an UPSTREAM, UPSTREAM_SHOWN or UPSTREAM_UNPINNED entry' 'none'
+done
 
 # --- Mocked runs ---------------------------------------------------------------------
 
@@ -133,6 +140,10 @@ case $cmd in
         shift 3
         case $1 in
             sh)
+                # The versions table's probe: <id>.installed is what the CT runs.
+                if [[ $3 == *osr-installed-version* ]]; then
+                    [[ ! -e $MOCK/$id.installed ]] || cat "$MOCK/$id.installed"; exit 0
+                fi
                 if [[ $3 == *osr-hcom-relay* ]]; then
                     [[ -e $MOCK/$id.hcom ]] || exit 3
                     cat "$MOCK/$id.hcom"; exit 0
@@ -301,7 +312,7 @@ plan=$(sed -n '/==== Plan ====/,$p' <<< "$out")
 assert_contains 'plans the upgrade' 'install-target.sh --upgrade' "$plan"
 [[ $(grep -n '^ollama' <<< "$plan" | cut -d: -f1) -lt $(grep -n '^strata' <<< "$plan" | cut -d: -f1) ]] &&
     _pass 'ollama before strata' || _fail 'ollama before strata' 'TARGET_ORDER' "$plan"
-assert_eq 'changes nothing' '' "$(grep -E 'snapshot|push|env' "$tmp/mock/pct.log")"
+assert_eq 'changes nothing' '' "$(grep -E '^[^ ]+ (snapshot|push) | -- env ' "$tmp/mock/pct.log")"
 
 describe 'successful upgrade'
 reset_mock
@@ -607,7 +618,7 @@ assert_contains 'a channel stays' 'keeps DSH_VERSION=latest' "$(in_tool latest_p
 assert_contains 'a newer release stays' 'newer than the latest upstream 0.3.0' "$(in_tool latest_pin_case 0.4.0)"
 assert_eq 'nothing when already there' '|' "$(in_tool latest_pin_case 0.3.0)"
 
-describe 'upstream releases: shown beside the pin, asked, and given to the installer'
+describe 'versions: installed and upstream releases shown beside the pin, asked, and given to the installer'
 ollama_pin=$(sed -n 's/^readonly OLLAMA_DEFAULT_VERSION=//p' "$ROOT/targets/ollama/install-target.sh")
 strata_pin=$(sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$ROOT/targets/strata/install-target.sh")
 strata_tip=$(printf 'c%.0s' {1..40})
@@ -617,10 +628,18 @@ upstream_fixtures() {
     upstream https://api.github.com/repos/Niko1221/Strata/commits/main "$strata_tip"
 }
 reset_mock; upstream_fixtures
+echo 0.30.0 > "$tmp/mock/252.installed"
+printf 'e%.0s' {1..40} > "$tmp/mock/251.installed"
 run_tool '' --dry-run
-table=$(sed -n '/==== Upstream releases ====/,/==== Plan ====/p' <<< "$out")
-assert_contains 'Ollama: the pin and the newest release (no pre-release or draft)' "$(printf '%-18s %-24s %s' ollama "$ollama_pin" v99.0.0)" "$table"
-assert_contains 'Strata: the pinned commit and the tip of main' "$(printf '%-18s %-24s %s' strata "${strata_pin:0:12}" "main @ ${strata_tip:0:12}")" "$table"
+table=$(sed -n '/==== Versions ====/,/==== Plan ====/p' <<< "$out")
+assert_contains 'the table has an installed column' "$(printf '%-18s %-6s %-22s %-22s %s' COMPONENT CT INSTALLED PINNED 'LATEST UPSTREAM')" "$table"
+assert_contains 'Ollama: installed, the pin and the newest release (no pre-release or draft)' "$(printf '%-18s %-6s %-22s %-22s %s' ollama 252 0.30.0 "$ollama_pin" v99.0.0)" "$table"
+assert_contains 'Strata: the installed commit (shortened), the pinned commit and the tip of main' "$(printf '%-18s %-6s %-22s %-22s %s' strata 251 "$(printf 'e%.0s' {1..12})" "${strata_pin:0:12}" "main @ ${strata_tip:0:12}")" "$table"
+rm "$tmp/mock/252.installed"; echo 'not a version; rm -rf /' > "$tmp/mock/251.installed"
+run_tool '' --dry-run
+table=$(sed -n '/==== Versions ====/,/==== Plan ====/p' <<< "$out")
+assert_contains 'nothing recorded: ?' "$(printf '%-18s %-6s %-22s' ollama 252 '?')" "$table"
+assert_contains 'and anything that is not a version is not shown' "$(printf '%-18s %-6s %-22s' strata 251 '?')" "$table"
 assert_not_contains 'a dry run plans the pins' 'latest upstream)' "$(sed -n '/==== Plan ====/,$p' <<< "$out")"
 reset_mock; upstream_fixtures
 run_tool 'l\np\ny\n'
@@ -695,6 +714,15 @@ assert_contains 'Hermes is listed' 'hermes update (never past a HERMES_COMMIT pi
 assert_contains 'and stays by default' 'Hermes itself stays at its installed version' "$out"
 run_tool '' --dry-run --only hermes --latest hermes
 assert_contains '--latest hermes is --update-hermes' 'then hermes update and a restart' "$out"
+# A pin whose upstream is shown but not offered (hcom, AirLLM, the router's LiteLLM).
+reset_mock
+conf 287 'ai;ai-tools;osr-target;hermes'; state 287 hermes-gateway osr-hcom-relay
+echo target=hermes > "$tmp/mock/287.hcom"; echo 0.7.30 > "$tmp/mock/287.installed"
+upstream 'https://api.github.com/repos/aannoo/hcom/releases?per_page=50' '[{"tag_name": "v9.0.0"}]'
+run_tool '' --dry-run --only hcom
+assert_contains 'hcom: installed, pin and latest' "$(printf '%-18s %-6s %-22s %-22s %s' hcom 287 0.7.30 "$(sed -n "s/.*== 'hcom \([^']*\)'.*/\1/p" "$ROOT/targets/hcom/install-target.sh")" 'v9.0.0 (not offered: this run installs the pin)')" "$out"
+run_tool '' --dry-run --only hcom --latest hcom
+assert_contains '--latest refuses it' 'hcom has no pinned upstream release here' "$out"
 # Components with no pin here are shown, not asked about.
 conf 286 'ai;ai-tools;osr-target;openclaw'; state 286 openclaw-gateway
 run_tool '' --dry-run --only openclaw
