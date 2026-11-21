@@ -64,7 +64,8 @@ never downgraded. Gitea and Mattermost releases are not pinned here: their setup
 is re-applied (accounts, token and webhook kept) and their version stays.
 Hermes Agent itself is not pinned either: its integration (units, dispatcher,
 settings) is upgraded and Hermes stays at its installed version unless
---update-hermes is given (never past a HERMES_COMMIT pin).
+--update-hermes is given or an interactive run chooses latest (the default;
+never past a HERMES_COMMIT pin).
 Stopped CTs are left alone unless --include-stopped.
 A llama.cpp target installed before the monitor dashboard existed gets it
 (llama-dashboard, TCP 8082); the plan and summary say so.
@@ -78,8 +79,9 @@ Before the plan it lists, for every CT it will upgrade, the version installed
 there now, the release pinned here (tested with this repository) and the
 newest upstream release (looked up on GitHub, PyPI or npm). Where the
 upstream one is newer, or a CT runs something the pin would change, a run on
-a terminal asks: the pin (p, the default and the answer for --yes), the latest
-upstream (l, when it is newer), or keep what is installed (k), which skips
+a terminal asks: the pin (p, the answer for --yes), the latest upstream (l,
+the default when offered), or keep what is installed (k, the default when
+already at the latest), which skips
 every CT of that component in this run (--skip does that unattended). (The router's row is its LiteLLM; it,
 AirLLM and hcom are listed but not offered: they install their pins.) A commit the installer must check
 (ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
@@ -114,6 +116,10 @@ Options:
   --update-hermes       also run `hermes update` in each Hermes CT (not one
                         pinned with HERMES_COMMIT) and restart its gateway and
                         dashboard; checked and rolled back like the rest
+  --colibri-model       ask for each Colibri CT whether to serve another model
+                        after its upgrade (needs a terminal); without it, the
+                        served model is kept, as for every other model target
+                        (change it any time with provision-lxc.sh --reconfigure)
   --latest LIST         install the latest upstream release instead of the pin
                         for these components (comma-separated, or all) without
                         asking; hermes here means --update-hermes
@@ -1488,14 +1494,20 @@ in_release_list() {
     return 1
 }
 
-# ask_release TEXT pk|plk: RELEASE_ANSWER pinned (p, the default), latest (l,
-# offered with plk only) or keep (k).
+# ask_release TEXT pk|plk DEFAULT: RELEASE_ANSWER pinned (p), latest (l,
+# offered with plk only) or keep (k). DEFAULT is shown in uppercase.
 RELEASE_ANSWER=''
 ask_release() {
-    local hint='[P/k]'
-    [[ $2 == plk ]] && hint='[P/l/k]'
+    local hint='[P/k]' default=${3:-p}
+    if [[ $2 == plk ]]; then
+        case $default in
+            l) hint='[p/L/k]' ;;
+            k) hint='[p/l/K]' ;;
+            *) hint='[P/l/k]' ;;
+        esac
+    fi
     while true; do
-        ask "$1 $hint " p
+        ask "$1 $hint " "$default"
         case ${REPLY,,} in
             p|pin|pinned) RELEASE_ANSWER=pinned; return 0 ;;
             l|latest) if [[ $2 == plk ]]; then RELEASE_ANSWER=latest; return 0; fi ;;
@@ -1515,6 +1527,21 @@ installed_list() {
     done
     if (( ${#found[@]} == 1 )); then printf '%s\n' "${found[0]% in CT *}"
     else (IFS=,; printf '%s\n' "${found[*]}" | sed 's/,/, /g'); fi
+}
+
+# installed_at_latest TARGET: all CTs being considered already run the newest
+# upstream release. Commit-based targets report the short commit instead.
+installed_at_latest() {
+    local t=$1 i v found=false
+    [[ -n ${REL_LATEST[$t]:-} ]] || return 1
+    for i in "${!I_TARGET[@]}"; do
+        [[ ${I_TARGET[$i]} == "$t" && -z ${I_RESULT[$i]} ]] || continue
+        found=true
+        v=${I_INSTALLED[$i]:-?}
+        [[ ${v#v} == "${REL_LATEST[$t]#v}" ||
+           ( -n ${REL_COMMIT[$t]:-} && $v == "${REL_COMMIT[$t]:0:12}" ) ]] || return 1
+    done
+    $found
 }
 
 # installed_differs TARGET: does a CT of TARGET run a known version other than
@@ -1545,7 +1572,7 @@ choose_release() {
         $UPDATE_HERMES && return 0
         if in_release_list hermes "$LATEST"; then UPDATE_HERMES=true; return 0; fi
         if $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then return 0; fi
-        ask_release "hermes: upgrade its integration with Hermes itself at its installed commit (p), also update Hermes with hermes update (l), or keep $(installed_list hermes) and skip its upgrade (k)?" plk
+        ask_release "hermes: upgrade its integration with Hermes itself at its installed commit (p), also update Hermes with hermes update (l), or keep $(installed_list hermes) and skip its upgrade (k)?" plk l
         case $RELEASE_ANSWER in
             latest) UPDATE_HERMES=true ;;
             keep) REL_CHOICE[$t]=keep ;;
@@ -1563,7 +1590,12 @@ choose_release() {
         text="$(component_label "$t"): install the pinned $(pinned_label "$t") (p)"
         if $offered; then text+=", the latest upstream $(latest_label "$t") (l)"; fi
         text+=", or keep $(installed_list "$t") and skip its upgrade (k)?"
-        if $offered; then ask_release "$text" plk; else ask_release "$text" pk; fi
+        if $offered; then
+            if installed_at_latest "$t"; then ask_release "$text" plk k
+            else ask_release "$text" plk l; fi
+        else
+            ask_release "$text" pk
+        fi
         REL_CHOICE[$t]=$RELEASE_ANSWER
     fi
     [[ ${REL_CHOICE[$t]} != latest ]] ||
@@ -1637,7 +1669,7 @@ decide_releases() {
         done
     fi
     if $offered && $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY; then
-        note 'Without --dry-run, a run asks for each component with a newer upstream release, or a CT the pin would change: pinned (the default), latest, or keep it as installed and skip it. This plan uses the pins.'
+        note 'Without --dry-run, a run asks for each component with a newer upstream release, or a CT the pin would change: pinned, latest (the default when offered), or keep it as installed and skip it (the default when already at the latest). This plan uses the pins.'
     fi
     for t in "${targets[@]}"; do choose_release "$t"; done
     for i in "${!I_TARGET[@]}"; do
@@ -1738,13 +1770,19 @@ needs_webui_token() {
     esac
 }
 
-# decide_colibri_model ITEM: ask whether this Colibri CT should serve another
-# model after its upgrade (the menu of targets/colibri/model-select.sh, with
-# the CT's memory, GPU, free disk and current model). Unattended runs and
-# dry runs keep the served model.
+# decide_colibri_model ITEM: with --colibri-model, ask whether this Colibri CT
+# should serve another model after its upgrade (the menu of
+# targets/colibri/model-select.sh, with the CT's memory, GPU, free disk and
+# current model). Without it, like every other model target, the served model
+# is kept and nothing is asked (provision-lxc.sh --reconfigure changes it).
+# Unattended runs and dry runs keep the served model.
 decide_colibri_model() {
     local i=$1 id=${I_CT[$1]} label
-    $INTERACTIVE || return 0
+    $ASK_COLIBRI_MODEL || return 0
+    if ! $INTERACTIVE; then
+        note "Colibri CT $id keeps its model: --colibri-model asks on a terminal, and this run asks nothing."
+        return 0
+    fi
     if ! declare -F colibri_choose_model >/dev/null; then
         # shellcheck source=targets/colibri/model-select.sh
         source "$REPO_ROOT/targets/colibri/model-select.sh"
@@ -2265,7 +2303,7 @@ cleanup() {
 }
 
 main() {
-    DRY_RUN=false LIST_ONLY=false ASSUME_YES=false ON_FAILURE='' KEEP_PINS=false INCLUDE_STOPPED=false UPDATE_HERMES=false
+    DRY_RUN=false LIST_ONLY=false ASSUME_YES=false ON_FAILURE='' KEEP_PINS=false INCLUDE_STOPPED=false UPDATE_HERMES=false ASK_COLIBRI_MODEL=false
     PINNED_ONLY=false LATEST=''
     SNAPSHOTS=true REQUIRE_SNAPSHOT=false KEEP_SNAPSHOTS=false NOTIFY=true ONLY='' SKIP='' NODES='' WEBUI_TOKEN=''
     HCOM_MQTT_CT='' HCOM_MATTERMOST_CT=''
@@ -2284,6 +2322,7 @@ main() {
             --on-failure=*) ON_FAILURE=${1#*=} ;;
             --keep-pins) KEEP_PINS=true ;;
             --update-hermes) UPDATE_HERMES=true ;;
+            --colibri-model) ASK_COLIBRI_MODEL=true ;;
             --pinned) PINNED_ONLY=true ;;
             --latest) [[ -n ${2:-} ]] || die '--latest needs components (or all).'; LATEST=$2; shift ;;
             --latest=*) LATEST=${1#*=}; [[ -n $LATEST ]] || die '--latest needs components (or all).' ;;

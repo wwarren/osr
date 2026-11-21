@@ -3438,12 +3438,17 @@ rm -f "$_f"
 # ── container clone ───────────────────────────────────────────────────────────
 describe verify_config_clone
 _vtree="$(mktemp -d)"; _vclone="$(mktemp -d)"
-mkdir -p "${_vtree}/install" "${_vtree}/services/osr-router" "${_vclone}/install" "${_vclone}/services/osr-router"
+mkdir -p "${_vtree}/install" "${_vtree}/services/osr-router" "${_vtree}/services/temperature-exporter" "${_vtree}/tools" \
+  "${_vclone}/install" "${_vclone}/services/osr-router" "${_vclone}/services/temperature-exporter" "${_vclone}/tools"
 echo "tool v2" > "${_vtree}/install/manage-model-servers.sh"
 echo "router v2" > "${_vtree}/services/osr-router/router.py"
+echo "temperature exporter v2" > "${_vtree}/services/temperature-exporter/exporter.py"
+echo "temperature setup v2" > "${_vtree}/tools/setup-temperature-exporter.sh"
 echo "A=1" > "${_vtree}/router.env"        # not installer-owned: never checked
 cp "${_vtree}/install/manage-model-servers.sh" "${_vclone}/install/"
 cp "${_vtree}/services/osr-router/router.py" "${_vclone}/services/osr-router/"
+cp "${_vtree}/services/temperature-exporter/exporter.py" "${_vclone}/services/temperature-exporter/"
+cp "${_vtree}/tools/setup-temperature-exporter.sh" "${_vclone}/tools/"
 # pct exec <id> -- CMD...: run CMD here, against the fake clone.
 mock_script pct <<'EOF'
 [ "$1" = exec ] && { shift 3; exec "$@"; }

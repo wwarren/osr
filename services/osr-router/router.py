@@ -880,7 +880,7 @@ def parse_tier_models(text: str) -> dict:
     for line in (text or "").splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if not line[0].isspace():
+        if not line[0].isspace() and not (in_list and line.startswith("-")):
             flush()
             item, item_indent = None, None
             in_list = line.split("#", 1)[0].strip() == "model_list:"

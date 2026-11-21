@@ -122,6 +122,10 @@ flowchart LR
 The four core services run in one unprivileged LXC (default 2 vCPU, 4 GB,
 32 GB) as the non-login account `osr-router`. Prometheus runs in the same
 CT as `prometheus`, and Grafana runs there as `grafana`.
+When metrics are enabled, a separate `osr-temperature-exporter.service` runs
+on the Proxmox host. Prometheus in the router CT scrapes its protected port
+9408 for host CPU and GPU temperature gauges. The router process itself does
+not read host sensors.
 
 ```mermaid
 flowchart TB
@@ -212,7 +216,7 @@ On `127.0.0.1:4000` only (no master key; the loopback binding is its access
 control), in its own hash-locked venv because `litellm[proxy]` pins
 fastapi/uvicorn versions that conflict with the router's. It is the fallback
 dispatch path and serves the non-chat passthrough. `manage-model-servers`
-generates `litellm_config.yaml` with one deployment per (tier, host), each
+generates `litellm_config.yaml` with one deployment per (tier, host, model), each
 kind's provider (`ollama/`, `lm_studio/`, `openai/`) and token reference,
 `latency-based-routing` and cross-tier fallbacks. `router_settings` is passed
 to `litellm.Router` as keyword arguments (checked against the pinned
@@ -264,8 +268,10 @@ webhook check without delaying host alerts.
 The **keep-alive maintainer** exists because Ollama's OpenAI endpoint ignores
 `keep_alive`. It runs in its own thread (a slow load never delays health
 checks) and touches only Ollama hosts, all of them side by side, so one
-host's cold load does not hold back the others. A host gets each of its tier
-models once, in tier order. If loading one unloads another (`/api/ps` no
+host's cold load does not hold back the others. A host gets each model that a
+tier deployment in `litellm_config.yaml` names on it, once, in file order (the
+file is read on every pass; without it, each tier's `MODEL_<TIER>` list on the
+tier's hosts). If loading one unloads another (`/api/ps` no
 longer lists it), the host cannot hold its tiers together: from then on only
 its resident tier models are refreshed (the first is loaded when none is),
 instead of reloading each on every pass; see
@@ -318,7 +324,8 @@ true`); a tool request whose candidates all lack tools gets `no-tool-model`
 | **Tools** | On a tool request, models known to lack tools are excluded (unless nothing else is left); `+tool_match` for reported support over unknown. Support comes from Ollama's `/api/show` capabilities (also the llama.cpp bridge's `MODEL_CAPABILITIES` and AirLLM), LM Studio's `trained_for_tool_use`, and `tool_kinds` in `router.ini` for the `/v1/models` kinds (all six Strata-style kinds by default; their text models count as capable, image generators not). Shown as `tools` in `/routing/inventory` |
 | **Context length** | Recorded in `/routing/inventory`, not scored: Ollama the smaller of model limit and configured `num_ctx`; the llama.cpp bridge its per-slot context; AirLLM its window; the `/v1/models` kinds `context_length`, `max_model_len`, `context_window` or `meta.n_ctx`. Ollama's `/api/show` answer is cached per model digest for `show_cache_seconds` (3600; 60 s for a server that lists no digest, such as the llama.cpp bridge, whose settings can change unseen), keeping the last good answer. It can overstate served context; the agent and Honcho dispatchers use it (§17.1). Beside it, `served_context_length` is set only when the value is what the server serves now (LM Studio's loaded instance, a `num_ctx`, the bridge's slot, AirLLM's window, the `/v1/models` kinds), never a model's own limit; `/v1/models` advertises it as `context_length` for a name every server of which reports one |
 | **Load** | `−busy_penalty` (0.03) for each request this router has in flight on the server (counted from sending it until its body is relayed, it fails or the client leaves; what agents or other clients send a server directly is not seen). An equally good idle server therefore wins, and a busy server that leads only by `loaded_bonus` gives way once the lead is within `tie_epsilon` (from its second request with the defaults). `busy_penalty = 0` turns it off |
-| **Tie order** | Candidates within `tie_epsilon` are tried least busy first, then the one the conversation used last (affinity), otherwise in rotation. For a tool request only the same model on several hosts takes part, so an agent loop keeps one model: the one its task has been using, while that is among the tied |
+| **Tier models** | With `[balancing] tier_models = true` (default), a model that `litellm_config.yaml` assigns to the requested class's tier (one deployment per tier, host and model: `set-model`, `set-server-model`, `add-model`) fits that band whatever its size (fit 1.0, distance 0), takes no within-band size bias, and gets `+tier_member` (0.2, above `prefer_larger`). A tier's models therefore tie with each other and rank before models that are only the right size, so `auto` and the tier alias rotate a class's requests across all of them and their hosts. Names compare case-insensitively, with `:latest` the same as no tag. The file (`tier_config`, default beside `router.ini`) is read again when its mtime changes, checked on every discovery refresh; `/routing/inventory` reports `tier_models` and `/routing/explain` each candidate's `tiers` |
+| **Tie order** | Candidates within `tie_epsilon` are tried least busy first, then the one the conversation used last (affinity), otherwise in rotation. For a tool request only the same model on several hosts takes part, so an agent loop keeps one model: the one its task has been using, while that is among the tied. When the tied models are all models of the requested tier and affinity is on, each new task takes the next of them in rotation and keeps it through its affinity |
 | **Affinity** | A conversation prefers the server and model that answered it last, for `sticky_seconds` (1800) after that answer, so its prompt cache is reused and its model does not change between equal choices. It only orders tied candidates: a better score or a less busy server still wins, and the conversation then stays with that one. Conversations are told apart by a hash of how they began (through the first assistant reply once there is one, so two that open alike differ from their second turn); at most 4096 are remembered. A named model's hosts are ordered the same way. `sticky_seconds = 0` turns it off |
 
 Sizes come from `details.parameter_size` (Ollama), `params_string` (LM Studio)
@@ -445,10 +452,13 @@ Seeded at `install/manage-model-servers.sh` and symlinked to
 * **New hosts are identified before they are accepted** (§15.3) and must list
   models (`--no-probe` overrides). Model tags are checked on the affected
   servers before they are written.
-* **Models are per (tier, server)**, as in LiteLLM's model list. Regeneration
-  keeps each pair's tag and the whole `router_settings` block; fallbacks are
-  rebuilt from existing tiers. A tier's tag governs only the LiteLLM path and
-  keep-alive pinning.
+* **Models are per (tier, server)**, as in LiteLLM's model list, and a pair
+  may hold several (`set-model` / `set-server-model` take a comma list;
+  `add-model` / `remove-model` change one), each its own deployment.
+  Regeneration keeps each pair's tags and the whole `router_settings` block;
+  fallbacks are rebuilt from existing tiers. A tier's models govern the
+  LiteLLM path and keep-alive pinning, and lead that tier's discovery ranking
+  (§5.2 Tier models).
 * The env rewrite keeps `0640 root:osr-router`; secret keys are refused in
   `env/router.env` and written to `secrets.env`. Anything `router.ini` omits
   uses `router.py`'s defaults. `apply` and `commit` also remove settings older
@@ -528,7 +538,8 @@ are created on the node running the installer, as are all other new CTs. They
 come first and supply their URL, token and webhook as prompt defaults. It then
 seeds missing configuration in Gitea (or ships a local tree), creates the
 router CT, clones and applies the configuration, starts the four core services,
-then attempts the local Prometheus and Grafana setup;
+then attempts the local Prometheus and Grafana setup and a host temperature
+exporter with a second authenticated scrape;
 a failed router build removes its half-built CT. Every new CT's ID defaults
 to the cluster's next free ID (`pvesh get /cluster/nextid`); the installer
 steps past IDs it has already given out in the run, since none of its CTs
@@ -573,6 +584,7 @@ service account before its venv is built.
 | 8080 | Open WebUI | `0.0.0.0` | LAN UI (port chosen at install) |
 | 4000 | LiteLLM | `127.0.0.1` | CT-local only |
 | 9090 | OSR Prometheus | `127.0.0.1` | CT-local scrape store and query API; 15-second authenticated scrape, 7-day/512-MB block retention |
+| 9408 | Host temperature exporter | Proxmox bridge IPv4 | Router CT Prometheus → host CPU/GPU sensors; bearer token and router source IP required |
 | 3000 | Grafana in router CT | `0.0.0.0` | Browser dashboard with login; installer adds a trusted-CIDR firewall rule when enabled |
 | 443 | Cloud APIs; subscription gateway | Outbound | LiteLLM → providers; router → gateway (any HTTPS port, or loopback HTTP) |
 | 11434 / 1234 / 8080 / 8093 | Model hosts | Outbound | Router, LiteLLM, monitor, agent and Honcho dispatchers → pool |

@@ -610,7 +610,9 @@ good idle server is used first. Among equal choices a conversation keeps the
 server and model that answered it last (its prompt cache is there); the rest
 rotate. `[balancing]` in `router.ini` sets both (`busy_penalty`,
 `sticky_seconds`; 0 turns either off). A named model is used if available; `auto` and tier aliases let the
-router choose; embedding models are never used for chat. Connect errors,
+router choose; embedding models are never used for chat. The models assigned
+to a tier ([Several models in one tier](#several-models-in-one-tier)) are that
+tier's first choice, whatever their size. Connect errors,
 timeouts, 404s, 5xx and tool-support rejections try the next candidate until
 streaming starts; other 400s go back to the client. With discovery off or an
 empty inventory, LiteLLM serves static tiers (`X-Router-Mode: litellm`).
@@ -678,8 +680,6 @@ goes through the router (not what agents send a server directly).
 | `osr_request_duration_seconds` | `mode`, `model`, `server` | Histogram: the same requests, until the last byte of the body |
 | `osr_in_flight_requests`, `osr_server_up`, `osr_server_models` | `server` (`osr_server_up` also `kind`) | Per model server: the router's requests in flight, up (1) or down (0), models listed |
 | `osr_inventory_age_seconds`, `osr_remembered_conversations`, `osr_start_time_seconds` | — | Seconds since the last discovery poll, conversations with a remembered server, start time |
-| `osr_cpu_temperature_celsius` | `driver`, `sensor` | CPU sensor temperatures on the Proxmox host running the router |
-| `osr_gpu_temperature_celsius` | `vendor`, `device`, `sensor` | NVIDIA, AMD or Intel GPU temperatures on that host, where the driver exposes a temperature sensor |
 
 ```yaml
 scrape_configs:
@@ -707,6 +707,9 @@ The dashboard also graphs host CPU and GPU temperatures in Celsius. The
 installer starts a small exporter on the Proxmox host at port 9408 and adds a
 second authenticated Prometheus scrape in the router CT. It reads Linux
 `hwmon` CPU and AMD/Intel GPU sensors plus `nvidia-smi` for NVIDIA GPUs.
+That host endpoint supplies `osr_cpu_temperature_celsius{driver,chip,sensor}` and
+`osr_gpu_temperature_celsius{vendor,device,sensor}`. These series are served by
+the host exporter, not by the router's own `/metrics` endpoint.
 Unavailable sensors have no series; the router CT's virtual CPU temperature is
 not used. The exporter accepts requests only from the router CT's IP and with
 a separate bearer key. If the Proxmox host firewall is enabled, allow TCP 9408
@@ -714,8 +717,7 @@ from the router CT IP to the host bridge IP. The scrape key stays outside Git
 in `/etc/osr-temperature-exporter/token` on the host and
 `/etc/prometheus/osr-sensors-key` in the CT.
 
-Open
-`http://<ct-ip>:3000` and sign in as `admin`. A new Grafana database starts
+Open `http://<ct-ip>:3000` and sign in as `admin`. A new Grafana database starts
 with a random password, kept in `/etc/grafana/osr.env` (root-readable). The
 installer, `setup-metrics.sh install` and `tools/upgrade-all.sh` print the
 address, user name and password at the end, ready to copy; to see them again:
@@ -739,9 +741,11 @@ pct exec <CT_ID> -- bash /app/config-repo/install/setup-metrics.sh install
 ```
 
 To add host temperatures to an existing metrics installation, run this on the
-Proxmox host from an updated OSR checkout:
+Proxmox host from an updated OSR checkout. Refresh the dashboard in the CT
+first so its CPU and GPU panels are provisioned:
 
 ```bash
+pct exec <router-ct-id> -- bash /app/config-repo/install/setup-metrics.sh install
 CT_ID=<router-ct-id> BRIDGE=<host-bridge> ROUTER_IP=<router-ct-ip> \
   bash tools/setup-temperature-exporter.sh
 ```
@@ -795,6 +799,8 @@ manage-model-servers remove 10.0.0.55 --apply                # by address or lis
 manage-model-servers set-tier large 10.0.0.54 10.0.0.55 --apply
 manage-model-servers set-model large qwen3:32b --apply       # every server in the tier
 manage-model-servers set-server-model large 10.0.0.54 llama3.3:70b --apply   # one server
+manage-model-servers add-model xlarge qwen3:235b --apply     # one more model in a tier
+manage-model-servers remove-model xlarge qwen3:235b --apply
 manage-model-servers set-keepalive 2h --apply
 manage-model-servers set-api-key [key|--generate|--off]
 manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi, colibri
@@ -809,10 +815,46 @@ manage-model-servers clear-lock [--force]
 
 Servers are keyed by URL, so removing one never re-points a tier. Models are
 set per (tier, server) and checked on the server first; pass full Ollama names
-without `ollama/` (e.g. `smtek/Qwen3.8-27B:Q3_K_XL-16gb`). A tier's tag drives
-only the LiteLLM fallback and keep-alive pinning; discovery picks from the live
-inventory. `commit` pushes with the deploy token from `secrets.env` (replace
-with `set-token`).
+without `ollama/` (e.g. `smtek/Qwen3.8-27B:Q3_K_XL-16gb`). A tier's models
+drive the LiteLLM fallback and keep-alive pinning, and are the tier's first
+choice in discovery routing (below). `commit` pushes with the deploy token from
+`secrets.env` (replace with `set-token`).
+
+### Several models in one tier
+
+A tier can hold several models, on one server or spread over several. Each is
+offered by name in Open WebUI's model list (from `/v1/models`), and `auto` and
+the tier alias spread the tier's requests across all of them:
+
+```bash
+manage-model-servers set-tier xlarge 10.0.0.54 maya://10.0.0.9 10.0.0.56 --apply
+manage-model-servers add-model xlarge llama3.3:70b --apply          # on every xlarge server that has it
+manage-model-servers add-model xlarge glm-5.3-flash maya://10.0.0.9 --apply   # on the server named
+manage-model-servers set-server-model xlarge 10.0.0.56 qwen3:235b,deepseek-r1:671b --apply
+manage-model-servers remove-model xlarge deepseek-r1:671b --apply
+manage-model-servers list                                            # one row per server, every model on it
+```
+
+`set-model` and `set-server-model` take a comma list; `add-model` adds one
+model, on the servers named or else on every server of the tier that lists it
+(`--no-probe`: on all of them); `remove-model` takes one out, and a server
+keeps at least one. Each model becomes its own LiteLLM deployment under the
+tier alias.
+
+In discovery routing (`router.ini [balancing] tier_models = true`, the
+default) the models assigned to a tier fit it whatever their size, score alike
+and get `[weights] tier_member` (0.2) ahead of any model that is only the
+right size. A request of that class therefore takes them in turn across every
+server serving one of them, the least busy first. A conversation keeps its
+model and server for `sticky_seconds`; an agent task (a request with tools)
+keeps one model while each new task takes the next. Code, vision and tool
+needs still decide first, and a resident model still wins over one that would
+have to load (`loaded_bonus`), so keep them all loaded (`set-keepalive`) or
+give each its own host. The router reads the assignments from
+`litellm_config.yaml` and follows a change without a restart;
+`/routing/inventory` shows them under `tier_models`, and `/routing/explain`
+lists each candidate's `tiers`. `tier_models = false` goes back to sizes
+alone.
 
 ### Server kinds
 
@@ -884,7 +926,8 @@ Ollama unloads idle models after ~5 minutes and its OpenAI endpoint ignores
 30m|2h|-1|0|<seconds> --apply`), LiteLLM sends `keep_alive` on native calls and
 the monitor calls each up Ollama host's `/api/chat` with an empty message every
 240 s (`monitor.ini [keep_alive] refresh_seconds` or
-`KEEP_ALIVE_REFRESH_SECONDS`), keeping each tier's model loaded. Blank (the
+`KEEP_ALIVE_REFRESH_SECONDS`), keeping each tier's models loaded: every model
+`litellm_config.yaml` assigns to a tier on that host. Blank (the
 default) sends nothing and leaves each server's own setting in charge.
 
 Hosts are refreshed side by side. A host that serves several tiers with
@@ -979,7 +1022,7 @@ settings or rollback changes:
 |---|---|---|
 | Router | `update-router-services.sh --host --no-push`, pushed once checks pass | Updater never touches `env/*.env`, tiers, `litellm_config.yaml`, ini files or secrets |
 | Open WebUI | `set-webui-version <pin> --apply` (never a downgrade) | `apply`'s snapshot and `webui.db` backup |
-| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say). An interactive run asks for each Colibri CT whether to serve another model afterwards (default no); a yes shows the model menu and runs `install-target.sh --model` after its upgrade | Each target's settings record or env files; the served Colibri model unless another is chosen |
+| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say). No model question, as for every other model target; with `--colibri-model`, an interactive run asks for each Colibri CT whether to serve another model afterwards (default no), and a yes shows the model menu and runs `install-target.sh --model` after its upgrade | Each target's settings record or env files; the served Colibri model unless `--colibri-model` chooses another |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request); then its Open WebUI connection is enabled for all users (needs the admin token; skipped without it) | Its recorded port, passed back; workspace limits kept by the installer; `OPEN_TERMINAL_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true`. Honcho's Open WebUI connection is enabled for all users | Recorded answers; an Open WebUI admin key is requested once when needed; `HONCHO_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
@@ -1047,10 +1090,12 @@ MQTT's row is the CT's Mosquitto package, which follows Debian.
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
 
 Where the upstream release is newer (or a different commit), a run on a
-terminal asks `[P/l/k]` for each: the pin (`p`, the default and the answer for
-`--yes`), the latest upstream (`l`), or keep what is installed (`k`). Where
-there is no newer upstream release but a CT runs a version the pin would
-change, it asks `[P/k]`. `k` skips every CT of that component for this run;
+terminal asks `[p/L/k]` for each: the pin (`p`, the answer for `--yes`), the
+latest upstream (`l`, the default), or keep what is installed (`k`). When
+every CT of a component already runs the latest release, the prompt instead
+defaults to `k` and shows `[p/l/K]`. Where there is no newer upstream release
+but a CT runs a version the pin would change, it asks `[P/k]`. `k` skips every
+CT of that component for this run;
 the plan and summary show them as `kept` (not a failure). Hermes is asked the
 same way: `p` upgrades its integration, `l` also runs `hermes update`, `k`
 skips it. To keep one CT of several, or to keep a component unattended, use

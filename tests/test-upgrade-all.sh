@@ -644,15 +644,19 @@ assert_not_contains 'a dry run plans the pins' 'latest upstream)' "$(sed -n '/==
 reset_mock; upstream_fixtures
 run_tool 'l\np\ny\n'
 assert_eq 'asked, then upgraded' 0 "$rc"
-assert_contains 'asks with the pin as the default' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep ? and skip its upgrade (k)? [P/l/k]" "$out"
+assert_contains 'asks with latest as the default' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep ? and skip its upgrade (k)? [p/L/k]" "$out"
 assert_contains 'the plan shows the choice' 'install-target.sh --upgrade with OLLAMA_VERSION=v99.0.0 (latest upstream)' "$out"
 assert_contains 'and warns it is untested' 'ollama: installing the latest upstream release v99.0.0, which this repository has not tested' "$out"
 assert_file_contains 'the installer gets the latest' 'INSTALL 252 env OLLAMA_VERSION=v99.0.0 bash /root/ollama-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
 assert_eq 'the pinned one gets nothing' '' "$(grep '^INSTALL 251' "$tmp/mock/installs.log" | grep STRATA_COMMIT)"
 reset_mock; upstream_fixtures
+run_tool '\np\ny\n'
+assert_eq 'Enter chooses latest when a newer release is available' upgraded "$(summary_line ollama 252)"
+assert_file_contains 'the default latest reaches the installer' 'INSTALL 252 env OLLAMA_VERSION=v99.0.0 bash /root/ollama-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
+reset_mock; upstream_fixtures
 run_tool '' --yes
 assert_eq 'unattended: the pins, unasked' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
-assert_not_contains 'and no question' '[P/' "$out"
+assert_not_contains 'and no question' '[p/' "$out"
 reset_mock; upstream_fixtures
 run_tool '' --yes --latest strata
 assert_file_contains '--latest names one' "INSTALL 251 env STRATA_COMMIT=$strata_tip bash" "$tmp/mock/installs.log"
@@ -664,7 +668,7 @@ assert_contains 'every one' "with STRATA_COMMIT=$strata_tip (latest upstream)" "
 reset_mock; upstream_fixtures
 run_tool 'y\n' --pinned
 assert_eq '--pinned: no question either' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
-assert_not_contains '--pinned asks nothing' '[P/' "$out"
+assert_not_contains '--pinned asks nothing' '[p/' "$out"
 reset_mock
 upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
 run_tool 'y\n' --only ollama
@@ -679,7 +683,7 @@ reset_mock; upstream_fixtures
 echo 0.30.0 > "$tmp/mock/252.installed"
 run_tool 'k\np\ny\n'
 assert_eq 'k: the run succeeds' 0 "$rc"
-assert_contains 'k shows what is kept' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep 0.30.0 and skip its upgrade (k)? [P/l/k]" "$out"
+assert_contains 'k shows what is kept' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep 0.30.0 and skip its upgrade (k)? [p/L/k]" "$out"
 assert_contains 'the plan says it is kept' 'kept: not upgraded: kept at 0.30.0 (k)' "$out"
 assert_eq 'kept in the summary' kept "$(summary_line ollama 252)"
 assert_eq 'not installed' '' "$(grep '^INSTALL 252' "$tmp/mock/installs.log")"
@@ -689,6 +693,18 @@ run_tool 'k\np\ny\n'
 assert_contains 'several CTs: each one'"'"'s version' 'keep 0.30.0 in CT 252, 0.31.0 in CT 254 and skip its upgrade (k)?' "$out"
 assert_eq 'all of them kept' 'kept kept' "$(summary_line ollama 252) $(summary_line ollama 254)"
 assert_eq 'and the run still succeeds' 0 "$rc"
+# Enter keeps a CT already at latest, even though the repository pin is older.
+reset_mock; upstream_fixtures
+echo 99.0.0 > "$tmp/mock/252.installed"
+run_tool '\n' --only ollama
+assert_contains 'latest installed makes keep the default' "or keep 99.0.0 and skip its upgrade (k)? [p/l/K]" "$out"
+assert_eq 'Enter keeps a current CT' kept "$(summary_line ollama 252)"
+assert_eq 'a kept CT is not installed' '' "$(grep '^INSTALL 252' "$tmp/mock/installs.log")"
+# If one of several CTs is behind, Enter still installs latest for the group.
+echo 0.30.0 > "$tmp/mock/254.installed"
+run_tool '\ny\n' --only ollama
+assert_contains 'one older CT makes latest the default' '[p/L/k]' "$out"
+assert_file_contains 'the older CT gets latest' 'INSTALL 254 env OLLAMA_VERSION=v99.0.0 bash' "$tmp/mock/installs.log"
 # No newer upstream, but the pin would change the CT: p or k.
 reset_mock
 upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
@@ -722,7 +738,8 @@ printf 'a%.0s' {1..40} > "$tmp/mock/282.installed"
 assert_eq 'hermes k: kept' 'kept|not upgraded: kept at aaaaaaaaaaaa (k)|false' "$(HERMES_ANSWER=k in_tool hermes_keep_case 2>/dev/null)"
 assert_eq 'hermes l: hermes update' '||true' "$(HERMES_ANSWER=l in_tool hermes_keep_case 2>/dev/null)"
 assert_eq 'hermes p: the integration only' '||false' "$(HERMES_ANSWER=p in_tool hermes_keep_case 2>/dev/null)"
-assert_contains 'the question' 'or keep aaaaaaaaaaaa and skip its upgrade (k)? [P/l/k]' "$(HERMES_ANSWER=p in_tool hermes_keep_case 2>&1)"
+assert_contains 'the question' 'or keep aaaaaaaaaaaa and skip its upgrade (k)? [p/L/k]' "$(HERMES_ANSWER=p in_tool hermes_keep_case 2>&1)"
+assert_eq 'Hermes Enter runs hermes update' '||true' "$(HERMES_ANSWER='' in_tool hermes_keep_case 2>/dev/null)"
 reset_mock
 export UPSTREAM_DOWN=1
 run_tool '' --dry-run
@@ -1455,7 +1472,7 @@ assert_contains 'saying the cluster filesystem would not take it' 'Cannot create
 assert_contains 'and how to check quorum' 'pvecm status' "$out"
 assert_not_contains 'not blaming another run' 'Another upgrade-all.sh holds' "$out"
 
-describe 'a Colibri CT can change its model after its upgrade'
+describe 'a Colibri CT keeps its model unless --colibri-model asks'
 colibri_ct() {
     reset_mock
     conf 270 'ai;ai-model;osr-target;colibri'; state 270 colibri
@@ -1464,7 +1481,18 @@ colibri_ct() {
         > "$tmp/mock/270.manifest"
 }
 colibri_ct
-run_tool 'y\nglm-5.3\ny\n' --only colibri --pinned
+run_tool 'y\n' --only colibri --pinned
+assert_eq 'a plain run succeeds' 0 "$rc"
+assert_not_contains 'a plain run does not ask about the model' 'Serve another model' "$out"
+assert_not_contains 'nor shows the model menu' 'glm-5.3 ' "$out"
+assert_contains 'it still upgrades' 'bash /root/colibri-target-deploy/install-target.sh --upgrade' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
+assert_not_contains 'and keeps the model' 'install-target.sh --model' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
+assert_eq 'reported as upgraded' upgraded "$(summary_line colibri 270)"
+colibri_ct
+run_tool 'y\n' --only colibri --pinned --dry-run
+assert_not_contains 'a plain dry run says nothing about the model' 'whether to change it' "$out"
+colibri_ct
+run_tool 'y\nglm-5.3\ny\n' --only colibri --pinned --colibri-model
 assert_eq 'the run succeeds' 0 "$rc"
 assert_contains 'it names the served model' 'Colibri CT 270 serves Qwen3-Coder-30B-A3B (19.4 GB)' "$out"
 assert_contains 'the menu shows what fits' 'glm-5.3                 GLM-5.3                        419.3 GB  RAM  16- 24 GiB  fits' "$out"
@@ -1475,15 +1503,16 @@ assert_contains 'then the model change' 'NONINTERACTIVE=true COLIBRI_MODEL_ID=gl
 assert_eq 'in that order' '--upgrade --model' "$(sed -n 's/.*install-target.sh \(--[a-z]*\)$/\1/p' <<< "$install_lines" | paste -sd' ')"
 assert_eq 'reported as upgraded' upgraded "$(summary_line colibri 270)"
 colibri_ct
-run_tool 'n\ny\n' --only colibri --pinned
+run_tool 'n\ny\n' --only colibri --pinned --colibri-model
 assert_eq 'keeping the model succeeds' 0 "$rc"
 assert_not_contains 'no model change without a yes' 'install-target.sh --model' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
 colibri_ct
-run_tool '' --only colibri --pinned --yes
+run_tool '' --only colibri --pinned --yes --colibri-model
 assert_not_contains 'an unattended run never asks' 'Serve another model' "$out"
+assert_contains 'and says why the model is kept' 'Colibri CT 270 keeps its model: --colibri-model asks on a terminal' "$out"
 assert_not_contains 'nor changes the model' 'install-target.sh --model' "$(cat "$tmp/mock/installs.log" 2>/dev/null)"
 colibri_ct
-run_tool 'y\n' --only colibri --pinned --dry-run
+run_tool 'y\n' --only colibri --pinned --dry-run --colibri-model
 assert_contains 'a dry run only says it would ask' 'without --dry-run, a run asks whether to change it' "$out"
 
 summary

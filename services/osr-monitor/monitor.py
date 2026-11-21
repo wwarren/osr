@@ -121,8 +121,15 @@ if KEEP_ALIVE_MODE == "auto":
 else:
     KEEP_ALIVE_ENABLED = KEEP_ALIVE_MODE in ("true", "yes", "1", "on")
 
-# tier -> model tag, so we pin only the models this system actually fronts
+# Where manage-model-servers writes the tier deployments, one per (tier,
+# server, model): what is pinned on each host. Read on every keep-alive pass,
+# so a set-model or add-model is followed without a restart.
+LITELLM_CONFIG = (os.getenv("MONITOR_LITELLM_CONFIG") or "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(MONITOR_INI)), "litellm_config.yaml")
+
+# tier -> model tag(s), so we pin only the models this system actually fronts
 # rather than everything a host happens to have pulled (which would thrash VRAM).
+# Only used when litellm_config.yaml cannot be read (a comma list is allowed).
 TIER_MODELS = {
     "fast": (os.getenv("MODEL_FAST", "") or "").strip(),
     "medium": (os.getenv("MODEL_MEDIUM", "") or "").strip(),
@@ -474,13 +481,65 @@ def pin_model(url: str, model: str) -> bool:
         return False
 
 
+def _yaml_scalar(value: str) -> str:
+    value = value.split(" #", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value.strip()
+
+
+def configured_ollama_models(path: str = None):
+    """Ollama host URL -> the model tags its tier deployments name, in file
+    order, from litellm_config.yaml's model_list (ollama/<tag> at api_base
+    <host>). None when the file cannot be read. The file is generated, so a
+    small line reader does."""
+    try:
+        with open(path or LITELLM_CONFIG, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    plan, item, in_list = {}, None, False
+
+    def flush():
+        model, base = (item or {}).get("model", ""), (item or {}).get("api_base", "").rstrip("/")
+        if model.startswith("ollama/") and base and server_kind(base) == "ollama":
+            models = plan.setdefault(base, [])
+            if model[len("ollama/"):] not in models:
+                models.append(model[len("ollama/"):])
+
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace() and not (in_list and line.startswith("-")):
+            flush()
+            item, in_list = None, line.split("#", 1)[0].strip() == "model_list:"
+            continue
+        if not in_list:
+            continue
+        text = line.strip()
+        if text.startswith("- ") and line.index("-") <= 2:
+            flush()
+            item, text = {}, text[2:].strip()
+        key, sep, value = text.partition(":")
+        if sep and item is not None and key in ("model", "api_base") and key not in item:
+            item[key] = _yaml_scalar(value)
+    flush()
+    return plan
+
+
 def keep_alive_plan() -> dict:
-    """Ollama host URL -> the tier models to keep loaded there, in tier order.
-    A model that two of a host's tiers share is listed once."""
+    """Ollama host URL -> the tier models to keep loaded there: every model a
+    tier deployment names on it (manage-model-servers set-model, set-server-
+    model, add-model), from litellm_config.yaml. Without that file, each tier's
+    MODEL_<TIER> on each host of the tier, in tier order. A model that two of a
+    host's tiers share is listed once."""
+    configured = configured_ollama_models()
+    if configured is not None:
+        return {url: models for url, models in configured.items() if models}
     plan = {}
     for tier, urls in BACKENDS.items():
-        model = TIER_MODELS.get(tier, "")
-        if not model:
+        tags = [t.strip() for t in TIER_MODELS.get(tier, "").split(",") if t.strip()]
+        if not tags:
             continue
         for url in urls:
             if server_kind(url) != "ollama":
@@ -488,8 +547,9 @@ def keep_alive_plan() -> dict:
                 # on its own idle TTL (configure that in LM Studio itself).
                 continue
             models = plan.setdefault(url, [])
-            if model not in models:
-                models.append(model)
+            for model in tags:
+                if model not in models:
+                    models.append(model)
     return plan
 
 

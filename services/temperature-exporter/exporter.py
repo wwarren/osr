@@ -42,7 +42,8 @@ def collect(hwmon_root="/sys/class/hwmon", nvidia_smi="nvidia-smi"):
             continue
         if driver not in CPU_DRIVERS and driver not in GPU_DRIVERS:
             continue
-        pci = re.search(r"(?<![0-9a-f])([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])", str(base.resolve()), re.I)
+        resolved = base.resolve()
+        pci = re.search(r"(?<![0-9a-f])([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])", str(resolved), re.I)
         for sensor in sorted(base.glob("temp*_input")):
             value = _temperature(sensor)
             if value is None:
@@ -53,7 +54,9 @@ def collect(hwmon_root="/sys/class/hwmon", nvidia_smi="nvidia-smi"):
             except OSError:
                 label = prefix
             if driver in CPU_DRIVERS:
-                labels = f'driver={_label(driver)},sensor={_label(label)}'
+                chip = (pci.group(1).lower() if pci else
+                        resolved.parent.parent.name if resolved.parent.name == "hwmon" else base.name)
+                labels = f'driver={_label(driver)},chip={_label(chip)},sensor={_label(label)}'
                 lines.append(f"osr_cpu_temperature_celsius{{{labels}}} {value:g}")
             else:
                 # PCI address remains stable if hwmon enumeration changes.

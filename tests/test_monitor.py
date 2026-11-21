@@ -647,3 +647,71 @@ def test_router_monitor_and_manager_agree_on_server_kinds(monkeypatch):
     assert router.SERVER_KINDS == monitor.SERVER_KINDS
     assert _manager_kinds() == router.SERVER_KINDS
     assert list(_manager_kinds()) == list(router.SERVER_KINDS)   # detection order too
+
+
+# --- keep-alive follows litellm_config.yaml --------------------------------------------
+TIER_YAML = f"""model_list:
+  - model_name: fast
+    litellm_params:
+      model: ollama/qwen3:4b
+      api_base: {A}
+      keep_alive: 2h
+  - model_name: xlarge
+    litellm_params:
+      model: ollama/llama3.3:70b
+      api_base: {B}
+  - model_name: xlarge
+    litellm_params:
+      model: "ollama/qwen3:235b"  # a second model in the same tier
+      api_base: {B}/
+  - model_name: xlarge
+    litellm_params:
+      model: openai/glm-5.3-flash
+      api_base: http://10.0.0.9:8080/v1
+  - model_name: large
+    litellm_params:
+      model: ollama/qwen3:235b
+      api_base: {B}
+  - model_name: openai/gpt-4.1
+    litellm_params:
+      model: openai/gpt-4.1
+router_settings:
+  routing_strategy: latency-based-routing
+"""
+
+
+def test_keep_alive_pins_every_configured_model_of_each_host(monkeypatch, tmp_path):
+    config = tmp_path / "litellm_config.yaml"
+    config.write_text(TIER_YAML)
+    module = load_monitor(monkeypatch, MONITOR_LITELLM_CONFIG=str(config),
+                          MODEL_FAST="stale:1b", OLLAMA_KEEP_ALIVE="2h")
+    assert module.keep_alive_plan() == {A: ["qwen3:4b"], B: ["llama3.3:70b", "qwen3:235b"]}
+    # Read again on every pass: a set-model or add-model needs no restart.
+    config.write_text(TIER_YAML.replace("ollama/qwen3:4b", "ollama/qwen3:8b"))
+    assert module.keep_alive_plan()[A] == ["qwen3:8b"]
+
+
+def test_keep_alive_config_beside_monitor_ini_by_default(monkeypatch, tmp_path):
+    ini = tmp_path / "monitor.ini"
+    ini.write_text((ROOT / "services/osr-monitor/monitor.ini").read_text())
+    (tmp_path / "litellm_config.yaml").write_text(TIER_YAML)
+    monkeypatch.delenv("MONITOR_LITELLM_CONFIG", raising=False)
+    module = load_monitor(monkeypatch, MONITOR_INI=str(ini))
+    assert module.LITELLM_CONFIG == str(tmp_path / "litellm_config.yaml")
+    assert module.keep_alive_plan()[B] == ["llama3.3:70b", "qwen3:235b"]
+
+
+def test_keep_alive_without_the_config_uses_tier_model_lists(monkeypatch, tmp_path):
+    module = load_monitor(monkeypatch, MONITOR_LITELLM_CONFIG=str(tmp_path / "missing.yaml"),
+                          BACKEND_XLARGE=C, MODEL_XLARGE="llama3.3:70b, qwen3:235b")
+    assert module.configured_ollama_models() is None
+    assert module.keep_alive_plan()[C] == ["llama3.3:70b", "qwen3:235b"]
+
+
+def test_configured_ollama_models_reads_a_zero_indent_list(monkeypatch, tmp_path):
+    module = load_monitor(monkeypatch)
+    config = tmp_path / "c.yaml"
+    config.write_text(f"model_list:\n- model_name: fast\n  litellm_params:\n    model: ollama/a:1b\n"
+                      f"    api_base: {A}\n- litellm_params:\n    api_base: {A}\n    model: ollama/b\n"
+                      f"  model_name: fast\nrouter_settings:\n  model: ollama/nope\n")
+    assert module.configured_ollama_models(str(config)) == {A: ["a:1b", "b"]}

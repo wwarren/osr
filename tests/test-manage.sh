@@ -109,7 +109,7 @@ assert_contains "documents --dry-run"    "--dry-run"           "$out"
 # option has at least one example line, so running the tool with no
 # arguments shows how to use all of it.
 for c in list status discover add remove set-tier set-model set-server-model \
-         models set-keepalive apply commit set-token set-api-key test-alert \
+         add-model remove-model models set-keepalive apply commit set-token set-api-key test-alert \
          set-webhook set-webui-version clear-lock; do
   assert_contains "example for $c" "manage-model-servers.sh $c" "$out"
 done
@@ -478,6 +478,37 @@ describe current_tier_tag
 assert_eq "first tag for the tier" "qwen3:32b" "$(current_tier_tag large)"
 assert_eq "fast tier"              "qwen2.5-coder:7b" "$(current_tier_tag fast)"
 assert_eq "unknown alias is empty" ""          "$(current_tier_tag nope)"
+
+describe current_tier_tags
+assert_eq "every tag of the tier, in file order" "qwen3:32b,mixtral:8x7b" "$(current_tier_tags large)"
+assert_eq "one-model tier"         "llama3.3:70b" "$(current_tier_tags xlarge)"
+assert_eq "unknown alias is empty" ""             "$(current_tier_tags nope)"
+
+describe model_list_arg
+assert_eq "one model"             "qwen3:32b"         "$(model_list_arg qwen3:32b)"
+assert_eq "a list, trimmed, duplicates dropped" "a:1b,smtek/B:Q3,c" "$(model_list_arg ' a:1b, smtek/B:Q3,,a:1b ,c')"
+assert_fail "an empty list"       bash -c "source '$FUNCS'; model_list_arg ' , '"
+assert_fail "a provider prefix"   bash -c "source '$FUNCS'; model_list_arg 'a,ollama/b'"
+assert_fail "a space in a name"   bash -c "source '$FUNCS'; model_list_arg 'a b'"
+
+describe show_tags
+assert_eq "prefixes each tag"      "ollama/a, ollama/b:7b" "$(show_tags ollama a,b:7b)"
+assert_eq "an empty list is unset" "openai/<unset>"        "$(show_tags openai '')"
+
+describe tags_contain
+assert_ok   "finds a member"            tags_contain "a,b:7b,c" "b:7b"
+assert_fail "a prefix is not a member"  tags_contain "a,b:7b" "b"
+assert_fail "an empty list has none"    tags_contain "" "a"
+
+describe pair_tags
+reset_repo
+assert_eq "the pair's own tag"    "mixtral:8x7b" "$(pair_tags large http://10.0.0.53:11434)"
+assert_eq "a pair without one takes the tier's first" "qwen3:32b" "$(pair_tags large http://10.0.0.99:11434)"
+PAIR_MODEL_OVERRIDE["large|http://10.0.0.53:11434"]="x:1b,y:2b"
+assert_eq "a pending pair override wins" "x:1b,y:2b" "$(pair_tags large http://10.0.0.53:11434)"
+TIER_MODEL_OVERRIDE[large]="z:3b"
+assert_eq "then a pending tier override" "z:3b" "$(pair_tags large http://10.0.0.52:11434)"
+reset_repo
 
 # ── reachability ──────────────────────────────────────────────────────────────
 describe probe_server
@@ -1184,6 +1215,93 @@ assert_eq "namespaced per-server tag survives regeneration" \
   "$namespaced_tag" "$(current_pair_tag large http://10.0.0.53:11434)"
 assert_fail "still rejects a provider-prefixed third-party model" cmd_set_server_model large 10.0.0.53 "ollama/${namespaced_tag}"
 reset_repo; NO_PROBE=true
+
+describe "several models in one tier"
+reset_repo; NO_PROBE=true
+cmd_set_model xlarge 'llama3.3:70b,qwen3:235b' >/dev/null 2>&1
+assert_eq "set-model writes one deployment per model" \
+  "llama3.3:70b,qwen3:235b" "$(current_pair_tag xlarge http://10.0.0.54:11434)"
+assert_eq "both under the tier alias" "2" "$(grep -c '^  - model_name: xlarge$' "$LITELLM_YAML")"
+TIER_MODEL_OVERRIDE=()
+regenerate_litellm >/dev/null 2>&1
+assert_eq "a model list survives regeneration" \
+  "llama3.3:70b,qwen3:235b" "$(current_pair_tag xlarge http://10.0.0.54:11434)"
+out="$(cmd_set_model xlarge 'llama3.3:70b,qwen3:235b' 2>&1)"
+assert_contains "the same list again changes nothing" "Nothing to do" "$out"
+cmd_set_server_model large http://10.0.0.53:11434 'a:1b,b:2b' >/dev/null 2>&1
+assert_eq "set-server-model takes a list" "a:1b,b:2b" "$(current_pair_tag large http://10.0.0.53:11434)"
+assert_eq "the other host keeps its model" "qwen3:32b" "$(current_pair_tag large http://10.0.0.52:11434)"
+out="$(cmd_list false)"
+assert_contains "list shows every model of a pair" "ollama/a:1b, ollama/b:2b" "$out"
+reset_repo; NO_PROBE=false
+mock_script curl <<'EOF'
+case "$*" in
+  *"10.0.0.52"*) echo '{"models":[{"name":"qwen3:32b"},{"name":"big:70b"}]}';;
+  *"10.0.0.53"*) echo '{"models":[{"name":"mixtral:8x7b"}]}';;
+  *) exit 7;;
+esac
+EOF
+assert_fail "set-model refuses a list one host lacks" cmd_set_model large 'qwen3:32b,big:70b'
+assert_fail "set-server-model refuses a missing model in the list" \
+  cmd_set_server_model large http://10.0.0.53:11434 'mixtral:8x7b,big:70b'
+assert_eq "a refused list writes nothing" "0" "$(grep -c 'big:70b' "$LITELLM_YAML" || true)"
+reset_repo; NO_PROBE=true
+
+describe tier_servers_arg
+reset_repo
+assert_eq "every server of the tier" "http://10.0.0.52:11434 http://10.0.0.53:11434" \
+  "$(tier_servers_arg large | paste -sd' ' -)"
+assert_eq "the ones named, by address or number" "http://10.0.0.53:11434" "$(tier_servers_arg large 3)"
+assert_fail "a server outside the tier" tier_servers_arg fast 10.0.0.53
+
+describe cmd_add_model
+reset_repo; NO_PROBE=false
+mock_script curl <<'EOF'
+case "$*" in
+  *"10.0.0.52"*) echo '{"models":[{"name":"qwen3:32b"},{"name":"big:70b"}]}';;
+  *"10.0.0.53"*) echo '{"models":[{"name":"mixtral:8x7b"}]}';;
+  *) exit 7;;
+esac
+EOF
+cmd_add_model large big:70b >/dev/null 2>&1
+assert_eq "adds the model where the tier has it" "qwen3:32b,big:70b" "$(current_pair_tag large http://10.0.0.52:11434)"
+assert_eq "and only there" "mixtral:8x7b" "$(current_pair_tag large http://10.0.0.53:11434)"
+assert_eq "another deployment of the tier" "3" "$(grep -c '^  - model_name: large$' "$LITELLM_YAML")"
+PAIR_MODEL_OVERRIDE=()
+out="$(cmd_add_model large big:70b 2>&1)"
+assert_contains "a model already there changes nothing" "Nothing to do" "$out"
+assert_fail "a named host without the model is refused" cmd_add_model large big:70b 10.0.0.53
+assert_fail "no host of the tier has it"                cmd_add_model large nowhere:1b
+assert_fail "one model at a time"                        cmd_add_model large a:1b,b:2b
+assert_fail "a host outside the tier"                    cmd_add_model fast big:70b 10.0.0.52
+assert_fail "an unknown tier"                            cmd_add_model turbo big:70b
+assert_fail "no model"                                   cmd_add_model large
+NO_PROBE=true; PAIR_MODEL_OVERRIDE=()
+cmd_add_model large solo:7b 10.0.0.53 >/dev/null 2>&1
+assert_eq "--no-probe adds it on the host named" "mixtral:8x7b,solo:7b" "$(current_pair_tag large http://10.0.0.53:11434)"
+PAIR_MODEL_OVERRIDE=()
+cmd_add_model xlarge other:8b >/dev/null 2>&1
+assert_eq "--no-probe without hosts adds it on every host of the tier" \
+  "llama3.3:70b,other:8b" "$(current_pair_tag xlarge http://10.0.0.54:11434)"
+validate_config >/dev/null 2>&1
+assert_ok "the config with several models per tier validates" validate_config
+reset_repo
+
+describe cmd_remove_model
+reset_repo; NO_PROBE=true
+cmd_add_model large extra:9b >/dev/null 2>&1
+PAIR_MODEL_OVERRIDE=()
+cmd_remove_model large extra:9b 10.0.0.52 >/dev/null 2>&1
+assert_eq "removes it from the host named" "qwen3:32b" "$(current_pair_tag large http://10.0.0.52:11434)"
+assert_eq "the other host keeps it" "mixtral:8x7b,extra:9b" "$(current_pair_tag large http://10.0.0.53:11434)"
+PAIR_MODEL_OVERRIDE=()
+cmd_remove_model large extra:9b >/dev/null 2>&1
+assert_eq "without hosts, from every host" "0" "$(grep -c 'extra:9b' "$LITELLM_YAML" || true)"
+PAIR_MODEL_OVERRIDE=()
+assert_fail "a host keeps at least one model" cmd_remove_model large mixtral:8x7b
+assert_fail "a model the tier does not have"  cmd_remove_model large nowhere:1b
+assert_fail "one model at a time"             cmd_remove_model large a:1b,b:2b
+reset_repo
 
 describe resolve_server_arg
 reset_repo
@@ -2292,7 +2410,7 @@ reset_repo
 assert_ok "returns immediately when the config is local" ensure_config_or_forward
 
 describe command_writes
-for c in add remove set-tier set-model set-server-model set-keepalive apply commit \
+for c in add remove set-tier set-model set-server-model add-model remove-model set-keepalive apply commit \
          set-token set-api-key set-cloud-key set-cloud-models set-freellmapi set-comfyui add-comfyui \
          set-lmstudio-token set-strata-token set-webhook set-webui-version; do
   assert_ok "${c} takes the lock" command_writes "$c"

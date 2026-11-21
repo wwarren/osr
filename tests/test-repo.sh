@@ -504,6 +504,9 @@ assert_file_contains "apply refreshes the Prometheus key" 'setup-metrics.sh" syn
 assert_ok "Prometheus is installed without its recommended node exporter" \
   grep -q 'apt-get install -y --no-install-recommends ca-certificates wget prometheus' "$metrics_setup"
 assert_file_contains "the installer can leave the metrics stack out" 'INSTALL_METRICS' "$INSTALLER"
+assert_file_contains "the installer configures host temperatures" 'tools/setup-temperature-exporter.sh' "$INSTALLER"
+assert_file_contains "host sensors have a separate scrape key" 'credentials_file: /etc/prometheus/osr-sensors-key' "$metrics_setup"
+assert_ok "host exporter setup is valid bash" bash -n "${ROOT}/tools/setup-temperature-exporter.sh"
 assert_ok "the firewall rule for Grafana cannot undo a finished install" bash -c \
   "[[ \$(grep -n -- '-dport 3000 -log nolog' '$INSTALLER' | head -1 | cut -d: -f1) -gt \$(grep -n '^trap - ERR' '$INSTALLER' | tail -1 | cut -d: -f1) ]]"
 assert_file_contains "the installer opens Grafana to the trusted CIDR" '-dport 3000 -log nolog' "$INSTALLER"
@@ -527,7 +530,8 @@ expressions = "\n".join(target["expr"] for panel in dashboard["panels"]
 for name in ("osr_requests_total", "osr_upstream_failures_total",
              "osr_response_start_seconds_bucket", "osr_request_duration_seconds_bucket",
              "osr_in_flight_requests", "osr_server_up", "osr_server_models",
-             "osr_inventory_age_seconds", "osr_remembered_conversations"):
+             "osr_inventory_age_seconds", "osr_remembered_conversations",
+             "osr_cpu_temperature_celsius", "osr_gpu_temperature_celsius"):
     assert name in expressions, name
 assert dashboard["uid"] == "osr-router"
 assert len({panel["id"] for panel in dashboard["panels"]}) == len(dashboard["panels"])

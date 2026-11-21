@@ -117,9 +117,10 @@ pct exec <id> -- bash /root/colibri-target-deploy/install-target.sh --model   # 
 reads its memory, GPU line, model directory, free disk and current model, shows
 the menu (Enter keeps the current model, `r` removes it), pushes the current
 deployment files and runs `install-target.sh --model` in the CT. Unattended,
-`COLIBRI_MODEL_ID` is an ID, `keep` or `remove`. `tools/upgrade-all.sh` asks for
-each Colibri CT whether to serve another model after its upgrade (default no;
-unattended and dry runs keep it).
+`COLIBRI_MODEL_ID` is an ID, `keep` or `remove`. `tools/upgrade-all.sh` keeps
+the served model, as it does for every other model target; with
+`--colibri-model` it asks for each Colibri CT whether to serve another model
+after its upgrade (default no; unattended and dry runs keep it).
 
 `install-target.sh --model`:
 
