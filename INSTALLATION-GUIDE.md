@@ -42,7 +42,11 @@ git clone https://github.com/wwarren/osr.git
 cd osr
 ```
 
-If you already have a full checkout, change into its directory instead. Confirm that `open-smart-router-install.sh` and the `targets/` directory are present. Run all following installer commands from this directory. You'll have to make the installer executable with "```chmod +x open-smart-router-install.sh```".
+If you already have a full checkout, change into its directory instead. Confirm that `open-smart-router-install.sh` and the `targets/` directory are present. Run all following installer commands from this directory. You'll have to make the installer executable with:
+
+```
+chmod +x open-smart-router-install.sh
+```
 
 ## 3. Choose the first model server
 
