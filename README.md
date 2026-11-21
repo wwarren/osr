@@ -240,7 +240,7 @@ half-built CT. A service CT that failed setup is kept for `--reconfigure`.
 |---|---|
 | CT | `CT_ID` (next free), `CT_NAME`, `IP_CIDR`, `GATEWAY`, `BRIDGE`, `NAMESERVER`, `STORAGE`, `TEMPLATE_REF`, `TEMPLATE_STORAGE`, `TEMPLATE_MIN_GIB` (2), `CORES` (2), `MEMORY` (4096), `SWAP` (1024), `ROOTFS_GB` (32; ~16 with CPU-only torch) |
 | Firewall | `FIREWALL`, `API_ALLOW_CIDR` (set it with the firewall, or 8000/8080 may be dropped) |
-| Open WebUI | `OPENWEBUI_VERSION` (latest; set a version to pin it), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
+| Open WebUI | `OPENWEBUI_VERSION` (0.13.4; `latest` for the newest release), `OPENWEBUI_PORT` (8080), `OPENWEBUI_PY_VERSION` (3.12), `OPENWEBUI_PY_DIR` (`/opt/python`), `TORCH_CPU_ONLY` (true) |
 | Model servers | `MODEL_SERVER_COUNT`, `MODEL_SERVER_<n>`, `OLLAMA_PORT` (11434), `MODEL_SERVER_MIN`/`_MAX` (1/20) |
 | Tiers | `TIER_FAST_SERVERS` … `TIER_XLARGE_SERVERS` (e.g. `1,3`), `MODEL_FAST` … `MODEL_XLARGE`, `OLLAMA_KEEP_ALIVE` |
 | Gitea | `GITEA_SERVER_URL`, `GITEA_ADMIN_USER`, `GITEA_DEPLOY_TOKEN`, `GITEA_REPO_NAME` (`open-smart-router`), `GITEA_REPO_LEGACY_NAME` (`ollama-smart-router`, used when the default name finds no repository), `GITEA_REPO_OWNER` (auto), `GITEA_REPO_PRIVATE`, `GITEA_VERIFY_TLS` (false) |
@@ -512,12 +512,20 @@ bash tools/webui-images.sh          # on the Proxmox host: make the router Open 
 The ComfyUI provisioner and the OSR installer (for a Colibri CT given an image
 model) set Open WebUI up with `tools/webui-images.py`; `tools/webui-images.sh`
 does it by hand (`--expect-model NAME` waits for a model, `--off` turns it
-off). When Open WebUI 0.12.4 is installed, the helper patches its image picker to
-read `/v1/images/models` from the local router; the installer and version
-manager reapply that patch after pip replaces Open WebUI. Choosing a named
-image model in the picker keeps that live list available. An admin's own
-ComfyUI workflow in Open WebUI is kept unless
-`--replace-custom`. A ComfyUI CT set up before this release still has Open
+off). On Open WebUI 0.13 (the pin), image engines are a list of connections:
+the helper adds the router as one OpenAI connection, `osr-router`, open to all
+users, generation only, listing the `image` alias and the image models the
+router serves at that moment, with the alias as the default model. Rerun it
+after adding an image model so the picker lists it by name; the alias draws
+with it at once anyway. Open WebUI's own upgrade from 0.12 turns the old
+router engine into such a connection (with the alias only), and the helper
+updates that one rather than adding another. A ComfyUI connection with OSR's
+workflow is disabled, as the router draws with that ComfyUI itself. An admin's
+own ComfyUI workflow stays enabled and stays the default unless
+`--replace-custom`. On Open WebUI 0.12.4, set with `OPENWEBUI_VERSION`, the
+helper instead patches its image picker to read `/v1/images/models` from the
+local router, and the installer and version manager reapply that patch after
+pip replaces Open WebUI. A ComfyUI CT set up before this release still has Open
 WebUI drive it directly: `CT_ID=<id> bash targets/comfyui/provision-lxc.sh
 --integrate-only` moves it behind the router.
 
@@ -1015,7 +1023,9 @@ It finds, on every node of the cluster, the router CT (tag `osr-router`),
 each target CT (tag `osr-target` plus the target's name) and each CT with
 hcom, then upgrades them in dependency order: router, Open WebUI, Gitea and Mattermost, model targets,
 ComfyUI and Open Terminal, Honcho, the agents, MQTT, hcom (agents before the
-observer). Each goes through its own supported path, so nothing about its
+observer). Once an upgrade run starts, it adds the `hcom` tag to each detected
+hcom CT that lacks it, keeping its other tags. `--list` and `--dry-run` leave
+tags alone. Each component goes through its own supported path, so nothing about its
 settings or rollback changes:
 
 | Component | Upgraded with | Settings kept by |
@@ -1069,7 +1079,7 @@ header file, never on a command line):
 ```
 COMPONENT          CT     INSTALLED              PINNED                 LATEST UPSTREAM
 router (LiteLLM)   200    1.75.5.post1           1.75.5.post1           1.79.0 (not offered: this run installs the pin)
-open-webui         200    0.11.0                 0.12.4                 0.12.4 (the pin is current)
+open-webui         200    0.11.0                 0.13.4                 0.13.4 (the pin is current)
 ollama             210    0.33.1                 v0.34.4                v0.35.0
 strata             211    0123456789ab           0123456789ab           main @ 89abcdef0123
 hcom               220    0.7.31                 0.7.31                 v0.7.31 (the pin is current)
@@ -1204,13 +1214,17 @@ manage-model-servers set-webui-version                 # pinned / installed / la
 manage-model-servers set-webui-version latest --apply  # or a specific version
 ```
 
-New installs get the latest available Open WebUI release. Set
-`OPENWEBUI_VERSION` to install a specific release; the resulting requirement is
-in `services/open-webui/requirements.txt`. The version manager checks releases
-against PyPI and the venv's Python first, and a failed health check restores
-the previous version and `webui.db`. Upgrade an existing router with
-`set-webui-version latest --apply`. Open WebUI 0.11.1, 0.12.0 and
-0.12.1 migrate the database irreversibly; `apply` keeps a copy in
+New installs get Open WebUI 0.13.4, the pinned release; the pin is in
+`services/open-webui/requirements.txt`. Set `OPENWEBUI_VERSION` to another
+release, or to `latest`. The version manager checks releases against PyPI and
+the venv's Python first, and a failed health check restores the previous
+version and `webui.db`. Upgrade an existing router with
+`set-webui-version 0.13.4 --apply` (or let `tools/upgrade-all.sh` do it).
+0.13 keeps image engines as a list of connections and converts the 0.12
+settings at its first start (see [Image generation](#image-generation)); its new terminal
+features (process output, events, desktop) need a newer Open Terminal than
+the pinned v0.14.0, and plain terminal sessions work as before.
+Open WebUI 0.11.1, 0.12.0 and 0.12.1 migrate the database irreversibly; `apply` keeps a copy in
 `/var/backups/open-smart-router/<timestamp>/openwebui-data/`, but only the
 last `APPLY_BACKUP_KEEP` (5) snapshots are kept, so copy it elsewhere if you
 may roll back later.

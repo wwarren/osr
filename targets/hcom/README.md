@@ -50,7 +50,8 @@ Remove `--dry-run` to install; rerun the same command (or add
 `--reconfigure`) to reconfigure. Credentials move through private `pct
 pull`/`pct push` files, never printed or passed as arguments, and temporary
 copies are removed. The CT needs Python 3.11+ (Debian 12/13, Ubuntu 24.04+),
-including an existing CT used as observer.
+including an existing CT used as observer. After a successful install or
+reconfigure, the CT gains the `hcom` tag if needed; its other tags are kept.
 
 **Firewall.** Hermes and OpenClaw default to `EGRESS=restricted` (private
 addresses dropped). When a CT's firewall has `policy_out: DROP`, the

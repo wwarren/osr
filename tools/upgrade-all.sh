@@ -24,6 +24,7 @@ umask 077
 
 SCRIPT_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -P -- "$SCRIPT_DIR/.." && pwd)
+source "$REPO_ROOT/targets/pve-select.sh"
 # Every node's CT configurations, and corosync's member list (online state
 # and address of each node), both shared by the cluster filesystem.
 PVE_NODES_DIR=${PVE_NODES_DIR:-/etc/pve/nodes}
@@ -623,8 +624,10 @@ discover() {
     done
 
     # hcom lives inside existing CTs (agents, or an observer that may share the
-    # broker CT), so look for its relay unit in every running OSR CT.
+    # broker CT), so look for its relay unit in every running OSR CT. Include
+    # CTs already tagged hcom even if their other target tags have gone missing.
     mapfile -t candidates < <({ printf '%s\n' "${tagged[@]}" "${all_routers[@]}"
+                                 tagged_cts hcom
                                  sed 's/[, ][, ]*/\n/g' <<< "${HCOM_EXTRA_CTS:-}"; } | sed '/^$/d' | sort -nu)
     for id in "${candidates[@]}"; do
         on_listed_node "$id" "$NODES" && node_usable "$id" || continue
@@ -1085,6 +1088,16 @@ run_hcom() {
     instructions=$(info_value "$i" instructions)
     [[ -z $instructions ]] || envs+=("HCOM_INSTRUCTIONS_FILE=$instructions")
     env "${envs[@]}" bash "$REPO_ROOT/targets/hcom/provision-lxc.sh" --reconfigure </dev/null
+}
+
+# Repair tags for every discovered hcom installation on an actual run, even
+# when its component is kept or skipped. This runs only after plan confirmation.
+tag_hcom_cts() {
+    local i
+    for i in "${!I_TARGET[@]}"; do
+        [[ ${I_TARGET[$i]} == hcom ]] || continue
+        pve_ensure_tags "${I_CT[$i]}" hcom
+    done
 }
 
 # Hermes Agent's own code is not pinned by this repository: its provisioner
@@ -2439,6 +2452,8 @@ main() {
     ask_token
     # Fixed from here on: nothing in the run can change or drop it.
     readonly WEBUI_TOKEN
+
+    tag_hcom_cts
 
     for i in "${!I_TARGET[@]}"; do
         if $ABORTED && [[ -z ${I_RESULT[$i]} ]]; then I_RESULT[i]=not-run; I_NOTE[i]='aborted before this one'; fi

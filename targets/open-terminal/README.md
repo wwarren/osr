@@ -72,7 +72,8 @@ internal API is plain HTTP, so keep the network trusted.
 ## Prerequisites
 
 - A running Open WebUI from this repository with the Open Terminal
-  integration (the pinned 0.12.4 has it), either a CT on this Proxmox node or
+  integration (0.12.4 and the pinned 0.13.4 have it; 0.13's process-output,
+  events and desktop features need a newer Open Terminal than v0.14.0), either a CT on this Proxmox node or
   any LXC/VM `root` on this node can reach over SSH.
 - Root on the Proxmox node for the terminal CT, a free CT ID, a downloaded
   Debian 12/13 amd64 template, `rootdir` storage and a static IPv4 address

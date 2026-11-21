@@ -7,6 +7,12 @@ ComfyUI fields changed, and the whole set written back, so every other image
 setting (and a custom workflow an admin made) is kept. The result is then
 checked through Open WebUI's own backend, which also proves that the ComfyUI
 CT's firewall admits the router; on failure the previous settings are restored.
+
+Open WebUI 0.13 keeps image engines as a list of connections
+(IMAGE_CONNECTIONS). There ComfyUI is one comfyui connection (the one with
+this URL, else one with OSR's or the built-in workflow, else a new
+osr-comfyui), open to every user, generation only, and its model becomes the
+default; a custom workflow on it is kept the same way.
 """
 import argparse
 import json
@@ -55,6 +61,10 @@ DEFAULT_VARIANT = "klein-4b"
 KLEIN_WORKFLOW = VARIANTS[DEFAULT_VARIANT]["workflow"]
 KLEIN_MODEL = VARIANTS[DEFAULT_VARIANT]["model"]
 KLEIN_ENCODER = VARIANTS[DEFAULT_VARIANT]["encoder"]
+# Open WebUI 0.13 image connections.
+CONNECTION_ID = "osr-comfyui"
+CONNECTION_NAME = "ComfyUI"
+PUBLIC_GRANTS = [{"principal_type": "user", "principal_id": "*", "permission": "read"}]
 KLEIN_NODES = [
     {"type": "prompt", "key": "text", "node_ids": ["4"]},
     {"type": "model", "key": "unet_name", "node_ids": ["1"]},
@@ -190,6 +200,114 @@ def build_config(config, comfyui, model, size, steps, workflow=KLEIN_WORKFLOW):
     return new
 
 
+def restore_after(base, token, original, comfyui, exc):
+    try:
+        request(f"{base}/config/update", token, original)
+        restored = "the previous image settings were restored"
+    except (RuntimeError, urllib.error.URLError, OSError) as again:
+        restored = f"restoring the previous image settings failed too ({again})"
+    return RuntimeError(f"{exc}. Open WebUI on the router could not use ComfyUI at {comfyui} "
+                        f"(is the router admitted by the ComfyUI CT's firewall?); {restored}")
+
+
+def pick_variant(wanted, workflow_text, custom, comfyui):
+    """The Klein variant: as asked, else the one the workflow is, else the one whose files ComfyUI has."""
+    if wanted != "auto":
+        return wanted
+    try:
+        current = json.loads(workflow_text or "null")
+    except json.JSONDecodeError:
+        current = None
+    variant = next((name for name, item in VARIANTS.items() if current == item["workflow"]), None)
+    if variant is None and not custom:
+        _version, available = comfyui_models(comfyui, KLEIN_WORKFLOW)
+        variant = next((name for name, item in VARIANTS.items()
+                        if item["model"] in available["unet_name"]
+                        and item["encoder"] in available["clip_name"]
+                        and item["vae"] in available["vae_name"]), DEFAULT_VARIANT)
+    return variant or DEFAULT_VARIANT
+
+
+def print_result(version, comfyui, custom, ready, variant, model, selected, missing):
+    print(f"Open WebUI generates images with ComfyUI {version} at {comfyui}.")
+    if custom:
+        print("The existing custom workflow and image settings were preserved.")
+    elif ready:
+        print(f"Image model: {variant}; diffusion file: {model}. Change it under Admin Settings > Images.")
+    else:
+        print(f"Image generation is left off until the {variant} assets are installed:")
+        for name in ([selected["model"]] if not model else []) + missing:
+            print(f"  {name}")
+        print("Download them in the ComfyUI CT with: env COMFYUI_IMAGE_VARIANT="
+              f"{variant} bash /root/comfyui-target-deploy/install-target.sh")
+        print("(klein-9b also needs HF_TOKEN_FILE), then rerun provision-lxc.sh --integrate-only.")
+
+
+def configure_connections(args, base, admin_token, original, comfyui):
+    """Open WebUI 0.13 and later: ComfyUI as one image connection."""
+    connections = [dict(item) for item in original.get("IMAGE_CONNECTIONS") or [] if isinstance(item, dict)]
+    comfy = [item for item in connections if item.get("type") == "comfyui"]
+    existing = (next((item for item in comfy if str(item.get("url") or "").rstrip("/") == comfyui), None)
+                or next((item for item in comfy
+                         if is_default_workflow((item.get("config") or {}).get("workflow"))), None)
+                or {})
+    config = dict(existing.get("config") or {})
+    custom = not is_default_workflow(config.get("workflow"))
+    variant = pick_variant(args.variant, config.get("workflow"), custom, comfyui)
+    selected = VARIANTS[variant]
+    if custom:
+        print("Keeping the custom ComfyUI workflow and its node mapping configured in Open WebUI.")
+    version, models = comfyui_models(comfyui, selected["workflow"], check_klein=not custom)
+    current = (config.get("model_ids") or [""])[0]
+    model = current if custom else choose_model(args.model, current, models["unet_name"], selected["model"])
+    missing = ([] if custom else [name for name, available in
+               ((selected["encoder"], models["clip_name"]), (selected["vae"], models["vae_name"]))
+               if name not in available])
+    ready = True if custom else (bool(model) and not missing)
+    connection_id = existing.get("id") or CONNECTION_ID
+    if connection_id in {item.get("id") for item in connections if item is not existing}:
+        connection_id = f"{CONNECTION_ID}-{len(connections)}"
+    config.update(enable=ready, access_grants=config.get("access_grants") or PUBLIC_GRANTS,
+                  auth_type=config.get("auth_type") or "bearer")
+    if not custom:
+        config.update(workflow=json.dumps(selected["workflow"], indent=2), nodes=KLEIN_NODES,
+                      model_ids=[model] if ready else [],
+                      capabilities={"image_generation": True, "image_edit": False},
+                      size=args.image_size or config.get("size") or "1024x1024",
+                      steps=args.image_steps or config.get("steps") or 4)
+    connection = dict(existing, id=connection_id, name=existing.get("name") or CONNECTION_NAME,
+                      type="comfyui", url=comfyui, key=existing.get("key") or "", config=config)
+    updated = [connection if item is existing else item for item in connections]
+    if not existing:
+        updated.append(connection)
+    new = dict(original, IMAGE_CONNECTIONS=updated)
+    current_default = original.get("IMAGE_GENERATION_DEFAULT_MODEL") or ""
+    if ready:
+        new["ENABLE_IMAGE_GENERATION"] = True
+        if not (custom and current_default.startswith(f"{connection_id}:")):
+            new["IMAGE_GENERATION_DEFAULT_MODEL"] = f"{connection_id}:{model or ''}"
+    elif current_default.startswith(f"{connection_id}:"):
+        new["IMAGE_GENERATION_DEFAULT_MODEL"] = ""
+
+    request(f"{base}/config/update", admin_token, new)
+    try:
+        saved = request(f"{base}/config", admin_token)
+        match = next((item for item in saved.get("IMAGE_CONNECTIONS") or []
+                      if isinstance(item, dict) and item.get("id") == connection_id), None)
+        if match is None or str(match.get("url") or "").rstrip("/") != comfyui:
+            raise RuntimeError(f"Open WebUI did not keep the ComfyUI connection {connection_id!r}")
+        # Open WebUI's backend reaches the URL itself (GET <url>/object_info).
+        request(f"{base}/connections/verify", admin_token, match, expect=list)
+        if ready and not custom:
+            listed = request(f"{base}/models", admin_token, expect=list)
+            if not any(isinstance(item, dict) and item.get("connection_id") == connection_id
+                       and item.get("model") == model for item in listed):
+                raise RuntimeError(f"Open WebUI does not list the diffusion model {model!r}")
+    except (RuntimeError, urllib.error.URLError, OSError) as exc:
+        raise restore_after(base, admin_token, original, comfyui, exc) from exc
+    print_result(version, comfyui, custom, ready, variant, model, selected, missing)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--webui-url", required=True)
@@ -213,26 +331,14 @@ def main(argv=None):
     base = f"{webui}/api/v1/images"
 
     original = request(f"{base}/config", admin_token)
+    if isinstance(original.get("IMAGE_CONNECTIONS"), list):
+        configure_connections(args, base, admin_token, original, comfyui)
+        return
     if "COMFYUI_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
         raise RuntimeError("This Open WebUI's image settings API is not supported "
-                           "(no COMFYUI_BASE_URL in /api/v1/images/config; the router pins Open WebUI 0.12.4)")
+                           "(neither IMAGE_CONNECTIONS nor COMFYUI_BASE_URL in /api/v1/images/config)")
     custom = not is_default_workflow(original.get("COMFYUI_WORKFLOW"))
-    variant = args.variant
-    if variant == "auto":
-        try:
-            current_workflow = json.loads(original.get("COMFYUI_WORKFLOW") or "null")
-        except json.JSONDecodeError:
-            current_workflow = None
-        variant = next((name for name, item in VARIANTS.items()
-                        if current_workflow == item["workflow"]), None)
-        if variant is None and not custom:
-            # A fresh Open WebUI: the variant whose three files ComfyUI has.
-            _version, available = comfyui_models(comfyui, KLEIN_WORKFLOW)
-            variant = next((name for name, item in VARIANTS.items()
-                            if item["model"] in available["unet_name"]
-                            and item["encoder"] in available["clip_name"]
-                            and item["vae"] in available["vae_name"]), DEFAULT_VARIANT)
-        variant = variant or DEFAULT_VARIANT
+    variant = pick_variant(args.variant, original.get("COMFYUI_WORKFLOW"), custom, comfyui)
     selected = VARIANTS[variant]
     if custom:
         print("Keeping the custom ComfyUI workflow and its node mapping configured in Open WebUI.")
@@ -262,26 +368,8 @@ def main(argv=None):
             if not any(isinstance(item, dict) and item.get("id") == model for item in listed):
                 raise RuntimeError(f"Open WebUI does not list the diffusion model {model!r}")
     except (RuntimeError, urllib.error.URLError, OSError) as exc:
-        try:
-            request(f"{base}/config/update", admin_token, original)
-            restored = "the previous image settings were restored"
-        except (RuntimeError, urllib.error.URLError, OSError) as again:
-            restored = f"restoring the previous image settings failed too ({again})"
-        raise RuntimeError(f"{exc}. Open WebUI on the router could not use ComfyUI at {comfyui} "
-                           f"(is the router admitted by the ComfyUI CT's firewall?); {restored}") from exc
-
-    print(f"Open WebUI generates images with ComfyUI {version} at {comfyui}.")
-    if custom:
-        print("The existing custom workflow and image settings were preserved.")
-    elif ready:
-        print(f"Image model: {variant}; diffusion file: {model}. Change it under Admin Settings > Images.")
-    else:
-        print(f"Image generation is left off until the {variant} assets are installed:")
-        for name in ([selected["model"]] if not model else []) + missing:
-            print(f"  {name}")
-        print("Download them in the ComfyUI CT with: env COMFYUI_IMAGE_VARIANT="
-              f"{variant} bash /root/comfyui-target-deploy/install-target.sh")
-        print("(klein-9b also needs HF_TOKEN_FILE), then rerun provision-lxc.sh --integrate-only.")
+        raise restore_after(base, admin_token, original, comfyui, exc) from exc
+    print_result(version, comfyui, custom, ready, variant, model, selected, missing)
 
 
 if __name__ == "__main__":

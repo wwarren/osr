@@ -162,13 +162,18 @@ the ComfyUI fields and writes the full set back (`POST /api/v1/images/config/upd
 * `COMFYUI_IMAGE_SIZE` and `COMFYUI_IMAGE_STEPS` when given (else 1024x1024 and
   4 steps).
 
-Open WebUI's backend then verifies the URL (`POST /api/v1/images/verify` from
-0.11.4, else `/api/v1/images/config/url/verify`) and lists the models, which
-proves the router reaches ComfyUI through the firewall; on failure the previous
-settings are restored and the run fails. Open WebUI 0.11.0 through the pinned
-0.12.4 expects ComfyUI's legacy model-list format, so the integration checks
-the model picker too. Rerun it after an Open WebUI upgrade only if image
-settings must change; it handles both verify endpoints.
+Open WebUI's backend then verifies the URL and lists the models, which proves
+the router reaches ComfyUI through the firewall; on failure the previous
+settings are restored and the run fails. On Open WebUI 0.13 (the pin) ComfyUI
+is one image connection (the one with this URL, else one with OSR's or the
+built-in workflow, else a new `osr-comfyui`), open to all users, generation
+only, with its diffusion file as the model and the default; the check is
+`POST /api/v1/images/connections/verify`. Open WebUI 0.11.0 through 0.12.4
+kept one engine, verified with `POST /api/v1/images/verify` (from 0.11.4, else
+`/api/v1/images/config/url/verify`), and expects ComfyUI's legacy model-list
+format, so the integration checks the model picker too. Open WebUI 0.13
+converts the 0.12 settings itself at its first start; rerun the integration
+after an upgrade only if image settings must change.
 
 The bundled graphs adapt ComfyUI's
 [official Klein text-to-image template](https://docs.comfy.org/tutorials/flux/flux-2-klein).

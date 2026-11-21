@@ -277,7 +277,7 @@ Examples (one or more for every command and option):
 
   Maintenance
     manage-model-servers.sh set-webui-version
-    manage-model-servers.sh set-webui-version 0.12.4 --apply
+    manage-model-servers.sh set-webui-version 0.13.4 --apply
     manage-model-servers.sh set-webui-version latest --apply
     manage-model-servers.sh clear-lock
     manage-model-servers.sh clear-lock --force

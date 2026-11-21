@@ -43,12 +43,21 @@ FRESH = {
     "ENABLE_IMAGE_EDIT": False, "IMAGE_EDIT_ENGINE": "openai", "IMAGE_EDIT_MODEL": "", "IMAGE_EDIT_SIZE": "",
 }
 
+# The shape of GET /api/v1/images/config in Open WebUI 0.13.4: a list of image
+# connections replaced the single engine (USER_PERMISSIONS is not returned).
+FRESH_013 = {
+    "ENABLE_IMAGE_GENERATION": False, "ENABLE_IMAGE_PROMPT_GENERATION": True, "ENABLE_IMAGE_EDIT": False,
+    "IMAGE_GENERATION_DEFAULT_MODEL": "", "IMAGE_EDIT_DEFAULT_MODEL": "", "IMAGE_CONNECTIONS": [],
+}
+REQUIRED_013 = ("ENABLE_IMAGE_GENERATION", "ENABLE_IMAGE_PROMPT_GENERATION", "ENABLE_IMAGE_EDIT")
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     """Open WebUI's admin API under /api/v1/images; the router under /router."""
     config = {}
     images = ["image", "flux2-klein-4b-comfyui"]
-    keep_engine = False        # an Open WebUI that does not save the engine
+    keep_engine = False        # an Open WebUI that does not save the engine (0.13: the connections)
+    required = tuple(FRESH)
     updates = []
     refreshed = 0
 
@@ -93,12 +102,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authorised("admin-secret"):
             return
         if self.path == "/api/v1/images/config/update":
-            missing = set(FRESH) - set(body)
+            missing = set(cls.required) - set(body)
             if missing:
                 self.reply(422, {"detail": f"missing {sorted(missing)}"})
                 return
+            if "IMAGE_CONNECTIONS" in body:
+                ids = [item.get("id") for item in body["IMAGE_CONNECTIONS"]]
+                if len(set(ids)) != len(ids) or any(":" in str(i) for i in ids):
+                    self.reply(400, {"detail": "Image connection IDs must be unique"})
+                    return
             cls.updates.append(copy.deepcopy(body))
-            if cls.keep_engine:
+            if cls.keep_engine and "IMAGE_CONNECTIONS" in body:
+                body = dict(body, IMAGE_CONNECTIONS=cls.config["IMAGE_CONNECTIONS"])
+            elif cls.keep_engine:
                 body = dict(body, IMAGE_GENERATION_ENGINE=cls.config["IMAGE_GENERATION_ENGINE"])
             cls.config = body
             self.reply(200, body)
@@ -119,6 +135,7 @@ class WebuiImagesTest(unittest.TestCase):
 
     def setUp(self):
         Handler.config = copy.deepcopy(FRESH)
+        Handler.required = tuple(FRESH)
         Handler.images = ["image", "flux2-klein-4b-comfyui"]
         Handler.keep_engine = False
         Handler.updates = []
@@ -278,6 +295,160 @@ class WebuiImagesTest(unittest.TestCase):
                          "--router-url", "http://127.0.0.1:9", "--router-secrets", str(self.folder / "secrets.env"),
                          "--wait", "0"])
         self.assertEqual(Handler.updates, [])
+
+
+class WebuiImages013Test(WebuiImagesTest):
+    """Open WebUI 0.13: the router as one image connection; no picker patch."""
+
+    def setUp(self):
+        super().setUp()
+        Handler.config = copy.deepcopy(FRESH_013)
+        Handler.required = REQUIRED_013
+
+    def router_connections(self):
+        return [item for item in Handler.config["IMAGE_CONNECTIONS"]
+                if item["type"] == "openai" and item["url"] == f"{self.base}/router/v1"]
+
+    # The 0.12 cases do not apply to the connections API.
+    test_points_the_openai_engine_at_the_router_alias = None
+    test_no_image_server_leaves_generation_off = None
+    test_an_expected_model_must_be_listed = None
+    test_steps_and_size = None
+    test_a_custom_comfyui_workflow_is_kept = None
+    test_osr_klein_workflow_moves_to_the_router = None
+    test_a_setting_open_webui_does_not_keep_is_restored = None
+    test_off_only_turns_off_the_router_engine = None
+    # Version-independent, run once in the 0.12 class.
+    test_picker_patch_is_repeatable_and_checks_the_upstream_branch = None
+    test_patched_picker_lists_router_models_even_after_choosing_one = None
+    test_router_port_and_key_come_from_its_env_files = None
+
+    def test_adds_the_router_as_one_connection_with_its_models(self):
+        picker_before = (self.folder / "images.py").read_text()
+        text = self.run_script()
+        (connection,) = self.router_connections()
+        self.assertEqual(connection["id"], "osr-router")
+        self.assertEqual(connection["name"], "Open Smart Router")
+        self.assertEqual(connection["key"], "router-key")
+        config = connection["config"]
+        self.assertTrue(config["enable"])
+        self.assertEqual(config["model_ids"], ["image", "flux2-klein-4b-comfyui"])
+        self.assertEqual(config["capabilities"], {"image_generation": True, "image_edit": False})
+        self.assertEqual(config["access_grants"], [{"principal_type": "user", "principal_id": "*", "permission": "read"}])
+        self.assertEqual(config["size"], "1024x1024")
+        self.assertTrue(Handler.config["ENABLE_IMAGE_GENERATION"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "osr-router:image")
+        self.assertTrue(Handler.config["ENABLE_IMAGE_PROMPT_GENERATION"])
+        self.assertEqual((self.folder / "images.py").read_text(), picker_before)   # 0.13 needs no patch
+        self.assertIn("The router draws with: flux2-klein-4b-comfyui", text)
+        self.run_script()
+        self.assertEqual(len(Handler.config["IMAGE_CONNECTIONS"]), 1)   # a rerun updates it
+
+    def test_the_connection_open_webui_migrated_from_0_12_is_updated_in_place(self):
+        migrated = {"id": "4f1c", "name": "OpenAI", "type": "openai", "url": f"{self.base}/router/v1/",
+                    "key": "old-key", "config": {"enable": True, "model_ids": ["image"], "size": "768x768",
+                                                 "params": {"steps": 9}, "access_grants": [{"principal_type": "group",
+                                                 "principal_id": "artists", "permission": "read"}]}}
+        Handler.config.update(IMAGE_CONNECTIONS=[migrated], IMAGE_GENERATION_DEFAULT_MODEL="4f1c:image",
+                              ENABLE_IMAGE_GENERATION=True)
+        self.run_script()
+        (connection,) = Handler.config["IMAGE_CONNECTIONS"]
+        self.assertEqual(connection["id"], "4f1c")
+        self.assertEqual(connection["key"], "router-key")
+        self.assertEqual(connection["config"]["model_ids"], ["image", "flux2-klein-4b-comfyui"])
+        self.assertEqual(connection["config"]["size"], "768x768")
+        self.assertEqual(connection["config"]["params"], {"steps": 9})
+        self.assertEqual(connection["config"]["access_grants"][0]["principal_id"], "artists")   # kept
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "4f1c:image")
+
+    def test_a_second_router_connection_is_dropped(self):
+        twin = {"id": "a", "name": "x", "type": "openai", "url": f"{self.base}/router/v1", "key": "", "config": {}}
+        Handler.config["IMAGE_CONNECTIONS"] = [twin, dict(twin, id="b")]
+        self.run_script()
+        self.assertEqual([item["id"] for item in Handler.config["IMAGE_CONNECTIONS"]], ["a"])
+
+    def test_an_unrelated_connection_and_its_id_are_respected(self):
+        cloud = {"id": "osr-router", "name": "Cloud", "type": "openai", "url": "https://api.openai.com/v1",
+                 "key": "sk-keep", "config": {"enable": True, "model_ids": ["gpt-image-1"]}}
+        Handler.config["IMAGE_CONNECTIONS"] = [cloud]
+        self.run_script()
+        kept, ours = Handler.config["IMAGE_CONNECTIONS"]
+        self.assertEqual(kept, cloud)
+        self.assertNotEqual(ours["id"], "osr-router")
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], f"{ours['id']}:image")
+
+    def test_no_image_server_leaves_the_connection_off(self):
+        Handler.images = []
+        text = self.run_script()
+        (connection,) = self.router_connections()
+        self.assertFalse(connection["config"]["enable"])
+        self.assertEqual(connection["config"]["model_ids"], ["image"])
+        self.assertFalse(Handler.config["ENABLE_IMAGE_GENERATION"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "")
+        self.assertIn("left off", text)
+
+    def test_an_expected_model_must_be_listed_013(self):
+        Handler.images = ["image", "qwen-image-2.1-colibri"]
+        self.run_script("--expect-model", "flux2-klein-4b-comfyui")
+        self.assertFalse(self.router_connections()[0]["config"]["enable"])
+        self.run_script("--expect-model", "qwen-image-2.1-colibri")
+        self.assertTrue(self.router_connections()[0]["config"]["enable"])
+        self.assertEqual(self.router_connections()[0]["config"]["model_ids"], ["image", "qwen-image-2.1-colibri"])
+
+    def test_steps_and_size_013(self):
+        self.run_script("--image-size", "768x512", "--image-steps", "12")
+        config = self.router_connections()[0]["config"]
+        self.assertEqual(config["size"], "768x512")
+        self.assertEqual(config["params"], {"steps": 12})
+        Handler.config["IMAGE_CONNECTIONS"][0]["config"]["size"] = "auto"
+        self.run_script()
+        self.assertEqual(self.router_connections()[0]["config"]["size"], "1024x1024")
+
+    def test_a_custom_comfyui_connection_stays_the_default(self):
+        custom = {"id": "mine", "name": "My ComfyUI", "type": "comfyui", "url": "http://10.0.0.9:8188", "key": "",
+                  "config": {"enable": True, "workflow": json.dumps({"1": {"class_type": "MyLoader", "inputs": {}}}),
+                             "model_ids": ["x.safetensors"]}}
+        Handler.config.update(IMAGE_CONNECTIONS=[custom], IMAGE_GENERATION_DEFAULT_MODEL="mine:x.safetensors")
+        text = self.run_script()
+        self.assertEqual(Handler.config["IMAGE_CONNECTIONS"][0], custom)
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "mine:x.safetensors")
+        self.assertEqual(len(self.router_connections()), 1)
+        self.assertIn("--replace-custom", text)
+        self.run_script("--replace-custom")
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "osr-router:image")
+        self.assertTrue(Handler.config["IMAGE_CONNECTIONS"][0]["config"]["enable"])   # still usable
+
+    def test_an_osr_klein_comfyui_connection_is_disabled(self):
+        klein = {"id": "c1", "name": "ComfyUI", "type": "comfyui", "url": "http://10.0.0.30:8188", "key": "",
+                 "config": {"enable": True, "workflow": json.dumps(KLEIN, indent=2),
+                            "model_ids": ["flux-2-klein-4b-fp8.safetensors"]}}
+        Handler.config.update(IMAGE_CONNECTIONS=[klein], IMAGE_GENERATION_DEFAULT_MODEL="c1:flux-2-klein-4b-fp8.safetensors")
+        text = self.run_script()
+        first = Handler.config["IMAGE_CONNECTIONS"][0]
+        self.assertFalse(first["config"]["enable"])
+        self.assertEqual(first["url"], "http://10.0.0.30:8188")   # kept, unused
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "osr-router:image")
+        self.assertIn("Disabled the ComfyUI connection(s)", text)
+
+    def test_a_connection_open_webui_does_not_keep_is_restored(self):
+        before = copy.deepcopy(Handler.config)
+        Handler.keep_engine = True
+        with self.assertRaisesRegex(RuntimeError, "restored"):
+            self.run_script()
+        self.assertEqual(Handler.updates[-1], before)
+
+    def test_off_only_turns_off_the_router_connection(self):
+        self.run_script()
+        text = self.run_script("--off")
+        (connection,) = self.router_connections()
+        self.assertFalse(connection["config"]["enable"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "")
+        self.assertIn("is off", text)
+        Handler.config = copy.deepcopy(FRESH_013)
+        Handler.updates = []
+        text = self.run_script("--off")
+        self.assertEqual(Handler.updates, [])
+        self.assertIn("left as they are", text)
 
 
 if __name__ == "__main__":

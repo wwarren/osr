@@ -169,6 +169,7 @@ if (( dry_run )); then
   printf '+ if CT %s restricts outbound traffic, allow it to reach the broker%s\n' "$CT_ID" "${MATTERMOST_CT_ID:+ and Mattermost}"
   printf '+ install hcom, the relay account and the agent bus socket\n'
   [[ -z ${MATTERMOST_CT_ID:-} ]] || printf '+ configure dedicated agent-handoffs webhook in Mattermost CT %s; install observer notifier\n' "$MATTERMOST_CT_ID"
+  pve_ensure_tags "$CT_ID" hcom
   exit 0
 fi
 [[ $EUID == 0 ]] || die 'Run as root on the Proxmox host.'
@@ -233,3 +234,4 @@ if [[ -n ${MATTERMOST_CT_ID:-} ]]; then
   env_args+=(HCOM_MATTERMOST_WEBHOOK_FILE=/root/osr-hcom-setup/webhook)
 fi
 pct exec "$CT_ID" -- env "${env_args[@]}" bash /root/osr-hcom-setup/install-target.sh
+pve_ensure_tags "$CT_ID" hcom

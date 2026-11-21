@@ -127,8 +127,19 @@ cmd=$1 id=${2:-}
 case $cmd in
     status) if [[ -e $MOCK/$id.stopped ]]; then echo 'status: stopped'; else echo 'status: running'; fi ;;
     config) printf 'hostname: ct%s\nnet0: name=eth0,bridge=vmbr0,ip=10.0.0.%s/24,gw=10.0.0.1\n' "$id" "$((id % 250))"
+            for conf in "$PVE_NODES_DIR"/*/lxc/"$id".conf; do
+                [[ ! -f $conf ]] || sed -n '/^tags:/p' "$conf"
+            done
             # <id>.memory: the CT's memory line (Colibri's model menu reads it).
             [[ ! -e $MOCK/$id.memory ]] || printf 'memory: %s\n' "$(cat "$MOCK/$id.memory")" ;;
+    set) [[ ${3:-} == --tags ]] || exit 1
+         for conf in "$PVE_NODES_DIR"/*/lxc/"$id".conf; do
+             [[ -f $conf ]] || continue
+             if grep -q '^tags:' "$conf"; then sed -i "s/^tags:.*/tags: $4/" "$conf"
+             else printf 'tags: %s\n' "$4" >> "$conf"; fi
+             exit 0
+         done
+         exit 1 ;;
     snapshot) [[ ! -e $MOCK/$id.nosnap ]] || exit 1 ;;
     delsnapshot|stop|start) : ;;
     rollback) cp "$MOCK/$id.state.orig" "$MOCK/$id.state" ;;
@@ -523,13 +534,26 @@ assert_contains 'router first' $'router\t280' "$(head -n 3 <<< "$out")"
 assert_contains 'hcom in the agent' $'hcom\t282\tpve1\ttarget=hermes' "$out"
 [[ $(grep -n $'^hcom\t290' <<< "$out" | cut -d: -f1) -gt $(grep -n $'^hcom\t282' <<< "$out" | cut -d: -f1) ]] &&
     _pass 'observer after the agents' || _fail 'observer after the agents' 'observer last' "$out"
+assert_not_contains '--list leaves hcom tags alone' 'hcom' "$(sed -n 's/^tags: //p' "$tmp/nodes/pve1/lxc/282.conf")"
+conf 291 'hcom'; state 291 osr-hcom-relay
+printf 'target=opencode\nnative=false\n' > "$tmp/mock/291.hcom"
+run_tool '' --list --only hcom
+assert_contains 'hcom tag finds a CT without other target tags' $'hcom\t291\tpve1\ttarget=opencode' "$out"
+rm "$tmp/nodes/pve1/lxc/291.conf"
+run_tool '' --dry-run --only hcom
+assert_not_contains '--dry-run leaves hcom tags alone' 'hcom' "$(sed -n 's/^tags: //p' "$tmp/nodes/pve1/lxc/282.conf")"
+run_tool '' --yes --only strata --pinned
+assert_contains 'an actual run tags a detected agent' 'tags: ai;ai-tools;osr-target;hermes;hcom' "$(cat "$tmp/nodes/pve1/lxc/282.conf")"
+assert_contains 'an actual run tags a detected observer' 'tags: ai;ai-tools;osr-target;mqtt;hcom' "$(cat "$tmp/nodes/pve1/lxc/290.conf")"
+tag_sets=$(grep -c ' set \(282\|290\) --tags' "$tmp/mock/pct.log")
+run_tool '' --yes --only strata --pinned
+assert_eq 'a later run does not set the hcom tags again' "$tag_sets" "$(grep -c ' set \(282\|290\) --tags' "$tmp/mock/pct.log")"
 run_tool '' --dry-run --skip router
-assert_contains 'unpinned Open WebUI keeps its installed release' 'Open WebUI 0.11.0' "$out"
-assert_not_contains 'unpinned Open WebUI does not request a version change' 'set-webui-version' "$out"
+assert_contains 'Open WebUI moves to the pin' "set-webui-version $(sed -n 's/^open-webui==//p' "$ROOT/services/open-webui/requirements.txt")" "$out"
 assert_contains 'hcom uses the one broker' 'broker CT 290' "$out"
 echo 99.0.0 > "$tmp/mock/280.webui"
 run_tool '' --dry-run --skip router
-assert_contains 'unpinned Open WebUI keeps a newer installed release' 'Open WebUI 99.0.0' "$out"
+assert_contains 'never downgrades Open WebUI' 'keeps Open WebUI 99.0.0' "$out"
 rm "$tmp/nodes/pve1/lxc/290.conf"
 run_tool '' --dry-run --skip router
 assert_contains 'hcom needs a broker' 'set MQTT_CT_ID' "$out"
@@ -707,7 +731,7 @@ assert_contains 'latest installed makes keep the default' "or keep 99.0.0 and sk
 assert_eq 'Enter keeps a current CT' kept "$(summary_line ollama 252)"
 assert_eq 'a kept CT is not installed' '' "$(grep '^INSTALL 252' "$tmp/mock/installs.log")"
 # If one of several CTs is behind, Enter still installs latest for the group.
-echo 0.30.0 > "$tmp/mock/254.installed"
+conf 254 'ai;ai-model;osr-target;ollama'; state 254 ollama; echo 0.30.0 > "$tmp/mock/254.installed"
 run_tool '\ny\n' --only ollama
 assert_contains 'one older CT makes latest the default' '[p/L/k]' "$out"
 assert_file_contains 'the older CT gets latest' 'INSTALL 254 env OLLAMA_VERSION=v99.0.0 bash' "$tmp/mock/installs.log"
@@ -772,7 +796,7 @@ assert_not_contains '--latest all does not ask unpinned services' 'skip its upgr
 hermes_keep_case() {
     # shellcheck disable=SC2034  # read by decide_releases
     INTERACTIVE=true INCLUDE_STOPPED=false PINNED_ONLY=false UPDATE_HERMES=false LATEST=''
-    ask() { printf '%s\n' "$1" >&2; REPLY=$HERMES_ANSWER; }
+    ask() { printf '%s\n' "$1" >&2; REPLY=${HERMES_ANSWER:-$2}; }   # Enter takes the default
     add_item hermes 282
     decide_releases
     echo "${I_RESULT[0]}|${I_NOTE[0]}|$UPDATE_HERMES"

@@ -44,7 +44,8 @@ fi
 if HCOM_TARGET=hermes HCOM_INSTRUCTIONS_FILE=/home/hermes/../../etc/x HCOM_RELAY_BUNDLE=$stage/bundle bash "$here/install-target.sh" --dry-run 2>/dev/null; then
   echo 'FAIL: instruction path with .. accepted'; exit 1
 fi
-CT_ID=281 MQTT_CT_ID=286 HCOM_TARGET=deepseek-harness bash "$here/provision-lxc.sh" --dry-run >/dev/null
+output=$(CT_ID=281 MQTT_CT_ID=286 HCOM_TARGET=deepseek-harness bash "$here/provision-lxc.sh" --dry-run)
+[[ $output == *'tag CT 281 hcom'* ]] || { echo 'FAIL: hcom tag missing from install plan'; exit 1; }
 if CT_ID=281 MQTT_CT_ID=286 HCOM_TARGET=deepseek-harness MATTERMOST_CT_ID=277 bash "$here/provision-lxc.sh" --dry-run 2>/dev/null; then exit 1; fi
 if CT_ID=283 MQTT_CT_ID=286 HCOM_TARGET=openclaw HCOM_HERMES_NATIVE=true bash "$here/provision-lxc.sh" --dry-run 2>/dev/null; then exit 1; fi
 output=$(CT_ID=286 MQTT_CT_ID=286 HCOM_TARGET=observer MATTERMOST_CT_ID=277 bash "$here/provision-lxc.sh" --dry-run)

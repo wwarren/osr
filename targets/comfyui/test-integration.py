@@ -35,6 +35,13 @@ FRESH = {
     "IMAGES_EDIT_COMFYUI_API_KEY": "", "IMAGES_EDIT_COMFYUI_WORKFLOW": "", "IMAGES_EDIT_COMFYUI_WORKFLOW_NODES": [],
 }
 
+# Open WebUI 0.13.4: a list of image connections replaced the single engine.
+FRESH_013 = {
+    "ENABLE_IMAGE_GENERATION": False, "ENABLE_IMAGE_PROMPT_GENERATION": True, "ENABLE_IMAGE_EDIT": False,
+    "IMAGE_GENERATION_DEFAULT_MODEL": "", "IMAGE_EDIT_DEFAULT_MODEL": "", "IMAGE_CONNECTIONS": [],
+}
+REQUIRED_013 = ("ENABLE_IMAGE_GENERATION", "ENABLE_IMAGE_PROMPT_GENERATION", "ENABLE_IMAGE_EDIT")
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     """ComfyUI at /comfy; Open WebUI's admin API under /api/v1/images."""
@@ -48,6 +55,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     reachable = True          # can "Open WebUI's backend" reach ComfyUI?
     legacy_verify = False     # Open WebUI before 0.11.4: GET .../config/url/verify
     models_override = None
+    required = tuple(FRESH)
     updates = []
     verified = []
 
@@ -101,6 +109,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, True)
             else:
                 self.reply(400, {"detail": "Invalid URL"})
+        elif self.path == "/api/v1/images/models" and "IMAGE_CONNECTIONS" in cls.config:
+            # Open WebUI 0.13: references "<connection>:<model>" from each enabled connection's model IDs.
+            listed = []
+            if cls.config.get("ENABLE_IMAGE_GENERATION"):
+                for item in cls.config["IMAGE_CONNECTIONS"]:
+                    if not (item.get("config") or {}).get("enable", True):
+                        continue
+                    models = cls.models_override if cls.models_override is not None else \
+                        ((item.get("config") or {}).get("model_ids") or [""])
+                    listed += [{"id": f"{item['id']}:{m}", "name": m or item["name"], "model": m,
+                                "connection_id": item["id"]} for m in models]
+            self.reply(200, listed)
         elif self.path == "/api/v1/images/models":
             # Open WebUI 0.11.0-0.12.4 reads UNETLoader's combo options at index 0.
             # Its model picker cannot read ComfyUI's newer COMBO format.
@@ -119,8 +139,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.admin():
             return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/v1/images/connections/verify" and "IMAGE_CONNECTIONS" in cls.config:
+            # Open WebUI 0.13: its backend reaches the connection (GET <url>/object_info).
+            cls.verified.append(body)
+            if body.get("type") == "comfyui" and body.get("url") == self.comfy_url() and cls.reachable:
+                self.reply(200, [{"id": m, "name": m} for m in cls.diffusion_models])
+            else:
+                self.reply(400, {"detail": "Failed to connect to the image generation engine"})
+            return
         if self.path == "/api/v1/images/config/update":
-            missing = set(FRESH) - set(body)
+            missing = set(cls.required) - set(body)
             if missing:   # ImagesConfig: every field is required
                 self.reply(422, {"detail": f"missing {sorted(missing)}"})
                 return
@@ -144,6 +172,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class IntegrationTest(unittest.TestCase):
     def setUp(self):
         Handler.config = copy.deepcopy(FRESH)
+        Handler.required = tuple(FRESH)
         Handler.diffusion_models = [MODULE.KLEIN_MODEL, "other.safetensors"]
         Handler.encoders = [MODULE.KLEIN_ENCODER]
         Handler.vaes = [MODULE.KLEIN_VAE]
@@ -389,6 +418,108 @@ class IntegrationTest(unittest.TestCase):
         self.token.write_text("\n")
         with self.assertRaisesRegex(RuntimeError, "empty"):
             self.run_script()
+
+
+class Integration013Test(IntegrationTest):
+    """Open WebUI 0.13: ComfyUI as one image connection."""
+
+    def setUp(self):
+        super().setUp()
+        Handler.config = copy.deepcopy(FRESH_013)
+        Handler.required = REQUIRED_013
+
+    def comfy(self):
+        return [item for item in Handler.config["IMAGE_CONNECTIONS"] if item["type"] == "comfyui"]
+
+    # The 0.12 cases do not apply; the version-independent ones ran in the 0.12 class.
+    for _name in [name for name in dir(IntegrationTest) if name.startswith("test_")]:
+        if _name not in ("test_not_comfyui", "test_an_unknown_diffusion_model_is_refused_before_anything_is_saved",
+                         "test_a_wrong_admin_token", "test_missing_workflow_node_is_refused_before_saving"):
+            locals()[_name] = None
+    del _name
+
+    def test_fresh_open_webui_gets_one_klein_connection(self):
+        out = self.run_script()
+        (connection,) = self.comfy()
+        self.assertEqual(connection["id"], "osr-comfyui")
+        self.assertEqual(connection["url"], f"{self.base}/comfy")
+        config = connection["config"]
+        self.assertTrue(config["enable"])
+        self.assertEqual(json.loads(config["workflow"]), MODULE.KLEIN_WORKFLOW)
+        self.assertEqual(config["nodes"], MODULE.KLEIN_NODES)
+        self.assertEqual(config["model_ids"], [MODULE.KLEIN_MODEL])
+        self.assertEqual((config["size"], config["steps"]), ("1024x1024", 4))
+        self.assertEqual(config["capabilities"], {"image_generation": True, "image_edit": False})
+        self.assertEqual(config["access_grants"], [{"principal_type": "user", "principal_id": "*", "permission": "read"}])
+        self.assertTrue(Handler.config["ENABLE_IMAGE_GENERATION"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], f"osr-comfyui:{MODULE.KLEIN_MODEL}")
+        self.assertEqual(Handler.verified[-1]["url"], f"{self.base}/comfy")
+        self.assertIn("ComfyUI 0.42.1", out)
+        self.run_script()
+        self.assertEqual(len(self.comfy()), 1)   # a rerun updates it
+
+    def test_an_osr_connection_to_an_old_address_is_moved(self):
+        old = {"id": "c1", "name": "ComfyUI", "type": "comfyui", "url": "http://10.0.0.30:8188", "key": "",
+               "config": {"enable": True, "workflow": json.dumps(MODULE.KLEIN_WORKFLOW), "model_ids": ["gone"]}}
+        router = {"id": "osr-router", "name": "Open Smart Router", "type": "openai", "url": "http://127.0.0.1:8000/v1",
+                  "key": "k", "config": {"enable": True, "model_ids": ["image"]}}
+        Handler.config["IMAGE_CONNECTIONS"] = [old, router]
+        self.run_script("--variant", "klein-4b")
+        first, second = Handler.config["IMAGE_CONNECTIONS"]
+        self.assertEqual((first["id"], first["url"]), ("c1", f"{self.base}/comfy"))
+        self.assertEqual(first["config"]["model_ids"], [MODULE.KLEIN_MODEL])
+        self.assertEqual(second, router)
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], f"c1:{MODULE.KLEIN_MODEL}")
+
+    def test_a_custom_workflow_connection_is_kept(self):
+        custom = {"1": {"inputs": {"unet_name": "flux.safetensors"}, "class_type": "UNETLoader"}}
+        mine = {"id": "mine", "name": "Mine", "type": "comfyui", "url": f"{self.base}/comfy", "key": "",
+                "config": {"enable": True, "workflow": json.dumps(custom), "model_ids": ["my-model"],
+                           "nodes": [{"type": "model", "key": "unet_name", "node_ids": ["1"]}]}}
+        Handler.config.update(IMAGE_CONNECTIONS=[copy.deepcopy(mine)], IMAGE_GENERATION_DEFAULT_MODEL="mine:my-model",
+                              ENABLE_IMAGE_GENERATION=True)
+        out = self.run_script()
+        (connection,) = self.comfy()
+        self.assertEqual(connection["config"]["workflow"], mine["config"]["workflow"])
+        self.assertEqual(connection["config"]["nodes"], mine["config"]["nodes"])
+        self.assertEqual(connection["config"]["model_ids"], ["my-model"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "mine:my-model")
+        self.assertIn("Keeping the custom ComfyUI workflow", out)
+
+    def test_missing_klein_assets_leave_the_connection_off(self):
+        Handler.encoders = []
+        out = self.run_script()
+        (connection,) = self.comfy()
+        self.assertFalse(connection["config"]["enable"])
+        self.assertEqual(connection["config"]["model_ids"], [])
+        self.assertFalse(Handler.config["ENABLE_IMAGE_GENERATION"])
+        self.assertEqual(Handler.config["IMAGE_GENERATION_DEFAULT_MODEL"], "")
+        self.assertIn(MODULE.KLEIN_ENCODER, out)
+
+    def test_size_steps_and_9b(self):
+        selected = MODULE.VARIANTS["klein-9b"]
+        Handler.diffusion_models.append(selected["model"])
+        Handler.encoders.append(selected["encoder"])
+        self.run_script("--variant", "klein-9b", "--image-size", "768x768", "--image-steps", "6")
+        config = self.comfy()[0]["config"]
+        self.assertEqual(json.loads(config["workflow"]), selected["workflow"])
+        self.assertEqual((config["size"], config["steps"]), ("768x768", 6))
+        self.run_script()   # Auto keeps the selected workflow on reintegration.
+        self.assertEqual(self.comfy()[0]["config"]["model_ids"], [selected["model"]])
+
+    def test_unreachable_from_open_webui_restores_the_previous_settings_013(self):
+        Handler.reachable = False
+        before = copy.deepcopy(Handler.config)
+        with self.assertRaisesRegex(RuntimeError, "firewall.*previous image settings were restored"):
+            self.run_script()
+        self.assertEqual(Handler.config, before)
+
+    def test_a_model_open_webui_does_not_list_restores_the_previous_settings_013(self):
+        Handler.models_override = ["other.safetensors"]
+        before = copy.deepcopy(Handler.config)
+        with self.assertRaisesRegex(RuntimeError, "does not list the diffusion model"):
+            self.run_script()
+        self.assertEqual(Handler.config, before)
 
 
 if __name__ == "__main__":

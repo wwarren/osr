@@ -396,12 +396,17 @@ down), a transport error, a failed ComfyUI job or a 5xx (Colibri's full queue
 is 503); a 400 is returned as is. `[images] read_timeout_seconds` (900) bounds
 one picture. A configured cloud image model (`openai/gpt-image-1`,
 `gemini/imagen-...`) goes to LiteLLM only when named, as cloud chat models do;
-an unknown name also goes to LiteLLM, as before. Open WebUI's image engine is
-set by `tools/webui-images.py`: engine OpenAI, base
-`http://127.0.0.1:8000/v1`, the router key, model `image`. The helper patches
-Open WebUI 0.12.4's image picker, when installed, to read the router's live
-`/v1/images/models` list; the installer and manager reapply it after pip
-installs that version.
+an unknown name also goes to LiteLLM, as before. `tools/webui-images.py` sets
+Open WebUI up. On 0.13 (the pin) it writes one OpenAI image connection,
+`osr-router`: base `http://127.0.0.1:8000/v1`, the router key, open to all
+users, generation only, models the `image` alias plus the image models the
+router lists at that moment, and the alias as the default model. Open WebUI
+0.13 would list a connection's models live only from `/models` with
+LiteLLM-style modes in `/model/info`, and the router keeps image models out of
+`/v1/models` so they never show as chat models, so the list is written when
+the helper runs. On 0.12.4 it sets the single engine the same way and patches
+that version's image picker to read the router's live `/v1/images/models`; the
+installer and manager reapply that patch after pip installs 0.12.4.
 
 ---
 
@@ -769,7 +774,7 @@ posts include local event IDs and use a channel distinct from health alerts.
 | OpenClaw and Honcho reuse Hermes's dispatcher (`DIRECT_ETC`, `DIRECT_SECRETS_FILE`, `DIRECT_CONTEXT_SETTING`) | A copy per agent | One implementation of ranking, task pinning, failover, Kindi gating and stream checks (`tests/test-repo.sh` checks the copies match) |
 | Cloud models only when named | Cloud models in the pool or fallbacks | Automatic routing must never incur API charges |
 | Subscription logins via a separate gateway selected by header | The pinned LiteLLM, or OSR storing OAuth tokens | Per-client logins need a newer LiteLLM with its own database; OSR never holds them |
-| Image generation through the router (`/v1/images/generations`, an `image` alias), Open WebUI's engine set to it | ComfyUI as Open WebUI's engine | Open WebUI has one image engine; through the router it reaches ComfyUI and Colibri alike with fail-forward, API clients get the same endpoint, and ComfyUI's newer COMBO model lists (which Open WebUI 0.12.4's picker cannot read) are read by the router. An admin's custom ComfyUI workflow keeps Open WebUI's ComfyUI engine |
+| Image generation through the router (`/v1/images/generations`, an `image` alias), Open WebUI's engine (0.13: its default image connection) set to it | ComfyUI as Open WebUI's engine | Open WebUI 0.12 had one image engine, and 0.13's connections still pick one default; through the router it reaches ComfyUI and Colibri alike with fail-forward, API clients get the same endpoint, and ComfyUI's newer COMBO model lists (which Open WebUI 0.12.4's picker cannot read) are read by the router. An admin's custom ComfyUI workflow keeps Open WebUI's ComfyUI engine |
 | Affinity and load only reorder or nudge near-equal candidates | Pin a conversation to its server, or always pick the idle one | Fit and residency must still decide: a pinned conversation would stay on a model too small for a later turn, and "always idle" would load a model on every server |
 | New installs use only `osr-*` names (units, `services/` directories, service account, Gitea router account, Mattermost team, channel and posting name); existing installs are migrated or keep what they recorded | Keep the `ollama-*` names; keep them on existing installs with drop-ins | The router routes to every kind of model server, so `ollama-*` misnamed it. `update-router.sh` moves the config repo's directories (`git mv`, keeping tuned `.ini` files), installer seeding moves them in an existing Gitea repo, and `apply` replaces the old units and renames the service account in place (same UID, so ownership is unchanged); `apply-config.sh` never installs a leftover old unit beside the new one. Gitea and Mattermost keep the accounts, team and channel they recorded, since renaming a login or moving a webhook would break running installs. Other renamed identifiers (repository, snapshot directory, lock, firewall tags, CT descriptions) are still recognised by their old names ([README](README.md#upgrading-from-ollama-smart-router)) |
 

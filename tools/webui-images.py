@@ -13,6 +13,17 @@ settings are read, the engine fields changed, and the whole set written back,
 so every other setting is kept. An admin's custom ComfyUI workflow (engine
 comfyui with a workflow that is not one of OSR's) is kept as it is unless
 --replace-custom is given. On failure the previous settings are restored.
+
+Open WebUI 0.13 replaced the single engine with a list of image connections
+(IMAGE_CONNECTIONS). There the router is one OpenAI connection (id osr-router,
+open to every user, generation only) whose models are the router's image alias
+and the image models it lists now, and the alias becomes the default model.
+Open WebUI's own upgrade turns a 0.12 router engine into such a connection;
+this updates that one instead of adding another. An admin's custom ComfyUI
+connection stays enabled, and stays the default unless --replace-custom; a
+ComfyUI connection with OSR's or the built-in workflow is disabled, as the
+router draws with that ComfyUI itself. Open WebUI 0.12.4's image picker is
+patched to list the router's models live; 0.13 needs no patch.
 """
 import argparse
 import json
@@ -32,6 +43,11 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # a ComfyUI engine using any of them is replaced; anything else was an admin's.
 OSR_WORKFLOW_NAMES = ("flux2-klein-4b-api.json", "flux2-klein-9b-api.json")
 DEFAULT_SIZE = "1024x1024"
+# Open WebUI 0.13 image connections.
+CONNECTION_ID = "osr-router"
+CONNECTION_NAME = "Open Smart Router"
+PUBLIC_GRANTS = [{"principal_type": "user", "principal_id": "*", "permission": "read"}]
+SIZE_PATTERN = r"[1-9][0-9]{1,4}x[1-9][0-9]{1,4}"
 PICKER_MARKER = "# OSR_IMAGE_MODELS_PATCH"
 PICKER_OLD = """        if image_config.IMAGE_GENERATION_ENGINE == 'openai':
             return [
@@ -170,12 +186,18 @@ def custom_comfyui(config, known):
     """Is Open WebUI drawing with an admin's own ComfyUI workflow?"""
     if config.get("IMAGE_GENERATION_ENGINE") != "comfyui":
         return False
-    text = config.get("COMFYUI_WORKFLOW")
+    return custom_workflow(config.get("COMFYUI_WORKFLOW"), known)
+
+
+def custom_workflow(text, known):
+    """Is TEXT a ComfyUI workflow an admin made (not OSR's, not the built-in one)?"""
     if not isinstance(text, str) or not text.strip():
         return False
     try:
         workflow = json.loads(text)
     except json.JSONDecodeError:
+        return True
+    if not isinstance(workflow, dict):
         return True
     # Open WebUI's built-in checkpoint graph has a CheckpointLoaderSimple and a KSampler.
     classes = {node.get("class_type") for node in workflow.values() if isinstance(node, dict)}
@@ -201,6 +223,146 @@ def router_models(router, key, wait, expect):
         time.sleep(3)
 
 
+def is_router_connection(item, router):
+    return (isinstance(item, dict) and item.get("type") == "openai"
+            and str(item.get("url") or "").rstrip("/") == f"{router}/v1")
+
+
+def connection_id_of(ref):
+    """The connection of a model reference ("<connection id>:<model>")."""
+    return ref.split(":", 1)[0] if isinstance(ref, str) and ":" in ref else ""
+
+
+def is_custom_comfyui_connection(item, known):
+    config = item.get("config") if isinstance(item, dict) else None
+    return (isinstance(config, dict) and item.get("type") == "comfyui"
+            and custom_workflow(config.get("workflow"), known))
+
+
+def save_connections(base, admin_token, original, new, check):
+    """Write NEW and read it back; restore ORIGINAL when CHECK(saved) fails."""
+    request(f"{base}/config/update", admin_token, new)
+    try:
+        check(request(f"{base}/config", admin_token))
+    except (RuntimeError, urllib.error.URLError, OSError) as exc:
+        try:
+            request(f"{base}/config/update", admin_token, original)
+            restored = "the previous image settings were restored"
+        except (RuntimeError, urllib.error.URLError, OSError) as again:
+            restored = f"restoring the previous image settings failed too ({again})"
+        raise RuntimeError(f"{exc}; {restored}") from exc
+
+
+def configure_connections(args, base, admin_token, original, router, key):
+    """Open WebUI 0.13 and later: the router as one image connection."""
+    connections = [dict(item) for item in original.get("IMAGE_CONNECTIONS") or [] if isinstance(item, dict)]
+    ours = [item for item in connections if is_router_connection(item, router)]
+    if args.off:
+        if not ours:
+            print("Open WebUI does not draw through the router; its image settings were left as they are.")
+            return
+        ids = {item.get("id") for item in ours}
+        for item in ours:
+            item["config"] = dict(item.get("config") or {}, enable=False)
+        new = dict(original, IMAGE_CONNECTIONS=connections)
+        if connection_id_of(original.get("IMAGE_GENERATION_DEFAULT_MODEL")) in ids:
+            new["IMAGE_GENERATION_DEFAULT_MODEL"] = ""
+
+        def check_off(saved):
+            for item in saved.get("IMAGE_CONNECTIONS") or []:
+                if isinstance(item, dict) and item.get("id") in ids and (item.get("config") or {}).get("enable", True):
+                    raise RuntimeError(f"Open WebUI did not keep the connection {item.get('id')!r} off")
+
+        save_connections(base, admin_token, original, new, check_off)
+        print("Open WebUI's image generation through the router is off.")
+        return
+
+    known = osr_workflows(pathlib.Path(__file__).resolve().parent)
+    names = router_models(router, key, args.wait, args.expect_model)
+    ready = args.alias in names and (not args.expect_model or args.expect_model in names)
+    existing = ours[0] if ours else {}
+    config = dict(existing.get("config") or {})
+    size = args.image_size or config.get("size") or DEFAULT_SIZE
+    if not re.fullmatch(SIZE_PATTERN, str(size)):
+        size = DEFAULT_SIZE   # "auto" is for gpt-image; the router's servers need a size
+    params = config.get("params") if isinstance(config.get("params"), dict) else {}
+    if args.image_steps:
+        params = dict(params, steps=args.image_steps)
+    taken = {item.get("id") for item in connections if item is not existing}
+    connection_id = existing.get("id") or CONNECTION_ID
+    if connection_id in taken:
+        connection_id = f"{CONNECTION_ID}-{len(connections)}"
+    config.update(
+        enable=ready,
+        capabilities={"image_generation": True, "image_edit": False},   # the router has no /images/edits
+        model_ids=[args.alias] + [name for name in names if name != args.alias],
+        access_grants=config.get("access_grants") or PUBLIC_GRANTS,
+        auth_type="bearer",
+        size=size,
+        params=params,
+    )
+    connection = dict(existing, id=connection_id, name=CONNECTION_NAME, type="openai",
+                      url=f"{router}/v1", key=key, config=config)
+    updated, placed, superseded = [], False, []
+    for item in connections:
+        if is_router_connection(item, router):
+            if not placed:
+                updated.append(connection)
+                placed = True
+            continue   # a second router connection would list every model twice
+        if item.get("type") == "comfyui" and (item.get("config") or {}).get("enable", True) \
+                and not is_custom_comfyui_connection(item, known):
+            # OSR's (or the built-in) ComfyUI workflow: the router draws with that ComfyUI itself.
+            item = dict(item, config=dict(item.get("config") or {}, enable=False))
+            superseded.append(item.get("name") or item.get("id"))
+        updated.append(item)
+    if not placed:
+        updated.append(connection)
+
+    default_ref = f"{connection_id}:{args.alias}"
+    current = original.get("IMAGE_GENERATION_DEFAULT_MODEL") or ""
+    current_connection = next((item for item in updated if item.get("id") == connection_id_of(current)), None)
+    keep_custom = (current_connection is not None and not args.replace_custom
+                   and is_custom_comfyui_connection(current_connection, known)
+                   and (current_connection.get("config") or {}).get("enable", True))
+    new = dict(original, IMAGE_CONNECTIONS=updated)
+    if ready:
+        new["ENABLE_IMAGE_GENERATION"] = True
+        if not keep_custom:
+            new["IMAGE_GENERATION_DEFAULT_MODEL"] = default_ref
+    elif connection_id_of(current) == connection_id:
+        new["IMAGE_GENERATION_DEFAULT_MODEL"] = ""
+
+    def check(saved):
+        match = next((item for item in saved.get("IMAGE_CONNECTIONS") or []
+                      if isinstance(item, dict) and item.get("id") == connection_id), None)
+        if match is None or str(match.get("url") or "").rstrip("/") != f"{router}/v1":
+            raise RuntimeError(f"Open WebUI did not keep the image connection {connection_id!r} to {router}/v1")
+        if (match.get("config") or {}).get("model_ids") != config["model_ids"]:
+            raise RuntimeError(f"Open WebUI did not keep the router's image models on {connection_id!r}")
+        if saved.get("IMAGE_GENERATION_DEFAULT_MODEL") != new.get("IMAGE_GENERATION_DEFAULT_MODEL"):
+            raise RuntimeError("Open WebUI did not keep the default image model "
+                               f"{new.get('IMAGE_GENERATION_DEFAULT_MODEL')!r}")
+
+    save_connections(base, admin_token, original, new, check)
+    print(f"Open WebUI generates images through the router ({router}/v1, image connection "
+          f"{connection_id!r}, model {args.alias!r}, {size}).")
+    if superseded:
+        print(f"Disabled the ComfyUI connection(s) the router now draws with: {', '.join(map(str, superseded))}.")
+    if ready:
+        shown = ", ".join(n for n in names if n != args.alias)
+        print(f"The router draws with: {shown}. Change the size or steps under Admin Settings > Images.")
+        if keep_custom:
+            print(f"The default image model stays {current!r} (an admin's custom ComfyUI workflow);")
+            print("rerun with --replace-custom to make the router's alias the default.")
+        print("A new image model on the router appears in Open WebUI after this step runs again.")
+    else:
+        wanted = args.expect_model or "an image model"
+        print(f"The connection is left off: the router does not list {wanted} yet "
+              f"(it lists: {', '.join(names) or 'nothing'}). Check GET {router}/routing/inventory,")
+        print("then rerun this step, or enable the connection under Admin Settings > Images once a model is up.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--webui-url", default="")
@@ -209,7 +371,8 @@ def main(argv=None):
     parser.add_argument("--picker-module", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-restart", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--patch-only", action="store_true",
-                        help="patch the installed Open WebUI 0.12.4 image picker after a pip install")
+                        help="patch the installed Open WebUI 0.12.4 image picker after a pip install "
+                             "(0.13 lists the router's models without a patch)")
     parser.add_argument("--router-url", default="")
     parser.add_argument("--router-env", default="/app/router/.env")
     parser.add_argument("--router-secrets", default="/app/router/secrets.env")
@@ -244,6 +407,9 @@ def main(argv=None):
     key = router_key(args.router_secrets)
 
     original = request(f"{base}/config", admin_token)
+    if isinstance(original.get("IMAGE_CONNECTIONS"), list):
+        configure_connections(args, base, admin_token, original, router, key)
+        return
     if "IMAGES_OPENAI_API_BASE_URL" not in original or "IMAGE_GENERATION_ENGINE" not in original:
         raise RuntimeError("This Open WebUI's image settings API is not supported "
                            "(no IMAGES_OPENAI_API_BASE_URL in /api/v1/images/config)")
