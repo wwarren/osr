@@ -644,7 +644,7 @@ assert_not_contains 'a dry run plans the pins' 'latest upstream)' "$(sed -n '/==
 reset_mock; upstream_fixtures
 run_tool 'l\np\ny\n'
 assert_eq 'asked, then upgraded' 0 "$rc"
-assert_contains 'asks with the pin as the default' "ollama: install the pinned $ollama_pin (p) or the latest upstream v99.0.0 (l)? [P/l]" "$out"
+assert_contains 'asks with the pin as the default' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep ? and skip its upgrade (k)? [P/l/k]" "$out"
 assert_contains 'the plan shows the choice' 'install-target.sh --upgrade with OLLAMA_VERSION=v99.0.0 (latest upstream)' "$out"
 assert_contains 'and warns it is untested' 'ollama: installing the latest upstream release v99.0.0, which this repository has not tested' "$out"
 assert_file_contains 'the installer gets the latest' 'INSTALL 252 env OLLAMA_VERSION=v99.0.0 bash /root/ollama-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
@@ -652,7 +652,7 @@ assert_eq 'the pinned one gets nothing' '' "$(grep '^INSTALL 251' "$tmp/mock/ins
 reset_mock; upstream_fixtures
 run_tool '' --yes
 assert_eq 'unattended: the pins, unasked' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
-assert_not_contains 'and no question' '[P/l]' "$out"
+assert_not_contains 'and no question' '[P/' "$out"
 reset_mock; upstream_fixtures
 run_tool '' --yes --latest strata
 assert_file_contains '--latest names one' "INSTALL 251 env STRATA_COMMIT=$strata_tip bash" "$tmp/mock/installs.log"
@@ -664,13 +664,65 @@ assert_contains 'every one' "with STRATA_COMMIT=$strata_tip (latest upstream)" "
 reset_mock; upstream_fixtures
 run_tool 'y\n' --pinned
 assert_eq '--pinned: no question either' '' "$(grep -E 'OLLAMA_VERSION|STRATA_COMMIT' "$tmp/mock/installs.log")"
-assert_not_contains '--pinned asks nothing' '[P/l]' "$out"
+assert_not_contains '--pinned asks nothing' '[P/' "$out"
 reset_mock
 upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
 run_tool 'y\n' --only ollama
 assert_contains 'a current pin is said so' '(the pin is current)' "$out"
-assert_not_contains 'and not asked about' '[P/l]' "$out"
+assert_not_contains 'and not asked about' '[P/' "$out"
 assert_eq 'ollama upgraded on its pin' upgraded "$(summary_line ollama 252)"
+echo "${ollama_pin#v}" > "$tmp/mock/252.installed"
+run_tool 'y\n' --only ollama
+assert_not_contains 'installed at the pin: nothing to ask either' '[P/' "$out"
+# k: keep what is installed, and skip every CT of that component.
+reset_mock; upstream_fixtures
+echo 0.30.0 > "$tmp/mock/252.installed"
+run_tool 'k\np\ny\n'
+assert_eq 'k: the run succeeds' 0 "$rc"
+assert_contains 'k shows what is kept' "ollama: install the pinned $ollama_pin (p), the latest upstream v99.0.0 (l), or keep 0.30.0 and skip its upgrade (k)? [P/l/k]" "$out"
+assert_contains 'the plan says it is kept' 'kept: not upgraded: kept at 0.30.0 (k)' "$out"
+assert_eq 'kept in the summary' kept "$(summary_line ollama 252)"
+assert_eq 'not installed' '' "$(grep '^INSTALL 252' "$tmp/mock/installs.log")"
+assert_file_contains 'the others still run' 'INSTALL 251 env bash /root/strata-target-deploy/install-target.sh --upgrade' "$tmp/mock/installs.log"
+conf 254 'ai;ai-model;osr-target;ollama'; state 254 ollama; echo 0.31.0 > "$tmp/mock/254.installed"
+run_tool 'k\np\ny\n'
+assert_contains 'several CTs: each one'"'"'s version' 'keep 0.30.0 in CT 252, 0.31.0 in CT 254 and skip its upgrade (k)?' "$out"
+assert_eq 'all of them kept' 'kept kept' "$(summary_line ollama 252) $(summary_line ollama 254)"
+assert_eq 'and the run still succeeds' 0 "$rc"
+# No newer upstream, but the pin would change the CT: p or k.
+reset_mock
+upstream 'https://api.github.com/repos/ollama/ollama/releases?per_page=50' "[{\"tag_name\": \"$ollama_pin\"}]"
+echo 0.1.0 > "$tmp/mock/252.installed"
+run_tool 'l\nk\ny\n' --only ollama
+assert_contains 'the pin would change it: asked' "ollama: install the pinned $ollama_pin (p), or keep 0.1.0 and skip its upgrade (k)? [P/k]" "$out"
+assert_eq 'l is not an answer there; k is' kept "$(summary_line ollama 252)"
+run_tool 'p\ny\n' --only ollama
+assert_eq 'p upgrades it to the pin' upgraded "$(summary_line ollama 252)"
+run_tool '' --yes --only ollama
+assert_eq 'unattended: the pin, unasked' upgraded "$(summary_line ollama 252)"
+echo 99.0.0 > "$tmp/mock/252.installed"
+run_tool 'y\n' --only ollama
+assert_not_contains 'a newer installed release is not asked about' '[P/' "$out"
+echo 0.1.0 > "$tmp/mock/252.installed"
+run_tool 'k\n' --dry-run --only ollama
+assert_not_contains 'a dry run never asks' '[P/' "$out"
+assert_contains 'but says a run would' 'or keep it as installed and skip it' "$out"
+# Hermes: k skips it.
+hermes_keep_case() {
+    # shellcheck disable=SC2034  # read by decide_releases
+    INTERACTIVE=true INCLUDE_STOPPED=false PINNED_ONLY=false UPDATE_HERMES=false LATEST=''
+    ask() { printf '%s\n' "$1" >&2; REPLY=$HERMES_ANSWER; }
+    add_item hermes 282
+    decide_releases
+    echo "${I_RESULT[0]}|${I_NOTE[0]}|$UPDATE_HERMES"
+}
+reset_mock
+conf 282 'ai;ai-tools;osr-target;hermes'; state 282 hermes-gateway
+printf 'a%.0s' {1..40} > "$tmp/mock/282.installed"
+assert_eq 'hermes k: kept' 'kept|not upgraded: kept at aaaaaaaaaaaa (k)|false' "$(HERMES_ANSWER=k in_tool hermes_keep_case 2>/dev/null)"
+assert_eq 'hermes l: hermes update' '||true' "$(HERMES_ANSWER=l in_tool hermes_keep_case 2>/dev/null)"
+assert_eq 'hermes p: the integration only' '||false' "$(HERMES_ANSWER=p in_tool hermes_keep_case 2>/dev/null)"
+assert_contains 'the question' 'or keep aaaaaaaaaaaa and skip its upgrade (k)? [P/l/k]' "$(HERMES_ANSWER=p in_tool hermes_keep_case 2>&1)"
 reset_mock
 export UPSTREAM_DOWN=1
 run_tool '' --dry-run

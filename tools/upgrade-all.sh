@@ -77,8 +77,10 @@ token; without it Open Terminal is still upgraded and its access is left alone.
 Before the plan it lists, for every CT it will upgrade, the version installed
 there now, the release pinned here (tested with this repository) and the
 newest upstream release (looked up on GitHub, PyPI or npm). Where the
-upstream one is newer, a run on a terminal asks which to install; the pin is
-the default, and the answer for --yes. (The router's row is its LiteLLM; it,
+upstream one is newer, or a CT runs something the pin would change, a run on
+a terminal asks: the pin (p, the default and the answer for --yes), the latest
+upstream (l, when it is newer), or keep what is installed (k), which skips
+every CT of that component in this run (--skip does that unattended). (The router's row is its LiteLLM; it,
 AirLLM and hcom are listed but not offered: they install their pins.) A commit the installer must check
 (ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
 names at that moment, not one reviewed here.
@@ -424,6 +426,8 @@ I_ENV=()
 # I_MODEL: the model a Colibri CT serves after its upgrade (an ID of
 # targets/colibri/model-select.sh, or remove), asked per CT; empty keeps it.
 I_MODEL=()
+# I_INSTALLED: the version the versions table found installed in the item's CT.
+I_INSTALLED=()
 ROUTER_CT=''
 add_item() {
     I_TARGET+=("$1"); I_CT+=("$2"); I_INFO+=("${3:-}"); I_RESULT+=(''); I_NOTE+=('')
@@ -1484,40 +1488,85 @@ in_release_list() {
     return 1
 }
 
-ask_release() {  # ask_release TEXT: 0 for the latest, 1 for the pin (the default)
+# ask_release TEXT pk|plk: RELEASE_ANSWER pinned (p, the default), latest (l,
+# offered with plk only) or keep (k).
+RELEASE_ANSWER=''
+ask_release() {
+    local hint='[P/k]'
+    [[ $2 == plk ]] && hint='[P/l/k]'
     while true; do
-        ask "$1 [P/l] " p
+        ask "$1 $hint " p
         case ${REPLY,,} in
-            p|pin|pinned) return 1 ;;
-            l|latest) return 0 ;;
+            p|pin|pinned) RELEASE_ANSWER=pinned; return 0 ;;
+            l|latest) if [[ $2 == plk ]]; then RELEASE_ANSWER=latest; return 0; fi ;;
+            k|keep) RELEASE_ANSWER=keep; return 0 ;;
         esac
     done
 }
 
-# choose_release TARGET: REL_CHOICE pinned or latest (for Hermes: whether to
-# run hermes update). Asked only on a terminal, and only when there is a newer
-# upstream release; --latest and --pinned answer instead.
+# installed_list TARGET: what its CTs to upgrade run, for a question
+# ("0.33.1", or "0.33.1 in CT 210, 0.34.4 in CT 211").
+installed_list() {
+    local i
+    local -a found=()
+    for i in "${!I_TARGET[@]}"; do
+        [[ ${I_TARGET[$i]} == "$1" && -z ${I_RESULT[$i]} ]] || continue
+        found+=("${I_INSTALLED[$i]:-?} in CT ${I_CT[$i]}")
+    done
+    if (( ${#found[@]} == 1 )); then printf '%s\n' "${found[0]% in CT *}"
+    else (IFS=,; printf '%s\n' "${found[*]}" | sed 's/,/, /g'); fi
+}
+
+# installed_differs TARGET: does a CT of TARGET run a known version other than
+# the pin (and not a newer one, which its installer keeps), so that installing
+# the pin would change it?
+installed_differs() {
+    local t=$1 i v pin
+    pin=$(pinned_label "$t")
+    [[ $pin != '?' ]] || return 1
+    for i in "${!I_TARGET[@]}"; do
+        [[ ${I_TARGET[$i]} == "$t" && -z ${I_RESULT[$i]} ]] || continue
+        v=${I_INSTALLED[$i]:-?}
+        [[ $v != '?'* && ${v#v} != "${pin#v}" ]] || continue
+        version_newer "$v" "$pin" && continue
+        return 0
+    done
+    return 1
+}
+
+# choose_release TARGET: REL_CHOICE pinned, latest or keep (for Hermes, latest
+# runs hermes update). Asked only on a terminal, and only when there is a
+# choice: a newer upstream release, or a CT that the pin would change. keep
+# leaves every CT of TARGET as it is: decide_releases marks them kept.
+# --latest and --pinned answer instead.
 choose_release() {
-    local t=$1
+    local t=$1 offered=false text
     if [[ $t == hermes ]]; then
         $UPDATE_HERMES && return 0
         if in_release_list hermes "$LATEST"; then UPDATE_HERMES=true; return 0; fi
         if $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then return 0; fi
-        if ask_release 'hermes: keep Hermes itself at its installed commit (p) or update it with hermes update (l)?'; then
-            UPDATE_HERMES=true
-        fi
+        ask_release "hermes: upgrade its integration with Hermes itself at its installed commit (p), also update Hermes with hermes update (l), or keep $(installed_list hermes) and skip its upgrade (k)?" plk
+        case $RELEASE_ANSWER in
+            latest) UPDATE_HERMES=true ;;
+            keep) REL_CHOICE[$t]=keep ;;
+        esac
         return 0
     fi
     REL_CHOICE[$t]=pinned
-    [[ -n ${UPSTREAM[$t]:-} ]] && release_offered "$t" || return 0
-    if in_release_list "$t" "$LATEST"; then
+    [[ -n $(upstream_spec "$t") ]] || return 0
+    if [[ -n ${UPSTREAM[$t]:-} ]] && release_offered "$t"; then offered=true; fi
+    if $offered && in_release_list "$t" "$LATEST"; then
         REL_CHOICE[$t]=latest
     elif $PINNED_ONLY || ! $INTERACTIVE || $DRY_RUN; then
         return 0
-    elif ask_release "$t: install the pinned $(pinned_label "$t") (p) or the latest upstream $(latest_label "$t") (l)?"; then
-        REL_CHOICE[$t]=latest
+    elif $offered || installed_differs "$t"; then
+        text="$(component_label "$t"): install the pinned $(pinned_label "$t") (p)"
+        if $offered; then text+=", the latest upstream $(latest_label "$t") (l)"; fi
+        text+=", or keep $(installed_list "$t") and skip its upgrade (k)?"
+        if $offered; then ask_release "$text" plk; else ask_release "$text" pk; fi
+        REL_CHOICE[$t]=$RELEASE_ANSWER
     fi
-    [[ ${REL_CHOICE[$t]} == pinned ]] ||
+    [[ ${REL_CHOICE[$t]} != latest ]] ||
         note "$t: installing the latest upstream release $(latest_label "$t"), which this repository has not tested."
 }
 
@@ -1578,13 +1627,25 @@ decide_releases() {
         printf '%-18s %-6s %-22s %-22s %s\n' COMPONENT CT INSTALLED PINNED 'LATEST UPSTREAM'
         for i in "${rows[@]}"; do
             t=${I_TARGET[$i]}
-            printf '%-18s %-6s %-22s %-22s %s\n' "$(component_label "$t")" "${I_CT[$i]}" "$(installed_release "$i")" "${pinned_of[$t]}" "${latest_of[$t]}"
+            I_INSTALLED[i]=$(installed_release "$i")
+            printf '%-18s %-6s %-22s %-22s %s\n' "$(component_label "$t")" "${I_CT[$i]}" "${I_INSTALLED[$i]}" "${pinned_of[$t]}" "${latest_of[$t]}"
         done
     } >&2
+    if ! $offered; then
+        for t in "${targets[@]}"; do
+            if [[ -n $(upstream_spec "$t") ]] && installed_differs "$t"; then offered=true; break; fi
+        done
+    fi
     if $offered && $DRY_RUN && $INTERACTIVE && ! $PINNED_ONLY; then
-        note 'Without --dry-run, a run asks for each component with a newer upstream release (pinned is the default); this plan uses the pins.'
+        note 'Without --dry-run, a run asks for each component with a newer upstream release, or a CT the pin would change: pinned (the default), latest, or keep it as installed and skip it. This plan uses the pins.'
     fi
     for t in "${targets[@]}"; do choose_release "$t"; done
+    for i in "${!I_TARGET[@]}"; do
+        t=${I_TARGET[$i]}
+        [[ -z ${I_RESULT[$i]} && ${REL_CHOICE[$t]:-} == keep ]] || continue
+        I_RESULT[i]=kept
+        I_NOTE[i]="not upgraded: kept at ${I_INSTALLED[$i]:-its installed version} (k)"
+    done
     for i in "${!I_TARGET[@]}"; do
         t=${I_TARGET[$i]}
         [[ -z ${I_RESULT[$i]} && ${REL_CHOICE[$t]:-} == latest ]] || continue

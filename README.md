@@ -1021,8 +1021,14 @@ MQTT's row is the CT's Mosquitto package, which follows Debian.
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
 
 Where the upstream release is newer (or a different commit), a run on a
-terminal asks `[P/l]` for each; the pin is the default and the answer for
-`--yes`. `--latest ollama,comfyui` (or `all`) takes the latest without asking,
+terminal asks `[P/l/k]` for each: the pin (`p`, the default and the answer for
+`--yes`), the latest upstream (`l`), or keep what is installed (`k`). Where
+there is no newer upstream release but a CT runs a version the pin would
+change, it asks `[P/k]`. `k` skips every CT of that component for this run;
+the plan and summary show them as `kept` (not a failure). Hermes is asked the
+same way: `p` upgrades its integration, `l` also runs `hermes update`, `k`
+skips it. To keep one CT of several, or to keep a component unattended, use
+`--skip`. `--latest ollama,comfyui` (or `all`) takes the latest without asking,
 and `--pinned` takes every pin. The latest is untested here, and a commit the
 installer checks is the one upstream names at that moment, not a reviewed one;
 the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
