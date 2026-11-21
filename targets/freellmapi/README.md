@@ -187,6 +187,21 @@ replacement uses the provisioner's backup because replacing the CT removes its
 snapshots.
 Templates of earlier releases stay in `TEMPLATE_STORAGE` until you delete them.
 
+**A CT on another cluster node.** `tools/upgrade-all.sh` runs this provisioner
+on one node with `tools/pct-cluster.sh` as `pct`, so the CT may be on another
+node. Proxmox's `vzdump` backs up only the guests of the node it runs on and
+succeeds without a backup for any other one ("skip external VMs"), and a
+`pct create` or `pct restore` of a CT that does not exist at that moment
+acts on the node it runs on. So for a replacement the provisioner asks the
+wrapper which node holds the CT (`pct --osr-node`). It then copies the
+template to that node's `TEMPLATE_STORAGE` unless the node already has the
+same file. `vzdump --stdout` runs there, compressed there with `zstd`, and the archive streams into
+`/var/lib/osr-freellmapi/<CT>/` on the node running the provisioner. The new
+CT is created on the CT's node, and a rollback restores there from a copy of
+that backup streamed to `/var/tmp` (removed afterwards). The backup itself
+stays on the node running the provisioner. Run directly with Proxmox's own
+`pct`, the CT is always on this node.
+
 ## Troubleshooting
 
 - **The CT stops right after starting.** The server is the CT's init: when it
@@ -201,8 +216,13 @@ Templates of earlier releases stay in `TEMPLATE_STORAGE` until you delete them.
 - **"has no [RULES] section".** The run rewrites FreeLLMAPI's rules in the
   CT's firewall file and stops before touching the CT when it cannot. Put the
   `[RULES]` line back in `/etc/pve/firewall/<CT>.fw` (or restore the file).
+- **"vzdump left no backup".** Before this was handled, a replacement run from
+  another node of the cluster stopped here, with "skip external VMs" in the
+  vzdump output. The CT was started again unchanged; run it again with this
+  version.
 - **"an earlier replacement ... did not finish".** `/var/lib/osr-freellmapi/<CT>/`
-  holds the backup of the CT as it was before. If the CT works, delete the
+  on the node that ran the provisioner holds the backup of the CT as it was
+  before (for a CT on another node, restore it on that node from a copy). If the CT works, delete the
   directory; if not, `pct destroy <CT>` and
   `pct restore <CT> /var/lib/osr-freellmapi/<CT>/vzdump-lxc-<CT>-*.tar.zst --storage <storage>`.
 - **Every model fails.** No provider key, or all are rate-limited: see the

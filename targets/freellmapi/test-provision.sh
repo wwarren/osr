@@ -118,7 +118,7 @@ fresh() {
     printf 'tags: ai;osr-router\nnet0: name=eth0,bridge=vmbr0,ip=192.0.2.10/24,gw=192.0.2.1\n' > "$PVE_ETC/lxc/210.conf"
     : > "$FAKE/ct/210/running"
     local name
-    for name in pct pvesh pvesm pveversion skopeo vzdump; do ln -s "$here/fake-pve.sh" "$tmp/host/bin/$name"; done
+    for name in pct pvesh pvesm pveversion skopeo vzdump zstd; do ln -s "$here/fake-pve.sh" "$tmp/host/bin/$name"; done
 }
 # host [--flag ...] [VAR=value ...]: a real run on the fake host; its status in rc.
 host() {
@@ -303,6 +303,43 @@ has 'nothing to do'
 pass 'after a rollback the backup is kept, root-only, and does not block the next run'
 [[ $(calls) == *"pct restore 280 $tmp/host/state/280/vzdump-lxc-280-"*' --storage local-lvm'* ]] || fail 'pct restore was not used'
 pass 'a release that does not become healthy is rolled back from the backup'
+
+# The CT on another cluster node, as tools/upgrade-all.sh sees it from this one
+# (pct is tools/pct-cluster.sh): this node's vzdump would skip it and succeed.
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_CT_NODE=pve2 --reconfigure; ok 'an upgrade of a CT on another node'
+[[ $(cat "$FAKE/ct/280/image") == v0.99.1 && -e $FAKE/ct/280/running && $(cat "$FAKE/ct/280/node") == pve2 ]] ||
+    fail 'the new CT does not run on the node the old one was on'
+[[ $(cat "$data/freeapi.db") == "$key" && $(cat "$data/freeapi.db-wal") == 'provider keys' && $(env_file) == "$env_before" ]] ||
+    fail 'the data did not survive on the other node'
+[[ $(cat "$PVE_ETC/firewall/280.fw") == "$fw_before" && $(conf) == *'cores: 4'* ]] || fail 'firewall or options changed on the other node'
+has 'pve2 (backup, template and new CT handled there'; has 'Copying the template'; has 'Backing up CT 280 on node pve2'
+remote_template=$FAKE/node-pve2/template/cache/freellmapi_v0.99.1.tar
+cmp -s "$remote_template" "$FAKE/template/cache/freellmapi_v0.99.1.tar" && [[ $(stat -c %a "$remote_template") == 644 ]] ||
+    fail 'the template was not copied to the node, readable'
+[[ $(calls) == *'vzdump 280 --mode stop --stdout 1 --tmpdir /var/tmp'* && $(calls) == *$'\nzstd -q\n'* && $(calls) != *'--dumpdir'* ]] ||
+    fail 'the backup was not taken on the CT'"'"'s node'
+[[ $(calls) != *'skip external'* && -z $(ls -A "$tmp/host/state") ]] || fail 'the backup was left behind'
+pass 'a CT on another node: template copied there, backup taken there and streamed here, new CT made there'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_UNHEALTHY=v0.99.2 FAKE_CT_NODE=pve2 --reconfigure; bad 'an unhealthy release on another node'
+has "is running FreeLLMAPI $default_version again"
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && $(cat "$FAKE/ct/280/node") == pve2 && -e $FAKE/ct/280/running ]] ||
+    fail 'the CT was not restored on its node'
+[[ $(cat "$data/freeapi.db") == "$key" && $(env_file) == "$env_before" ]] || fail 'the restored CT lost its data'
+[[ $(calls) == *'pct restore 280 /var/tmp/osr-freellmapi.'*'/vzdump-lxc-280-'*'.tar.zst --storage local-lvm'* ]] ||
+    fail 'the backup was not restored from a copy on the node'
+[[ -z $(ls -d /var/tmp/osr-freellmapi.* 2>/dev/null) ]] || fail 'the copy of the backup was left on the node'
+[[ -s $(echo "$tmp"/host/state/280.rolled-back-*/vzdump-lxc-280-*.tar.zst) ]] || fail 'the backup is not kept here'
+pass 'a CT on another node that fails is restored there from the backup kept here'
+
+upgrade_ready
+host CT_ID=280 FREELLMAPI_VERSION=v0.99.1 FAKE_CT_NODE=pve2 FAKE_VZDUMP_FAILS=1 --reconfigure; bad 'a failed backup on another node'
+[[ $(cat "$FAKE/ct/280/image") == "$default_version" && -e $FAKE/ct/280/running && $(calls) != *'pct destroy'* ]] ||
+    fail 'the CT was changed although no backup was taken'
+[[ -z $(ls -A "$tmp/host/state") ]] || fail 'an empty backup was left behind'
+pass 'a backup that fails on another node leaves the CT as it was'
 
 upgrade_ready
 host CT_ID=280 FREELLMAPI_VERSION=v0.99.2 FAKE_REKEY=v0.99.2 --reconfigure; bad 'a release with another key'

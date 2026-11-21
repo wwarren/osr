@@ -203,6 +203,51 @@ ensure_template() {
     chmod 0644 -- "$tmp" && mv -- "$tmp" "$path" || { rm -f -- "$tmp"; die "Could not store $volume."; }
 }
 
+# --- The CT's node ----------------------------------------------------------
+# Under tools/upgrade-all.sh, pct is tools/pct-cluster.sh and the CT may live
+# on another node of the cluster: pct reaches it there, but vzdump, pvesm and
+# a pct create or restore (of a CT that does not exist at that moment) act on
+# the node they run on. vzdump even succeeds with no backup for a guest of
+# another node ("skip external VMs"). So the replacement runs them on the CT's
+# node (pct --osr-on-node) and streams the backup to and from this one. With
+# Proxmox's own pct (no --osr-node) the CT is on this node.
+ct_node=''
+find_ct_node() {
+    local node here
+    node=$(pct --osr-node "$CT_ID" 2>/dev/null) || node=''
+    here=$(pct --osr-local-node 2>/dev/null) || here=''
+    if [[ -n $node && -n $here && $node != "$here" ]]; then ct_node=$node; fi
+    return 0
+}
+# on_ct_node COMMAND...: on the CT's node; stdin and stdout pass through.
+on_ct_node() {
+    if [[ -n $ct_node ]]; then pct --osr-on-node "$ct_node" "$@"; else "$@"; fi
+}
+# sync_template: the template of the release on the CT's node too, when that
+# is another node (its template storage may be its own): copied from here
+# unless the node already has the same file.
+sync_template() {
+    [[ -n $ct_node ]] || return 0
+    local volume path remote sum
+    volume=$(template_volume "$FREELLMAPI_VERSION")
+    path=$(pvesm path "$volume") || die "Storage $TEMPLATE_STORAGE cannot hold container templates: $volume"
+    remote=$(on_ct_node pvesm path "$volume" </dev/null) ||
+        die "Storage $TEMPLATE_STORAGE on node $ct_node cannot hold container templates: $volume"
+    sum=$(sha256sum < "$path") || die "Could not read $path."
+    if [[ $(on_ct_node sh -c 'sha256sum < "$1"' sh "$remote" </dev/null 2>/dev/null) == "$sum" ]]; then
+        note "Node $ct_node has the template $volume."
+        return 0
+    fi
+    note "Copying the template $volume to node $ct_node (CT $CT_ID is there)."
+    # Readable by the CT's mapped root, which unpacks it (see ensure_template).
+    on_ct_node sh -c 'umask 022; [ -d "${1%/*}" ] || exit 1; t="$1.tmp.$$"
+        if cat > "$t" && chmod 0644 "$t" && mv -f -- "$t" "$1"; then exit 0; fi
+        rm -f -- "$t"; exit 1' sh "$remote" < "$path" ||
+        die "Could not copy the template $volume to node $ct_node."
+    [[ $(on_ct_node sh -c 'sha256sum < "$1"' sh "$remote" </dev/null) == "$sum" ]] ||
+        die "The template $volume on node $ct_node differs from $path after the copy."
+}
+
 # --- Inside the CT -----------------------------------------------------------
 # The image is Debian with Node: sh, coreutils, tar and setpriv are there. None
 # of these scripts carries a secret; secrets travel on stdin.
@@ -627,10 +672,16 @@ fi
 create_ct() {
     local template=$1 net=$2 rootfs=$3 data=$4
     shift 4
-    (umask 022; run pct create "$CT_ID" "$template" --unprivileged 1 --rootfs "$rootfs" \
-        --mp0 "$data,mp=$GUEST_DATA,backup=1" --net0 "$net" --tags 'ai;ai-model;osr-target;freellmapi' \
-        --description "$CT_DESCRIPTION"$'\n'"OpenAI-compatible API and dashboard on TCP $FREELLMAPI_PORT" "$@") ||
-        { note "pct create failed for CT $CT_ID (see its message above)."; return 1; }
+    local -a create=(pct create "$CT_ID" "$template" --unprivileged 1 --rootfs "$rootfs"
+        --mp0 "$data,mp=$GUEST_DATA,backup=1" --net0 "$net" --tags 'ai;ai-model;osr-target;freellmapi'
+        --description "$CT_DESCRIPTION"$'\n'"OpenAI-compatible API and dashboard on TCP $FREELLMAPI_PORT" "$@")
+    if [[ -n $ct_node ]]; then
+        # The replacement of a CT on another node: made again there.
+        printf '+ on node %s:' "$ct_node"; printf ' %q' "${create[@]}"; printf '\n'
+        on_ct_node sh -c 'umask 022; exec "$@"' sh "${create[@]}"
+    else
+        (umask 022; run "${create[@]}")
+    fi || { note "pct create failed for CT $CT_ID (see its message above)."; return 1; }
     (( dry_run )) && return 0
     old_entrypoint=$(ct_value entrypoint)
     [[ $old_entrypoint =~ $IMAGE_ENTRYPOINT_RE ]] || {
@@ -755,8 +806,14 @@ rollback() {
     fi
     # pct restore creates /var/lib/lxc/<CT>/rootfs with the caller's umask and
     # unpacks as the CT's mapped root, like pct create (see create_ct).
-    (umask 022; pct restore "$CT_ID" "$dump" --storage "$ct_storage") ||
-        { note "pct restore failed. The backup is kept: $dump (pct restore $CT_ID $dump --storage $ct_storage)"; return 1; }
+    if [[ -n $ct_node ]]; then
+        # On the CT's node, from a copy of the backup streamed there.
+        on_ct_node sh -c 'umask 022; d=$(mktemp -d -p /var/tmp osr-freellmapi.XXXXXX) || exit 1
+            cat > "$d/$2" && pct restore "$1" "$d/$2" --storage "$3"; r=$?; rm -rf -- "$d"; exit $r' \
+            sh "$CT_ID" "${dump##*/}" "$ct_storage" < "$dump"
+    else
+        (umask 022; pct restore "$CT_ID" "$dump" --storage "$ct_storage")
+    fi || { note "pct restore failed. The backup is kept: $dump (on node ${ct_node:-$(hostname -s)}: pct restore $CT_ID <that file> --storage $ct_storage)"; return 1; }
     pct start "$CT_ID" || { note "The restored CT $CT_ID did not start. The backup is kept: $dump"; return 1; }
     FREELLMAPI_PORT=$old_port
     ROUTER_CT_ID=$old_router
@@ -861,6 +918,8 @@ else
     done
 fi
 [[ -r $firewall_file || $dry_run == 1 ]] || die "Missing firewall file: $firewall_file"
+(( dry_run )) || find_ct_node
+[[ -z $ct_node ]] || pve_row 'Node' "$ct_node (backup, template and new CT handled there; the backup is kept on this node)"
 
 pve_row 'Change' "replace the CT with one made from the new image; data, ID and address stay"
 note '  Options set on the CT by hand (other than cores, memory, swap, start order,'
@@ -868,6 +927,7 @@ note '  DNS and the network device) are not carried over; the backup has them.'
 pve_confirm "Replace FreeLLMAPI CT $CT_ID with release $FREELLMAPI_VERSION (it is down for a few minutes)?"
 
 ensure_template "$FREELLMAPI_VERSION" "$FREELLMAPI_DIGEST"
+(( dry_run )) || sync_template
 if (( dry_run )); then
     stage="$STATE_DIR/$CT_ID" dump="$stage/vzdump-lxc-$CT_ID-<time>.tar.zst" data_tar="$stage/data.tar"
     printf '+ vzdump %s --mode stop --compress zstd --dumpdir %s --tmpdir /var/tmp (the whole CT, for rollback)\n' "$CT_ID" "$stage"
@@ -891,9 +951,21 @@ else
     # /var/tmp (vzdump's own fallback) keeps that temporary copy reachable, and
     # umask 022 lets vzdump create it reachable: tools/upgrade-all.sh runs with
     # umask 077. The archive is written by root into the root-only directory.
-    (umask 022; vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" --tmpdir /var/tmp >&2)
+    if [[ -z $ct_node ]]; then
+        (umask 022; vzdump "$CT_ID" --mode stop --compress zstd --dumpdir "$stage" --tmpdir /var/tmp >&2)
+    else
+        # vzdump backs up only its own node's guests: it runs on the CT's
+        # node and streams the archive here, into the root-only directory.
+        # Its documented stream is the plain tar (--stdout), compressed there
+        # with the zstd its own --compress zstd uses; pipefail keeps a vzdump
+        # failure a failure.
+        note "Backing up CT $CT_ID on node $ct_node into $stage."
+        on_ct_node bash -c 'set -o pipefail; umask 022; vzdump "$1" --mode stop --stdout 1 --tmpdir /var/tmp | zstd -q' bash "$CT_ID" \
+            </dev/null > "$stage/vzdump-lxc-$CT_ID-$(date +%Y_%m_%d-%H_%M_%S).tar.zst"
+    fi
     dumps=("$stage"/vzdump-lxc-"$CT_ID"-*.tar.zst)
-    [[ ${#dumps[@]} -eq 1 && -s ${dumps[0]} ]] || { note "vzdump left no backup in $stage."; false; }
+    [[ ${#dumps[@]} -eq 1 && -s ${dumps[0]} ]] ||
+        { note "vzdump left no backup in $stage (a CT on another node is skipped by this node's vzdump)."; false; }
     dump=${dumps[0]}
     maintenance_boot
     export_data || { note "Could not save the data directory of CT $CT_ID."; false; }

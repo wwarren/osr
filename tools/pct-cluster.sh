@@ -15,6 +15,11 @@
 #
 #   pct list                         every node's CTs (unreachable nodes skipped)
 #   pct --osr-node ID                the node that holds CT ID
+#   pct --osr-local-node             this node's name
+#   pct --osr-on-node NODE CMD...    a host command (vzdump, pvesm, a pct create
+#                                    of a CT not made yet, ...) on NODE: here for
+#                                    this node, else over the same SSH; our stdin
+#                                    (unless a terminal) and stdout pass through
 #   pct --osr-check-node NODE        exit 0 when NODE answers over SSH
 #   pct --osr-node-state NODE        local, ok, offline, unreachable or unknown
 #   pct --osr-close                  end the shared SSH connections
@@ -185,6 +190,16 @@ main() {
     local sub=${1:-} id=${2:-} node here real tty=none
     case $sub in
         --osr-node) node_of "$id"; return ;;
+        --osr-local-node) local_node; return ;;
+        --osr-on-node)
+            (( $# >= 3 )) && [[ -n $id ]] || die 'usage: pct --osr-on-node NODE COMMAND [ARGUMENT...]'
+            shift 2
+            [[ $id != "$(local_node)" ]] || exec "$@"
+            [[ -d $NODES_DIR/$id ]] || die "$id is not a node of this cluster"
+            [[ $(node_member "$id" online) != 0 ]] || die "node $id is offline"
+            if [[ -t 0 ]]; then tty=none; else tty=stdin; fi
+            on_node "$id" "$tty" "$(quote "$@")"
+            return ;;
         --osr-check-node) [[ -n $id ]] || die '--osr-check-node needs a node name'
                           on_node "$id" none true ;
                           return ;;

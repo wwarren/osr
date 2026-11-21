@@ -152,6 +152,18 @@ rm -f "$tmp/out2"
 assert_status 'a failed pull returns its status' 5 pct pull 998 /nope "$tmp/out2"
 assert_eq 'and writes nothing here' '' "$(find "$tmp" -maxdepth 1 \( -name out2 -o -name '.pct-pull.*' \))"
 
+describe 'host commands run on a named node'
+reset
+assert_eq 'this node'"'"'s name' pve1 "$(pct --osr-local-node)"
+assert_eq 'on another node, over SSH' 'pve2 a b c' "$(pct --osr-on-node pve2 sh -c 'echo "$OSR_MOCK_NODE $*"' sh 'a b' c)"
+assert_file_contains 'as root at its address' 'pve2 root@10.0.0.2 -T --' "$tmp/mock/ssh.log"
+assert_eq 'stdin goes there, stdout comes back' "$(printf 'x\001y')" "$(printf 'x\001y' | pct --osr-on-node pve2 cat)"
+assert_eq 'on this node, here' 'local' "$(pct --osr-on-node pve1 sh -c 'echo "${OSR_MOCK_NODE:-local}"')"
+assert_status 'its exit status comes back' 3 pct --osr-on-node pve2 sh -c 'exit 3'
+assert_status 'a node not in the cluster is refused' 2 pct --osr-on-node pve9 true
+assert_status 'an offline node is refused' 2 pct --osr-on-node pve3 true
+assert_status 'a command is needed' 2 pct --osr-on-node pve2
+
 describe 'nodes that cannot be reached'
 reset
 assert_status 'an offline node is refused without SSH' 2 pct status 301

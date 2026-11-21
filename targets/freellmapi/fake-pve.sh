@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # A stand-in for the Proxmox commands targets/freellmapi/provision-lxc.sh runs
-# (pct, pvesh, pvesm, pveversion, skopeo, vzdump), for test-provision.sh. Each
+# (pct, pvesh, pvesm, pveversion, skopeo, vzdump, zstd), for test-provision.sh. Each
 # is a link to this file. A CT is a directory: its configuration in
 # $PVE_ETC/lxc/<id>.conf as `pct config` prints it, its file system under
 # $FAKE/ct/<id>/fs. `pct exec` runs the provisioner's own guest scripts against
 # that tree (paths under /app are mapped into it); only the Node one-liners are
 # imitated, by what they ask for.
+#
+# FAKE_CT_NODE=pve2 puts the CTs on another node of a cluster, the way
+# tools/pct-cluster.sh (pct under tools/upgrade-all.sh) sees them from pve1:
+# pct --osr-node, --osr-local-node and --osr-on-node answer, a command run with
+# --osr-on-node gets FAKE_ON_NODE, and vzdump, pvesm and pct create/restore act
+# for the node they run on (vzdump skips a CT of another node and succeeds).
 set -euo pipefail
 : "${FAKE:?}" "${PVE_ETC:?}"
 name=${0##*/}
@@ -21,6 +27,12 @@ set_value() {
     if grep -q "^$2: " "$file"; then sed -i "s|^$2: .*|$2: $3|" "$file"; else printf '%s: %s\n' "$2" "$3" >> "$file"; fi
 }
 running() { [[ -e $FAKE/ct/$1/running ]]; }
+# The node a command runs on, and its template directory.
+this_node() { printf '%s\n' "${FAKE_ON_NODE:-pve1}"; }
+template_dir() {
+    if [[ -n ${FAKE_ON_NODE:-} && $FAKE_ON_NODE != pve1 ]]; then printf '%s/node-%s/template/cache\n' "$FAKE" "$FAKE_ON_NODE"
+    else printf '%s/template/cache\n' "$FAKE"; fi
+}
 entrypoint='/usr/local/bin/docker-entrypoint.sh node server/dist/index.js'
 runtime_entrypoint_re='^/usr/bin/env PORT=([1-9][0-9]{0,4}) /usr/local/bin/docker-entrypoint\.sh node server/dist/index\.js$'
 
@@ -102,9 +114,11 @@ guest_exec() {
 }
 
 case $name in
+    # Archives here are plain tar: zstd passes the stream through.
+    zstd) [[ $* == -q ]] || exit 2; cat ;;
     pveversion) printf 'pve-manager/%s/0123abcd (running kernel: 6.17.2-1-pve)\n' "${FAKE_PVE_VERSION:-9.1.2}" ;;
     pvesh) [[ $1 == get && $2 == /cluster/nextid ]] || exit 2; ! exists "$4" ;;
-    pvesm) [[ $1 == path ]] || exit 2; mkdir -p "$FAKE/template/cache"; printf '%s/template/cache/%s\n' "$FAKE" "${2##*/}" ;;
+    pvesm) [[ $1 == path ]] || exit 2; mkdir -p "$(template_dir)"; printf '%s/%s\n' "$(template_dir)" "${2##*/}" ;;
     skopeo)
         case "$1 ${4:-}" in
             'inspect docker://'*)
@@ -120,24 +134,31 @@ case $name in
         esac ;;
     vzdump)
         id=$1; shift
-        dumpdir='' tmpdir=''
+        dumpdir='' tmpdir='' stdout=''
         while (( $# )); do
             case $1 in
                 --mode) [[ $2 == stop ]] || exit 1 ;;
-                --compress) [[ $2 == zstd ]] || exit 1 ;;
+                --compress) [[ $2 == zstd && -z $stdout ]] || exit 1 ;;
                 --dumpdir) dumpdir=$2 ;;
                 --tmpdir) tmpdir=$2 ;;
+                --stdout) [[ $2 == 1 ]] || exit 1; stdout=1 ;;
                 *) exit 1 ;;
             esac
             shift 2
         done
-        [[ -n $dumpdir && -z ${FAKE_VZDUMP_FAILS:-} ]] || exit 1
+        # Like Proxmox's vzdump: a guest of another node is skipped, successfully.
+        if [[ -n ${FAKE_CT_NODE:-} && $FAKE_CT_NODE != "$(this_node)" ]]; then
+            printf 'INFO: skip external VMs: %s\n' "$id" >&2
+            exit 0
+        fi
+        [[ ( -n $dumpdir || -n $stdout ) && -z ${FAKE_VZDUMP_FAILS:-} ]] || exit 1
         ! running "$id" || exit 1
         # The real vzdump runs tar for an unprivileged CT as its mapped root,
         # reading the CT config from the temporary directory: by default
         # <dumpdir>/<name>.tmp, else <tmpdir>/vzdumptmp<pid>_<id>. Every
         # directory above it must let others through.
         tmp_parent=${tmpdir:-$dumpdir}
+        [[ -n $tmp_parent ]] || exit 1
         # vzdump makes that directory with mkdir under the caller's umask.
         (( (8#777 & ~8#$(umask)) & 1 )) || {
             printf 'INFO: tar: %s/vzdumptmp%s_%s/: Cannot open: Permission denied\n' "$tmp_parent" "$$" "$id" >&2
@@ -154,10 +175,15 @@ case $name in
             done
         }
         cp "$(conf "$id")" "$FAKE/ct/$id/conf.saved"; cp "$PVE_ETC/firewall/$id.fw" "$FAKE/ct/$id/fw.saved"
-        tar -C "$FAKE/ct" -cf "$dumpdir/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id" ;;
+        if [[ -n $stdout ]]; then tar -C "$FAKE/ct" -cf - "$id"
+        else tar -C "$FAKE/ct" -cf "$dumpdir/vzdump-lxc-$id-2026_11_16-00_00_00.tar.zst" "$id"; fi ;;
     pct)
         command=$1 id=${2:-}; shift 2 || true
         case $command in
+            --osr-node) [[ -n ${FAKE_CT_NODE:-} ]] || exit 99; exists "$id" && printf '%s\n' "$FAKE_CT_NODE"; exit 0 ;;
+            --osr-local-node) [[ -n ${FAKE_CT_NODE:-} ]] || exit 99; echo pve1 ;;
+            --osr-on-node) [[ -n ${FAKE_CT_NODE:-} && -n $id && $# -ge 1 ]] || exit 99
+                           FAKE_ON_NODE=$id exec "$@" ;;
             status) exists "$id" || exit 2; if running "$id"; then echo 'status: running'; else echo 'status: stopped'; fi ;;
             config) exists "$id" || exit 2; cat "$(conf "$id")" ;;
             create)
@@ -167,15 +193,16 @@ case $name in
                 # FAKE_CREATE_FAILS: a release whose template pct create refuses.
                 [[ -z ${FAKE_CREATE_FAILS:-} || $1 != *"freellmapi_${FAKE_CREATE_FAILS}.tar" ]] || { echo 'fake: create failed' >&2; exit 1; }
                 template=$1; shift
-                [[ $template == *:vztmpl/freellmapi_v*.tar && -f $FAKE/template/cache/${template##*/} ]] || { echo 'no such template' >&2; exit 1; }
+                [[ $template == *:vztmpl/freellmapi_v*.tar && -f $(template_dir)/${template##*/} ]] || { echo 'no such template' >&2; exit 1; }
                 # Proxmox opens the OCI archive inside the CT's user namespace,
                 # as its mapped root: the template must be readable by others.
-                (( 8#$(stat -c %a "$FAKE/template/cache/${template##*/}") & 4 )) ||
+                (( 8#$(stat -c %a "$(template_dir)/${template##*/}") & 4 )) ||
                     { echo "fake: unable to open OCI archive ${template##*/}: Permission denied" >&2; exit 1; }
                 # mp0 is a fresh file system: its root has a lost+found.
                 mkdir -p "$FAKE/ct/$id" "$(fs "$id")/app/server/data/lost+found"
                 chmod 0700 "$(fs "$id")/app/server/data/lost+found"
                 version=${template##*freellmapi_}; printf '%s\n' "${version%.tar}" > "$FAKE/ct/$id/image"
+                this_node > "$FAKE/ct/$id/node"
                 {
                     printf 'arch: amd64\n'
                     [[ -n ${FAKE_NO_ENTRYPOINT:-} ]] || printf 'entrypoint: %s\n' "$entrypoint"
@@ -208,6 +235,7 @@ case $name in
                 ! exists "$id" && [[ -f $1 && $2 == --storage && -z ${FAKE_RESTORE_FAILS:-} ]] || exit 1
                 tar -C "$FAKE/ct" -xf "$1"
                 mv "$FAKE/ct/$id/conf.saved" "$(conf "$id")"; mv "$FAKE/ct/$id/fw.saved" "$PVE_ETC/firewall/$id.fw"
+                this_node > "$FAKE/ct/$id/node"
                 rm -f "$FAKE/ct/$id/running" "$FAKE/ct/$id/listening" ;;
             exec) [[ $1 == -- ]] && shift; guest_exec "$id" "$@" ;;
             *) echo "fake pct: unknown command $command" >&2; exit 99 ;;
