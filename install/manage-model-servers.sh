@@ -110,9 +110,20 @@ Commands:
                              Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
-  set-model <tier> <model>   Set the model for EVERY server in a tier
-  set-server-model <tier> <server> <model>
-                             Set the model for ONE server within a tier
+  set-model <tier> <model[,model...]>
+                             Set the model(s) for EVERY server in a tier
+  set-server-model <tier> <server> <model[,model...]>
+                             Set the model(s) for ONE server within a tier
+  add-model <tier> <model> [server...]
+                             Add one more model to a tier: on the servers
+                             named, or else on every server of the tier that
+                             has it. Each model of a tier is offered by name
+                             in Open WebUI, and auto and the tier alias spread
+                             the tier's requests across all of them
+  remove-model <tier> <model> [server...]
+                             Take a model out of a tier (on the servers named,
+                             or else on all of them); a server keeps at least
+                             one model
   set-keepalive <value>      Set how long Ollama keeps models resident
                              (e.g. 30m, 2h, -1 = never unload, blank = use the
                              server's own OLLAMA_KEEP_ALIVE)
@@ -226,6 +237,11 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-model fast llama3.2:3b --no-probe
     manage-model-servers.sh set-server-model large 10.0.0.54 llama3.3:70b --apply
     manage-model-servers.sh set-server-model medium 192.0.2.14 smtek/Qwen3.8-27B:Q3_K_XL-16gb --apply
+    manage-model-servers.sh set-model xlarge llama3.3:70b,qwen3:235b --apply
+    manage-model-servers.sh set-server-model xlarge 10.0.0.56 llama3.3:70b,qwen3:235b --apply
+    manage-model-servers.sh add-model xlarge deepseek-r1:671b --apply
+    manage-model-servers.sh add-model xlarge glm-5.3-flash maya://10.0.0.9 --apply
+    manage-model-servers.sh remove-model xlarge qwen3:235b --apply
     manage-model-servers.sh set-keepalive 2h --apply
     manage-model-servers.sh set-keepalive -1 --apply
     manage-model-servers.sh set-keepalive '' --apply
@@ -848,8 +864,9 @@ model_present_on() {
   return 1
 }
 
-# The ollama tag configured for one specific (model_name, api_base) deployment.
-# Deployments are per (tier, server), so each pair can carry its own model.
+# The model tags configured for one (model_name, api_base) pair, comma-joined
+# in file order. Deployments are per (tier, server, model), so each pair can
+# carry its own model, or several.
 current_pair_tag() {
   local want_name="$1" want_base="$2"
   [[ -f "$LITELLM_YAML" ]] || return 0
@@ -863,8 +880,11 @@ current_pair_tag() {
     }
     /^[[:space:]]*api_base:[[:space:]]*/ {
       b = $0; sub(/.*api_base:[[:space:]]*/, "", b); sub(/[[:space:]]*$/, "", b)
-      if (n == want && b == base && tag != "") { print tag; exit }
-    }' "$LITELLM_YAML"
+      if (n == want && b == base && tag != "" && !(tag in seen)) {
+        seen[tag] = 1; out = out (out == "" ? "" : ",") tag
+      }
+    }
+    END { if (out != "") print out }' "$LITELLM_YAML"
 }
 
 # The ollama tag currently configured for a LiteLLM model_name (first match).
@@ -879,6 +899,63 @@ current_tier_tag() {
       t=$0; sub(/.*model:[[:space:]]*(ollama|lm_studio|openai)\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t); print t; exit
     }' "$LITELLM_YAML"
 }
+
+# Every model tag of a LiteLLM model_name (a tier), comma-joined in file order.
+current_tier_tags() {
+  local want="$1"
+  [[ -f "$LITELLM_YAML" ]] || return 0
+  awk -v want="$want" '
+    /^[[:space:]]*-[[:space:]]*model_name:/ {
+      n=$0; sub(/.*model_name:[[:space:]]*/,"",n); sub(/[[:space:]]*$/,"",n); next
+    }
+    /^[[:space:]]*model:[[:space:]]*(ollama|lm_studio|openai)\// && n==want {
+      t=$0; sub(/.*model:[[:space:]]*(ollama|lm_studio|openai)\//,"",t); sub(/[[:space:]]*(#.*)?$/,"",t)
+      if (t != "" && !(t in seen)) { seen[t] = 1; out = out (out == "" ? "" : ",") t }
+    }
+    END { if (out != "") print out }' "$LITELLM_YAML"
+}
+
+# The tags one (tier, server) pair serves, resolved as regenerate_litellm does:
+# a pending override, else what the pair has, else the tier's first tag.
+pair_tags() {
+  local tier="$1" url="$2" alias tags
+  alias="$(tier_model_name "$tier")"
+  tags="${PAIR_MODEL_OVERRIDE[${tier}|${url}]:-}"
+  [[ -n "$tags" ]] || tags="${TIER_MODEL_OVERRIDE[$tier]:-}"
+  [[ -n "$tags" ]] || tags="$(current_pair_tag "$alias" "$url")"
+  [[ -n "$tags" ]] || tags="$(current_tier_tag "$alias")"
+  printf '%s\n' "${tags:-$alias}"
+}
+
+# A model-list argument ("a" or "a,b") -> its tags comma-joined, duplicates
+# dropped. Dies on an empty list, a space or an "ollama/" prefix; a die inside
+# $(...) only ends the subshell, so call it as  x="$(model_list_arg "$y")" || exit 1.
+model_list_arg() {
+  local raw="$1" tag out=""
+  local -A seen=()
+  while IFS= read -r tag; do
+    tag="${tag#"${tag%%[![:space:]]*}"}"; tag="${tag%"${tag##*[![:space:]]}"}"
+    [[ -n "$tag" ]] || continue
+    [[ "$tag" != *[[:space:]]* ]] || die "a model name has no spaces: '${tag}'"
+    # Namespace slashes belong to the model name; only the provider prefix is forbidden.
+    [[ "$tag" != ollama/* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
+    [[ -z "${seen[$tag]:-}" ]] || continue
+    seen[$tag]=1
+    out="${out}${out:+,}${tag}"
+  done < <(printf '%s\n' "$raw" | tr ',' '\n')
+  [[ -n "$out" ]] || die "no model given (e.g. qwen3:32b)"
+  printf '%s\n' "$out"
+}
+
+# "a,b" -> "ollama/a, ollama/b" for messages.
+show_tags() {
+  local provider="$1" tags="$2"
+  [[ -n "$tags" ]] || { printf '%s/<unset>\n' "$provider"; return 0; }
+  printf '%s\n' "$tags" | tr ',' '\n' | sed "s|^|${provider}/|" | paste -sd, - | sed 's/,/, /g'
+}
+
+# Is tag one of the comma-joined tags?
+tags_contain() { [[ ",$1," == *",$2,"* ]]; }
 
 # --- rendering ----------------------------------------------------------------
 tiers_of() {  # which tiers reference this URL
@@ -922,8 +999,8 @@ cmd_list() {
     echo "FreeLLMAPI: ${freellmapi} (freellmapi/<id>; only when named, never by auto)"
   fi
   echo
-  # One row per (tier, server) deployment, because each pair can carry its own
-  # model — a single MODEL column per tier would hide that.
+  # One row per (tier, server), because each pair can carry its own model, or
+  # several — a single MODEL column per tier would hide that.
   echo "Tier assignments (one row per server):"
   printf '  %-7s %-14s %-34s %s\n' "TIER" "ALIAS" "SERVER" "MODEL"
   local tier alias tag url any
@@ -935,7 +1012,12 @@ cmd_list() {
       any=true
       tag="$(current_pair_tag "$alias" "$url")"
       [[ -n "$tag" ]] || tag="$(current_tier_tag "$alias")"
-      printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "$url" "$(litellm_provider "$url")/${tag:-?}"
+      if [[ -n "$tag" ]]; then
+        tag="$(show_tags "$(litellm_provider "$url")" "$tag")"
+      else
+        tag="$(litellm_provider "$url")/?"
+      fi
+      printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "$url" "$tag"
     done < <(get_tier "$tier")
     $any || printf '  %-7s %-14s %-34s %s\n' "$tier" "$alias" "<no servers>" "-"
   done
@@ -1167,7 +1249,7 @@ kindi_budget_note() {
 }
 
 regenerate_litellm() {
-  local tmp tier name tag tier_tag url tail_block keep_alive fallbacks retry_policy sig kindi_timeout
+  local tmp tier name tag tags tier_tag url tail_block keep_alive fallbacks retry_policy sig kindi_timeout
   local provider cloud_key cloud_ids cloud_id
   local -a sig_lines=()
   local kind key_env k
@@ -1190,7 +1272,7 @@ regenerate_litellm() {
       sig=""
       while IFS= read -r url || [[ -n "$url" ]]; do
         [[ -n "$url" ]] || continue
-        # Resolve the model for THIS (tier, server) pair, most specific first:
+        # Resolve the model(s) for THIS (tier, server) pair, most specific first:
         #   1. an explicit set-server-model for this pair
         #   2. an explicit set-model for the whole tier
         #   3. whatever this exact pair already had  <- without this, a server
@@ -1202,30 +1284,36 @@ regenerate_litellm() {
           tag="$(current_pair_tag "$name" "$url")"
         fi
         [[ -n "$tag" ]] || tag="$tier_tag"
-        printf '  - model_name: %s\n' "$name"
-        printf '    litellm_params:\n'
-        printf '      model: %s/%s\n' "$(litellm_provider "$url")" "$tag"
-        printf '      api_base: %s\n' "$(litellm_api_base "$url")"
-        kind="$(server_kind "$url")"
-        if [[ "$kind" == kindi ]]; then
-          # A first prompt can take minutes on a small card, and Kindi serves
-          # one request at a time: allow the hour its agent guide asks for.
-          printf '      timeout: %s\n' "$kindi_timeout"
-        fi
-        if [[ "$kind" == ollama ]]; then
-          [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
-        else
-          # Tokens come from secrets.env, which the LiteLLM unit loads.
-          # keep_alive is an Ollama setting and is never sent elsewhere.
-          key_env="$(kind_field "$kind" key)"
-          if [[ -n "${kind_has_token[$kind]:-}" ]]; then
-            printf '      api_key: os.environ/%s\n' "$key_env"
-          elif is_openai_kind "$kind"; then
-            # LiteLLM's openai provider needs some key even for a keyless server.
-            printf '      api_key: none\n'
+        tags="$tag"
+        # One deployment per model: a pair may serve several (add-model), and
+        # LiteLLM spreads the tier's requests across all of its deployments.
+        while IFS= read -r tag || [[ -n "$tag" ]]; do
+          [[ -n "$tag" ]] || continue
+          printf '  - model_name: %s\n' "$name"
+          printf '    litellm_params:\n'
+          printf '      model: %s/%s\n' "$(litellm_provider "$url")" "$tag"
+          printf '      api_base: %s\n' "$(litellm_api_base "$url")"
+          kind="$(server_kind "$url")"
+          if [[ "$kind" == kindi ]]; then
+            # A first prompt can take minutes on a small card, and Kindi serves
+            # one request at a time: allow the hour its agent guide asks for.
+            printf '      timeout: %s\n' "$kindi_timeout"
           fi
-        fi
-        sig+="${tag}@${url} "
+          if [[ "$kind" == ollama ]]; then
+            [[ -n "$keep_alive" ]] && printf '      keep_alive: %s\n' "$keep_alive"
+          else
+            # Tokens come from secrets.env, which the LiteLLM unit loads.
+            # keep_alive is an Ollama setting and is never sent elsewhere.
+            key_env="$(kind_field "$kind" key)"
+            if [[ -n "${kind_has_token[$kind]:-}" ]]; then
+              printf '      api_key: os.environ/%s\n' "$key_env"
+            elif is_openai_kind "$kind"; then
+              # LiteLLM's openai provider needs some key even for a keyless server.
+              printf '      api_key: none\n'
+            fi
+          fi
+          sig+="${tag}@${url} "
+        done < <(csv_to_lines "$tags")
       done < <(get_tier "$tier")
       if [[ -n "$sig" ]]; then
         sig_lines+=("${name} $(tr ' ' '\n' <<< "$sig" | sed '/^$/d' | sort | paste -sd, -)")
@@ -1459,13 +1547,12 @@ resolve_server_arg() {
 
 cmd_set_server_model() {
   local tier="${1:-}" server="${2:-}" tag="${3:-}"
-  local url alias current rc=0
+  local url alias current one rc=0
   [[ -n "$tier" ]]   || die "set-server-model: no tier given"
   tier_env_key "$tier" >/dev/null
   [[ -n "$server" ]] || die "set-server-model: no server given"
   [[ -n "$tag" ]]    || die "set-server-model: no model given (e.g. qwen3:32b)"
-  # Namespace slashes belong to the model name; only the provider prefix is forbidden.
-  [[ "$tag" != ollama/* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
+  tag="$(model_list_arg "$tag")" || exit 1
 
   url="$(resolve_server_arg "$server")"
   get_tier "$tier" | contains_line "$url" \
@@ -1480,17 +1567,20 @@ cmd_set_server_model() {
   fi
 
   if ! $NO_PROBE; then
-    rc=0; model_present_on "$url" "$tag" || rc=$?
-    case "$rc" in
-      1) note "  '${tag}' is not present on ${url}."
-         note "  Pull it there (ollama pull ${tag}), see '$0 models', or use --no-probe."
-         die "model '${tag}' is not available on ${url}" ;;
-      2) note "  WARNING: ${url} is unreachable; cannot verify '${tag}' is present." ;;
-    esac
+    while IFS= read -r one; do
+      rc=0; model_present_on "$url" "$one" || rc=$?
+      case "$rc" in
+        1) note "  '${one}' is not present on ${url}."
+           note "  Pull it there (ollama pull ${one}), see '$0 models', or use --no-probe."
+           die "model '${one}' is not available on ${url}" ;;
+        2) note "  WARNING: ${url} is unreachable; cannot verify '${one}' is present."
+           break ;;
+      esac
+    done < <(csv_to_lines "$tag")
   fi
 
   echo "Tier '${tier}' on ${url}:"
-  echo "  ollama/${current:-<unset>}  ->  ollama/${tag}"
+  echo "  $(show_tags ollama "$current")  ->  $(show_tags ollama "$tag")"
   confirm "Apply this change?" || { note "Aborted."; return 1; }
   PAIR_MODEL_OVERRIDE["${tier}|${url}"]="$tag"
   regenerate_litellm
@@ -1680,23 +1770,19 @@ cmd_models() {
   rm -f "$tmp"
   echo
   echo "Set one for a tier with:  $0 set-model <fast|medium|large|xlarge> <model>"
+  echo "Add one more to a tier:   $0 add-model <fast|medium|large|xlarge> <model> [server...]"
 }
 
 cmd_set_model() {
   local tier="${1:-}" tag="${2:-}"
-  local url current alias missing="" unreachable="" rc
+  local url current alias missing="" unreachable="" rc one same=true
   [[ -n "$tier" ]] || die "set-model: no tier given"
   tier_env_key "$tier" >/dev/null          # validates the tier name
   [[ -n "$tag" ]] || die "set-model: no model given (e.g. qwen3:32b)"
-  # Namespace slashes belong to the model name; only the provider prefix is forbidden.
-  [[ "$tag" != ollama/* ]] || die "give the Ollama tag only, without the 'ollama/' prefix"
+  tag="$(model_list_arg "$tag")" || exit 1
 
   alias="$(tier_model_name "$tier")"
-  current="$(current_tier_tag "$alias")"
-  if [[ "$current" == "$tag" ]]; then
-    note "Tier '${tier}' already serves '${tag}'. Nothing to do."
-    return 0
-  fi
+  current="$(current_tier_tags "$alias")"
 
   local -a servers=()
   while IFS= read -r url || [[ -n "$url" ]]; do
@@ -1704,28 +1790,39 @@ cmd_set_model() {
   done < <(get_tier "$tier")
   if (( ${#servers[@]} == 0 )); then
     note "  WARNING: tier '${tier}' has no servers assigned; setting the tag anyway."
+    [[ "$current" == "$tag" ]] || same=false
+  fi
+  for url in "${servers[@]}"; do
+    [[ "$(current_pair_tag "$alias" "$url")" == "$tag" ]] || same=false
+  done
+  if $same; then
+    note "Tier '${tier}' already serves '${tag}'. Nothing to do."
+    return 0
   fi
 
-  # Verify the tag actually exists on the hosts that will be asked to serve it.
+  # Verify every tag actually exists on the hosts that will be asked to serve it.
   if ! $NO_PROBE && (( ${#servers[@]} > 0 )); then
     for url in "${servers[@]}"; do
-      rc=0; model_present_on "$url" "$tag" || rc=$?
-      case "$rc" in
-        1) missing="${missing}${missing:+, }${url}" ;;
-        2) unreachable="${unreachable}${unreachable:+, }${url}" ;;
-      esac
+      while IFS= read -r one; do
+        rc=0; model_present_on "$url" "$one" || rc=$?
+        case "$rc" in
+          1) missing="${missing}${missing:+, }${one} on ${url}" ;;
+          2) unreachable="${unreachable}${unreachable:+, }${url}"; break ;;
+        esac
+      done < <(csv_to_lines "$tag")
     done
     [[ -n "$unreachable" ]] && note "  WARNING: could not check ${unreachable} (unreachable)."
     if [[ -n "$missing" ]]; then
-      note "  '${tag}' is not present on: ${missing}"
-      note "  Pull it there first (ollama pull ${tag}), pick another with '$0 models',"
+      note "  Not present: ${missing}"
+      note "  Pull it there first (ollama pull <model>), pick another with '$0 models',"
+      note "  use add-model to put a model only on the servers that have it,"
       note "  or re-run with --no-probe to set it anyway."
       die "model '${tag}' is not available on every server in tier '${tier}'"
     fi
   fi
 
   echo "Tier '${tier}' (${alias}) — ALL servers in this tier:"
-  echo "  ollama/${current:-<unset>}  ->  ollama/${tag}"
+  echo "  $(show_tags ollama "$current")  ->  $(show_tags ollama "$tag")"
   local n_servers
   n_servers="$(get_tier "$tier" | grep -c . || true)"
   if (( n_servers > 1 )); then
@@ -1735,9 +1832,123 @@ cmd_set_model() {
   confirm "Apply this change?" || { note "Aborted."; return 1; }
   TIER_MODEL_OVERRIDE["$tier"]="$tag"
   regenerate_litellm
-  note "  NOTE: the tier's model tag governs the LiteLLM fallback path. In"
-  note "        discovery mode OSR picks a model from the live inventory,"
-  note "        so this does not by itself change discovery-mode routing."
+  note "  NOTE: in discovery mode OSR picks from the live inventory, and prefers"
+  note "        the models assigned to the tier for that tier's requests"
+  note "        (router.ini [balancing] tier_models); the tag also governs the"
+  note "        LiteLLM fallback path and keep-alive pinning."
+}
+
+# Servers of a tier, one per line: the ones named (each checked to be in the
+# tier), or else every server of the tier.
+tier_servers_arg() {
+  local tier="$1" arg url; shift
+  if (( $# == 0 )); then
+    get_tier "$tier"
+    return 0
+  fi
+  for arg in "$@"; do
+    url="$(resolve_server_arg "$arg")" || exit 1
+    get_tier "$tier" | contains_line "$url" \
+      || die "${url} is not in tier '${tier}'. Add it with: $0 set-tier ${tier} ... "
+    printf '%s\n' "$url"
+  done
+}
+
+cmd_add_model() {
+  local tier="${1:-}" tag="${2:-}"
+  shift 2 2>/dev/null || shift $#
+  local url current rc unreachable="" named=false listing
+  local -a targets=() servers=()
+  local -A updated=()
+  [[ -n "$tier" ]] || die "add-model: no tier given"
+  tier_env_key "$tier" >/dev/null
+  [[ -n "$tag" ]] || die "add-model: no model given (e.g. qwen3:32b)"
+  [[ "$tag" != *,* ]] || die "add-model takes one model; set-model and set-server-model take a list"
+  tag="$(model_list_arg "$tag")" || exit 1
+  (( $# > 0 )) && named=true
+  listing="$(tier_servers_arg "$tier" "$@")" || exit 1
+  while IFS= read -r url; do
+    [[ -n "$url" ]] && servers+=("$url")
+  done <<< "$listing"
+  (( ${#servers[@]} > 0 )) \
+    || die "tier '${tier}' has no servers. Assign some first: $0 set-tier ${tier} <server...>"
+
+  for url in "${servers[@]}"; do
+    if $NO_PROBE; then targets+=("$url"); continue; fi
+    rc=0; model_present_on "$url" "$tag" || rc=$?
+    case "$rc" in
+      0) targets+=("$url") ;;
+      1) if $named; then
+           note "  '${tag}' is not present on ${url}."
+           note "  Pull it there (ollama pull ${tag}), see '$0 models', or use --no-probe."
+           die "model '${tag}' is not available on ${url}"
+         fi ;;
+      *) if $named; then
+           note "  WARNING: ${url} is unreachable; cannot verify '${tag}' is present."
+           targets+=("$url")
+         else
+           unreachable="${unreachable}${unreachable:+, }${url}"
+         fi ;;
+    esac
+  done
+  [[ -n "$unreachable" ]] && \
+    note "  WARNING: could not check ${unreachable} (unreachable); name it to add '${tag}' there anyway."
+  (( ${#targets[@]} > 0 )) || die "no server in tier '${tier}' serves '${tag}'. Pull it on one" \
+    "(see '$0 models'), name the servers, or use --no-probe."
+
+  echo "Tier '${tier}': add $(show_tags ollama "$tag")"
+  for url in "${targets[@]}"; do
+    current="$(pair_tags "$tier" "$url")"
+    if tags_contain "$current" "$tag"; then
+      echo "  ${url}: already serves it"
+      continue
+    fi
+    updated["$url"]="${current}${current:+,}${tag}"
+    echo "  ${url}: $(show_tags "$(litellm_provider "$url")" "${updated[$url]}")"
+  done
+  if (( ${#updated[@]} == 0 )); then
+    note "Nothing to do."
+    return 0
+  fi
+  confirm "Apply this change?" || { note "Aborted."; return 1; }
+  for url in "${!updated[@]}"; do
+    PAIR_MODEL_OVERRIDE["${tier}|${url}"]="${updated[$url]}"
+  done
+  regenerate_litellm
+}
+
+cmd_remove_model() {
+  local tier="${1:-}" tag="${2:-}"
+  shift 2 2>/dev/null || shift $#
+  local url current rest listing
+  local -A updated=()
+  [[ -n "$tier" ]] || die "remove-model: no tier given"
+  tier_env_key "$tier" >/dev/null
+  [[ -n "$tag" ]] || die "remove-model: no model given"
+  [[ "$tag" != *,* ]] || die "remove-model takes one model"
+  tag="$(model_list_arg "$tag")" || exit 1
+  listing="$(tier_servers_arg "$tier" "$@")" || exit 1
+
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    current="$(pair_tags "$tier" "$url")"
+    tags_contain "$current" "$tag" || continue
+    rest="$(printf '%s\n' "$current" | tr ',' '\n' | grep -Fxv -- "$tag" | paste -sd, - || true)"
+    [[ -n "$rest" ]] || die "${url} serves only '${tag}' in tier '${tier}'. Give it another model" \
+      "first ($0 set-server-model ${tier} ${url} <model>), or take it out of the tier ($0 set-tier)."
+    updated["$url"]="$rest"
+  done <<< "$listing"
+  (( ${#updated[@]} > 0 )) || die "tier '${tier}' has no model '${tag}' on those servers."
+
+  echo "Tier '${tier}': remove $(show_tags ollama "$tag")"
+  for url in "${!updated[@]}"; do
+    echo "  ${url}: $(show_tags "$(litellm_provider "$url")" "${updated[$url]}")"
+  done
+  confirm "Apply this change?" || { note "Aborted."; return 1; }
+  for url in "${!updated[@]}"; do
+    PAIR_MODEL_OVERRIDE["${tier}|${url}"]="${updated[$url]}"
+  done
+  regenerate_litellm
 }
 
 # Install Open WebUI into its venv, CPU-only by default.
@@ -3019,7 +3230,7 @@ cmd_commit() {
 # read-only ones (list, status, models, discover, test-alert) never wait on it.
 command_writes() {
   case "$1" in
-    add|remove|set-tier|set-model|set-server-model|set-keepalive|apply|commit|\
+    add|remove|set-tier|set-model|set-server-model|add-model|remove-model|set-keepalive|apply|commit|\
     set-token|set-api-key|set-cloud-key|set-cloud-models|set-freellmapi|set-comfyui|add-comfyui|\
     set-webhook|set-webui-version) return 0 ;;
     *) [[ -n "$(token_command_kind "$1")" ]] ;;
@@ -3289,6 +3500,8 @@ case "$COMMAND" in
   set-tier) cmd_set_tier "${ARGS[@]:-}" ;;
   set-model) cmd_set_model "${ARGS[0]:-}" "${ARGS[1]:-}" ;;
   set-server-model) cmd_set_server_model "${ARGS[0]:-}" "${ARGS[1]:-}" "${ARGS[2]:-}" ;;
+  add-model) cmd_add_model ${ARGS[@]+"${ARGS[@]}"} ;;
+  remove-model) cmd_remove_model ${ARGS[@]+"${ARGS[@]}"} ;;
   models)   cmd_models ;;
   set-keepalive) cmd_set_keepalive "${ARGS[0]-}" ;;
   apply)    cmd_apply ;;
@@ -3312,7 +3525,7 @@ case "$COMMAND" in
 esac
 
 case "$COMMAND" in
-  add|remove|set-tier|set-model|set-server-model|set-keepalive|set-webui-version|set-webhook|set-cloud-models)
+  add|remove|set-tier|set-model|set-server-model|add-model|remove-model|set-keepalive|set-webui-version|set-webhook|set-cloud-models)
     if ! $CHANGED && ! $DRY_RUN; then
       exit 0        # nothing was written; no need to nag about applying
     fi

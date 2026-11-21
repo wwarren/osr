@@ -3376,3 +3376,210 @@ def test_image_requests_are_validated(imaging):
         metrics = client.get("/metrics").text
     assert 'osr_requests_total{class="",mode="",model="",route="images",server="",status="400"} 3' in metrics
     assert 'osr_server_up{kind="comfyui",server="http://10.0.0.30:8188"} 1' in metrics
+
+
+# --- several models in one tier ---------------------------------------------------------
+XL_YAML = """model_list:
+  - model_name: xlarge
+    litellm_params:
+      model: ollama/llama3.3:70b
+      api_base: http://10.0.0.1:11434
+  - model_name: xlarge
+    litellm_params:
+      model: ollama/qwen3:235b
+      api_base: http://10.0.0.1:11434
+  - model_name: xlarge
+    litellm_params:
+      model: ollama/deepseek-r1:671b  # the biggest
+      api_base: http://10.0.0.2:11434
+  - model_name: fast
+    litellm_params:
+      model: ollama/qwen3:4b
+      api_base: http://10.0.0.2:11434
+  - model_name: openai/gpt-4.1
+    litellm_params:
+      model: openai/gpt-4.1
+      api_key: os.environ/OPENAI_API_KEY
+router_settings:
+  routing_strategy: latency-based-routing
+"""
+XL_MODELS = {"llama3.3:70b", "qwen3:235b", "deepseek-r1:671b"}
+PROOF = "Prove that sqrt 2 is irrational"
+
+
+def xl_tier(router, tmp_path, text=XL_YAML):
+    path = tmp_path / "litellm_config.yaml"
+    path.write_text(text)
+    router.TIER_CONFIG = str(path)
+    router.load_tier_models(force=True)
+    return path
+
+
+@pytest.fixture
+def xl(served, tmp_path):
+    router, upstream, client = served
+    upstream.inventory = {
+        HOST_A: tags(("llama3.3:70b", "70.6B", "llama"), ("qwen3:235b", "235B", "qwen3"),
+                     ("mistral-large:123b", "123B", "llama")),
+        HOST_B: tags(("deepseek-r1:671b", "671B", "deepseek2"), ("qwen3:4b", "4B", "qwen3")),
+    }
+    xl_tier(router, tmp_path)
+    assert client.post("/routing/refresh").status_code == 200
+    router._rotation.clear()
+    return router, upstream, client
+
+
+def test_parse_tier_models_reads_every_deployment_of_a_tier(router):
+    assert router.parse_tier_models(XL_YAML) == {
+        "xlarge": XL_MODELS, "fast": {"qwen3:4b"}}
+    # Key order inside an item, quotes, comments and ":latest" do not matter;
+    # cloud models, router_settings and other sections are not tiers.
+    assert router.parse_tier_models(
+        "model_list:\n"
+        "  - litellm_params:\n"
+        "      model: 'openai/GLM-5.3-Flash'\n"
+        "      tags:\n"
+        "        - model: ollama/nope\n"
+        "    model_name: large\n"
+        "  - model_name: \"large\"\n"
+        "    litellm_params: {model: ignored}\n"
+        "  - model_name: large\n"
+        "    litellm_params:\n"
+        "      model: lm_studio/qwen/qwen3-32b:latest\n"
+        "router_settings:\n"
+        "  model: ollama/also-nope\n") == {"large": {"glm-5.3-flash", "qwen/qwen3-32b"}}
+    assert router.parse_tier_models("") == {}
+    assert router.parse_tier_models("not: yaml: at all\n  - ]") == {}
+
+
+def test_auto_spreads_a_tier_across_all_of_its_models(xl):
+    router, upstream, client = xl
+    picked = [chat(client, messages=[user(f"{PROOF} ({n})")]).json()["model"] for n in range(6)]
+    assert set(picked) == XL_MODELS                         # every assigned model takes a turn...
+    assert "mistral-large:123b" not in picked               # ...and none that is only the right size
+    assert set(served_hosts(upstream)) == {HOST_A, HOST_B}
+
+
+def test_without_tier_models_the_largest_model_always_wins(xl, monkeypatch):
+    router, upstream, client = xl
+    monkeypatch.setattr(router, "TIER_MODELS_ENABLED", False)
+    router.load_tier_models(force=True)
+    assert router.TIER_MEMBERS == {}
+    picked = {chat(client, messages=[user(f"{PROOF} ({n})")]).json()["model"] for n in range(4)}
+    assert picked == {"deepseek-r1:671b"}
+
+
+def test_tier_alias_spreads_across_its_models(xl):
+    router, upstream, client = xl
+    picked = {chat(client, model="xlarge", messages=[user(f"hello {n}")]).json()["model"]
+              for n in range(6)}
+    assert picked == XL_MODELS
+
+
+def test_each_tier_model_is_listed_and_can_be_named(xl):
+    router, upstream, client = xl
+    listed = [m["id"] for m in client.get("/v1/models").json()["data"]]
+    assert XL_MODELS <= set(listed)
+    for name in XL_MODELS:
+        for _ in range(3):
+            response = chat(client, model=name, messages=[user(PROOF)])
+            assert response.json()["model"] == name
+
+
+def test_an_assigned_model_fits_its_tier_whatever_its_size(router, tmp_path):
+    xl_tier(router, tmp_path, XL_YAML.replace("deepseek-r1:671b", "qwen3:32b"))
+    small = router.build_entry(HOST_B, {"name": "qwen3:32b", "details": {"parameter_size": "32B"}})
+    unsized = router.build_entry(HOST_A, {"name": "qwen3:235b", "details": {}})
+    giant = router.build_entry(HOST_A, {"name": "kimi:1000b", "details": {"parameter_size": "1000B"}})
+    inv = {"models": [small, unsized, giant], "servers": {}}
+    need = {"class": "xlarge", "code": False, "vision": False}
+    first = {router.rank_candidates(need, inv)[0]["name"] for _ in range(4)}
+    assert first == {"qwen3:32b", "qwen3:235b"}
+    assert router.in_requested_band(small, need) and router.band_distance(unsized, need) == 0.0
+    # Not assigned to large: there it is judged by its size alone, as before.
+    assert router.tier_classes(small) == ["xlarge"]
+    assert not router.is_tier_member(small, {"class": "large"})
+
+
+def test_tier_models_still_respect_the_request_needs(xl):
+    router, upstream, client = xl
+    upstream.capabilities.update({"llama3.3:70b": ["completion", "vision"],
+                                  "qwen3:235b": ["completion"], "deepseek-r1:671b": ["completion"]})
+    router._CAPABILITIES.clear()
+    client.post("/routing/refresh")
+    image = [{"role": "user", "content": [{"type": "text", "text": PROOF},
+                                          {"type": "image_url", "image_url": {"url": "data:,"}}]}]
+    picked = {chat(client, messages=image).json()["model"] for _ in range(4)}
+    assert picked == {"llama3.3:70b"}
+
+
+def test_busy_server_gives_way_inside_a_tier(xl):
+    router, upstream, client = xl
+    router._IN_FLIGHT[HOST_A] = 3
+    try:
+        need = {"class": "xlarge", "code": False, "vision": False}
+        assert router.rank_candidates(need)[0]["server"] == HOST_B
+    finally:
+        router._IN_FLIGHT.clear()
+
+
+def test_a_conversation_keeps_its_tier_model(xl):
+    router, upstream, client = xl
+    history = [user(PROOF)]
+    first = chat(client, messages=history).json()["model"]
+    history += [{"role": "assistant", "content": "ok"}, user("Now prove it for cube roots")]
+    assert {chat(client, messages=history).json()["model"] for _ in range(4)} == {first}
+
+
+def test_tool_tasks_take_the_tier_models_in_turn_and_keep_theirs(xl):
+    router, upstream, client = xl
+    upstream.capabilities.update({name: ["completion", "tools"] for name in XL_MODELS})
+    router._CAPABILITIES.clear()
+    client.post("/routing/refresh")
+    tasks = {}
+    for n in range(6):
+        tasks[n] = chat(client, model="xlarge", tools=TOOLS,
+                        messages=[user(f"task {n}")]).json()["model"]
+    assert set(tasks.values()) == XL_MODELS
+    # Later steps of one task stay on its model.
+    steps = [user("task 2"), {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+             {"role": "tool", "tool_call_id": "1", "content": "done"}]
+    assert {chat(client, model="xlarge", tools=TOOLS, messages=steps).json()["model"]
+            for _ in range(4)} == {tasks[2]}
+
+
+def test_tool_tasks_stay_on_one_model_when_affinity_is_off(xl, monkeypatch):
+    router, upstream, client = xl
+    monkeypatch.setattr(router, "STICKY_SECONDS", 0.0)
+    upstream.capabilities.update({name: ["completion", "tools"] for name in XL_MODELS})
+    router._CAPABILITIES.clear()
+    client.post("/routing/refresh")
+    picked = {chat(client, model="xlarge", tools=TOOLS, messages=[user(f"task {n}")]).json()["model"]
+              for n in range(4)}
+    assert len(picked) == 1
+
+
+def test_tier_assignments_are_read_again_when_the_file_changes(xl, tmp_path):
+    router, upstream, client = xl
+    path = tmp_path / "litellm_config.yaml"
+    path.write_text(XL_YAML.replace("ollama/qwen3:235b", "ollama/mistral-large:123b"))
+    os.utime(path, ns=(time.time_ns(), time.time_ns() + 10_000_000_000))
+    client.post("/routing/refresh")
+    assert router.TIER_MEMBERS["xlarge"] == {"llama3.3:70b", "mistral-large:123b", "deepseek-r1:671b"}
+    inventory = client.get("/routing/inventory").json()
+    assert inventory["tier_models"]["xlarge"] == ["deepseek-r1:671b", "llama3.3:70b", "mistral-large:123b"]
+    explain = client.post("/routing/explain", json={"prompt": PROOF}).json()
+    assert all(c["tiers"] == ["xlarge"] for c in explain["candidates"][:3])
+    path.unlink()
+    client.post("/routing/refresh")
+    assert router.TIER_MEMBERS == {}
+
+
+def test_tier_config_defaults_beside_router_ini(monkeypatch, tmp_path):
+    ini = tmp_path / "router.ini"
+    ini.write_text((ROOT / "services/osr-router/router.ini").read_text())
+    (tmp_path / "litellm_config.yaml").write_text(XL_YAML)
+    router = load_router(monkeypatch, ROUTER_INI=str(ini))
+    assert router.TIER_CONFIG == str(tmp_path / "litellm_config.yaml")
+    assert router.TIER_MEMBERS["xlarge"] == XL_MODELS

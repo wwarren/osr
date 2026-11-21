@@ -206,6 +206,8 @@ INSTALLER_OWNED_CODE=(
   install/apply-config.sh
   install/manage-model-servers.sh
   install/setup-metrics.sh
+  tools/setup-temperature-exporter.sh
+  services/temperature-exporter/exporter.py
 )
 # OLD:NEW service directories renamed with the project (the unit file inside
 # is renamed too). Seeding moves an existing repo's old directories.
@@ -11323,6 +11325,197 @@ MANAGEEOF
 chmod 0755 "${REPO_DIR}/install/manage-model-servers.sh"
 
 # --- optional local metrics stack (Prometheus + Grafana) ---
+mkdir -p "${REPO_DIR}/services/temperature-exporter"
+cat > "${REPO_DIR}/services/temperature-exporter/exporter.py" <<'TEMPEXPORTPY'
+#!/usr/bin/env python3
+"""Read Proxmox host CPU/GPU sensors for the OSR Prometheus dashboard."""
+
+import argparse
+import glob
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import re
+import subprocess
+
+
+CPU_DRIVERS = {"coretemp", "k10temp", "zenpower", "cpu_thermal"}
+GPU_DRIVERS = {"amdgpu": "amd", "i915": "intel", "xe": "intel"}
+
+
+def _label(value):
+    return '"' + str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"') + '"'
+
+
+def _temperature(path):
+    try:
+        value = int(Path(path).read_text().strip()) / 1000
+    except (OSError, ValueError):
+        return None
+    return value if -30 <= value <= 150 else None
+
+
+def collect(hwmon_root="/sys/class/hwmon", nvidia_smi="nvidia-smi"):
+    """Return Prometheus text; absent or unreadable sensors emit no sample."""
+    lines = [
+        "# HELP osr_cpu_temperature_celsius Proxmox host CPU sensor temperature in Celsius.",
+        "# TYPE osr_cpu_temperature_celsius gauge",
+        "# HELP osr_gpu_temperature_celsius Proxmox host GPU temperature in Celsius.",
+        "# TYPE osr_gpu_temperature_celsius gauge",
+    ]
+    for directory in sorted(glob.glob(f"{hwmon_root}/hwmon*")):
+        base = Path(directory)
+        try:
+            driver = (base / "name").read_text().strip()
+        except OSError:
+            continue
+        if driver not in CPU_DRIVERS and driver not in GPU_DRIVERS:
+            continue
+        pci = re.search(r"(?<![0-9a-f])([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])", str(base.resolve()), re.I)
+        for sensor in sorted(base.glob("temp*_input")):
+            value = _temperature(sensor)
+            if value is None:
+                continue
+            prefix = sensor.name.removesuffix("_input")
+            try:
+                label = (base / f"{prefix}_label").read_text().strip()
+            except OSError:
+                label = prefix
+            if driver in CPU_DRIVERS:
+                labels = f'driver={_label(driver)},sensor={_label(label)}'
+                lines.append(f"osr_cpu_temperature_celsius{{{labels}}} {value:g}")
+            else:
+                # PCI address remains stable if hwmon enumeration changes.
+                device = pci.group(1).lower() if pci else base.name
+                labels = f'vendor={_label(GPU_DRIVERS[driver])},device={_label(device)},sensor={_label(label)}'
+                lines.append(f"osr_gpu_temperature_celsius{{{labels}}} {value:g}")
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=uuid,temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result:
+        for row in result.stdout.splitlines():
+            parts = [part.strip() for part in row.split(",")]
+            if len(parts) != 2 or not parts[0].startswith("GPU-"):
+                continue
+            try:
+                value = float(parts[1])
+            except ValueError:
+                continue
+            if -30 <= value <= 150:
+                labels = f'vendor="nvidia",device={_label(parts[0])},sensor="gpu"'
+                lines.append(f"osr_gpu_temperature_celsius{{{labels}}} {value:g}")
+    return "\n".join(lines) + "\n"
+
+
+def serve(bind, port, allowed_ip, token_file):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_error(404)
+                return
+            if self.client_address[0] != allowed_ip:
+                self.send_error(403)
+                return
+            try:
+                token = Path(token_file).read_text().strip()
+            except OSError:
+                self.send_error(503)
+                return
+            supplied = self.headers.get("Authorization", "")
+            if not token or not hmac.compare_digest(supplied, f"Bearer {token}"):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                self.end_headers()
+                return
+            body = collect().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bind", required=True)
+    parser.add_argument("--allow", required=True)
+    parser.add_argument("--port", type=int, default=9408)
+    parser.add_argument("--token-file", default="/etc/osr-temperature-exporter/token")
+    args = parser.parse_args()
+    serve(args.bind, args.port, args.allow, args.token_file)
+TEMPEXPORTPY
+cat > "${REPO_DIR}/tools/setup-temperature-exporter.sh" <<'TEMPEXPORTSH'
+#!/usr/bin/env bash
+# On the Proxmox host: install an OSR temperature exporter for one router CT.
+# CT_ID=<router CT> BRIDGE=<host bridge> ROUTER_IP=<CT IPv4> bash this-file
+set -euo pipefail
+
+: "${CT_ID:?set CT_ID to the router CT ID}"
+: "${BRIDGE:?set BRIDGE to the Proxmox bridge with an IPv4 address}"
+: "${ROUTER_IP:?set ROUTER_IP to the router CT IPv4 address}"
+[[ $EUID -eq 0 ]] || { echo 'Run as root on the Proxmox host.' >&2; exit 1; }
+[[ $CT_ID =~ ^[0-9]+$ && $ROUTER_IP =~ ^[0-9.]+$ && $BRIDGE =~ ^[a-zA-Z0-9_.-]+$ ]] || exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${SCRIPT_DIR}/../services/temperature-exporter/exporter.py"
+[[ -f $SOURCE ]] || { echo "Missing $SOURCE" >&2; exit 1; }
+HOST_IP="$(ip -4 -o addr show dev "$BRIDGE" | awk 'NR == 1 {split($4, a, "/"); print a[1]}')"
+[[ $HOST_IP =~ ^[0-9.]+$ ]] || { echo "No IPv4 address on $BRIDGE; temperature exporter was not installed." >&2; exit 1; }
+python3 - "$HOST_IP" "$ROUTER_IP" <<'PY'
+import ipaddress, sys
+for address in sys.argv[1:]:
+    ipaddress.IPv4Address(address)
+PY
+
+id -u osr-temperature >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin osr-temperature
+install -d -m 0755 /usr/local/libexec /etc/osr-temperature-exporter
+install -m 0755 "$SOURCE" /usr/local/libexec/osr-temperature-exporter.py
+if [[ ! -s /etc/osr-temperature-exporter/token ]]; then
+  umask 077
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > /etc/osr-temperature-exporter/token
+fi
+chown osr-temperature:osr-temperature /etc/osr-temperature-exporter/token
+chmod 0600 /etc/osr-temperature-exporter/token
+cat > /etc/systemd/system/osr-temperature-exporter.service <<EOF
+[Unit]
+Description=OSR Proxmox host temperature exporter
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=osr-temperature
+Group=osr-temperature
+ExecStart=/usr/bin/python3 /usr/local/libexec/osr-temperature-exporter.py --bind ${HOST_IP} --allow ${ROUTER_IP}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable osr-temperature-exporter.service
+systemctl restart osr-temperature-exporter.service
+
+# Keep the bearer secret off command lines and out of the Git config repo.
+pct push "$CT_ID" /etc/osr-temperature-exporter/token /etc/prometheus/osr-sensors-key --perms 0600
+pct exec "$CT_ID" -- chown prometheus:prometheus /etc/prometheus/osr-sensors-key
+pct exec "$CT_ID" -- env OSR_SENSOR_TARGET="${HOST_IP}:9408" bash /app/config-repo/install/setup-metrics.sh sync-sensors
+echo "Temperature metrics: ${HOST_IP}:9408 (only ${ROUTER_IP} is accepted; allow TCP 9408 from it in the host firewall if enabled)."
+TEMPEXPORTSH
+chmod 0755 "${REPO_DIR}/tools/setup-temperature-exporter.sh" "${REPO_DIR}/services/temperature-exporter/exporter.py"
 cat > "${REPO_DIR}/install/setup-metrics.sh" <<'METRICSEOF'
 #!/usr/bin/env bash
 # Install a small local Prometheus + Grafana stack in the router CT.
@@ -11348,7 +11541,7 @@ die() { printf 'metrics setup: %s\n' "$*" >&2; exit 1; }
 note() { printf 'metrics setup: %s\n' "$*" >&2; }
 
 [[ $EUID -eq 0 || -n $FS ]] || die 'run as root in the router CT'
-[[ $MODE == install || $MODE == sync-key || $MODE == login ]] || die 'usage: setup-metrics.sh [install|sync-key|login]'
+[[ $MODE == install || $MODE == sync-key || $MODE == sync-sensors || $MODE == login ]] || die 'usage: setup-metrics.sh [install|sync-key|sync-sensors|login]'
 
 env_value() {
   local file=$1 key=$2
@@ -11418,6 +11611,58 @@ if [[ $MODE == login ]]; then
   exit 0
 fi
 
+write_scrape_config() {
+  local router_host router_port sensor_target
+  router_host="$(env_value "${ROUTER_DIR}/.env" ROUTER_HOST)"
+  router_port="$(env_value "${ROUTER_DIR}/.env" ROUTER_PORT)"
+  router_port="${router_port:-8000}"
+  [[ $router_port =~ ^[0-9]+$ ]] && (( router_port >= 1 && router_port <= 65535 )) || die 'invalid ROUTER_PORT'
+  case "$router_host" in
+    ''|0.0.0.0|127.0.0.1|localhost|::|::1) router_host=127.0.0.1 ;;
+    *:*) [[ $router_host =~ ^[0-9a-fA-F:]+$ ]] || die 'invalid ROUTER_HOST'; router_host="[$router_host]" ;;
+    *) [[ $router_host =~ ^[a-zA-Z0-9.-]+$ ]] || die 'invalid ROUTER_HOST' ;;
+  esac
+  cat > "${FS}/etc/prometheus/osr.yml" <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: osr
+    metrics_path: /metrics
+    authorization:
+      credentials_file: ${KEY_FILE}
+    static_configs:
+      - targets: ['${router_host}:${router_port}']
+EOF
+  sensor_target="$(cat "${FS}/etc/prometheus/osr-sensors-target" 2>/dev/null || true)"
+  if [[ -n $sensor_target ]]; then
+    [[ $sensor_target =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:9408$ ]] || die 'invalid sensor target'
+    [[ -s ${FS}/etc/prometheus/osr-sensors-key ]] || die 'missing sensor scrape key'
+    cat >> "${FS}/etc/prometheus/osr.yml" <<EOF
+  - job_name: osr-temperature
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /etc/prometheus/osr-sensors-key
+    static_configs:
+      - targets: ['${sensor_target}']
+EOF
+  fi
+  chmod 0644 "${FS}/etc/prometheus/osr.yml"
+  promtool check config "${FS}/etc/prometheus/osr.yml"
+}
+
+if [[ $MODE == sync-sensors ]]; then
+  [[ -d ${FS}/etc/prometheus && -f ${FS}/etc/prometheus/osr.yml ]] || die 'install the metrics stack first'
+  [[ -s ${FS}/etc/prometheus/osr-sensors-key ]] || die 'missing sensor scrape key'
+  [[ ${OSR_SENSOR_TARGET:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:9408$ ]] || die 'OSR_SENSOR_TARGET must be a host IPv4 address on port 9408'
+  printf '%s\n' "$OSR_SENSOR_TARGET" > "${FS}/etc/prometheus/osr-sensors-target"
+  chmod 0644 "${FS}/etc/prometheus/osr-sensors-target"
+  write_scrape_config
+  systemctl restart osr-prometheus.service
+  note "sensor scrape configured for ${OSR_SENSOR_TARGET}"
+  exit 0
+fi
+
 [[ -f $SECRETS_FILE ]] || die "missing ${SECRETS_FILE}"
 if [[ -n $GRAFANA_KEY_FINGERPRINT ]]; then
   GRAFANA_KEY_FINGERPRINT="${GRAFANA_KEY_FINGERPRINT// /}"
@@ -11484,30 +11729,7 @@ systemctl stop grafana-server.service 2>/dev/null || true
 
 sync_key
 
-router_host="$(env_value "${ROUTER_DIR}/.env" ROUTER_HOST)"
-router_port="$(env_value "${ROUTER_DIR}/.env" ROUTER_PORT)"
-router_port="${router_port:-8000}"
-[[ $router_port =~ ^[0-9]+$ ]] && (( router_port >= 1 && router_port <= 65535 )) || die 'invalid ROUTER_PORT'
-case "$router_host" in
-  ''|0.0.0.0|127.0.0.1|localhost|::|::1) router_host=127.0.0.1 ;;
-  *:*) [[ $router_host =~ ^[0-9a-fA-F:]+$ ]] || die 'invalid ROUTER_HOST'; router_host="[$router_host]" ;;
-  *) [[ $router_host =~ ^[a-zA-Z0-9.-]+$ ]] || die 'invalid ROUTER_HOST' ;;
-esac
-
-cat > "${FS}/etc/prometheus/osr.yml" <<EOF
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-scrape_configs:
-  - job_name: osr
-    metrics_path: /metrics
-    authorization:
-      credentials_file: ${KEY_FILE}
-    static_configs:
-      - targets: ['${router_host}:${router_port}']
-EOF
-chmod 0644 "${FS}/etc/prometheus/osr.yml"
-promtool check config "${FS}/etc/prometheus/osr.yml"
+write_scrape_config
 mkdir -p "${FS}/var/lib/prometheus/osr"
 chown prometheus:prometheus "${FS}/var/lib/prometheus/osr"
 chmod 0750 "${FS}/var/lib/prometheus/osr"
@@ -11565,7 +11787,7 @@ EOF
 cat > "${FS}/etc/grafana/osr-dashboards/router.json" <<'EOF'
 {
   "uid": "osr-router", "title": "Open Smart Router", "schemaVersion": 39,
-  "version": 2, "refresh": "15s", "time": {"from": "now-6h", "to": "now"},
+  "version": 3, "refresh": "15s", "time": {"from": "now-6h", "to": "now"},
   "panels": [
     {"id": 1, "type": "stat", "title": "Router scrape", "description": "Prometheus can scrape the protected router /metrics endpoint.", "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "Down", "color": "red"}, "1": {"text": "Up", "color": "green"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 1}]}}, "overrides": []}, "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}, "targets": [{"refId": "A", "expr": "up{job=\"osr\"}", "instant": true}]},
     {"id": 2, "type": "stat", "title": "Requests / sec", "description": "All router answers, averaged over five minutes.", "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "reqps"}}, "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}, "targets": [{"refId": "A", "expr": "sum(rate(osr_requests_total[5m])) or vector(0)", "instant": true}]},
@@ -11582,7 +11804,9 @@ cat > "${FS}/etc/grafana/osr-dashboards/router.json" <<'EOF'
     {"id": 13, "type": "timeseries", "title": "Requests in flight by server", "gridPos": {"x": 0, "y": 28, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_in_flight_requests", "legendFormat": "{{server}}"}]},
     {"id": 14, "type": "timeseries", "title": "Server availability", "description": "1 means up; 0 means down according to the last discovery poll or dispatch.", "gridPos": {"x": 12, "y": 28, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"min": 0, "max": 1}}, "targets": [{"refId": "A", "expr": "osr_server_up", "legendFormat": "{{server}}"}]},
     {"id": 15, "type": "timeseries", "title": "Models per server", "gridPos": {"x": 0, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_server_models", "legendFormat": "{{server}}"}]},
-    {"id": 16, "type": "timeseries", "title": "Remembered conversations", "description": "Conversations whose last server is remembered for affinity.", "gridPos": {"x": 12, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_remembered_conversations", "legendFormat": "remembered"}]}
+    {"id": 16, "type": "timeseries", "title": "Remembered conversations", "description": "Conversations whose last server is remembered for affinity.", "gridPos": {"x": 12, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_remembered_conversations", "legendFormat": "remembered"}]},
+    {"id": 17, "type": "timeseries", "title": "Host CPU temperature", "description": "CPU sensor readings from the Proxmox host running the router.", "gridPos": {"x": 0, "y": 44, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "celsius"}}, "targets": [{"refId": "A", "expr": "osr_cpu_temperature_celsius", "legendFormat": "{{driver}} {{sensor}}"}]},
+    {"id": 18, "type": "timeseries", "title": "Host GPU temperature", "description": "GPU sensor readings from the Proxmox host running the router.", "gridPos": {"x": 12, "y": 44, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "celsius"}}, "targets": [{"refId": "A", "expr": "osr_gpu_temperature_celsius", "legendFormat": "{{vendor}} {{device}} {{sensor}}"}]}
   ]
 }
 EOF
@@ -12167,7 +12391,6 @@ echo "Installing secrets outside the config repo."
 pct push "$CT_ID" "$SECRETS_STAGE" /app/router/secrets.env --perms 0640
 run_ct chown root:osr-router /app/router/secrets.env
 
-rm -rf "$STAGE_DIR"; STAGE_DIR=""
 unset GITEA_DEPLOY_TOKEN_KEEP
 
 echo "Installing Python dependencies (from the repo's requirements files)."
@@ -12323,11 +12546,19 @@ else
   echo "Installing local Prometheus and Grafana."
   if run_ct bash "${CONFIG_REPO_DIR}/install/setup-metrics.sh" install; then
     METRICS_INSTALLED=true
+    echo "Installing host CPU/GPU temperature metrics."
+    if ! CT_ID="$CT_ID" BRIDGE="$BRIDGE" ROUTER_IP="$ROUTER_IP" \
+      bash "${REPO_DIR}/tools/setup-temperature-exporter.sh"; then
+      echo "WARNING: Host temperature metrics could not be configured; router metrics remain available." >&2
+      echo "         Retry using tools/setup-temperature-exporter.sh from an updated OSR checkout on this host." >&2
+    fi
   else
     echo "WARNING: Metrics dashboard setup failed; the router remains available." >&2
     echo "         Retry inside the CT: bash ${CONFIG_REPO_DIR}/install/setup-metrics.sh install" >&2
   fi
 fi
+
+rm -rf "$STAGE_DIR"; STAGE_DIR=""
 
 # Provisioning succeeded — disarm the failure trap so we keep the container.
 CT_CREATED=""

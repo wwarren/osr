@@ -285,6 +285,9 @@ _DEFAULTS = {
         # Bonus, on a tool request, for a model the server reports as
         # tool-capable over one whose tool support is unknown.
         "tool_match": "0.3",
+        # Bonus for a model assigned to the requested tier in
+        # litellm_config.yaml (manage-model-servers set-model / add-model).
+        "tier_member": "0.2",
     },
     # How load is spread once the scores have been compared.
     "balancing": {
@@ -294,6 +297,12 @@ _DEFAULTS = {
         # How long a conversation prefers the server and model that answered
         # it last, among equally good candidates. 0 turns it off.
         "sticky_seconds": "1800",
+        # Models assigned to a tier are that tier's models whatever their size,
+        # and requests of that class are spread across all of them.
+        "tier_models": "true",
+        # Where the tier assignments are read from. Blank: litellm_config.yaml
+        # next to router.ini.
+        "tier_config": "",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
     # Basalt, Maya, Xolotl, Avalon, Colibri) lists without a parameter count. Matching is by the whole
@@ -648,8 +657,12 @@ W_OFFTASK = _cfg.getfloat("weights", "offtask_penalty")
 TIE_EPSILON = _cfg.getfloat("weights", "tie_epsilon")
 W_LOADED = _cfg.getfloat("weights", "loaded_bonus")
 W_TOOLS = _cfg.getfloat("weights", "tool_match")
+W_TIER_MEMBER = max(0.0, _cfg.getfloat("weights", "tier_member"))
 BUSY_PENALTY = max(0.0, _cfg.getfloat("balancing", "busy_penalty"))
 STICKY_SECONDS = max(0.0, _cfg.getfloat("balancing", "sticky_seconds"))
+TIER_MODELS_ENABLED = _cfg.getboolean("balancing", "tier_models")
+TIER_CONFIG = (_cfg.get("balancing", "tier_config").strip()
+               or os.path.join(os.path.dirname(os.path.abspath(ROUTER_INI)), "litellm_config.yaml"))
 
 # --- server kinds -----------------------------------------------------------------
 # A server entry is a base URL. Entries for servers that are not Ollama carry a
@@ -820,6 +833,112 @@ def tier_has_kindi(tier: str) -> bool:
 # Replaced wholesale on each refresh, so readers never see a half-built dict.
 INVENTORY = {"models": [], "images": [], "servers": {}, "updated_at": 0.0, "errors": {}}
 _rotation = {}
+
+# --- tier assignments -----------------------------------------------------------
+# class -> model names assigned to that tier, from the model_list that
+# manage-model-servers writes to litellm_config.yaml (one deployment per tier,
+# server and model). Names are lower-cased, without a ":latest" suffix. Read
+# again whenever the file changes (checked on each discovery refresh), so a
+# set-model / add-model needs no router restart.
+TIER_MEMBERS = {}
+_TIER_CONFIG_STATE = {"mtime": None, "read": False}
+_YAML_ITEM = re.compile(r"^(\s*)-\s+(.*)$")
+_YAML_FIELD = re.compile(r"^\s*(model_name|model)\s*:\s*(.*?)\s*$")
+
+
+def _model_key(name: str) -> str:
+    """How tier names and inventory names are compared: case-insensitive, and
+    Ollama's implicit ":latest" tag is the same model as no tag."""
+    name = (name or "").strip().lower()
+    return name[:-len(":latest")] if name.endswith(":latest") else name
+
+
+def _yaml_scalar(value: str) -> str:
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value.strip()
+
+
+def parse_tier_models(text: str) -> dict:
+    """class -> {model key} from litellm_config.yaml's model_list.
+
+    Only deployments whose model_name is a tier alias count (cloud models are
+    named after themselves). The model is litellm_params.model without its
+    provider prefix: ollama/qwen3:14b -> qwen3:14b, openai/glm-5.3-flash ->
+    glm-5.3-flash, lm_studio/qwen/qwen3-14b -> qwen/qwen3-14b. The file is
+    generated, so a small line reader does; a line it does not understand is
+    skipped rather than failing the router."""
+    members, item, in_list, item_indent = {}, None, False, None
+
+    def flush():
+        if item and item.get("model_name") in TIER_NAMES and "/" in item.get("model", ""):
+            tag = _model_key(item["model"].split("/", 1)[1])
+            if tag:
+                members.setdefault(TIER_NAMES[item["model_name"]], set()).add(tag)
+
+    for line in (text or "").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            flush()
+            item, item_indent = None, None
+            in_list = line.split("#", 1)[0].strip() == "model_list:"
+            continue
+        if not in_list:
+            continue
+        start = _YAML_ITEM.match(line)
+        if start and (item_indent is None or len(start.group(1)) <= item_indent):
+            flush()
+            item, item_indent = {}, len(start.group(1))
+            line = start.group(1) + "  " + start.group(2)
+        field = _YAML_FIELD.match(line)
+        if field and item is not None and field.group(1) not in item:
+            item[field.group(1)] = _yaml_scalar(field.group(2))
+    flush()
+    return members
+
+
+def load_tier_models(force: bool = False) -> dict:
+    """Read the tier assignments again if litellm_config.yaml changed."""
+    global TIER_MEMBERS
+    if not TIER_MODELS_ENABLED:
+        TIER_MEMBERS = {}
+        return TIER_MEMBERS
+    try:
+        mtime = os.stat(TIER_CONFIG).st_mtime_ns
+    except OSError:
+        mtime = None
+    if not force and _TIER_CONFIG_STATE["read"] and mtime == _TIER_CONFIG_STATE["mtime"]:
+        return TIER_MEMBERS
+    members = {}
+    if mtime is not None:
+        try:
+            with open(TIER_CONFIG, encoding="utf-8") as handle:
+                members = parse_tier_models(handle.read())
+        except (OSError, UnicodeDecodeError) as exc:
+            log.warning("tier models: cannot read %s (%s); sizes alone decide", TIER_CONFIG, exc)
+    _TIER_CONFIG_STATE.update(mtime=mtime, read=True)
+    if members != TIER_MEMBERS:
+        log.info("tier models: %s", "; ".join(
+            "%s=%s" % (cls, ",".join(sorted(members[cls])))
+            for cls in CLASS_ORDER if cls in members) or "none assigned")
+    TIER_MEMBERS = members
+    return TIER_MEMBERS
+
+
+def tier_classes(entry: dict) -> list:
+    """The classes whose tier this model is assigned to, in class order."""
+    key = _model_key(entry.get("name", ""))
+    return [cls for cls in CLASS_ORDER if key in TIER_MEMBERS.get(cls, ())]
+
+
+def is_tier_member(entry: dict, need: dict) -> bool:
+    """Is this model assigned to the tier of the requested class?"""
+    return _model_key(entry.get("name", "")) in TIER_MEMBERS.get(need.get("class"), ())
+
+
+load_tier_models()
 
 # --- load and conversation affinity -------------------------------------------
 # server -> requests this router has sent there and not yet seen finish. Only
@@ -1390,6 +1509,7 @@ async def fetch_server_models(client: httpx.AsyncClient, server: str,
 async def refresh_inventory(force_probe: bool = False) -> dict:
     """Poll every target for the models it is currently serving."""
     global INVENTORY
+    load_tier_models()
     if not SERVERS and not COMFYUI_SERVERS:
         INVENTORY = {"models": [], "images": [], "servers": {}, "updated_at": time.time(),
                      "errors": {"config": "no servers configured"}}
@@ -1730,6 +1850,8 @@ def band_distance(entry: dict, need: dict) -> float:
     rank_candidates. A model of unknown size sorts after known out-of-band
     models, but remains eligible when no known-size model exists.
     """
+    if is_tier_member(entry, need):
+        return 0.0
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
     if params <= 0:
@@ -1747,6 +1869,8 @@ def in_requested_band(entry: dict, need: dict) -> bool:
     model in the pool must not switch off distance ranking for every other
     candidate.
     """
+    if is_tier_member(entry, need):
+        return True
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     return entry["params_b"] > 0 and _in_band(entry["params_b"], low, high)
 
@@ -1756,7 +1880,13 @@ def score_entry(entry: dict, need: dict) -> float:
     low, high = BANDS.get(need["class"], (0.0, 999.0))
     params = entry["params_b"]
     in_band = _in_band(params, low, high)
-    if params <= 0:
+    # A model assigned to the requested tier (manage-model-servers set-model /
+    # add-model) fits it whatever its size, and every such model scores alike,
+    # so they tie and the requests rotate across all of them and their hosts.
+    member = is_tier_member(entry, need)
+    if member:
+        fit = 1.0
+    elif params <= 0:
         fit = W_UNKNOWN
     elif in_band:
         fit = 1.0
@@ -1785,7 +1915,7 @@ def score_entry(entry: dict, need: dict) -> float:
     # large's exclusive ceiling, so the gentle falloff still scores it ~1.0, and
     # an unbounded size bonus would push it past the 32B that actually belongs
     # to the tier.
-    if params > 0 and in_band:
+    if params > 0 and in_band and not member:
         span = high - low
         position = (params - low) / span if span > 0 else 1.0
         position = max(0.0, min(position, 1.0))
@@ -1793,6 +1923,10 @@ def score_entry(entry: dict, need: dict) -> float:
             score += W_LARGER * position
         elif need["class"] == "fast":
             score += W_SMALLER * (1.0 - position)
+    if member:
+        # Ahead of any model that is only the right size: the tier's own
+        # models are the ones asked for.
+        score += W_TIER_MEMBER
     if entry.get("loaded"):
         score += W_LOADED
     if need.get("tools") and entry.get("tools"):
@@ -1864,8 +1998,17 @@ def rank_candidates(need: dict, inventory: dict = None, affinity: list = None) -
         # shares the load.
         # The model the task has been using stays the one, while it is tied.
         best_name = tied[0]["name"]
+        names = list(dict.fromkeys(e["name"] for e in tied))
         if sticky and any(e["name"] == sticky[1] for e in tied):
             best_name = sticky[1]
+        elif STICKY_SECONDS > 0 and len(names) > 1 \
+                and all(is_tier_member(e, need) for e in tied):
+            # A tier with several assigned models: each new task takes the
+            # next of them, and keeps it through the conversation affinity.
+            key = f"tools-model|{need['class']}|{need['code']}|{need['vision']}"
+            index = _rotation.get(key, 0) % len(names)
+            _rotation[key] = index + 1
+            best_name = names[index]
         rest = [e for e in tied if e["name"] != best_name] + rest
         tied = [e for e in tied if e["name"] == best_name]
     if len(tied) > 1:
@@ -2341,6 +2484,10 @@ async def routing_inventory():
         # Image models (POST /v1/images/generations), never offered for chat.
         "images": INVENTORY.get("images", []),
         "image_alias": IMAGE_ALIAS,
+        # class -> the models assigned to its tier (litellm_config.yaml), which
+        # auto and the tier alias spread that class's requests across.
+        "tier_models": {cls: sorted(TIER_MEMBERS[cls]) for cls in CLASS_ORDER
+                        if cls in TIER_MEMBERS},
         # The direct dispatchers of Hermes, OpenClaw and Honcho compare this
         # with the budget their CT was configured for.
         "kindi_read_timeout_seconds": KINDI_READ_TIMEOUT,
@@ -2427,7 +2574,8 @@ async def routing_explain(request: Request):
                    if candidates else None),
         "candidates": [
             {"model": e["name"], "server": e["server"], "params_b": e["params_b"],
-             "tools": e.get("tools"), "score": round(score_entry(e, need), 4),
+             "tools": e.get("tools"), "tiers": tier_classes(e),
+             "score": round(score_entry(e, need), 4),
              "in_flight": _IN_FLIGHT.get(e["server"], 0)}
             for e in candidates[:10]
         ],

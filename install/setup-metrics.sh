@@ -22,7 +22,7 @@ die() { printf 'metrics setup: %s\n' "$*" >&2; exit 1; }
 note() { printf 'metrics setup: %s\n' "$*" >&2; }
 
 [[ $EUID -eq 0 || -n $FS ]] || die 'run as root in the router CT'
-[[ $MODE == install || $MODE == sync-key || $MODE == login ]] || die 'usage: setup-metrics.sh [install|sync-key|login]'
+[[ $MODE == install || $MODE == sync-key || $MODE == sync-sensors || $MODE == login ]] || die 'usage: setup-metrics.sh [install|sync-key|sync-sensors|login]'
 
 env_value() {
   local file=$1 key=$2
@@ -92,6 +92,58 @@ if [[ $MODE == login ]]; then
   exit 0
 fi
 
+write_scrape_config() {
+  local router_host router_port sensor_target
+  router_host="$(env_value "${ROUTER_DIR}/.env" ROUTER_HOST)"
+  router_port="$(env_value "${ROUTER_DIR}/.env" ROUTER_PORT)"
+  router_port="${router_port:-8000}"
+  [[ $router_port =~ ^[0-9]+$ ]] && (( router_port >= 1 && router_port <= 65535 )) || die 'invalid ROUTER_PORT'
+  case "$router_host" in
+    ''|0.0.0.0|127.0.0.1|localhost|::|::1) router_host=127.0.0.1 ;;
+    *:*) [[ $router_host =~ ^[0-9a-fA-F:]+$ ]] || die 'invalid ROUTER_HOST'; router_host="[$router_host]" ;;
+    *) [[ $router_host =~ ^[a-zA-Z0-9.-]+$ ]] || die 'invalid ROUTER_HOST' ;;
+  esac
+  cat > "${FS}/etc/prometheus/osr.yml" <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: osr
+    metrics_path: /metrics
+    authorization:
+      credentials_file: ${KEY_FILE}
+    static_configs:
+      - targets: ['${router_host}:${router_port}']
+EOF
+  sensor_target="$(cat "${FS}/etc/prometheus/osr-sensors-target" 2>/dev/null || true)"
+  if [[ -n $sensor_target ]]; then
+    [[ $sensor_target =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:9408$ ]] || die 'invalid sensor target'
+    [[ -s ${FS}/etc/prometheus/osr-sensors-key ]] || die 'missing sensor scrape key'
+    cat >> "${FS}/etc/prometheus/osr.yml" <<EOF
+  - job_name: osr-temperature
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /etc/prometheus/osr-sensors-key
+    static_configs:
+      - targets: ['${sensor_target}']
+EOF
+  fi
+  chmod 0644 "${FS}/etc/prometheus/osr.yml"
+  promtool check config "${FS}/etc/prometheus/osr.yml"
+}
+
+if [[ $MODE == sync-sensors ]]; then
+  [[ -d ${FS}/etc/prometheus && -f ${FS}/etc/prometheus/osr.yml ]] || die 'install the metrics stack first'
+  [[ -s ${FS}/etc/prometheus/osr-sensors-key ]] || die 'missing sensor scrape key'
+  [[ ${OSR_SENSOR_TARGET:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:9408$ ]] || die 'OSR_SENSOR_TARGET must be a host IPv4 address on port 9408'
+  printf '%s\n' "$OSR_SENSOR_TARGET" > "${FS}/etc/prometheus/osr-sensors-target"
+  chmod 0644 "${FS}/etc/prometheus/osr-sensors-target"
+  write_scrape_config
+  systemctl restart osr-prometheus.service
+  note "sensor scrape configured for ${OSR_SENSOR_TARGET}"
+  exit 0
+fi
+
 [[ -f $SECRETS_FILE ]] || die "missing ${SECRETS_FILE}"
 if [[ -n $GRAFANA_KEY_FINGERPRINT ]]; then
   GRAFANA_KEY_FINGERPRINT="${GRAFANA_KEY_FINGERPRINT// /}"
@@ -158,30 +210,7 @@ systemctl stop grafana-server.service 2>/dev/null || true
 
 sync_key
 
-router_host="$(env_value "${ROUTER_DIR}/.env" ROUTER_HOST)"
-router_port="$(env_value "${ROUTER_DIR}/.env" ROUTER_PORT)"
-router_port="${router_port:-8000}"
-[[ $router_port =~ ^[0-9]+$ ]] && (( router_port >= 1 && router_port <= 65535 )) || die 'invalid ROUTER_PORT'
-case "$router_host" in
-  ''|0.0.0.0|127.0.0.1|localhost|::|::1) router_host=127.0.0.1 ;;
-  *:*) [[ $router_host =~ ^[0-9a-fA-F:]+$ ]] || die 'invalid ROUTER_HOST'; router_host="[$router_host]" ;;
-  *) [[ $router_host =~ ^[a-zA-Z0-9.-]+$ ]] || die 'invalid ROUTER_HOST' ;;
-esac
-
-cat > "${FS}/etc/prometheus/osr.yml" <<EOF
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-scrape_configs:
-  - job_name: osr
-    metrics_path: /metrics
-    authorization:
-      credentials_file: ${KEY_FILE}
-    static_configs:
-      - targets: ['${router_host}:${router_port}']
-EOF
-chmod 0644 "${FS}/etc/prometheus/osr.yml"
-promtool check config "${FS}/etc/prometheus/osr.yml"
+write_scrape_config
 mkdir -p "${FS}/var/lib/prometheus/osr"
 chown prometheus:prometheus "${FS}/var/lib/prometheus/osr"
 chmod 0750 "${FS}/var/lib/prometheus/osr"
@@ -239,7 +268,7 @@ EOF
 cat > "${FS}/etc/grafana/osr-dashboards/router.json" <<'EOF'
 {
   "uid": "osr-router", "title": "Open Smart Router", "schemaVersion": 39,
-  "version": 2, "refresh": "15s", "time": {"from": "now-6h", "to": "now"},
+  "version": 3, "refresh": "15s", "time": {"from": "now-6h", "to": "now"},
   "panels": [
     {"id": 1, "type": "stat", "title": "Router scrape", "description": "Prometheus can scrape the protected router /metrics endpoint.", "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "Down", "color": "red"}, "1": {"text": "Up", "color": "green"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 1}]}}, "overrides": []}, "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}, "targets": [{"refId": "A", "expr": "up{job=\"osr\"}", "instant": true}]},
     {"id": 2, "type": "stat", "title": "Requests / sec", "description": "All router answers, averaged over five minutes.", "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "reqps"}}, "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}, "targets": [{"refId": "A", "expr": "sum(rate(osr_requests_total[5m])) or vector(0)", "instant": true}]},
@@ -256,7 +285,9 @@ cat > "${FS}/etc/grafana/osr-dashboards/router.json" <<'EOF'
     {"id": 13, "type": "timeseries", "title": "Requests in flight by server", "gridPos": {"x": 0, "y": 28, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_in_flight_requests", "legendFormat": "{{server}}"}]},
     {"id": 14, "type": "timeseries", "title": "Server availability", "description": "1 means up; 0 means down according to the last discovery poll or dispatch.", "gridPos": {"x": 12, "y": 28, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"min": 0, "max": 1}}, "targets": [{"refId": "A", "expr": "osr_server_up", "legendFormat": "{{server}}"}]},
     {"id": 15, "type": "timeseries", "title": "Models per server", "gridPos": {"x": 0, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_server_models", "legendFormat": "{{server}}"}]},
-    {"id": 16, "type": "timeseries", "title": "Remembered conversations", "description": "Conversations whose last server is remembered for affinity.", "gridPos": {"x": 12, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_remembered_conversations", "legendFormat": "remembered"}]}
+    {"id": 16, "type": "timeseries", "title": "Remembered conversations", "description": "Conversations whose last server is remembered for affinity.", "gridPos": {"x": 12, "y": 36, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "targets": [{"refId": "A", "expr": "osr_remembered_conversations", "legendFormat": "remembered"}]},
+    {"id": 17, "type": "timeseries", "title": "Host CPU temperature", "description": "CPU sensor readings from the Proxmox host running the router.", "gridPos": {"x": 0, "y": 44, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "celsius"}}, "targets": [{"refId": "A", "expr": "osr_cpu_temperature_celsius", "legendFormat": "{{driver}} {{sensor}}"}]},
+    {"id": 18, "type": "timeseries", "title": "Host GPU temperature", "description": "GPU sensor readings from the Proxmox host running the router.", "gridPos": {"x": 12, "y": 44, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "osr-prometheus"}, "fieldConfig": {"defaults": {"unit": "celsius"}}, "targets": [{"refId": "A", "expr": "osr_gpu_temperature_celsius", "legendFormat": "{{vendor}} {{device}} {{sensor}}"}]}
   ]
 }
 EOF

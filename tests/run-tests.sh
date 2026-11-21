@@ -83,6 +83,7 @@ add_suite llamacpp-dashboard pytest "${ROOT}/targets/llamacpp/test_dashboard.py"
 add_suite airllm  pytest "${ROOT}/targets/airllm/test_server.py"   "$BRIDGE_PYTHON"
 add_suite router  pytest "${HERE}/test_router.py"                  "$ROUTER_PYTHON"
 add_suite monitor pytest "${HERE}/test_monitor.py"                 "$ROUTER_PYTHON"
+add_suite temperature-exporter python "${HERE}/test_temperature_exporter.py" python3
 # Standard-library unittest scripts: no venv needed.
 add_suite open-terminal-integration python "${ROOT}/targets/open-terminal/test-integration.py" python3
 # The workspace gateway runs from the Open Terminal venv (starlette, httpx,

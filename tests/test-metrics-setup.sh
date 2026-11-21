@@ -173,7 +173,7 @@ assert_not_contains "so none is" "Password:" "$out"
 new_ct "s3cret-key"
 assert_eq "a CT without the stack prints nothing" "0|" "$(run login 2>&1; echo "$?|")"
 out="$(run nonsense 2>&1)"
-assert_contains "the usage names the mode" "install|sync-key|login" "$out"
+assert_contains "the usage names the mode" "install|sync-key|sync-sensors|login" "$out"
 # The cases below continue from an installed CT.
 run install >/dev/null 2>&1
 
@@ -188,6 +188,20 @@ assert_eq "still private" "600" "$(mode_of "$(keyfile)")"
 assert_contains "and Prometheus restarted" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
 assert_contains "it says so" "router scrape key updated" "$out"
 assert_eq "no temporary key file is left" "" "$(find "${fs}/etc/prometheus" -name '.osr-router-key.*')"
+
+describe temperature_scrape
+config="${fs}/etc/prometheus/osr.yml"
+printf '%s\n' sensor-secret > "${fs}/etc/prometheus/osr-sensors-key"
+: > "$calls"
+out="$(OSR_SENSOR_TARGET=10.1.2.1:9408 run sync-sensors 2>&1)"; rc=$?
+assert_eq "sensor scrape is configured" "0" "$rc"
+assert_file_contains "sensor job is written" "job_name: osr-temperature" "$config"
+assert_file_contains "host target is written" "targets: ['10.1.2.1:9408']" "$config"
+assert_file_contains "separate bearer key is used" "credentials_file: /etc/prometheus/osr-sensors-key" "$config"
+assert_contains "Prometheus reloads the sensor job" "systemctl restart osr-prometheus.service" "$(cat "$calls")"
+assert_status "bad sensor targets are rejected" 1 env OSR_SENSOR_TARGET='bad-host:9408' OSR_METRICS_ROOT="$fs" ROUTER_DIR="$router" PATH="${bin}:${PATH}" bash "$script" sync-sensors
+run install >/dev/null 2>&1
+assert_file_contains "a normal reinstall retains the sensor job" "job_name: osr-temperature" "$config"
 : > "${router}/secrets.env"
 run sync-key >/dev/null 2>&1
 assert_eq "a key turned off leaves the old one (the router ignores it)" "rotated" "$(cat "$(keyfile)")"

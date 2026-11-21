@@ -678,6 +678,8 @@ goes through the router (not what agents send a server directly).
 | `osr_request_duration_seconds` | `mode`, `model`, `server` | Histogram: the same requests, until the last byte of the body |
 | `osr_in_flight_requests`, `osr_server_up`, `osr_server_models` | `server` (`osr_server_up` also `kind`) | Per model server: the router's requests in flight, up (1) or down (0), models listed |
 | `osr_inventory_age_seconds`, `osr_remembered_conversations`, `osr_start_time_seconds` | — | Seconds since the last discovery poll, conversations with a remembered server, start time |
+| `osr_cpu_temperature_celsius` | `driver`, `sensor` | CPU sensor temperatures on the Proxmox host running the router |
+| `osr_gpu_temperature_celsius` | `vendor`, `device`, `sensor` | NVIDIA, AMD or Intel GPU temperatures on that host, where the driver exposes a temperature sensor |
 
 ```yaml
 scrape_configs:
@@ -700,7 +702,19 @@ scrapes `GET /metrics` on the CT's loopback address using a protected copy of
 provisioned `OSR Prometheus` data source and an **Open Smart Router** dashboard
 with an at-a-glance scrape, traffic, 5xx, server, model and inventory summary;
 traffic and upstream failures by label; p50/p95 latency and per-model p95;
-and in-flight load, server state, model counts and conversation affinity. Open
+and in-flight load, server state, model counts and conversation affinity.
+The dashboard also graphs host CPU and GPU temperatures in Celsius. The
+installer starts a small exporter on the Proxmox host at port 9408 and adds a
+second authenticated Prometheus scrape in the router CT. It reads Linux
+`hwmon` CPU and AMD/Intel GPU sensors plus `nvidia-smi` for NVIDIA GPUs.
+Unavailable sensors have no series; the router CT's virtual CPU temperature is
+not used. The exporter accepts requests only from the router CT's IP and with
+a separate bearer key. If the Proxmox host firewall is enabled, allow TCP 9408
+from the router CT IP to the host bridge IP. The scrape key stays outside Git
+in `/etc/osr-temperature-exporter/token` on the host and
+`/etc/prometheus/osr-sensors-key` in the CT.
+
+Open
 `http://<ct-ip>:3000` and sign in as `admin`. A new Grafana database starts
 with a random password, kept in `/etc/grafana/osr.env` (root-readable). The
 installer, `setup-metrics.sh install` and `tools/upgrade-all.sh` print the
@@ -723,6 +737,18 @@ the setup inside the CT after fixing package access:
 ```bash
 pct exec <CT_ID> -- bash /app/config-repo/install/setup-metrics.sh install
 ```
+
+To add host temperatures to an existing metrics installation, run this on the
+Proxmox host from an updated OSR checkout:
+
+```bash
+CT_ID=<router-ct-id> BRIDGE=<host-bridge> ROUTER_IP=<router-ct-ip> \
+  bash tools/setup-temperature-exporter.sh
+```
+
+This installs and starts `osr-temperature-exporter.service`, copies the scrape
+key into the router CT, and updates the Prometheus scrape configuration. Check
+`up{job="osr-temperature"}` in Grafana's Explore view; it should be 1.
 
 For an existing router CT, first update its config repo using
 `install/update-router.sh` as described under [Updating](#updating),
