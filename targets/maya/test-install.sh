@@ -59,7 +59,7 @@ for helper in help_has help_choices check_choice validate_setup_options setup_ar
               load_settings fingerprint_env saved_settings; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
-MAYA_MODEL=Maya-S-v2-IQ2_XXS MAYA_CONTEXT=32768 MAYA_NO_VISION=false MAYA_DRAFT=mtp
+MAYA_MODEL=Maya-S-v2-IQ2_XXS MAYA_CONTEXT=32768 MAYA_PARALLEL=1 MAYA_NO_VISION=false MAYA_DRAFT=mtp
 MAYA_PORT=8080 MAYA_DATA_DIR=/var/lib/maya MAYA_NVCC=/usr/local/cuda-12.8/bin/nvcc
 
 SETUP_HELP=$(< "$help_current")
@@ -77,6 +77,10 @@ MAYA_NO_VISION=true
 [[ $(setup_args | tr '\n' ' ') == *' --no-vision '* ]] || fail 'no-vision not passed'
 MAYA_NO_VISION=false
 pass 'setup is given the model, --draft mtp and the installed nvcc, never the key'
+MAYA_PARALLEL=4
+(validate_setup_options) || fail 'parallel refused by supporting Maya checkout'
+[[ $(setup_args | tr '\n' ' ') == *'--parallel 4 '* ]] || fail 'parallel not passed to Maya setup'
+MAYA_PARALLEL=1
 
 SETUP_HELP=$(< "$help_older")
 (validate_setup_options) || fail 'older help rejected with the default draft'
@@ -85,6 +89,8 @@ args=$(setup_args | tr '\n' ' ')
 out=$( (MAYA_DRAFT=dflash2; validate_setup_options) 2>&1 ) && fail 'dflash2 accepted without --draft'
 [[ $out == *'no --draft option'* ]] || fail "draft message: $out"
 pass 'an older checkout without --draft/--nvcc gets neither, and refuses another draft'
+out=$( (MAYA_PARALLEL=4; validate_setup_options) 2>&1 ) && fail 'parallel accepted without checkout support'
+[[ $out == *'no --parallel option'* ]] || fail "parallel support message: $out"
 
 SETUP_HELP=$(< "$help_keyless")
 out=$( (validate_setup_options) 2>&1 ) && fail 'a checkout without --api-key was accepted'
@@ -147,7 +153,7 @@ pass 'the newest vX.Y.Z tag is chosen by version, not by name (v1.1.15 > v1.1.9)
 # all-or-nothing, never sourced.
 MAYA_CUDA_VERSION=12.8
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^MAYA_' "$tmp_root/installed-env") == 7 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^MAYA_' "$tmp_root/installed-env") == 8 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
 MAYA_DRAFT=dflash2 MAYA_PORT=11434 MAYA_MODEL=Maya-S24
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $MAYA_DRAFT == mtp && $MAYA_PORT == 8080 && $MAYA_MODEL == Maya-S-v2-IQ2_XXS ]] ||

@@ -40,7 +40,7 @@ Optional: CT_HOSTNAME=strata-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           STRATA_REF=<branch or tag> (explicitly follow it when no commit is set),
           STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (or swift, coder,
           unsloth: whatever the checkout's setup.sh offers),
-          STRATA_CONTEXT=65536,
+          STRATA_CONTEXT=65536, STRATA_PARALLEL=1 (1 to 8),
           STRATA_KV=<asked> (the KV cache: int8, k8v4 = 8-bit keys and 4-bit
                     values, or q4_0; suggested: int8 when the cache fits in
                     the CT's RAM from a 64K context, else k8v4 for 12 and 16 GB
@@ -204,6 +204,7 @@ case $STRATA_FAMILY in
     *) strata_model_default=IQ2_XS; strata_models=$'IQ2_XS|default pack\nQ2_0|alternative 2-bit pack\nIQ3_XXS|larger pack\nIQ3_S|largest listed pack' ;;
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
+STRATA_PARALLEL=${STRATA_PARALLEL:-1}
 STRATA_KV=${STRATA_KV:-}
 STRATA_MESSAGE_CACHE=${STRATA_MESSAGE_CACHE:-}
 STRATA_VISION=${STRATA_VISION:-no}
@@ -250,6 +251,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $STRATA_FAMILY =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die 'STRATA_FAMILY must be a family name such as qwen, swift, coder or unsloth (the guest checks it against setup.sh).'
 [[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'STRATA_VISION must be yes, no, gpu, or cpu.'
 [[ $STRATA_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( STRATA_PORT <= 65535 )) || die 'STRATA_PORT must be 1..65535.'
+[[ $STRATA_PARALLEL =~ ^[1-8]$ ]] || die 'STRATA_PARALLEL must be 1 to 8.'
 [[ $STRATA_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'STRATA_READY_TIMEOUT must be a positive number of seconds.'
 [[ $STRATA_ALLOW_NO_KEY =~ ^(true|false)$ ]] || die 'STRATA_ALLOW_NO_KEY must be true or false.'
 
@@ -357,7 +359,7 @@ pve_summary "Strata: create"
 pve_row 'Strata CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Server' "context $STRATA_CONTEXT, KV cache $STRATA_KV, message cache $STRATA_MESSAGE_CACHE, port $STRATA_PORT"
+pve_row 'Server' "context $STRATA_CONTEXT, parallel $STRATA_PARALLEL, KV cache $STRATA_KV, message cache $STRATA_MESSAGE_CACHE, port $STRATA_PORT"
 pve_confirm "Create Strata CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Strata pins tens of GiB of model memory. systemd's LimitMEMLOCK must be
@@ -407,7 +409,7 @@ run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/strata-target-deploy/nvidi
 nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/strata-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "STRATA_REF=$STRATA_REF" "STRATA_COMMIT=$STRATA_COMMIT" \
     "STRATA_MODEL=$STRATA_MODEL" "STRATA_FAMILY=$STRATA_FAMILY" \
-    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_KV=$STRATA_KV" "STRATA_MESSAGE_CACHE=$STRATA_MESSAGE_CACHE" \
+    "STRATA_CONTEXT=$STRATA_CONTEXT" "STRATA_PARALLEL=$STRATA_PARALLEL" "STRATA_KV=$STRATA_KV" "STRATA_MESSAGE_CACHE=$STRATA_MESSAGE_CACHE" \
     "STRATA_VISION=$STRATA_VISION" "STRATA_PORT=$STRATA_PORT" \
     "STRATA_READY_TIMEOUT=$STRATA_READY_TIMEOUT" "STRATA_ALLOW_NO_KEY=$STRATA_ALLOW_NO_KEY" \
     bash /root/strata-target-deploy/install-target.sh

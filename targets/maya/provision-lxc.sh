@@ -37,7 +37,8 @@ Optional: CT_HOSTNAME=maya-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           NVIDIA_GUEST_INSTALLER=<host path to matching LXC helper>,
           MAYA_REF=latest (newest vX.Y.Z tag; or e.g. main),
           MAYA_COMMIT=<optional full SHA-1 pin>,
-          MAYA_MODEL=Maya-S-v2-IQ2_XXS, MAYA_CONTEXT=65536, MAYA_DRAFT=mtp,
+          MAYA_MODEL=Maya-S-v2-IQ2_XXS, MAYA_CONTEXT=65536, MAYA_PARALLEL=1,
+          MAYA_DRAFT=mtp,
           MAYA_NO_VISION=false, MAYA_CUDA_VERSION=12.8, MAYA_PORT=8080,
           MAYA_READY_TIMEOUT=900.
 
@@ -111,6 +112,7 @@ MAYA_REF=${MAYA_REF:-latest}
 MAYA_COMMIT=${MAYA_COMMIT:-}
 MAYA_MODEL=${MAYA_MODEL:-}
 MAYA_CONTEXT=${MAYA_CONTEXT:-65536}
+MAYA_PARALLEL=${MAYA_PARALLEL:-1}
 MAYA_DRAFT=${MAYA_DRAFT:-mtp}
 MAYA_NO_VISION=${MAYA_NO_VISION:-false}
 MAYA_CUDA_VERSION=${MAYA_CUDA_VERSION:-12.8}
@@ -152,6 +154,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $MAYA_REF =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $MAYA_REF != HEAD && $MAYA_REF != *..* ]] || die 'MAYA_REF must be latest, a branch or a tag name.'
 [[ -z $MAYA_COMMIT || $MAYA_COMMIT =~ ^[0-9a-fA-F]{40}$ ]] || die 'MAYA_COMMIT must be a full 40-digit SHA-1.'
 [[ $MAYA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid MAYA_MODEL.'
+[[ $MAYA_PARALLEL =~ ^[1-8]$ ]] || die 'MAYA_PARALLEL must be 1 to 8.'
 [[ $MAYA_DRAFT =~ ^[a-z0-9]+$ ]] || die 'MAYA_DRAFT must be a setup.sh --draft choice (mtp or dflash2).'
 [[ $MAYA_NO_VISION =~ ^(true|false)$ ]] || die 'MAYA_NO_VISION must be true or false.'
 [[ $MAYA_CUDA_VERSION =~ ^(12\.(8|9)|1[3-9]\.[0-9]+)$ ]] || die 'MAYA_CUDA_VERSION must be 12.8 or newer.'
@@ -237,7 +240,7 @@ pve_summary "Maya: create"
 pve_row 'Maya CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Model' "${MAYA_MODEL} (context ${MAYA_CONTEXT}, port ${MAYA_PORT})"
+pve_row 'Model' "${MAYA_MODEL} (context ${MAYA_CONTEXT}, parallel ${MAYA_PARALLEL}, port ${MAYA_PORT})"
 pve_confirm "Create Maya CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Maya pins tens of GiB of model memory. systemd's LimitMEMLOCK must be
@@ -276,7 +279,7 @@ run pct push "$CT_ID" "$source_dir/cuda-toolkit.sh" /root/maya-target-deploy/cud
 run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/maya-target-deploy/nvidia-guest-install.sh --perms 0755
 nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/maya-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "MAYA_REF=$MAYA_REF" "MAYA_COMMIT=$MAYA_COMMIT" \
-    "MAYA_MODEL=$MAYA_MODEL" "MAYA_CONTEXT=$MAYA_CONTEXT" "MAYA_DRAFT=$MAYA_DRAFT" \
+    "MAYA_MODEL=$MAYA_MODEL" "MAYA_CONTEXT=$MAYA_CONTEXT" "MAYA_PARALLEL=$MAYA_PARALLEL" "MAYA_DRAFT=$MAYA_DRAFT" \
     "MAYA_NO_VISION=$MAYA_NO_VISION" "MAYA_CUDA_VERSION=$MAYA_CUDA_VERSION" "MAYA_PORT=$MAYA_PORT" \
     "MAYA_READY_TIMEOUT=$MAYA_READY_TIMEOUT" \
     bash /root/maya-target-deploy/install-target.sh

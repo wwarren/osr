@@ -105,7 +105,10 @@ reject 'GPU_GID' GPU_GID=0
 plan
 has 'STRATA_KV=int8'; has 'KV cache int8'
 plan "${gpu[@]}" FAKE_VRAM_MIB=16311          # 64K, 64 GiB, IQ2_XS: streamed
-has 'STRATA_KV=int8'; has 'context 65536, KV cache int8, message cache false, port 8080'
+has 'STRATA_KV=int8'; has 'context 65536, parallel 1, KV cache int8, message cache false, port 8080'
+plan "${gpu[@]}" STRATA_PARALLEL=4
+has 'STRATA_PARALLEL=4'
+reject 'STRATA_PARALLEL' STRATA_PARALLEL=9
 plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=IQ3_S STRATA_CONTEXT=262144 MEMORY_MB=90112
 has 'STRATA_KV=int8'                          # 96 GB host: IQ3_S at 256K in an 88 GiB CT
 plan "${gpu[@]}" FAKE_VRAM_MIB=16311 STRATA_MODEL=IQ3_XXS STRATA_CONTEXT=131072 MEMORY_MB=61440

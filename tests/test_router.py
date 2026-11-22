@@ -1928,6 +1928,42 @@ def test_lmstudio_served_context_is_the_loaded_instance(router):
     assert router.build_entry("lmstudio+http://h:1234", v0[0], [])["served_context_length"] is None
 
 
+def test_lmstudio_parallel_slots_split_the_context(router, monkeypatch):
+    """With parallel > 1 and the Unified KV Cache off, llama.cpp gives each
+    slot context_length / parallel: that, not context_length, is what one
+    request can use. lmstudio_unified_kv = true counts the whole pool."""
+    payload = {"models": [
+        {"key": "split", "type": "llm", "max_context_length": 262144,
+         "loaded_instances": [{"id": "a", "config": {"context_length": 262144, "parallel": 8}}]},
+        {"key": "single", "type": "llm",
+         "loaded_instances": [{"id": "b", "config": {"context_length": 262144, "parallel": 1}}]},
+        {"key": "unreported", "type": "llm",
+         "loaded_instances": [{"id": "c", "config": {"context_length": 65536}}]},
+        {"key": "bogus", "type": "llm",
+         "loaded_instances": [{"id": "d", "config": {"context_length": 65536, "parallel": True}},
+                              {"id": "e", "config": {"context_length": 65536, "parallel": "4"}}]},
+        {"key": "mixed", "type": "llm",
+         "loaded_instances": [{"id": "f", "config": {"context_length": 131072, "parallel": 4}},
+                              {"id": "g", "config": {"context_length": 65536, "parallel": 1}}]},
+        {"key": "tiny", "type": "llm", "max_context_length": 4096,
+         "loaded_instances": [{"id": "h", "config": {"context_length": 2, "parallel": 4}}]},
+    ]}
+
+    def windows():
+        return {r["name"]: (r["context_length"], r["served_context_length"])
+                for r in router._lmstudio_v1_models(payload)}
+
+    assert windows() == {"split": (32768, 32768), "single": (262144, 262144),
+                         "unreported": (65536, 65536), "bogus": (65536, 65536),
+                         "mixed": (32768, 32768), "tiny": (4096, None)}
+    raw = router._lmstudio_v1_models(payload)[0]
+    assert router.build_entry("lmstudio+http://h:1234", raw, raw["capabilities"])["served_context_length"] == 32768
+    monkeypatch.setattr(router, "LMSTUDIO_UNIFIED_KV", True)
+    assert windows() == {"split": (262144, 262144), "single": (262144, 262144),
+                         "unreported": (65536, 65536), "bogus": (65536, 65536),
+                         "mixed": (65536, 65536), "tiny": (2, 2)}
+
+
 def test_show_served_context(router):
     served = router.show_served_context
     # The model's own limit alone: Ollama serves its OLLAMA_CONTEXT_LENGTH.

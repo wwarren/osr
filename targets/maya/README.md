@@ -57,6 +57,7 @@ refused; a failed new CT is kept for inspection.
 |---|---|---|
 | `MAYA_MODEL` | `Maya-S-v2-IQ2_XXS` | Any name the checkout's `setup.sh --help` lists (`Maya-S24`, `Maya-M`, `Maya-L`, ...) |
 | `MAYA_CONTEXT` | 65536 | |
+| `MAYA_PARALLEL` | 1 | Concurrent requests, 1–8; requires a checkout with `--parallel` |
 | `MAYA_DRAFT` | `mtp` | Always passed as `--draft`. `dflash2` downloads 0.7 GB more, is licensed non-commercial only, and adds a 5–20 minute calibration on first start (raise `MAYA_READY_TIMEOUT`, e.g. 2400) |
 | `MAYA_NO_VISION` | false | |
 | `MAYA_CUDA_VERSION`, `MAYA_NVCC` | 12.8, `/usr/local/cuda-<ver>/bin/nvcc` | See above |

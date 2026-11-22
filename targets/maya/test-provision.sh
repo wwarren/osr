@@ -47,6 +47,7 @@ has 'bash /root/maya-target-deploy/install-target.sh'
 has 'MAYA_REF=latest'
 has 'MAYA_COMMIT='
 has 'MAYA_MODEL=Maya-S-v2-IQ2_XXS'
+has 'MAYA_PARALLEL=1'
 output=$(printf '2\n' | env -i "PATH=$PATH" "${common[@]}" PVE_INTERACTIVE=true \
     bash "$provision" --dry-run 2>&1) || {
     printf 'FAIL interactive Maya model selection\n%s\n' "$output" >&2; exit 1;
@@ -118,6 +119,9 @@ reject 'MAYA_PORT' MAYA_PORT=70000
 reject 'MAYA_COMMIT' MAYA_COMMIT=bad
 reject 'MAYA_REF' MAYA_REF='a..b'
 reject 'MAYA_MODEL' MAYA_MODEL='Maya;x'
+reject 'MAYA_PARALLEL' MAYA_PARALLEL=9
+plan MAYA_PARALLEL=4
+has 'MAYA_PARALLEL=4'
 reject 'MAYA_DRAFT' MAYA_DRAFT='Mtp;x'
 reject 'MAYA_NO_VISION' MAYA_NO_VISION=yes
 reject 'MAYA_CUDA_VERSION' MAYA_CUDA_VERSION=12.4

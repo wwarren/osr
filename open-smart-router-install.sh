@@ -1977,6 +1977,49 @@ host_memory_mib() {
 }
 
 # --- context windows ----------------------------------------------------------
+# target_parallel_var NAME: the concurrency setting accepted by a model target.
+target_parallel_var() {
+  case "$1" in
+    ollama) echo OLLAMA_NUM_PARALLEL ;;
+    llamacpp) echo PARALLEL_SLOTS ;;
+    strata|basalt|maya|avalon|xolotl) echo "$(target_var_prefix "$1")_PARALLEL" ;;
+    *) return 1 ;;
+  esac
+}
+target_parallel_count() {
+  local var
+  var="$(target_parallel_var "$1")" || { echo 1; return 0; }
+  if [[ ${!var:-} =~ ^[1-9][0-9]*$ ]]; then echo "${!var}"; else echo 1; fi
+}
+target_parallel_env() {
+  local var
+  var="$(target_parallel_var "$1")" || return 0
+  [[ -z ${!var:-} ]] || echo "${var}=${!var}"
+}
+valid_target_parallel() { [[ $1 =~ ^[1-8]$ ]]; }
+prompt_target_parallel() {
+  local name var default any=false
+  for name in ${TARGETS:-}; do
+    if target_parallel_var "$name" >/dev/null; then any=true; break; fi
+  done
+  [[ $any == true ]] || return 0
+  echo
+  echo '--- Parallel requests ---'
+  echo '  More slots serve more requests at once and use more memory.'
+  for name in $TARGETS; do
+    var="$(target_parallel_var "$name")" || continue
+    default="${!var:-1}"
+    prompt_until_valid "  ${name} concurrent requests (1 to 8)" "$var" "$default" valid_target_parallel || return 1
+    if [[ $name == basalt && ${!var} -gt 1 ]]; then
+      if [[ -n ${BASALT_KV:-} && $BASALT_KV != int8 ]]; then
+        echo '  Basalt parallel requests require BASALT_KV=int8. Change BASALT_KV or choose one request.' >&2
+        return 1
+      fi
+      BASALT_KV=int8
+      echo '    Basalt will use int8 KV for parallel requests.'
+    fi
+  done
+}
 # A model target's context window is the most tokens one request can hold
 # (prompt, history, tool definitions and reply). Every target that has the
 # setting defaults to 65536; prompt_target_contexts asks for each one and
@@ -2179,6 +2222,10 @@ prompt_target_contexts() {
     if [[ $name == llamacpp && $(llamacpp_slots) -gt 1 ]]; then
       echo "    llama.cpp shares CONTEXT_SIZE among its ${PARALLEL_SLOTS} slots: CONTEXT_SIZE=$(( value * $(llamacpp_slots) ))."
     fi
+    if [[ ( $name == basalt || $name == avalon ) && $(target_parallel_count "$name") -gt 1 ]]; then
+      echo "    ${name} shares its ${value} tokens among $(target_parallel_count "$name") slots: about $(( value / $(target_parallel_count "$name") )) per request."
+      value=$(( value / $(target_parallel_count "$name") ))
+    fi
     context_shortfall "$value"
     if [[ -z $smallest ]] || (( value < smallest )); then smallest=$value; fi
   done
@@ -2339,7 +2386,7 @@ preset_target_model_servers() {
 # and the like must not reach a target, and the admin token only reaches the
 # companions (as an environment variable, never an argument).
 run_target_provisioner() {
-  local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env cuda_env context_env client_ips="" client
+  local name="$1" phase script id ip storage template image_variant hf_token="" gpu_env cuda_env context_env parallel_env client_ips="" client
   local colibri_model_id="${COLIBRI_MODEL_ID:-}"
   local unattended=${NONINTERACTIVE:-false}
   local -a flags=()
@@ -2376,6 +2423,7 @@ run_target_provisioner() {
   gpu_env="$(target_gpu_env "$name")"
   cuda_env="$(target_cuda_env "$name" "$template")"
   context_env="$(target_context_env "$name")"
+  parallel_env="$(target_parallel_env "$name")"
   (
     local router_ct="$CT_ID" router_ip="${IP_CIDR%/*}" gateway="$GATEWAY" bridge="$BRIDGE" nameserver="$NAMESERVER"
     local webui_port="$OPENWEBUI_PORT" admin_token="${TARGET_ADMIN_TOKEN:-}"
@@ -2407,6 +2455,7 @@ run_target_provisioner() {
     done <<< "$gpu_env"
     [[ -z "$cuda_env" ]] || export "${cuda_env?}"
     [[ -z "$context_env" ]] || export "${context_env?}"
+    [[ -z "$parallel_env" ]] || export "${parallel_env?}"
     [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
     [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
     [[ "$name" != basalt || -z ${BASALT_MODEL:-} ]] || export BASALT_MODEL
@@ -3753,6 +3802,7 @@ prompt_target_settings || exit 1
 # then costs nothing but a rerun).
 prompt_target_gpus || exit 1
 # Each model target's context window, recommended from its GPU and the agents.
+prompt_target_parallel || exit 1
 prompt_target_contexts || exit 1
 # Strata's KV cache precision (suggested from its context, CT memory and GPU)
 # and its opt-in message cache.
@@ -4180,6 +4230,12 @@ _DEFAULTS = {
         # load models on demand. true: only route to models already loaded
         # there (no multi-second JIT load on the request path).
         "lmstudio_loaded_only": "false",
+        # LM Studio reports each loaded instance's parallel (Max Concurrent
+        # Predictions) but not its Unified KV Cache setting. false: one
+        # request gets context_length / parallel, each slot's share with the
+        # setting off. true: every LM Studio host loads with it on, so one
+        # request may use the whole context_length.
+        "lmstudio_unified_kv": "false",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -4543,6 +4599,7 @@ DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
 CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
 LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
+LMSTUDIO_UNIFIED_KV = _cfg.getboolean("discovery", "lmstudio_unified_kv")
 
 
 def _model_sizes(cp: configparser.ConfigParser) -> dict:
@@ -5182,21 +5239,36 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
     return _CAPABILITIES.get(key, caps)
 
 
+def lmstudio_instance_context(config: dict):
+    """The tokens one request may use on a loaded LM Studio instance, or None.
+    With parallel > 1 (Max Concurrent Predictions) and the Unified KV Cache
+    off, llama.cpp gives each slot context_length / parallel, and a longer
+    request fails with "request (N tokens) exceeds the available context
+    size". LM Studio does not report that setting: lmstudio_unified_kv says
+    whether the slots share one pool instead."""
+    context = positive_int(config.get("context_length"))
+    parallel = positive_int(config.get("parallel"))
+    if context and parallel and parallel > 1 and not LMSTUDIO_UNIFIED_KV:
+        return context // parallel or None
+    return context
+
+
 def lmstudio_loaded_context(model: dict):
-    """The context LM Studio serves a model with: its smallest loaded
-    instance's configured context_length, or None when it is not loaded (a
+    """The context LM Studio serves one request with: the smallest loaded
+    instance's per-request window, or None when it is not loaded (a
     just-in-time load uses LM Studio's load settings, which it does not list)."""
     loaded = []
     for instance in model.get("loaded_instances") or []:
         config = instance.get("config") if isinstance(instance, dict) else None
-        if isinstance(config, dict) and positive_int(config.get("context_length")):
-            loaded.append(config["context_length"])
+        context = lmstudio_instance_context(config) if isinstance(config, dict) else None
+        if context:
+            loaded.append(context)
     return min(loaded) if loaded else None
 
 
 def lmstudio_context(model: dict):
     """LM Studio's context for a model: the smallest loaded instance's
-    configured context_length, else max_context_length; None if neither."""
+    per-request window, else max_context_length; None if neither."""
     return lmstudio_loaded_context(model) or positive_int(model.get("max_context_length"))
 
 
@@ -7994,6 +8066,13 @@ show_cache_seconds = 3600
 # request never waits for LM Studio's just-in-time load (and never evicts
 # another model to make room).
 lmstudio_loaded_only = false
+# LM Studio reports each loaded instance's parallel (Max Concurrent
+# Predictions) but not its Unified KV Cache setting. false: one request is
+# counted as context_length / parallel, each slot's share with that setting off
+# (a longer request fails with "request (N tokens) exceeds the available
+# context size"). true: every LM Studio host loads models with Unified KV
+# Cache on, so one request may use the whole context_length.
+lmstudio_unified_kv = false
 # Parameter-count bands (billions) each request class prefers: low:high
 fast_params = 0:9
 medium_params = 9:20

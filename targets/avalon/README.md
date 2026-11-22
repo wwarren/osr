@@ -81,6 +81,7 @@ failed new CT is kept; an interrupted download resumes on rerun.
 | `AVALON_CUDA_ARCH` | `auto` | Compute capability as a number; `auto` reads GPU 0 |
 | `AVALON_PORT` | `8080` | |
 | `AVALON_CONTEXT` | `65536` | `-c`, 4096–262144, or `auto` |
+| `AVALON_PARALLEL` | `1` | Concurrent llama-server slots; `AVALON_CONTEXT` is shared among them |
 | `AVALON_MTP` | `true` | `false` skips the 1.4 GB draft head |
 | `AVALON_MODEL_NAME` | `qwen3.8-flash-next-avalon` | `--alias` |
 | `AVALON_READY_TIMEOUT` | `1800` | Seconds to wait for the load |

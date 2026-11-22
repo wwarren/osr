@@ -41,11 +41,13 @@ lacks 'install_nvidia'; lacks '+ pct exec 270 -- env'
 has 'To adopt it into the target layout'
 
 FLAGS=--install-target ok 'install plan adopts the install and pulls models' OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b'
-has "+ pct exec 270 -- env OLLAMA_GPU=none OLLAMA_PULL_MODELS=qwen3:8b\\ qwen3:14b OLLAMA_CONTEXT_LENGTH=65536 bash /root/ollama-target-deploy/install-target.sh"
+has "+ pct exec 270 -- env OLLAMA_GPU=none OLLAMA_PULL_MODELS=qwen3:8b\\ qwen3:14b OLLAMA_CONTEXT_LENGTH=65536 OLLAMA_NUM_PARALLEL=1 bash /root/ollama-target-deploy/install-target.sh"
 FLAGS=--install-target ok 'OLLAMA_CONTEXT_LENGTH reaches the guest install' OLLAMA_CONTEXT_LENGTH=32768
-has 'OLLAMA_CONTEXT_LENGTH=32768 bash /root/ollama-target-deploy/install-target.sh'
+has 'OLLAMA_CONTEXT_LENGTH=32768 OLLAMA_NUM_PARALLEL=1 bash /root/ollama-target-deploy/install-target.sh'
+FLAGS=--install-target ok 'OLLAMA_NUM_PARALLEL reaches the guest install' OLLAMA_NUM_PARALLEL=4
+has 'OLLAMA_NUM_PARALLEL=4 bash /root/ollama-target-deploy/install-target.sh'
 ok 'the manual adoption command carries the context'
-has 'OLLAMA_GPU=none OLLAMA_CONTEXT_LENGTH=65536 bash /root/ollama-target-deploy/install-target.sh'
+has 'OLLAMA_GPU=none OLLAMA_CONTEXT_LENGTH=65536 OLLAMA_NUM_PARALLEL=1 bash /root/ollama-target-deploy/install-target.sh'
 fails 'an invalid OLLAMA_CONTEXT_LENGTH is refused' 'OLLAMA_CONTEXT_LENGTH must be a whole number' OLLAMA_CONTEXT_LENGTH=64k
 fails 'a too-small OLLAMA_CONTEXT_LENGTH is refused' 'OLLAMA_CONTEXT_LENGTH must be a whole number' OLLAMA_CONTEXT_LENGTH=1024
 

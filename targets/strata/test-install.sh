@@ -62,7 +62,7 @@ for helper in help_has help_choices check_choice validate_setup_options setup_ar
               validate_settings settings_env load_settings fingerprint_env saved_settings; do
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
-STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_KV=int8 STRATA_MESSAGE_CACHE=false STRATA_VISION=no
+STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_PARALLEL=1 STRATA_KV=int8 STRATA_MESSAGE_CACHE=false STRATA_VISION=no
 STRATA_PORT=8080 STRATA_DATA_DIR=/var/lib/strata STRATA_ALLOW_NO_KEY=false
 
 SETUP_HELP=$(< "$help_documented")
@@ -125,6 +125,13 @@ out=$( (validate_settings) 2>&1 ) && fail 'an unknown cache was accepted'
 [[ $out == *'STRATA_KV must be int8, k8v4 or q4_0'* ]] || fail "kv validation: $out"
 STRATA_KV=int8
 pass 'the KV cache is passed only to checkouts with --kv and checked against their choices'
+STRATA_PARALLEL=4
+out=$( (validate_setup_options) 2>&1 ) && fail 'parallel accepted without checkout support'
+[[ $out == *'no --parallel option'* ]] || fail "parallel support message: $out"
+SETUP_HELP=$(sed 's/\[--context CONTEXT\]/[--context CONTEXT] [--parallel N]/' "$help_documented")
+(validate_setup_options) || fail 'parallel refused by supporting checkout'
+[[ $(setup_args | tr '\n' ' ') == *'--parallel 4 '* ]] || fail 'parallel not passed to setup'
+STRATA_PARALLEL=1 SETUP_HELP=$(< "$help_documented")
 
 STRATA_DIR=$tmp_root/strata; mkdir -p "$STRATA_DIR"
 printf '#!/bin/sh\nexit 0\n' > "$STRATA_DIR/run-iq2_xs.sh"
@@ -157,7 +164,7 @@ pass 'an unnamed launcher falls back to the one setup just wrote, never a guess'
 # all-or-nothing, never sourced.
 STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_CONTEXT=32768 STRATA_VISION=no STRATA_PORT=8080
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 8 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^STRATA_' "$tmp_root/installed-env") == 9 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
 STRATA_MODEL=IQ3_S STRATA_PORT=11434
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $STRATA_MODEL == IQ2_XS && $STRATA_PORT == 8080 ]] || fail "record not restored: $STRATA_MODEL $STRATA_PORT"

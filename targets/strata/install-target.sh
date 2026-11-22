@@ -81,6 +81,7 @@ STRATA_REF=<branch or tag> (follow it when no commit is set); STRATA_COMMIT=
 explicitly follows main,
 STRATA_MODEL=IQ2_XS (IQ1_M for coder, UD-IQ4_XS for unsloth), STRATA_FAMILY=qwen (any family the
 checkout's setup.sh lists, e.g. swift, coder, unsloth), STRATA_CONTEXT=65536,
+STRATA_PARALLEL=1 (concurrent requests; requires checkout --parallel above 1),
 STRATA_KV=int8 (the KV cache: int8, k8v4 = 8-bit keys and 4-bit values, or
 q4_0; used above an 8192-token context; installs from before this setting keep
 int8), STRATA_MESSAGE_CACHE=false (true: also checkpoint a long conversation
@@ -133,6 +134,8 @@ validate_setup_options() {
     help_has --kv || [[ $STRATA_KV == int8 ]] ||
         die "This Strata checkout has no --kv option, so STRATA_KV=$STRATA_KV cannot be selected (it always uses the 8-bit cache). Set STRATA_KV=int8, or pin STRATA_REF/STRATA_COMMIT to a release that has --kv."
     check_choice --kv "$STRATA_KV"
+    help_has --parallel || [[ $STRATA_PARALLEL == 1 ]] ||
+        die 'This Strata checkout has no --parallel option; choose STRATA_PARALLEL=1 or a newer STRATA_COMMIT.'
 }
 
 # setup_args: setup.sh arguments, one per line, for installing or refreshing
@@ -146,6 +149,7 @@ setup_args() {
     printf '%s\n' --model "$STRATA_MODEL"
     if help_has --context; then printf '%s\n' --context "$STRATA_CONTEXT"; fi
     if help_has --kv; then printf '%s\n' --kv "$STRATA_KV"; fi
+    if help_has --parallel && (( STRATA_PARALLEL > 1 )); then printf '%s\n' --parallel "$STRATA_PARALLEL"; fi
     if help_has --vision; then printf '%s\n' --vision "$STRATA_VISION"; fi
     printf '%s\n' --host 0.0.0.0 --port "$STRATA_PORT"
     if help_has --data-dir; then
@@ -215,17 +219,18 @@ settings_fingerprint() {
     # Only a non-default cache adds a line: an install from before STRATA_KV
     # ran int8 and keeps its fingerprint, so an unchanged rerun stays a no-op.
     if [[ $STRATA_KV != int8 ]]; then printf 'kv=%s\n' "$STRATA_KV"; fi
+    if [[ $STRATA_PARALLEL != 1 ]]; then printf 'parallel=%s\n' "$STRATA_PARALLEL"; fi
     if [[ $STRATA_MESSAGE_CACHE == true ]]; then printf 'message_cache=true\n'; fi
 }
 
 # The settings that decide how setup runs. save_settings records them after
 # every successful install or upgrade, so a failed upgrade can roll back to
 # what last worked rather than re-running setup with the settings that failed.
-SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_KV STRATA_MESSAGE_CACHE STRATA_VISION STRATA_PORT
+SETTING_KEYS=(STRATA_FAMILY STRATA_MODEL STRATA_CONTEXT STRATA_PARALLEL STRATA_KV STRATA_MESSAGE_CACHE STRATA_VISION STRATA_PORT
               STRATA_ALLOW_NO_KEY)
 # Settings added after records existed, with the value those installs ran with.
 # A record without one of them is still complete.
-declare -gA SETTING_LEGACY_DEFAULTS=([STRATA_KV]=int8 [STRATA_MESSAGE_CACHE]=false)
+declare -gA SETTING_LEGACY_DEFAULTS=([STRATA_KV]=int8 [STRATA_PARALLEL]=1 [STRATA_MESSAGE_CACHE]=false)
 
 # required_setting_keys: the settings every record must hold.
 required_setting_keys() {
@@ -241,6 +246,7 @@ validate_settings() {
     [[ $STRATA_FAMILY =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die 'Invalid STRATA_FAMILY.'
     [[ $STRATA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid STRATA_MODEL.'
     [[ $STRATA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid STRATA_CONTEXT.'
+    [[ $STRATA_PARALLEL =~ ^[1-8]$ ]] || die 'STRATA_PARALLEL must be 1 to 8.'
     [[ $STRATA_KV =~ ^(int8|k8v4|q4_0)$ ]] || die 'STRATA_KV must be int8, k8v4 or q4_0.'
     [[ $STRATA_MESSAGE_CACHE =~ ^(true|false)$ ]] || die 'STRATA_MESSAGE_CACHE must be true or false.'
     [[ $STRATA_VISION =~ ^(yes|no|gpu|cpu)$ ]] || die 'Invalid STRATA_VISION.'
@@ -296,6 +302,7 @@ fingerprint_env() {
     sed -n -e 's/^family=/STRATA_FAMILY=/p' \
         -e 's/^model=/STRATA_MODEL=/p' \
         -e 's/^context=/STRATA_CONTEXT=/p' \
+        -e 's/^parallel=/STRATA_PARALLEL=/p' \
         -e 's/^kv=/STRATA_KV=/p' \
         -e 's/^message_cache=/STRATA_MESSAGE_CACHE=/p' \
         -e 's/^vision=/STRATA_VISION=/p' \
@@ -917,6 +924,7 @@ case $STRATA_FAMILY in
     *) STRATA_MODEL=${STRATA_MODEL:-IQ2_XS} ;;
 esac
 STRATA_CONTEXT=${STRATA_CONTEXT:-65536}
+STRATA_PARALLEL=${STRATA_PARALLEL:-1}
 STRATA_KV=${STRATA_KV:-int8}
 STRATA_MESSAGE_CACHE=${STRATA_MESSAGE_CACHE:-false}
 STRATA_VISION=${STRATA_VISION:-no}

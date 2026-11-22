@@ -100,7 +100,7 @@ authenticate; a keyed server that cannot identify itself is added as
 | Kind | Default port | Token (`secrets.env`) | Notes |
 |---|---|---|---|
 | Ollama (also llama.cpp bridge, AirLLM) | 11434 | — | Keep-alive pinned by the monitor |
-| LM Studio | 1234 | `set-lmstudio-token` | Resident models preferred; `lmstudio_loaded_only = true` never triggers a just-in-time load. Names differ (`qwen/qwen3-14b`); set LM Studio's own idle TTL |
+| LM Studio | 1234 | `set-lmstudio-token` | Resident models preferred; `lmstudio_loaded_only = true` never triggers a just-in-time load. Names differ (`qwen/qwen3-14b`); set LM Studio's own idle TTL. Context counts per request: `context_length / parallel` unless `lmstudio_unified_kv = true` |
 | Strata | 8080 | `set-strata-token` | Must listen on a reachable address (below); `strata://host:11434` for that port |
 | Basalt | 8080 | `set-basalt-token` | Model ID `BASALT_ALIAS` (default `qwen3.8-flash-next`) |
 | Maya | 8080 | `set-maya-token` | Model ID `glm-5.3-flash` |

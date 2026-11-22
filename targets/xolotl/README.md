@@ -77,6 +77,7 @@ interrupted download resumes when the installer runs again.
 | `XOLOTL_CUDA_ARCH` | `auto` | Compute capability as a number (`86`, `89`, `120`) |
 | `XOLOTL_PORT` | `8080` | |
 | `XOLOTL_CONTEXT` | `65536` | `--ctx`; up to 512K with the 4-bit KV cache (upstream uses 131072 on 24 GB) |
+| `XOLOTL_PARALLEL` | `1` | 1..8 concurrent batch slots; requires a checkout with parallel support |
 | `XOLOTL_ARENA_GIB` | `60` | `--arena-gib` |
 | `XOLOTL_DSPARK` | `true` | `false` skips the 5.7 GB draft and frees ~2.9 GB VRAM |
 | `XOLOTL_MODEL_NAME` | `deepseek-v4.1-flash` | Model id the API lists |

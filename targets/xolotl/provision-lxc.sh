@@ -46,7 +46,7 @@ Optional: CT_HOSTNAME=xolotl-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=98304,
           XOLOTL_REF=<branch or tag>, XOLOTL_COMMIT=<full SHA-1 pin>
           (default: tested commit in upstream-commit.txt),
           XOLOTL_CUDA_VERSION=13.0, XOLOTL_CUDA_ARCH=auto, XOLOTL_PORT=8080,
-          XOLOTL_CONTEXT=65536, XOLOTL_ARENA_GIB=60, XOLOTL_DSPARK=true,
+          XOLOTL_CONTEXT=65536, XOLOTL_PARALLEL=1, XOLOTL_ARENA_GIB=60, XOLOTL_DSPARK=true,
           XOLOTL_MODEL_NAME=deepseek-v4.1-flash, XOLOTL_READY_TIMEOUT=1800.
 
 XOLOTL_ARENA_GIB is the RAM the engine pins for experts; the CT needs at least
@@ -140,6 +140,7 @@ XOLOTL_CUDA_VERSION=${XOLOTL_CUDA_VERSION:-13.0}
 XOLOTL_CUDA_ARCH=${XOLOTL_CUDA_ARCH:-auto}
 XOLOTL_PORT=${XOLOTL_PORT:-8080}
 XOLOTL_CONTEXT=${XOLOTL_CONTEXT:-65536}
+XOLOTL_PARALLEL=${XOLOTL_PARALLEL:-1}
 XOLOTL_ARENA_GIB=${XOLOTL_ARENA_GIB:-60}
 XOLOTL_DSPARK=${XOLOTL_DSPARK:-true}
 XOLOTL_MODEL_NAME=${XOLOTL_MODEL_NAME:-deepseek-v4.1-flash}
@@ -186,6 +187,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
     die 'XOLOTL_CUDA_ARCH must be auto or a compute capability of 75 or newer (e.g. 86, 89, 120).'
 [[ $XOLOTL_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( XOLOTL_PORT <= 65535 )) || die 'XOLOTL_PORT must be 1..65535.'
 (( XOLOTL_CONTEXT >= 1000 && XOLOTL_CONTEXT <= 1048576 )) || die 'XOLOTL_CONTEXT must be 1000..1048576 tokens.'
+[[ $XOLOTL_PARALLEL =~ ^[1-8]$ ]] || die 'XOLOTL_PARALLEL must be 1..8.'
 [[ $XOLOTL_DSPARK =~ ^(true|false)$ ]] || die 'XOLOTL_DSPARK must be true or false.'
 [[ $XOLOTL_MODEL_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'Invalid XOLOTL_MODEL_NAME (lowercase letters, digits, ., _ and -).'
 [[ $XOLOTL_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'XOLOTL_READY_TIMEOUT must be a positive number of seconds.'
@@ -285,7 +287,7 @@ pve_summary "Xolotl: create"
 pve_row 'Xolotl CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Model' "${XOLOTL_MODEL_NAME} (context ${XOLOTL_CONTEXT}, port ${XOLOTL_PORT})"
+pve_row 'Model' "${XOLOTL_MODEL_NAME} (context ${XOLOTL_CONTEXT}, parallel ${XOLOTL_PARALLEL}, port ${XOLOTL_PORT})"
 pve_confirm "Create Xolotl CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # Xolotl pins tens of GiB of expert memory (XOLOTL_ARENA_GIB). systemd's LimitMEMLOCK must be
@@ -328,7 +330,7 @@ run pct push "$CT_ID" "$NVIDIA_GUEST_INSTALLER" /root/xolotl-target-deploy/nvidi
 nvidia_lxc_install_guest "$CT_ID" "$NVIDIA_DRIVER_VERSION" /root/xolotl-target-deploy/nvidia-guest-install.sh
 run pct exec "$CT_ID" -- env "XOLOTL_REF=$XOLOTL_REF" "XOLOTL_COMMIT=$XOLOTL_COMMIT" \
     "XOLOTL_CUDA_VERSION=$XOLOTL_CUDA_VERSION" "XOLOTL_CUDA_ARCH=$XOLOTL_CUDA_ARCH" "XOLOTL_PORT=$XOLOTL_PORT" \
-    "XOLOTL_CONTEXT=$XOLOTL_CONTEXT" "XOLOTL_ARENA_GIB=$XOLOTL_ARENA_GIB" "XOLOTL_DSPARK=$XOLOTL_DSPARK" \
+    "XOLOTL_CONTEXT=$XOLOTL_CONTEXT" "XOLOTL_PARALLEL=$XOLOTL_PARALLEL" "XOLOTL_ARENA_GIB=$XOLOTL_ARENA_GIB" "XOLOTL_DSPARK=$XOLOTL_DSPARK" \
     "XOLOTL_MODEL_NAME=$XOLOTL_MODEL_NAME" "XOLOTL_READY_TIMEOUT=$XOLOTL_READY_TIMEOUT" \
     bash /root/xolotl-target-deploy/install-target.sh
 

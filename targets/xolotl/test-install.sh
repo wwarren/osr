@@ -32,10 +32,10 @@ make_fixture() {
     printf 'option(STRATA_DSV41_FQ_OP "" OFF)\noption(STRATA_DSV41_HC_MIX "" OFF)\n' > "$dir/tools/v41/engine/v41_engine.cmake"
     : > "$dir/requirements.txt"
     printf '#!/usr/bin/env bash\nPIN=3cf03257f219afbe7334045ff7c6a06ac68c627d\n' > "$dir/tools/xolotl/fetch-llama.sh"
-    printf 'print("serve")\n' > "$dir/tools/v41/serve/serve_ds41.py"
+    printf 'cfg.get("parallel")\n' > "$dir/tools/v41/serve/serve_ds41.py"
     printf '0 1 2\n' > "$dir/tools/v41/serve/dspark_expert_counts.txt"
     for flag in -m --backend --experts --engram --rank --ctx --stop --arena-adapt --kv-fp4 --route-bias \
-                --route-bias-file --arena-gib --tier-batch-pcie --prompt-batch; do
+                --route-bias-file --arena-gib --tier-batch-pcie --prompt-batch --batch-slots; do
         printf 'if (a == "%s") {}\n' "$flag"
     done > "$dir/tools/v41/engine/ds41_generate.cpp"
     printf 'a.host = a.host or cfg.get("host")\nsvc.api_key = api_key_of(a.api_key or cfg.get("api_key", ""))\n' > "$dir/serve/server.py"
@@ -54,10 +54,19 @@ for helper in validate_checkout cmake_args compute_cap_arch model_path engram_di
     declare -F "$helper" >/dev/null || die "Helper extraction failed: $helper"
 done
 XOLOTL_DIR=$fixture XOLOTL_DATA_DIR=/var/lib/xolotl XOLOTL_CUDA_VERSION=13.0 XOLOTL_NVCC=/usr/local/cuda-13.0/bin/nvcc
-XOLOTL_CUDA_ARCH=89 XOLOTL_PORT=8080 XOLOTL_CONTEXT=131072 XOLOTL_ARENA_GIB=60 XOLOTL_DSPARK=true
+XOLOTL_CUDA_ARCH=89 XOLOTL_PORT=8080 XOLOTL_CONTEXT=131072 XOLOTL_PARALLEL=1 XOLOTL_ARENA_GIB=60 XOLOTL_DSPARK=true
 XOLOTL_MODEL_NAME=deepseek-v4.1-flash
 
 validate_checkout "$fixture" || fail 'the fixture checkout was refused'
+XOLOTL_PARALLEL=4
+validate_checkout "$fixture" || fail 'a parallel checkout was refused'
+[[ $(server_config) == *'"parallel": 4'* ]] || fail 'parallel slots missing from server config'
+cp -a "$fixture" "$tmp_root/no-batch"
+sed -i '/--batch-slots/d' "$tmp_root/no-batch/tools/v41/engine/ds41_generate.cpp"
+validate_checkout "$tmp_root/no-batch" 2>/dev/null && fail 'an engine without batch slots accepted parallel requests'
+rm -rf "$tmp_root/no-batch"
+XOLOTL_PARALLEL=1
+[[ $(server_config) != *'"parallel"'* ]] || fail 'default server config changed'
 for broken in serve/server.py tools/v41/serve/dspark_expert_counts.txt; do
     cp -a "$fixture" "$tmp_root/broken"; rm -f "$tmp_root/broken/$broken"
     out=$(validate_checkout "$tmp_root/broken" 2>&1) && fail "a checkout without $broken was accepted"
@@ -130,7 +139,11 @@ XOLOTL_DSPARK=true
 pass 'the server config carries the model, Engram, rank, arena and key; the unit environment does not carry the key'
 
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^XOLOTL_' "$tmp_root/installed-env") == 8 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^XOLOTL_' "$tmp_root/installed-env") == 9 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+grep -v '^XOLOTL_PARALLEL=' "$tmp_root/installed-env" > "$tmp_root/old-parallel-env"
+XOLOTL_PARALLEL=4
+load_settings "$tmp_root/old-parallel-env" || fail 'a record from before parallel slots was not loaded'
+[[ $XOLOTL_PARALLEL == 1 ]] || fail 'old records did not default to one slot'
 XOLOTL_CONTEXT=65536 XOLOTL_PORT=11434 XOLOTL_CUDA_ARCH=120
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $XOLOTL_CONTEXT == 131072 && $XOLOTL_PORT == 8080 && $XOLOTL_CUDA_ARCH == 89 ]] ||

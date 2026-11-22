@@ -84,7 +84,8 @@ XOLOTL_REF=<branch or tag, e.g. main> or XOLOTL_COMMIT=<full SHA-1 pin>
 overrides that default (XOLOTL_COMMIT wins if both are set).
 XOLOTL_CUDA_VERSION=13.0,
 XOLOTL_CUDA_ARCH=auto (the GPU's compute capability, e.g. 89 for RTX 40; 75 or
-newer), XOLOTL_PORT=8080, XOLOTL_CONTEXT=65536, XOLOTL_ARENA_GIB=60 (the
+newer), XOLOTL_PORT=8080, XOLOTL_CONTEXT=65536, XOLOTL_PARALLEL=1 (batch
+slots, 1..8), XOLOTL_ARENA_GIB=60 (the
 pinned RAM expert arena), XOLOTL_DSPARK=true (speculative decoding with the
 5.7 GB DSpark sidecar), XOLOTL_MODEL_NAME=deepseek-v4.1-flash (the API's model
 id), XOLOTL_READY_TIMEOUT=1800 (seconds).
@@ -125,6 +126,11 @@ validate_checkout() {
     # Strata's server must take its API key and listen address from the config.
     grep -q 'cfg.get("api_key"' "$dir/serve/server.py" && grep -q 'cfg.get("host")' "$dir/serve/server.py" ||
         { note "This Xolotl checkout's server does not read \"api_key\" and \"host\" from its config. Pin a compatible XOLOTL_COMMIT."; return 1; }
+    if (( XOLOTL_PARALLEL > 1 )); then
+        grep -qF 'cfg.get("parallel")' "$dir/tools/v41/serve/serve_ds41.py" &&
+            grep -qF '"--batch-slots"' "$dir/tools/v41/engine/ds41_generate.cpp" ||
+            { note 'This Xolotl checkout does not support parallel batch slots. Pin a compatible XOLOTL_COMMIT or set XOLOTL_PARALLEL=1.'; return 1; }
+    fi
 }
 
 # cmake_args: the configure arguments for the DeepSeek-V4.1 engine (README:
@@ -185,7 +191,7 @@ weight_rows() {
 # records them after every successful install or upgrade, so a failed upgrade
 # can roll back to what last worked.
 SETTING_KEYS=(XOLOTL_CUDA_VERSION XOLOTL_NVCC XOLOTL_CUDA_ARCH XOLOTL_PORT XOLOTL_CONTEXT
-    XOLOTL_ARENA_GIB XOLOTL_DSPARK XOLOTL_MODEL_NAME)
+    XOLOTL_PARALLEL XOLOTL_ARENA_GIB XOLOTL_DSPARK XOLOTL_MODEL_NAME)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
@@ -196,6 +202,7 @@ validate_settings() {
     [[ $XOLOTL_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( XOLOTL_PORT <= 65535 )) || die 'Invalid XOLOTL_PORT.'
     [[ $XOLOTL_CONTEXT =~ ^[1-9][0-9]{3,6}$ ]] && (( XOLOTL_CONTEXT <= 1048576 )) ||
         die 'XOLOTL_CONTEXT must be 1000..1048576 tokens.'
+    [[ $XOLOTL_PARALLEL =~ ^[1-8]$ ]] || die 'XOLOTL_PARALLEL must be 1..8.'
     [[ $XOLOTL_ARENA_GIB =~ ^[1-9][0-9]{0,3}$ ]] && (( XOLOTL_ARENA_GIB >= 8 )) ||
         die 'XOLOTL_ARENA_GIB must be at least 8.'
     [[ $XOLOTL_DSPARK =~ ^(true|false)$ ]] || die 'XOLOTL_DSPARK must be true or false.'
@@ -220,6 +227,7 @@ load_settings() {
         [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
         found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
     done < "$file"
+    [[ -v found[XOLOTL_PARALLEL] ]] || found[XOLOTL_PARALLEL]=1 # Existing records predate parallel slots.
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -237,6 +245,7 @@ fingerprint_env() {
         -e 's/^arch=/XOLOTL_CUDA_ARCH=/p' \
         -e 's/^port=/XOLOTL_PORT=/p' \
         -e 's/^context=/XOLOTL_CONTEXT=/p' \
+        -e 's/^parallel=/XOLOTL_PARALLEL=/p' \
         -e 's/^arena_gib=/XOLOTL_ARENA_GIB=/p' \
         -e 's/^dspark=/XOLOTL_DSPARK=/p' \
         -e 's/^model_name=/XOLOTL_MODEL_NAME=/p' "$1"
@@ -297,7 +306,7 @@ server_config() {
     XC_DIR=$XOLOTL_DIR XC_MODEL=$(model_path V41-XQ-1017-v4.gguf) XC_RANK=$(model_path rank-1017-v4.bin) \
     XC_TOKENIZER=$(model_path tokenizer) XC_DSPARK_FILE=$(model_path V41-MTP-Vision-1017.Q2_K.gguf) \
     XC_ENGRAM=$(engram_dir) XC_CACHE=$XOLOTL_DATA_DIR/cache/dense-requant \
-    XC_CONTEXT=$XOLOTL_CONTEXT XC_ARENA=$XOLOTL_ARENA_GIB XC_DSPARK=$XOLOTL_DSPARK \
+    XC_CONTEXT=$XOLOTL_CONTEXT XC_PARALLEL=$XOLOTL_PARALLEL XC_ARENA=$XOLOTL_ARENA_GIB XC_DSPARK=$XOLOTL_DSPARK \
     XC_NAME=$XOLOTL_MODEL_NAME XC_KEY=${api_key:-} python3 -c '
 import json, os
 e = os.environ
@@ -344,6 +353,8 @@ config = {
     "reasoning_budget_tokens": 32768,
     "env": env,
 }
+if int(e["XC_PARALLEL"]) > 1:
+    config["parallel"] = int(e["XC_PARALLEL"])
 print(json.dumps(config, indent=2))
 '
 }
@@ -358,6 +369,7 @@ settings_fingerprint() {
     printf 'cuda=%s\nnvcc=%s\narch=%s\nport=%s\ncontext=%s\narena_gib=%s\ndspark=%s\nmodel_name=%s\ntoolkit_sha256=%s\nweights_sha256=%s\nconfig_sha256=%s\n' \
         "$XOLOTL_CUDA_VERSION" "$XOLOTL_NVCC" "$XOLOTL_CUDA_ARCH" "$XOLOTL_PORT" "$XOLOTL_CONTEXT" \
         "$XOLOTL_ARENA_GIB" "$XOLOTL_DSPARK" "$XOLOTL_MODEL_NAME" "$toolkit_hash" "$weights_hash" "$config_hash"
+    if (( XOLOTL_PARALLEL > 1 )); then printf 'parallel=%s\n' "$XOLOTL_PARALLEL"; fi
 }
 
 # start_env: the EnvironmentFile the unit expands into ExecStart (no secrets).
@@ -1070,6 +1082,7 @@ XOLOTL_NVCC=${XOLOTL_NVCC:-/usr/local/cuda-$XOLOTL_CUDA_VERSION/bin/nvcc}
 XOLOTL_CUDA_ARCH=${XOLOTL_CUDA_ARCH:-auto}
 XOLOTL_PORT=${XOLOTL_PORT:-8080}
 XOLOTL_CONTEXT=${XOLOTL_CONTEXT:-65536}
+XOLOTL_PARALLEL=${XOLOTL_PARALLEL:-1}
 XOLOTL_ARENA_GIB=${XOLOTL_ARENA_GIB:-60}
 XOLOTL_DSPARK=${XOLOTL_DSPARK:-true}
 XOLOTL_MODEL_NAME=${XOLOTL_MODEL_NAME:-deepseek-v4.1-flash}

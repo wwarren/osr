@@ -55,7 +55,7 @@ for helper in validate_checkout rocm_dir cmake_args compute_cap_arch gfx_of_pci_
 done
 AVALON_DIR=$fixture AVALON_DATA_DIR=/var/lib/avalon AVALON_CONFIG_DIR=/etc/avalon AVALON_BACKEND=rocm
 AVALON_ROCM_VERSION=7.2.4 AVALON_GPU_TARGET=gfx1100 AVALON_CUDA_VERSION=12.9 AVALON_NVCC=/usr/local/cuda-12.9/bin/nvcc
-AVALON_CUDA_ARCH=auto AVALON_PORT=8080 AVALON_CONTEXT=262144 AVALON_MTP=true AVALON_MODEL_NAME=qwen3.8-flash-next-avalon
+AVALON_CUDA_ARCH=auto AVALON_PORT=8080 AVALON_CONTEXT=262144 AVALON_PARALLEL=1 AVALON_MTP=true AVALON_MODEL_NAME=qwen3.8-flash-next-avalon
 
 validate_checkout "$fixture" || fail 'the fixture checkout was refused'
 for broken in common/arg.cpp ggml/src/ggml-cuda/moe-cache.cu; do
@@ -122,9 +122,12 @@ AVALON_MTP=false
 [[ $(server_args) != *-md* && $(server_args) != *draft-mtp* ]] || fail 'MTP arguments without AVALON_MTP'
 AVALON_MTP=true
 pass 'the server runs upstream'\''s command with absolute paths, the alias and a key file; no key in its arguments'
+AVALON_PARALLEL=4
+[[ $(server_args | tr '\n' ' ') == *'--parallel 4 '* ]] || fail 'parallel slots not passed to Avalon'
+AVALON_PARALLEL=1
 
 settings_env > "$tmp_root/installed-env"
-[[ $(grep -c '^AVALON_' "$tmp_root/installed-env") == 10 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
+[[ $(grep -c '^AVALON_' "$tmp_root/installed-env") == 11 ]] || fail "settings record: $(cat "$tmp_root/installed-env")"
 AVALON_CONTEXT=65536 AVALON_PORT=11434 AVALON_GPU_TARGET=gfx1101
 load_settings "$tmp_root/installed-env" || fail 'a valid record was not loaded'
 [[ $AVALON_CONTEXT == 262144 && $AVALON_PORT == 8080 && $AVALON_GPU_TARGET == gfx1100 ]] ||

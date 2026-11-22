@@ -109,7 +109,8 @@ the next run.
 
 Settings: `BASALT_PORT`, `BASALT_MODEL`, `BASALT_HF_REPO`, `BASALT_ALIAS`,
 `BASALT_GPUS` (for `0,1` also add `/dev/nvidia1` to `GPU_DEVICES`),
-`BASALT_CONTEXT` (at most 999999), `BASALT_KV`, `BASALT_KV_RESIDENT`,
+`BASALT_CONTEXT` (at most 999999), `BASALT_PARALLEL` (1 to 8),
+`BASALT_KV`, `BASALT_KV_RESIDENT`,
 `BASALT_VRAM_RESERVE_MIB`,
 `CUDA_VERSION`, and `BASALT_ALLOW_NO_KEY=true` for an unauthenticated API. `BASALT_URL` and `BASALT_REF` (default `main`) select the
 source; pin a tested commit with `BASALT_COMMIT` for production.
@@ -117,10 +118,21 @@ source; pin a tested commit with `BASALT_COMMIT` for production.
 To increase the context while keeping 32,768 KV cells on the GPU and streaming
 the rest from pinned CT RAM, set `BASALT_KV=int8` and
 `BASALT_KV_RESIDENT=32768`. The resident count must be at least 20,480 and no
-greater than `BASALT_CONTEXT`. The defaults are `fp16` and `0` (all KV in
+greater than the context per parallel slot. The defaults are `fp16` and `0` (all KV in
 VRAM). Basalt also supports `q4_0` and `k8v4`, but `k8v4` cannot use
 `BASALT_KV_RESIDENT`. These settings are saved across reruns, and an existing
 install with the defaults is not restarted by an installer that adds them.
+
+`BASALT_PARALLEL=4` serves four concurrent requests. `BASALT_CONTEXT` is
+shared, so 262144 gives each slot 65536 tokens. Parallel counts above one
+require `BASALT_KV=int8`; with KV streaming, each slot keeps
+`BASALT_KV_RESIDENT` cells in VRAM. The installer validates these combinations
+before changing the service. For example:
+
+```bash
+pct exec 164 -- env BASALT_CONTEXT=262144 BASALT_PARALLEL=4 BASALT_KV=int8 \
+    BASALT_KV_RESIDENT=32768 bash /root/basalt-target-deploy/install-target.sh
+```
 
 `BASALT_VRAM_RESERVE_MIB` controls how much GPU memory Basalt's automatic
 expert cache leaves for other allocations. Its default is 700 MiB; the Linux

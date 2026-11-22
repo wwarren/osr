@@ -249,6 +249,12 @@ _DEFAULTS = {
         # load models on demand. true: only route to models already loaded
         # there (no multi-second JIT load on the request path).
         "lmstudio_loaded_only": "false",
+        # LM Studio reports each loaded instance's parallel (Max Concurrent
+        # Predictions) but not its Unified KV Cache setting. false: one
+        # request gets context_length / parallel, each slot's share with the
+        # setting off. true: every LM Studio host loads with it on, so one
+        # request may use the whole context_length.
+        "lmstudio_unified_kv": "false",
         # Parameter-count bands (in billions) each request class prefers.
         "fast_params": "0:9",
         "medium_params": "9:20",
@@ -612,6 +618,7 @@ DISCOVERY_REFRESH = _cfg.getint("discovery", "refresh_seconds")
 DISCOVERY_TIMEOUT = _cfg.getfloat("discovery", "timeout_seconds")
 CAPABILITY_PROBE = _cfg.getboolean("discovery", "capability_probe")
 LMSTUDIO_LOADED_ONLY = _cfg.getboolean("discovery", "lmstudio_loaded_only")
+LMSTUDIO_UNIFIED_KV = _cfg.getboolean("discovery", "lmstudio_unified_kv")
 
 
 def _model_sizes(cp: configparser.ConfigParser) -> dict:
@@ -1251,21 +1258,36 @@ async def model_capabilities(client: httpx.AsyncClient, server: str, raw: dict,
     return _CAPABILITIES.get(key, caps)
 
 
+def lmstudio_instance_context(config: dict):
+    """The tokens one request may use on a loaded LM Studio instance, or None.
+    With parallel > 1 (Max Concurrent Predictions) and the Unified KV Cache
+    off, llama.cpp gives each slot context_length / parallel, and a longer
+    request fails with "request (N tokens) exceeds the available context
+    size". LM Studio does not report that setting: lmstudio_unified_kv says
+    whether the slots share one pool instead."""
+    context = positive_int(config.get("context_length"))
+    parallel = positive_int(config.get("parallel"))
+    if context and parallel and parallel > 1 and not LMSTUDIO_UNIFIED_KV:
+        return context // parallel or None
+    return context
+
+
 def lmstudio_loaded_context(model: dict):
-    """The context LM Studio serves a model with: its smallest loaded
-    instance's configured context_length, or None when it is not loaded (a
+    """The context LM Studio serves one request with: the smallest loaded
+    instance's per-request window, or None when it is not loaded (a
     just-in-time load uses LM Studio's load settings, which it does not list)."""
     loaded = []
     for instance in model.get("loaded_instances") or []:
         config = instance.get("config") if isinstance(instance, dict) else None
-        if isinstance(config, dict) and positive_int(config.get("context_length")):
-            loaded.append(config["context_length"])
+        context = lmstudio_instance_context(config) if isinstance(config, dict) else None
+        if context:
+            loaded.append(context)
     return min(loaded) if loaded else None
 
 
 def lmstudio_context(model: dict):
     """LM Studio's context for a model: the smallest loaded instance's
-    configured context_length, else max_context_length; None if neither."""
+    per-request window, else max_context_length; None if neither."""
     return lmstudio_loaded_context(model) or positive_int(model.get("max_context_length"))
 
 

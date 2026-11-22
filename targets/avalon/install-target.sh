@@ -97,7 +97,8 @@ gfx1102, from the card's PCI ID), AVALON_CUDA_VERSION=12.9,
 AVALON_CUDA_ARCH=auto (the GPU's compute capability, 75 or newer),
 AVALON_PORT=8080, AVALON_CONTEXT=65536 (auto: 262144 tokens with 19 GB of
 VRAM or more, else 65536), AVALON_MTP=true (speculative decoding with the 1.4 GB MTP
-draft head), AVALON_MODEL_NAME=qwen3.8-flash-next-avalon (the API's model id),
+draft head), AVALON_PARALLEL=1 (concurrent slots),
+AVALON_MODEL_NAME=qwen3.8-flash-next-avalon (the API's model id),
 AVALON_READY_TIMEOUT=1800 (seconds).
 USAGE
 }
@@ -244,7 +245,7 @@ weight_rows() {
 # records them after every successful install or upgrade, so a failed upgrade
 # can roll back to what last worked.
 SETTING_KEYS=(AVALON_BACKEND AVALON_ROCM_VERSION AVALON_GPU_TARGET AVALON_CUDA_VERSION AVALON_NVCC
-    AVALON_CUDA_ARCH AVALON_PORT AVALON_CONTEXT AVALON_MTP AVALON_MODEL_NAME)
+    AVALON_CUDA_ARCH AVALON_PORT AVALON_CONTEXT AVALON_PARALLEL AVALON_MTP AVALON_MODEL_NAME)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
@@ -259,6 +260,7 @@ validate_settings() {
     [[ $AVALON_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( AVALON_PORT <= 65535 )) || die 'Invalid AVALON_PORT.'
     [[ $AVALON_CONTEXT == auto || ( $AVALON_CONTEXT =~ ^[1-9][0-9]{3,5}$ && $AVALON_CONTEXT -ge 4096 &&
        $AVALON_CONTEXT -le 262144 ) ]] || die 'AVALON_CONTEXT must be auto or 4096..262144 tokens.'
+    [[ $AVALON_PARALLEL =~ ^[1-9][0-9]{0,2}$ ]] || die 'AVALON_PARALLEL must be a positive slot count.'
     [[ $AVALON_MTP =~ ^(true|false)$ ]] || die 'AVALON_MTP must be true or false.'
     [[ $AVALON_MODEL_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'Invalid AVALON_MODEL_NAME (lowercase letters, digits, ., _ and -).'
 }
@@ -281,6 +283,7 @@ load_settings() {
         [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
         found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
     done < "$file"
+    [[ -v found[AVALON_PARALLEL] ]] || found[AVALON_PARALLEL]=1
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -301,6 +304,7 @@ fingerprint_env() {
         -e 's/^arch=/AVALON_CUDA_ARCH=/p' \
         -e 's/^port=/AVALON_PORT=/p' \
         -e 's/^context=/AVALON_CONTEXT=/p' \
+        -e 's/^parallel=/AVALON_PARALLEL=/p' \
         -e 's/^mtp=/AVALON_MTP=/p' \
         -e 's/^model_name=/AVALON_MODEL_NAME=/p' "$1"
 }
@@ -364,7 +368,7 @@ saved_settings() {
 # alias, context, address and key file. The key itself is never an argument.
 server_args() {
     printf '%s\n' -m "$(model_path "$MODEL_FILE")" --alias "$AVALON_MODEL_NAME" -c "$AVALON_CONTEXT" \
-        -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1
+        -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel "$AVALON_PARALLEL"
     if [[ $AVALON_MTP == true ]]; then
         printf '%s\n' -md "$(model_path "$MTP_FILE")" --spec-type draft-mtp --spec-draft-n-max 2 \
             -ubd 256 -ctkd q8_0 -ctvd q8_0
@@ -391,6 +395,7 @@ settings_fingerprint() {
         "$AVALON_BACKEND" "$AVALON_ROCM_VERSION" "$AVALON_GPU_TARGET" "$AVALON_CUDA_VERSION" "$AVALON_NVCC" \
         "$AVALON_CUDA_ARCH" "$AVALON_PORT" "$AVALON_CONTEXT" "$AVALON_MTP" "$AVALON_MODEL_NAME" \
         "$toolkit_hash" "$weights_hash" "$env_hash"
+    if [[ $AVALON_PARALLEL != 1 ]]; then printf 'parallel=%s\n' "$AVALON_PARALLEL"; fi
 }
 
 # End install helpers. ----------------------------------------------------------
@@ -1022,6 +1027,7 @@ AVALON_NVCC=${AVALON_NVCC:-/usr/local/cuda-$AVALON_CUDA_VERSION/bin/nvcc}
 AVALON_CUDA_ARCH=${AVALON_CUDA_ARCH:-auto}
 AVALON_PORT=${AVALON_PORT:-8080}
 AVALON_CONTEXT=${AVALON_CONTEXT:-65536}
+AVALON_PARALLEL=${AVALON_PARALLEL:-1}
 AVALON_MTP=${AVALON_MTP:-true}
 AVALON_MODEL_NAME=${AVALON_MODEL_NAME:-qwen3.8-flash-next-avalon}
 AVALON_READY_TIMEOUT=${AVALON_READY_TIMEOUT:-1800}

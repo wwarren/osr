@@ -49,7 +49,8 @@ Optional: CT_HOSTNAME=avalon-target, BRIDGE=vmbr0, CORES=8, MEMORY_MB=65536,
           AVALON_ROCM_VERSION=7.2.4, AVALON_GPU_TARGET=auto,
           AVALON_CUDA_VERSION=12.9, AVALON_CUDA_ARCH=auto, AVALON_PORT=8080,
           AVALON_CONTEXT=65536 (auto: 262144 with 19 GB of VRAM or more, else 65536),
-          AVALON_MTP=true, AVALON_MODEL_NAME=qwen3.8-flash-next-avalon,
+          AVALON_PARALLEL=1, AVALON_MTP=true,
+          AVALON_MODEL_NAME=qwen3.8-flash-next-avalon,
           AVALON_READY_TIMEOUT=1800.
 
 The model (~90 GiB) is memory-mapped: what does not fit in RAM is read again
@@ -160,6 +161,7 @@ AVALON_CUDA_VERSION=${AVALON_CUDA_VERSION:-12.9}
 AVALON_CUDA_ARCH=${AVALON_CUDA_ARCH:-auto}
 AVALON_PORT=${AVALON_PORT:-8080}
 AVALON_CONTEXT=${AVALON_CONTEXT:-65536}
+AVALON_PARALLEL=${AVALON_PARALLEL:-1}
 AVALON_MTP=${AVALON_MTP:-true}
 AVALON_MODEL_NAME=${AVALON_MODEL_NAME:-qwen3.8-flash-next-avalon}
 AVALON_READY_TIMEOUT=${AVALON_READY_TIMEOUT:-1800}
@@ -230,6 +232,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 [[ $AVALON_PORT =~ ^[1-9][0-9]{0,4}$ ]] && (( AVALON_PORT <= 65535 )) || die 'AVALON_PORT must be 1..65535.'
 [[ $AVALON_CONTEXT == auto || ( $AVALON_CONTEXT =~ ^[1-9][0-9]{3,5}$ && $AVALON_CONTEXT -ge 4096 && $AVALON_CONTEXT -le 262144 ) ]] ||
     die 'AVALON_CONTEXT must be auto or 4096..262144 tokens.'
+[[ $AVALON_PARALLEL =~ ^[1-9][0-9]{0,2}$ ]] || die 'AVALON_PARALLEL must be a positive slot count.'
 [[ $AVALON_MTP =~ ^(true|false)$ ]] || die 'AVALON_MTP must be true or false.'
 [[ $AVALON_MODEL_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'Invalid AVALON_MODEL_NAME (lowercase letters, digits, ., _ and -).'
 [[ $AVALON_READY_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die 'AVALON_READY_TIMEOUT must be a positive number of seconds.'
@@ -366,7 +369,7 @@ pve_summary "Avalon: create"
 pve_row 'Avalon CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${ROOTFS_GB} GiB on $STORAGE"
 pve_row 'Template' "$TEMPLATE"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
-pve_row 'Model' "${AVALON_MODEL_NAME} (context ${AVALON_CONTEXT}, port ${AVALON_PORT})"
+pve_row 'Model' "${AVALON_MODEL_NAME} (context ${AVALON_CONTEXT}, parallel ${AVALON_PARALLEL}, port ${AVALON_PORT})"
 pve_confirm "Create Avalon CT $CT_ID?"
 (umask 022; run "${create[@]}")
 # The expert cache pins host memory for its PCIe copies; systemd's
@@ -412,7 +415,7 @@ fi
 run pct exec "$CT_ID" -- env "AVALON_REF=$AVALON_REF" "AVALON_COMMIT=$AVALON_COMMIT" "AVALON_BACKEND=$AVALON_BACKEND" \
     "AVALON_ROCM_VERSION=$AVALON_ROCM_VERSION" "AVALON_GPU_TARGET=$AVALON_GPU_TARGET" \
     "AVALON_CUDA_VERSION=$AVALON_CUDA_VERSION" "AVALON_CUDA_ARCH=$AVALON_CUDA_ARCH" "AVALON_PORT=$AVALON_PORT" \
-    "AVALON_CONTEXT=$AVALON_CONTEXT" "AVALON_MTP=$AVALON_MTP" "AVALON_MODEL_NAME=$AVALON_MODEL_NAME" \
+    "AVALON_CONTEXT=$AVALON_CONTEXT" "AVALON_PARALLEL=$AVALON_PARALLEL" "AVALON_MTP=$AVALON_MTP" "AVALON_MODEL_NAME=$AVALON_MODEL_NAME" \
     "AVALON_READY_TIMEOUT=$AVALON_READY_TIMEOUT" \
     bash /root/avalon-target-deploy/install-target.sh
 

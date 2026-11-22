@@ -76,6 +76,9 @@ means Arc) selects the runtime. The hardened unit does not grant
 context for requests that do not set `num_ctx`; it is written to `ollama.env`
 and kept by reruns that do not set it. It costs VRAM: under 16 GB use 32768 or
 a smaller model. Agents need 65536 (Hermes at least 64000).
+`OLLAMA_NUM_PARALLEL` controls concurrent requests per model (default 1).
+Set it when provisioning or rerunning `install-target.sh`; an unset value on
+rerun keeps the value in `ollama.env`. Each slot uses its own KV cache.
 
 ## Operate
 

@@ -75,7 +75,8 @@ environment values override them. A fresh install uses the defaults below.
 
 Environment: MAYA_REF=latest (the newest vX.Y.Z tag; or a branch/tag name
 such as main), MAYA_COMMIT=<optional full SHA-1 pin, overrides MAYA_REF>,
-MAYA_MODEL=Maya-S-v2-IQ2_XXS, MAYA_CONTEXT=65536, MAYA_DRAFT=mtp,
+MAYA_MODEL=Maya-S-v2-IQ2_XXS, MAYA_CONTEXT=65536, MAYA_PARALLEL=1,
+MAYA_DRAFT=mtp,
 MAYA_NO_VISION=false, MAYA_CUDA_VERSION=12.8, MAYA_PORT=8080,
 MAYA_READY_TIMEOUT=900 (seconds).
 
@@ -126,6 +127,8 @@ validate_setup_options() {
     elif [[ $MAYA_DRAFT != mtp ]]; then
         die "This Maya checkout has no --draft option, so MAYA_DRAFT=$MAYA_DRAFT cannot be set."
     fi
+    help_has --parallel || [[ $MAYA_PARALLEL == 1 ]] ||
+        die 'This Maya checkout has no --parallel option; choose MAYA_PARALLEL=1 or a newer MAYA_COMMIT.'
 }
 
 # setup_args: setup.sh arguments, one per line, for installing or refreshing
@@ -140,6 +143,7 @@ setup_args() {
     # that fits": a newer toolkit already in the CT (CUDA 13) cannot build for V100.
     if help_has --nvcc; then printf '%s\n' --nvcc "$MAYA_NVCC"; fi
     if help_has --context; then printf '%s\n' --context "$MAYA_CONTEXT"; fi
+    if help_has --parallel && (( MAYA_PARALLEL > 1 )); then printf '%s\n' --parallel "$MAYA_PARALLEL"; fi
     if [[ $MAYA_NO_VISION == true ]]; then printf '%s\n' --no-vision; fi
     printf '%s\n' --host 0.0.0.0 --port "$MAYA_PORT"
     printf '%s\n' --models-dir "$MAYA_DATA_DIR/models"
@@ -198,6 +202,7 @@ settings_fingerprint() {
     printf 'model=%s\ncontext=%s\ndraft=%s\nno_vision=%s\ncuda=%s\nnvcc=%s\ntoolkit_sha256=%s\nport=%s\ndata_dir=%s\nkey_sha256=%s\n' \
         "$MAYA_MODEL" "$MAYA_CONTEXT" "$MAYA_DRAFT" "$MAYA_NO_VISION" "$MAYA_CUDA_VERSION" "$MAYA_NVCC" \
         "$toolkit_hash" "$MAYA_PORT" "$MAYA_DATA_DIR" "$key_hash"
+    if [[ $MAYA_PARALLEL != 1 ]]; then printf 'parallel=%s\n' "$MAYA_PARALLEL"; fi
 }
 
 # newest_release_tag: read `git ls-remote --tags --refs` output on stdin and
@@ -210,12 +215,13 @@ newest_release_tag() {
 # The settings that decide how setup runs. save_settings records them after
 # every successful install or upgrade, so a failed upgrade can roll back to
 # what last worked rather than re-running setup with the settings that failed.
-SETTING_KEYS=(MAYA_MODEL MAYA_CONTEXT MAYA_DRAFT MAYA_NO_VISION MAYA_CUDA_VERSION MAYA_NVCC MAYA_PORT)
+SETTING_KEYS=(MAYA_MODEL MAYA_CONTEXT MAYA_PARALLEL MAYA_DRAFT MAYA_NO_VISION MAYA_CUDA_VERSION MAYA_NVCC MAYA_PORT)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
     [[ $MAYA_MODEL =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'Invalid MAYA_MODEL.'
     [[ $MAYA_CONTEXT =~ ^[1-9][0-9]{0,8}$ ]] || die 'Invalid MAYA_CONTEXT.'
+    [[ $MAYA_PARALLEL =~ ^[1-8]$ ]] || die 'MAYA_PARALLEL must be 1 to 8.'
     [[ $MAYA_DRAFT =~ ^[a-z0-9]+$ ]] || die 'Invalid MAYA_DRAFT (mtp or dflash2).'
     [[ $MAYA_NO_VISION =~ ^(true|false)$ ]] || die 'MAYA_NO_VISION must be true or false.'
     [[ $MAYA_CUDA_VERSION =~ ^(12\.(8|9)|1[3-9]\.[0-9]+)$ ]] || die 'MAYA_CUDA_VERSION must be 12.8 or newer.'
@@ -242,6 +248,7 @@ load_settings() {
         [[ " ${SETTING_KEYS[*]} " == *" ${BASH_REMATCH[1]} "* ]] || continue
         found[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
     done < "$file"
+    [[ -v found[MAYA_PARALLEL] ]] || found[MAYA_PARALLEL]=1
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
     # Validate in a subshell first: validate_settings dies on a bad value.
     (
@@ -262,6 +269,7 @@ start_env() {
 fingerprint_env() {
     sed -n -e 's/^model=/MAYA_MODEL=/p' \
         -e 's/^context=/MAYA_CONTEXT=/p' \
+        -e 's/^parallel=/MAYA_PARALLEL=/p' \
         -e 's/^draft=/MAYA_DRAFT=/p' \
         -e 's/^no_vision=/MAYA_NO_VISION=/p' \
         -e 's/^cuda=/MAYA_CUDA_VERSION=/p' \
@@ -790,6 +798,7 @@ MAYA_COMMIT=${MAYA_COMMIT:-}
 MAYA_CUDA_VERSION=${MAYA_CUDA_VERSION:-12.8}
 MAYA_MODEL=${MAYA_MODEL:-Maya-S-v2-IQ2_XXS}
 MAYA_CONTEXT=${MAYA_CONTEXT:-65536}
+MAYA_PARALLEL=${MAYA_PARALLEL:-1}
 MAYA_DRAFT=${MAYA_DRAFT:-mtp}
 MAYA_NVCC=${MAYA_NVCC:-/usr/local/cuda-$MAYA_CUDA_VERSION/bin/nvcc}
 MAYA_NO_VISION=${MAYA_NO_VISION:-false}

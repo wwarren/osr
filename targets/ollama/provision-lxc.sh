@@ -46,6 +46,7 @@ Settings (environment; values shown here are presets or defaults):
   OLLAMA_PULL_MODELS='qwen3:8b qwen3:14b'
   OLLAMA_CONTEXT_LENGTH=65536   the context a request gets when it does not set
                       num_ctx (install-target.sh writes it to ollama.env)
+  OLLAMA_NUM_PARALLEL=1   concurrent requests per model
   OLLAMA_CT_OS=debian  OLLAMA_CT_VERSION=13   the CT's distribution: debian 12|13 or
                       ubuntu 22.04|24.04|26.04 (the community script's own
                       installer handles Debian 13; Ollama's release bundles its
@@ -216,6 +217,7 @@ GPU=${GPU:-auto}
 GPU_CARD=${GPU_CARD:-}
 OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-}
 OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-65536}
+OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
 COMMUNITY_SCRIPT_URL=${COMMUNITY_SCRIPT_URL:-$COMMUNITY_SCRIPT_DEFAULT_URL}
 COMMUNITY_SCRIPT_SHA256=${COMMUNITY_SCRIPT_SHA256:-}
 OLLAMA_CT_OS=${OLLAMA_CT_OS:-debian}
@@ -237,6 +239,7 @@ if [[ -n $VLAN_TAG ]]; then positive_int VLAN_TAG "$VLAN_TAG"; (( VLAN_TAG <= 40
 valid_models "$OLLAMA_PULL_MODELS" || die 'OLLAMA_PULL_MODELS is a space-separated list of name[:tag] entries.'
 [[ $OLLAMA_CONTEXT_LENGTH =~ ^[1-9][0-9]{3,6}$ ]] && (( OLLAMA_CONTEXT_LENGTH >= 2048 && OLLAMA_CONTEXT_LENGTH <= 1048576 )) ||
     die 'OLLAMA_CONTEXT_LENGTH must be a whole number of tokens from 2048 to 1048576.'
+[[ $OLLAMA_NUM_PARALLEL =~ ^[1-9][0-9]{0,2}$ ]] || die 'OLLAMA_NUM_PARALLEL must be a positive slot count.'
 [[ $COMMUNITY_SCRIPT_URL =~ ^https://[A-Za-z0-9./_-]+\.sh$ ]] || die 'COMMUNITY_SCRIPT_URL must be an https URL of a .sh file.'
 [[ -z $COMMUNITY_SCRIPT_SHA256 || $COMMUNITY_SCRIPT_SHA256 =~ ^[0-9A-Fa-f]{64}$ ]] || die 'COMMUNITY_SCRIPT_SHA256 must be 64 hex digits.'
 valid_ct_os "$OLLAMA_CT_OS" "$OLLAMA_CT_VERSION" ||
@@ -346,7 +349,7 @@ pve_row 'Ollama CT' "$CT_ID ($CT_HOSTNAME), $CORES cores, ${MEMORY_MB} MiB, ${RO
 pve_row 'Template' "$OLLAMA_CT_OS $OLLAMA_CT_VERSION from ${TEMPLATE_STORAGE:-$script_choice}"
 pve_row 'Network' "$IP_CIDR${GATEWAY:+ via $GATEWAY} on $BRIDGE${VLAN_TAG:+ (VLAN $VLAN_TAG)}"
 pve_row 'GPU' "$gpu${card:+ ($card)}"
-pve_row 'Models to pull' "${OLLAMA_PULL_MODELS:-none} (context $OLLAMA_CONTEXT_LENGTH)"
+pve_row 'Models to pull' "${OLLAMA_PULL_MODELS:-none} (context $OLLAMA_CONTEXT_LENGTH, parallel $OLLAMA_NUM_PARALLEL)"
 pve_confirm "Create Ollama CT $CT_ID with the community script?"
 script=${TMPDIR:-/tmp}/community-ollama.$$.sh
 trap 'rm -f -- "$script"' EXIT
@@ -397,11 +400,11 @@ if (( INSTALL_TARGET )); then
         fi
     fi
     run pct exec "$CT_ID" -- env "OLLAMA_GPU=$gpu" "OLLAMA_PULL_MODELS=$OLLAMA_PULL_MODELS" \
-        "OLLAMA_CONTEXT_LENGTH=$OLLAMA_CONTEXT_LENGTH" bash /root/ollama-target-deploy/install-target.sh
+        "OLLAMA_CONTEXT_LENGTH=$OLLAMA_CONTEXT_LENGTH" "OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL" bash /root/ollama-target-deploy/install-target.sh
 else
     printf '\nOllama is installed as the community script left it (running as root).\n'
     printf 'To adopt it into the target layout, inside the CT (pct enter %s) run:\n' "$CT_ID"
     if [[ $gpu == nvidia ]]; then printf '  DRIVER_VERSION=%s bash /root/ollama-target-deploy/install-nvidia-driver.sh lxc   # if NVML or CUDA does not match the host\n' "$nvidia_host_version"; fi
-    printf '  OLLAMA_GPU=%s OLLAMA_CONTEXT_LENGTH=%s bash /root/ollama-target-deploy/install-target.sh\n' "$gpu" "$OLLAMA_CONTEXT_LENGTH"
+    printf '  OLLAMA_GPU=%s OLLAMA_CONTEXT_LENGTH=%s OLLAMA_NUM_PARALLEL=%s bash /root/ollama-target-deploy/install-target.sh\n' "$gpu" "$OLLAMA_CONTEXT_LENGTH" "$OLLAMA_NUM_PARALLEL"
 fi
 printf 'Register it with the router: manage-model-servers add http://<CT %s address>:11434\n' "$CT_ID"

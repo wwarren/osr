@@ -179,6 +179,8 @@ printf 'prompt-env %s|%s|%s\n' "${PVE_ACCEPT_DEFAULTS:-}" "${PVE_CONFIRM:-}" "${
   printf 'gpu-env %s|%s|%s|%s\n' "${GPU:-}" "${BACKEND:-}" "${GPU_DEVICES:-}" "${GPU_CARD:-}" >> "$MOCK_LOG"
 _ctx="${OLLAMA_CONTEXT_LENGTH:-}|${CONTEXT_SIZE:-}|${STRATA_CONTEXT:-}|${AVALON_CONTEXT:-}|${HONCHO_CONTEXT_TOKENS-unset}|${DEEPSEEK_HARNESS_CONTEXT_WINDOW:-}"
 [[ $_ctx == '||||unset|' ]] || printf 'context-env %s\n' "$_ctx" >> "$MOCK_LOG"
+_parallel="${OLLAMA_NUM_PARALLEL:-}|${PARALLEL_SLOTS:-}|${STRATA_PARALLEL:-}|${BASALT_PARALLEL:-}|${MAYA_PARALLEL:-}|${AVALON_PARALLEL:-}|${XOLOTL_PARALLEL:-}"
+[[ $_parallel == '||||||' ]] || printf 'parallel-env %s\n' "$_parallel" >> "$MOCK_LOG"
 [[ -z ${STRATA_KV:-} ]] || printf 'strata-kv %s\n' "$STRATA_KV" >> "$MOCK_LOG"
 [[ -z ${STRATA_MESSAGE_CACHE:-} ]] || printf 'strata-message-cache %s\n' "$STRATA_MESSAGE_CACHE" >> "$MOCK_LOG"
 [[ -z ${BASALT_MODEL:-} ]] || printf 'basalt-model %s\n' "$BASALT_MODEL" >> "$MOCK_LOG"
@@ -1380,6 +1382,26 @@ assert_eq "the Strata-style targets use <NAME>_CONTEXT" "STRATA_CONTEXT BASALT_C
 assert_fail "AirLLM keeps its own small window" target_context_var airllm
 assert_fail "an agent has none" target_context_var hermes
 
+describe target_parallel_var
+assert_eq "Basalt has its own parallel setting" BASALT_PARALLEL "$(target_parallel_var basalt)"
+assert_eq "Xolotl has its own parallel setting" XOLOTL_PARALLEL "$(target_parallel_var xolotl)"
+assert_eq "Ollama uses its documented server setting" OLLAMA_NUM_PARALLEL "$(target_parallel_var ollama)"
+assert_eq "llama.cpp keeps its existing slot setting" PARALLEL_SLOTS "$(target_parallel_var llamacpp)"
+assert_fail "Kindi has no parallel setting" target_parallel_var kindi
+assert_eq "Basalt parallel reaches the provisioner" BASALT_PARALLEL=4 "$(BASALT_PARALLEL=4 target_parallel_env basalt)"
+assert_eq "an unset count is one" 1 "$(unset BASALT_PARALLEL; target_parallel_count basalt)"
+assert_ok "four is valid" valid_target_parallel 4
+assert_fail "nine exceeds the common prompt limit" valid_target_parallel 9
+TARGETS="basalt ollama"; unset BASALT_PARALLEL BASALT_KV OLLAMA_NUM_PARALLEL
+_out="$(mktemp)"
+prompt_target_parallel > "$_out" 2>&1 <<< $'4\n2\n'
+assert_eq "Basalt slot answer" 4 "$BASALT_PARALLEL"
+assert_eq "Basalt parallel selects int8 KV" int8 "$BASALT_KV"
+assert_eq "Ollama slot answer" 2 "$OLLAMA_NUM_PARALLEL"
+rm -f "$_out"
+unset BASALT_PARALLEL BASALT_KV OLLAMA_NUM_PARALLEL
+TARGETS=""
+
 describe llamacpp_slots
 assert_eq "one slot by default" 1 "$(unset PARALLEL_SLOTS; llamacpp_slots)"
 assert_eq "PARALLEL_SLOTS when set" 3 "$(PARALLEL_SLOTS=3 llamacpp_slots)"
@@ -1870,6 +1892,20 @@ assert_contains "the chosen model, and the router's API range for the web UI" "o
 mock_reset_log
 STRATA_CONTEXT=131072 run_target_provisioner strata
 assert_contains "a model target gets its chosen window" "context-env ||131072||unset|" "$(mock_calls)"
+mock_reset_log
+BASALT_CT_ID=924 BASALT_IP_CIDR=192.0.2.104/24 BASALT_STORAGE=gpu-store BASALT_PARALLEL=4 run_target_provisioner basalt
+assert_contains "Basalt gets parallel slots" "parallel-env |||4|||" "$(mock_calls)"
+mock_reset_log
+XOLOTL_CT_ID=925 XOLOTL_IP_CIDR=192.0.2.105/24 XOLOTL_STORAGE=gpu-store XOLOTL_PARALLEL=4 run_target_provisioner xolotl
+assert_contains "Xolotl gets parallel slots" "parallel-env ||||||4" "$(mock_calls)"
+mock_reset_log
+OLLAMA_NUM_PARALLEL=2 run_target_provisioner ollama
+assert_contains "Ollama gets parallel slots" "parallel-env 2||||||" "$(mock_calls)"
+mock_reset_log
+PARALLEL_SLOTS=3 run_target_provisioner llamacpp
+assert_contains "llama.cpp keeps its parallel slots" "parallel-env |3|||||" "$(mock_calls)"
+mock_reset_log
+run_target_provisioner strata
 assert_not_contains "no KV cache was chosen, none is passed" "strata-kv" "$(mock_calls)"
 STRATA_KV=k8v4
 mock_reset_log

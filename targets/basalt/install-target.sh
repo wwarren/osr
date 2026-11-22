@@ -89,6 +89,7 @@ Environment:
   BASALT_ALIAS=qwen3.8-flash-next   (the served model name)
   BASALT_GPUS=0                     (--gpu list, e.g. 0 or 0,1)
   BASALT_CONTEXT=65536              (maximum context tokens, up to 999999)
+  BASALT_PARALLEL=1                  (concurrent requests, 1 to 8; >1 needs int8 KV)
   BASALT_KV=fp16                    (fp16, int8, q4_0 or k8v4)
   BASALT_KV_RESIDENT=0              (KV cells kept in VRAM; 0 disables RAM streaming)
   BASALT_VRAM_RESERVE_MIB=700        (VRAM left for graphs and other allocations)
@@ -110,6 +111,7 @@ generate_run_script() {
                     --host 0.0.0.0 --port "$BASALT_PORT"
                     --max-context "$BASALT_CONTEXT" )
     if [[ -n $BASALT_ALIAS ]]; then args+=( --alias "$BASALT_ALIAS" ); fi
+    (( BASALT_PARALLEL == 1 )) || args+=( --parallel "$BASALT_PARALLEL" )
     args+=( --gpu "$BASALT_GPUS" )
     [[ $BASALT_KV == fp16 ]] || args+=( --kv "$BASALT_KV" )
     (( BASALT_KV_RESIDENT == 0 )) || args+=( --kv-resident "$BASALT_KV_RESIDENT" )
@@ -148,6 +150,7 @@ settings_fingerprint() {
     # existed ran fp16 with all KV in VRAM and keeps its fingerprint, so an
     # unchanged rerun stays a no-op instead of rebuilding and reloading.
     if [[ $BASALT_KV != fp16 ]]; then printf 'kv=%s\n' "$BASALT_KV"; fi
+    if [[ $BASALT_PARALLEL != 1 ]]; then printf 'parallel=%s\n' "$BASALT_PARALLEL"; fi
     if [[ $BASALT_KV_RESIDENT != 0 ]]; then printf 'kv_resident=%s\n' "$BASALT_KV_RESIDENT"; fi
     if [[ $BASALT_VRAM_RESERVE_MIB != 700 ]]; then printf 'vram_reserve_mib=%s\n' "$BASALT_VRAM_RESERVE_MIB"; fi
 }
@@ -156,7 +159,7 @@ settings_fingerprint() {
 # records them after every successful install or upgrade, so a failed upgrade
 # can roll back to what last worked rather than relaunching with the settings
 # that failed (including another model).
-SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_KV BASALT_KV_RESIDENT BASALT_VRAM_RESERVE_MIB BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
+SETTING_KEYS=(BASALT_MODEL BASALT_HF_REPO BASALT_ALIAS BASALT_GPUS BASALT_CONTEXT BASALT_PARALLEL BASALT_KV BASALT_KV_RESIDENT BASALT_VRAM_RESERVE_MIB BASALT_PORT BASALT_ALLOW_NO_KEY CUDA_VERSION)
 
 # validate_settings: die unless every setting has a value this script accepts.
 validate_settings() {
@@ -165,11 +168,13 @@ validate_settings() {
     [[ $BASALT_ALIAS =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || die 'Invalid BASALT_ALIAS.'
     [[ $BASALT_GPUS =~ ^[0-9]+(,[0-9]+)*$ ]] || die 'Invalid BASALT_GPUS (e.g. 0 or 0,1).'
     [[ $BASALT_CONTEXT =~ ^[1-9][0-9]{0,5}$ ]] || die 'Invalid BASALT_CONTEXT (1 to 999999 tokens).'
+    [[ $BASALT_PARALLEL =~ ^[1-8]$ ]] || die 'BASALT_PARALLEL must be 1 to 8.'
     [[ $BASALT_KV =~ ^(fp16|int8|q4_0|k8v4)$ ]] || die 'Invalid BASALT_KV (fp16, int8, q4_0 or k8v4).'
+    (( BASALT_PARALLEL == 1 )) || [[ $BASALT_KV == int8 ]] || die 'BASALT_PARALLEL above 1 requires BASALT_KV=int8.'
     [[ $BASALT_KV_RESIDENT =~ ^(0|[1-9][0-9]{0,5})$ ]] || die 'Invalid BASALT_KV_RESIDENT.'
     if (( BASALT_KV_RESIDENT > 0 )); then
-        (( BASALT_KV_RESIDENT >= 20480 && BASALT_KV_RESIDENT <= BASALT_CONTEXT )) ||
-            die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than BASALT_CONTEXT.'
+        (( BASALT_KV_RESIDENT >= 20480 && BASALT_KV_RESIDENT <= BASALT_CONTEXT / BASALT_PARALLEL )) ||
+            die 'BASALT_KV_RESIDENT must be at least 20480 and no greater than the context per parallel slot.'
         [[ $BASALT_KV != k8v4 ]] || die 'BASALT_KV=k8v4 cannot be combined with BASALT_KV_RESIDENT.'
     fi
     [[ $BASALT_VRAM_RESERVE_MIB =~ ^[1-9][0-9]{0,4}$ ]] && (( BASALT_VRAM_RESERVE_MIB >= 128 )) ||
@@ -201,6 +206,7 @@ load_settings() {
     # Existing installations predate these settings; preserve their original
     # fp16, all-VRAM behavior when reading either saved record format.
     [[ -v found[BASALT_KV] ]] || found[BASALT_KV]=fp16
+    [[ -v found[BASALT_PARALLEL] ]] || found[BASALT_PARALLEL]=1
     [[ -v found[BASALT_KV_RESIDENT] ]] || found[BASALT_KV_RESIDENT]=0
     [[ -v found[BASALT_VRAM_RESERVE_MIB] ]] || found[BASALT_VRAM_RESERVE_MIB]=700
     for key in "${SETTING_KEYS[@]}"; do [[ -v found[$key] ]] || return 1; done
@@ -222,6 +228,7 @@ fingerprint_env() {
         -e 's/^alias=/BASALT_ALIAS=/p' \
         -e 's/^gpus=/BASALT_GPUS=/p' \
         -e 's/^context=/BASALT_CONTEXT=/p' \
+        -e 's/^parallel=/BASALT_PARALLEL=/p' \
         -e 's/^kv=/BASALT_KV=/p' \
         -e 's/^kv_resident=/BASALT_KV_RESIDENT=/p' \
         -e 's/^vram_reserve_mib=/BASALT_VRAM_RESERVE_MIB=/p' \
@@ -744,7 +751,8 @@ do_upgrade() {
         # A matching legacy fingerprint is sufficient to migrate its records,
         # including a record from before the KV settings existed.
         if [[ ! -f $BASALT_ETC_DIR/installed-env ]] ||
-                ! grep -q '^BASALT_KV_RESIDENT=' "$BASALT_ETC_DIR/installed-env"; then
+                ! grep -q '^BASALT_KV_RESIDENT=' "$BASALT_ETC_DIR/installed-env" ||
+                ! grep -q '^BASALT_PARALLEL=' "$BASALT_ETC_DIR/installed-env"; then
             save_settings
         fi
         note 'Basalt is up to date and healthy; nothing to do.'
@@ -929,6 +937,7 @@ BASALT_MODEL=${BASALT_MODEL:-Qwen3.8-FN-UD-IQ3_XXS.basalt}
 BASALT_ALIAS=${BASALT_ALIAS:-qwen3.8-flash-next}
 BASALT_GPUS=${BASALT_GPUS:-0}
 BASALT_CONTEXT=${BASALT_CONTEXT:-65536}
+BASALT_PARALLEL=${BASALT_PARALLEL:-1}
 BASALT_KV=${BASALT_KV:-fp16}
 BASALT_KV_RESIDENT=${BASALT_KV_RESIDENT:-0}
 BASALT_VRAM_RESERVE_MIB=${BASALT_VRAM_RESERVE_MIB:-700}

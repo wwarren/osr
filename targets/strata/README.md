@@ -38,6 +38,11 @@ checkout's `setup.sh --help` and:
   against the choices `setup.sh` lists (`qwen`, `swift`, `coder`, `unsloth` at
   the pin), and refuses a `STRATA_KV` other than `int8` without `--kv`.
 
+`STRATA_PARALLEL=1` is the default. Set it to 2–8 for concurrent requests;
+the guest passes `--parallel` to `setup.sh` and rejects a checkout that lacks
+that option before changing the running service. The setting is saved across
+reruns and restored after a failed upgrade.
+
 ## KV cache
 
 `STRATA_KV` is how Strata stores the text it is working on (its context):

@@ -53,6 +53,7 @@ Settings (environment; all optional):
   OLLAMA_CONTEXT_LENGTH=65536               the context a request gets when it does not
                                             set num_ctx; given, it replaces the value in
                                             ollama.env (unset keeps the file's, 65536 new)
+  OLLAMA_NUM_PARALLEL=1                 concurrent requests per model; unset keeps ollama.env
   OLLAMA_VERSION=$OLLAMA_DEFAULT_VERSION             release for --upgrade
   OLLAMA_SHA256=<hex>                       also require this archive checksum (--upgrade)
   OLLAMA_GPU=auto|nvidia|amd|intel|none     the GPU this CT was given (auto: /dev/kfd
@@ -267,6 +268,9 @@ valid_models "$OLLAMA_PULL_MODELS" || die 'OLLAMA_PULL_MODELS is a space-separat
 OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-}
 [[ -z $OLLAMA_CONTEXT_LENGTH ]] || valid_context_length "$OLLAMA_CONTEXT_LENGTH" ||
     die 'OLLAMA_CONTEXT_LENGTH must be a whole number of tokens from 2048 to 1048576.'
+OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-}
+[[ -z $OLLAMA_NUM_PARALLEL || $OLLAMA_NUM_PARALLEL =~ ^[1-9][0-9]{0,2}$ ]] ||
+    die 'OLLAMA_NUM_PARALLEL must be a positive slot count.'
 gpu=$(gpu_vendor) || die 'OLLAMA_GPU must be auto, nvidia, amd, intel or none.'
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -372,6 +376,10 @@ fi
 if [[ -n $OLLAMA_CONTEXT_LENGTH ]]; then
     set_env_key "$TARGET_ENV" OLLAMA_CONTEXT_LENGTH "$OLLAMA_CONTEXT_LENGTH"
     printf 'Default context: %s tokens (OLLAMA_CONTEXT_LENGTH in %s).\n' "$OLLAMA_CONTEXT_LENGTH" "$TARGET_ENV"
+fi
+if [[ -n $OLLAMA_NUM_PARALLEL ]]; then
+    set_env_key "$TARGET_ENV" OLLAMA_NUM_PARALLEL "$OLLAMA_NUM_PARALLEL"
+    printf 'Parallel requests per model: %s (OLLAMA_NUM_PARALLEL in %s).\n' "$OLLAMA_NUM_PARALLEL" "$TARGET_ENV"
 fi
 
 # The GPU's runtime: ROCm libraries matching the installed release (AMD), or
