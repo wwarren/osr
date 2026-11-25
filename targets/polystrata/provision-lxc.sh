@@ -282,6 +282,9 @@ if [[ $IP_CIDR != dhcp ]]; then ipv4 "$GATEWAY" || die 'GATEWAY must be a valid 
 for name in CORES MEMORY_MB ROOTFS_GB POLYSTRATA_CONTEXT; do positive_int "$name" "${!name}"; done
 (( MEMORY_MB >= 16384 )) || die 'MEMORY_MB must be at least 16384 for PolyStrata.'
 (( ROOTFS_GB >= 60 )) || die 'ROOTFS_GB must be at least 60 for PolyStrata model downloads.'
+if [[ $POLYSTRATA_FAMILY == unsloth && $POLYSTRATA_MODEL == Q8_0 ]] && (( ROOTFS_GB < 200 )); then
+    die 'Unsloth Q8_0 downloads about 188 GB before setup overhead; set ROOTFS_GB to at least 200.'
+fi
 polystrata_ram_gb=$(polystrata_model_ram_gb "$POLYSTRATA_FAMILY" "$POLYSTRATA_MODEL")
 if [[ -n $polystrata_ram_gb ]] && (( MEMORY_MB < polystrata_ram_gb * 1000 * 1000 / 1024 )); then
     printf 'Warning: %s %s wants about %s GB of RAM by setup'"'"'s estimate and the CT gets %s MiB; setup may page experts from disk or refuse it.\n' \
@@ -485,7 +488,7 @@ run pct exec "$CT_ID" -- env "POLYSTRATA_REF=$POLYSTRATA_REF" "POLYSTRATA_COMMIT
     "POLYSTRATA_READY_TIMEOUT=$POLYSTRATA_READY_TIMEOUT" "POLYSTRATA_ALLOW_NO_KEY=$POLYSTRATA_ALLOW_NO_KEY" \
     bash /root/polystrata-target-deploy/install-target.sh
 
-printf '\nStrata target CT %s: API port %s. Read its generated key with:\n' "$CT_ID" "$POLYSTRATA_PORT"
+printf '\nPolyStrata target CT %s: API port %s. Read its generated key with:\n' "$CT_ID" "$POLYSTRATA_PORT"
 printf '  pct exec %s -- cat /etc/polystrata-target/api-key\n' "$CT_ID"
 printf 'Then on the router: manage-model-servers set-polystrata-token --apply, and\n'
 printf '  manage-model-servers add polystrata://<CT address>:%s --apply\n' "$POLYSTRATA_PORT"

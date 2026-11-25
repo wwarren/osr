@@ -8,7 +8,7 @@
 #
 # PolyStrata (https://github.com/simplexai-labs/PolyStrata) is a descendant of
 # Strata: the same setup.sh, run-<model>.sh launchers and /health contract,
-# with eleven more model families on its own engine ("strata-poly"). Its
+# with fourteen more model families on its own engine ("strata-poly"). Its
 # setup.sh options differ between releases, so this script reads the
 # checked-out setup.sh --help and passes only options it supports, and refuses
 # to continue when a required one is missing instead of guessing.

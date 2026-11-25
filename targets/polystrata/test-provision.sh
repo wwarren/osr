@@ -104,8 +104,10 @@ reject 'families.sh has no sizes' POLYSTRATA_FAMILY=hy4-flash
 plan POLYSTRATA_FAMILY=hy4-flash POLYSTRATA_MODEL=SQ-96
 has 'POLYSTRATA_FAMILY=hy4-flash'; has 'POLYSTRATA_KV=auto'; has 'not in families.sh'
 reject 'does not fit the hy4-flash family' POLYSTRATA_FAMILY=hy4-flash POLYSTRATA_MODEL=SQ-96 POLYSTRATA_KV=fp16
-plan POLYSTRATA_FAMILY=unsloth POLYSTRATA_MODEL=Q8_0
+reject 'Unsloth Q8_0 downloads about 188 GB' POLYSTRATA_FAMILY=unsloth POLYSTRATA_MODEL=Q8_0
+plan POLYSTRATA_FAMILY=unsloth POLYSTRATA_MODEL=Q8_0 ROOTFS_GB=200
 has 'Warning: unsloth Q8_0 wants about 136 GB of RAM'
+has '--rootfs local-lvm:200'
 has '+ pct push 280 '; has 'families.sh /root/polystrata-target-deploy/families.sh'
 
 reject 'CT_ID' CT_ID=99

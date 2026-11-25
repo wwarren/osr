@@ -18,6 +18,8 @@ Intel Arc and Mac paths are not provisioned here.
 Defaults: family `qwen`, size `IQ2_XS`, context 65536, KV cache `auto` (the
 engine's default), 8 cores, 64 GiB RAM, 160 GiB disk, port **8080**. The first
 install downloads 11 to 190 GB depending on the size.
+For Unsloth `Q8_0`, set `ROOTFS_GB` to at least 200; its model download alone
+is about 188 GB, above the default disk size.
 
 ## Model families
 
