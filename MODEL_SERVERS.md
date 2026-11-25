@@ -29,7 +29,7 @@ manage-model-servers add-model xlarge qwen3:235b --apply     # one more model in
 manage-model-servers remove-model xlarge qwen3:235b --apply
 manage-model-servers set-keepalive 2h --apply
 manage-model-servers set-api-key [key|--generate|--off]
-manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi, colibri
+manage-model-servers set-<kind>-token [token|--off]          # lmstudio, strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata
 manage-model-servers set-cloud-key <openai|anthropic|gemini> [key|--off]
 manage-model-servers set-cloud-models <openai|anthropic|gemini> <id[,id...]|--off>
 manage-model-servers set-freellmapi <url|--off> [key]      # FreeLLMAPI: freellmapi/<id>, explicit only
@@ -93,6 +93,10 @@ default port. Avalon is identified from `/v1/models` (`"owned_by": "llamacpp"`
 and an Avalon id), which needs its key once set, so add a keyed Avalon as
 `avalon://host`. Colibri is identified the same way (`"owned_by": "colibri"`),
 so add a keyed Colibri (every one the target installs) as `colibri://host`.
+PolyStrata answers `/health` as Strata does; a model of its own engine
+(`gemma-4-26b-a4b-…`, `deepseek-v4-flash-…`) tells it apart, but a
+Qwen3.8-Flash-Next or Qwen3.6 PolyStrata is detected as Strata, so add it as
+`polystrata://host`.
 Set the token before adding a keyed server, so the probe can
 authenticate; a keyed server that cannot identify itself is added as
 `kind://host` (or with `--no-probe`).
@@ -107,6 +111,7 @@ authenticate; a keyed server that cannot identify itself is added as
 | Xolotl | 8080 | `set-xolotl-token` | `XOLOTL_MODEL_NAME` (default `deepseek-v4.1-flash`, sized 552B) |
 | Avalon | 8080 | `set-avalon-token` | `AVALON_MODEL_NAME` (default `qwen3.8-flash-next-avalon`, sized 125B) |
 | Kindi | 8093 | `set-kindi-token` | `bonsai2-<size>` or `nanbeige-33b-iq3`, sized from the id; one request at a time |
+| PolyStrata | 8080 | `set-polystrata-token` | `<family name>-<size>` ids (`qwen3.6-35b-a3b-ud-q3_k_m`), sized from the id or `[model_sizes]`; its own key, never Strata's |
 | Colibri | 8080 | `set-colibri-token` | `<model>-colibri` ids, sized from the id or `[model_sizes]`; tool calls on every chat engine but Inkling and OLMoE; image and decision models are not offered for chat |
 
 ```bash
@@ -127,8 +132,8 @@ counts them down while `/v1/models` is empty (engine not running).
 
 ## Model sizes for unsized IDs
 
-Strata, Basalt, Maya, Xolotl, Avalon and most Colibri models report no
-parameter count (Kindi's ids include it). `[model_sizes]` in `router.ini` maps exact IDs
+Strata, Basalt, Maya, Xolotl, Avalon, most Colibri models and some
+PolyStrata families report no parameter count (Kindi's ids include it). `[model_sizes]` in `router.ini` maps exact IDs
 (case-insensitive) to a size; built-in entries include:
 
 ```ini

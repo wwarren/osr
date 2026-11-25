@@ -11,5 +11,5 @@ an `act_runner` with an ubuntu-latest style image whose job containers run as
 root (`--strict` fails on skipped root-only tests). `.github/workflows/tests.yml`
 is the same file for GitHub Actions, where the suites run through `sudo`;
 `tests/test-repo.sh` keeps the two identical. The `strata-upstream`,
-`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `colibri-upstream`, `freellmapi-upstream` and
+`maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `colibri-upstream`, `polystrata-upstream`, `freellmapi-upstream` and
 `honcho-upstream` jobs also need GitHub (and PyPI) access.

@@ -204,7 +204,7 @@ _DEFAULTS = {
         # tool-capable. Their APIs say nothing per model, but each of these
         # servers parses "tools" and returns OpenAI tool_calls. A kind left
         # out is reported unknown. Blank: none.
-        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri",
+        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -311,7 +311,7 @@ _DEFAULTS = {
         "tier_config": "",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya, Xolotl, Avalon, Colibri) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl, Avalon, Colibri, PolyStrata) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
@@ -342,6 +342,35 @@ _DEFAULTS = {
         "deepseek-v4.1-flash-colibri": "552B",
         "mimo-v2.6-flash": "309B",
         "mimo-v2.6-pro": "1020B",
+        # PolyStrata (and Strata) ids, <family name>-<size>, that name no
+        # parameter count. Every Qwen3.8-Flash-Next family is the 125B model;
+        # Coder, GLM's REAP50 (pruned) and Kolibri stay unlisted.
+        "swift-1.5-iq2_xs": "125B",
+        "swift-1.5-iq3_xxs": "125B",
+        "swift-1.5-iq3_s": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq4_xs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q4_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q5_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q6_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-q8_0": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq1_m": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q2_0": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq2_xs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q2_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq3_xxs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q3_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31": "125B",
+        "qwen3.8-flash-next-gyro-gyro-s": "125B",
+        "qwen3.8-flash-next-gyro-gyro-m": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4-nvidia": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4-qad": "125B",
+        "glm-5.3-flash-3.0bit": "321B",
+        "glm-5.3-flash-ud-iq2_xxs": "321B",
+        "deepseek-v4-flash-ud-iq2_xxs": "284B",
+        "hy4-flash-sq-64": "220B",
+        "hy4-flash-sq-96": "220B",
+        "hy4-flash-sq-128": "220B",
     },
 }
 ROUTER_INI = os.getenv(
@@ -698,6 +727,8 @@ SERVER_KINDS = {
               "label": "Kindi", "openai": True},
     "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
                 "label": "Colibri", "openai": True},
+    "polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY",
+                   "label": "PolyStrata", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
 # Capabilities a /v1/models entry can declare (Colibri's "capabilities") that
@@ -1373,7 +1404,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri or PolyStrata model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),

@@ -670,7 +670,7 @@ router_url="http://${router_ip}:${router_port}"
 pct exec "$ROUTER_CT_ID" -- awk -F= '$1=="ROUTER_API_KEY" {sub(/^[^=]*=/,""); print; exit}' \
   /app/router/secrets.env > "$stage/router-api-key"
 [[ -s $stage/router-api-key ]] || printf 'no-key\n' > "$stage/router-api-key"
-pct exec "$ROUTER_CT_ID" -- awk -F= '$1 ~ /^(LMSTUDIO_API_TOKEN|STRATA_API_KEY|BASALT_API_KEY|MAYA_API_KEY|XOLOTL_API_KEY|AVALON_API_KEY|KINDI_API_KEY|COLIBRI_API_KEY)$/ {print}' \
+pct exec "$ROUTER_CT_ID" -- awk -F= '$1 ~ /^(LMSTUDIO_API_TOKEN|STRATA_API_KEY|BASALT_API_KEY|MAYA_API_KEY|XOLOTL_API_KEY|AVALON_API_KEY|KINDI_API_KEY|COLIBRI_API_KEY|POLYSTRATA_API_KEY)$/ {print}' \
   /app/router/secrets.env > "$stage/backend-keys"
 # Validate the admin token and endpoint before creating or modifying a Honcho CT.
 printf '%s\n' "$OPENWEBUI_ADMIN_TOKEN" > "$stage/openwebui-admin-token"

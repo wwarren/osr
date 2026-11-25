@@ -735,6 +735,33 @@ mock_reset_log
 assert_eq "a keyless Colibri is identified by its model's owner" "colibri" "$(detect_server_kind http://h:8080)"
 assert_not_contains "Colibri detection sends no key" "-H @" "$(mock_calls)"
 assert_eq "colibri:// names a keyed one, on 8080" "colibri+http://h:8080" "$(normalize_addr colibri://h)"
+# PolyStrata answers /health like Strata (service strata). A model of its own
+# engine tells it apart; Xolotl's deepseek-v4.1-flash is not PolyStrata's
+# deepseek-v4-flash, and a Qwen3.8-Flash-Next family stays Strata.
+polystrata_health() {
+  mock_script curl <<EOF3
+case "\$*" in
+  *"/api/tags"*) exit 22;;
+  *"/health"*) printf '{"status":"ok","max_context":65536,"model":"$1","api_key":true,"loaded":true,"service":"strata"}';;
+  *) exit 22;;
+esac
+EOF3
+}
+polystrata_health qwen3.6-35b-a3b-ud-q3_k_m
+assert_eq "Qwen3.6 has Strata's own qwen36-strata id: Strata" strata "$(detect_server_kind http://h:8080)"
+for model in deepseek-v4-flash-ud-iq2_xxs glm-5.3-flash-3.0bit gemma-4-26b-a4b-ud-q3_k_m ornith-1.5-122b-q8_0 \
+             groot-19b-a3b-261023-q4_k_m qwen3.8-flash-next-gyro-gyro-s; do
+  polystrata_health "$model"
+  mock_reset_log
+  assert_eq "a PolyStrata serving $model is identified" polystrata "$(detect_server_kind http://h:8080)"
+  assert_not_contains "PolyStrata detection sends no key ($model)" "-H @" "$(mock_calls)"
+done
+polystrata_health deepseek-v4.1-flash
+assert_eq "Xolotl's deepseek-v4.1-flash stays Xolotl" xolotl "$(detect_server_kind http://h:8080)"
+polystrata_health qwen3.8-flash-next-iq2_xs
+assert_eq "a Qwen3.8-Flash-Next PolyStrata answers as Strata" strata "$(detect_server_kind http://h:8080)"
+assert_eq "polystrata:// names it, on 8080" "polystrata+http://h:8080" "$(normalize_addr polystrata://h)"
+assert_eq "polystrata:// keeps an explicit port" "polystrata+http://h:11434" "$(normalize_addr polystrata://h:11434)"
 # A keyed older Strata without a distinguishing public /health response still
 # cannot be identified safely, so such a host has to be named.
 reset_repo
@@ -2101,7 +2128,7 @@ assert_eq "--off clears it" "" "$(env_get ROUTER_API_KEY)"
 reset_repo
 
 describe server_kinds
-assert_eq "kinds, in detection order" "lmstudio strata basalt maya xolotl avalon kindi colibri" "$(server_kinds | paste -sd' ' -)"
+assert_eq "kinds, in detection order" "lmstudio strata basalt maya xolotl avalon kindi colibri polystrata" "$(server_kinds | paste -sd' ' -)"
 
 describe kind_field
 assert_eq "maya key" MAYA_API_KEY "$(kind_field maya key)"
@@ -2125,10 +2152,10 @@ assert_fail "LM Studio is not" is_openai_kind lmstudio
 assert_fail "nor is Ollama" is_openai_kind ollama
 
 describe openai_kinds
-assert_eq "OpenAI-style kinds" "strata basalt maya xolotl avalon kindi colibri" "$(openai_kinds | paste -sd' ' -)"
+assert_eq "OpenAI-style kinds" "strata basalt maya xolotl avalon kindi colibri polystrata" "$(openai_kinds | paste -sd' ' -)"
 
 describe kind_labels
-assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri" "$(kind_labels)"
+assert_eq "labels for messages" "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri or PolyStrata" "$(kind_labels)"
 
 describe kind_secret_name
 assert_eq "LM Studio has a token" "LM Studio token" "$(kind_secret_name lmstudio)"
@@ -2145,6 +2172,10 @@ assert_eq "avalon default port" 8080 "$(kind_field avalon port)"
 assert_eq "set-kindi-token names kindi" kindi "$(token_command_kind set-kindi-token)"
 assert_eq "kindi key" KINDI_API_KEY "$(kind_field kindi key)"
 assert_eq "kindi default port (its own)" 8093 "$(kind_field kindi port)"
+assert_eq "set-polystrata-token names polystrata" polystrata "$(token_command_kind set-polystrata-token)"
+assert_eq "polystrata key" POLYSTRATA_API_KEY "$(kind_field polystrata key)"
+assert_eq "polystrata default port" 8080 "$(kind_field polystrata port)"
+assert_eq "polystrata label" PolyStrata "$(kind_field polystrata label)"
 assert_eq "set-lmstudio-token names lmstudio" lmstudio "$(token_command_kind set-lmstudio-token)"
 assert_eq "set-token is not a kind command" "" "$(token_command_kind set-token)"
 assert_eq "set-ollama-token is not a kind command" "" "$(token_command_kind set-ollama-token)"
@@ -2153,8 +2184,8 @@ assert_fail "unknown token commands do not" command_writes set-bogus-token
 
 describe secret_keys
 assert_eq "secrets include every kind's key" \
-  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY XOLOTL_API_KEY AVALON_API_KEY KINDI_API_KEY COLIBRI_API_KEY" \
-  "$(secret_keys | tail -n 8 | paste -sd' ' -)"
+  "LMSTUDIO_API_TOKEN STRATA_API_KEY BASALT_API_KEY MAYA_API_KEY XOLOTL_API_KEY AVALON_API_KEY KINDI_API_KEY COLIBRI_API_KEY POLYSTRATA_API_KEY" \
+  "$(secret_keys | tail -n 9 | paste -sd' ' -)"
 
 describe litellm_provider
 assert_eq "litellm provider for maya" openai "$(litellm_provider maya+http://h:8080)"

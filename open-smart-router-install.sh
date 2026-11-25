@@ -849,6 +849,8 @@ valid_ollama_addr() {
   [[ "$raw" == kindi://* ]] && raw="${raw#kindi://}"
   raw="${raw#colibri+}"
   [[ "$raw" == colibri://* ]] && raw="${raw#colibri://}"
+  raw="${raw#polystrata+}"
+  [[ "$raw" == polystrata://* ]] && raw="${raw#polystrata://}"
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     valid_http_url "$raw"; return $?
   fi
@@ -862,7 +864,7 @@ valid_ollama_addr() {
 }
 # Normalise any accepted form to a base URL with an explicit port.
 # Stored form: http://host:port for Ollama or a kind-prefixed URL for
-# LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri, matching the manager, router and monitor.
+# LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri and PolyStrata, matching the manager, router and monitor.
 normalize_ollama_url() {
   local raw="${1%/}" prefix="" port="$OLLAMA_PORT"
   if [[ "$raw" == lmstudio+* ]]; then
@@ -897,6 +899,10 @@ normalize_ollama_url() {
     prefix="colibri+"; raw="${raw#colibri+}"; port="${COLIBRI_PORT:-8080}"
   elif [[ "$raw" == colibri://* ]]; then
     prefix="colibri+"; raw="${raw#colibri://}"; port="${COLIBRI_PORT:-8080}"
+  elif [[ "$raw" == polystrata+* ]]; then
+    prefix="polystrata+"; raw="${raw#polystrata+}"; port="${POLYSTRATA_PORT:-8080}"
+  elif [[ "$raw" == polystrata://* ]]; then
+    prefix="polystrata+"; raw="${raw#polystrata://}"; port="${POLYSTRATA_PORT:-8080}"
   fi
   if [[ "$raw" == http://* || "$raw" == https://* ]]; then
     printf '%s%s\n' "$prefix" "$raw"
@@ -1027,6 +1033,7 @@ target_table() {
     'colibri|model|Colibri: large MoE models with experts across GPU, RAM and NVMe; CPU, NVIDIA (CUDA) or AMD/Intel Arc (Vulkan); you place the model|colibri+http://@IP@:@PORT@|colibri|optional:nvidia,amd,intel' \
     'llamacpp|model|llama.cpp llama-server behind an Ollama bridge (CUDA, or Vulkan on AMD/Intel Arc)|http://@IP@:11434||required:nvidia,amd,intel' \
     'strata|model|Strata (Qwen3.8-Flash-Next) on an NVIDIA GPU|strata+http://@IP@:@PORT@|strata|required:nvidia' \
+    'polystrata|model|PolyStrata: Qwen3.8-Flash-Next or one of 14 experimental families (GLM, DeepSeek, Gemma 4, Qwen3.6, ...) on an NVIDIA GPU|polystrata+http://@IP@:@PORT@|polystrata|required:nvidia' \
     'basalt|model|Basalt on a Blackwell GPU (CUDA 13)|basalt+http://@IP@:@PORT@|basalt|required:nvidia:rtx50' \
     'maya|model|Project Maya (GLM-5.3-Flash) on an NVIDIA GPU|maya+http://@IP@:@PORT@|maya|required:nvidia' \
     'xolotl|model|Xolotl (DeepSeek-V4.1-Flash, 552B) on a 24 GB NVIDIA GPU; ~372 GB download|xolotl+http://@IP@:@PORT@|xolotl|required:nvidia' \
@@ -1563,9 +1570,10 @@ target_gpu_env() {
   esac
 }
 
-# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri take a template; the others choose or prompt for theirs.
+# Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri take a template; the others choose or prompt for theirs.
 target_needs_template() {
-  [[ "$1" == strata || "$1" == basalt || "$1" == maya || "$1" == xolotl || "$1" == avalon || "$1" == kindi || "$1" == colibri ]]
+  [[ "$1" == strata || "$1" == polystrata || "$1" == basalt || "$1" == maya || "$1" == xolotl || "$1" == avalon ||
+     "$1" == kindi || "$1" == colibri ]]
 }
 
 # The newer NVIDIA repositories do not carry the targets' CUDA defaults.
@@ -1737,6 +1745,13 @@ valid_colibri_template() { valid_strata_template "$1"; }
 # floors (8192 MiB, 40 GiB) - for the engine; the model needs more.
 valid_colibri_memory_mb() { [[ $1 =~ ^[1-9][0-9]{3,8}$ ]] && (( $1 >= 8192 )); }
 valid_colibri_rootfs_gb() { [[ $1 =~ ^[1-9][0-9]{1,5}$ ]] && (( $1 >= 40 )); }
+# PolyStrata: Strata's setup.sh and CUDA toolkit fallback, so Strata's releases.
+valid_polystrata_template() { valid_strata_template "$1"; }
+# valid_polystrata_memory_mb MIB / valid_polystrata_rootfs_gb GIB: its
+# provisioner's floors (16384 MiB, 60 GiB); setup's estimate for the chosen
+# size is shown beside the question.
+valid_polystrata_memory_mb() { [[ $1 =~ ^[1-9][0-9]{4,8}$ ]] && (( $1 >= 16384 )); }
+valid_polystrata_rootfs_gb() { [[ $1 =~ ^[1-9][0-9]{1,5}$ ]] && (( $1 >= 60 )); }
 show_strata_template_alternatives() {
   local selected="$1" storage ref shown=0
   while IFS= read -r storage; do
@@ -1797,7 +1812,7 @@ host_gpu_cuda_arch() {
 # Colibri's toolkit lane (Debian 13 also has the Mesa its Vulkan lane wants).
 gpu_target_template_order() {
   case "$1" in
-    strata|kindi|colibri) echo debian-13 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
+    strata|polystrata|kindi|colibri) echo debian-13 ubuntu-24.04 ubuntu-22.04 debian-12 ;;
     avalon) echo ubuntu-24.04 ubuntu-22.04 ;;
     maya)
       local arch
@@ -1840,10 +1855,10 @@ ensure_target_template() {
 
 # For each selected target: a CT ID (default: the next free one not already
 # taken by this install), static address and storage (and a template for
-# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri). Presets: <NAME>_CT_ID,
+# Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri). Presets: <NAME>_CT_ID,
 # <NAME>_IP_CIDR, <NAME>_STORAGE, <NAME>_TEMPLATE.
 prompt_target_settings() {
-  local name prefix id_var ip_var storage_var template_var default ip id_default host_mib
+  local name prefix id_var ip_var storage_var template_var default ip id_default host_mib ram_gb
   [[ -n "${TARGETS:-}" ]] || return 0
   echo
   echo "--- Target containers ---"
@@ -1930,6 +1945,10 @@ prompt_target_settings() {
         [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
         prompt_until_valid "    Template (Debian 13 or 12, Ubuntu 24.04 or 22.04; Debian 13 for Vulkan; downloaded if missing)" \
           "$template_var" "$default" valid_colibri_template || return 1
+      elif [[ $name == polystrata ]]; then
+        [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
+        prompt_until_valid "    Template (Ubuntu 22.04/24.04 or Debian 12/13; downloaded if missing)" \
+          "$template_var" "$default" valid_polystrata_template || return 1
       else
         [[ -n "$default" ]] || default="$(default_gpu_target_template "$name")" || default=""
         prompt_until_valid "    Template (Ubuntu 22.04/24.04/26.04 or Debian 12/13; downloaded if missing; Ubuntu 26.04 needs CUDA 13.3+)" \
@@ -1962,6 +1981,23 @@ prompt_target_settings() {
       prompt_until_valid "    Disk (GiB, 40 or more; the model's files go on it)" COLIBRI_ROOTFS_GB \
         "${COLIBRI_ROOTFS_GB:-160}" valid_colibri_rootfs_gb || return 1
     fi
+    if [[ $name == polystrata ]]; then
+      prompt_polystrata_model || return 1
+      host_mib="$(host_memory_mib)"
+      ram_gb="$(polystrata_model_ram_gb_safe "$POLYSTRATA_FAMILY" "${POLYSTRATA_MODEL:-}")"
+      if [[ -n $ram_gb ]]; then
+        echo "    PolyStrata's setup estimates about ${ram_gb} GB of RAM for ${POLYSTRATA_FAMILY} ${POLYSTRATA_MODEL};"
+        echo "    with less it reads part of the experts from disk (slower) or refuses the size."
+      fi
+      [[ -z $host_mib ]] || echo "    This host has ${host_mib} MiB; leave some for Proxmox."
+      prompt_until_valid "    RAM (MiB, 16384 or more)" POLYSTRATA_MEMORY_MB "${POLYSTRATA_MEMORY_MB:-65536}" \
+        valid_polystrata_memory_mb || return 1
+      if [[ -n $host_mib ]] && (( POLYSTRATA_MEMORY_MB > host_mib )); then
+        echo "    WARNING: ${POLYSTRATA_MEMORY_MB} MiB is more than this host's ${host_mib} MiB." >&2
+      fi
+      prompt_until_valid "    Disk (GiB, 60 or more; the model's files go on it: 11 to 190 GB)" POLYSTRATA_ROOTFS_GB \
+        "${POLYSTRATA_ROOTFS_GB:-160}" valid_polystrata_rootfs_gb || return 1
+    fi
   done
 }
 # valid_strata_memory_mb MIB: Strata's CT memory, 32768 MiB or more (its
@@ -1982,7 +2018,7 @@ target_parallel_var() {
   case "$1" in
     ollama) echo OLLAMA_NUM_PARALLEL ;;
     llamacpp) echo PARALLEL_SLOTS ;;
-    strata|basalt|maya|avalon|xolotl) echo "$(target_var_prefix "$1")_PARALLEL" ;;
+    strata|polystrata|basalt|maya|avalon|xolotl) echo "$(target_var_prefix "$1")_PARALLEL" ;;
     *) return 1 ;;
   esac
 }
@@ -2034,7 +2070,7 @@ target_context_var() {
   case "$1" in
     ollama) echo OLLAMA_CONTEXT_LENGTH ;;
     llamacpp) echo LLAMACPP_CONTEXT ;;
-    strata|basalt|maya|xolotl|avalon|kindi) echo "$(target_var_prefix "$1")_CONTEXT" ;;
+    strata|polystrata|basalt|maya|xolotl|avalon|kindi) echo "$(target_var_prefix "$1")_CONTEXT" ;;
     *) return 1 ;;
   esac
 }
@@ -2139,7 +2175,7 @@ context_recommendation() {
       avalon) ceiling="$(avalon_auto_context "$vram")" ;;
       kindi) ceiling="$(kindi_auto_context "$vram")" ;;
       xolotl) if (( vram >= 24000 )); then ceiling=131072; else ceiling=65536; fi ;;
-      strata|basalt|maya)
+      strata|polystrata|basalt|maya)
         if (( vram >= 24000 )); then ceiling=131072
         elif (( vram >= 12000 )); then ceiling=65536
         else ceiling=32768; fi ;;
@@ -2341,6 +2377,120 @@ prompt_strata_message_cache() {
     "${STRATA_MESSAGE_CACHE:-false}" valid_bool || return 1
 }
 
+# --- PolyStrata ---------------------------------------------------------------
+# targets/polystrata/families.sh lists its families, their sizes and setup's RAM
+# estimates, and the KV cache formats each family's engine has. When it cannot
+# be read (a copy of this installer without the targets), any family name is
+# taken and the guest checks it.
+polystrata_catalog_ready() {
+  declare -F polystrata_catalog >/dev/null && return 0
+  [[ -r "${TARGETS_DIR}/polystrata/families.sh" ]] || return 1
+  # shellcheck source=targets/polystrata/families.sh
+  source "${TARGETS_DIR}/polystrata/families.sh"
+}
+polystrata_model_ram_gb_safe() {
+  polystrata_catalog_ready || return 0
+  polystrata_model_ram_gb "$1" "$2"
+}
+valid_polystrata_family() { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ || $1 =~ ^[1-9][0-9]?$ ]]; }
+# polystrata_pick N LIST...: the Nth of LIST when N is a number in range, else N.
+polystrata_pick() {
+  local n=$1; shift
+  if [[ $n =~ ^[1-9][0-9]?$ ]] && (( n <= $# )); then printf '%s\n' "${!n}"; else printf '%s\n' "$n"; fi
+}
+# A blank size takes the family's default (the provisioner's families.sh).
+valid_polystrata_model() { [[ -z $1 || $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+# polystrata_engine: the chosen family's engine (strata or poly), or nothing.
+polystrata_engine() {
+  polystrata_catalog_ready || return 0
+  polystrata_family_engine "${POLYSTRATA_FAMILY:-qwen}" 2>/dev/null || true
+}
+# prompt_polystrata_model: the family (default qwen) and its size (default the
+# family's in families.sh). Presets POLYSTRATA_FAMILY and POLYSTRATA_MODEL are
+# the defaults; unattended runs take them.
+prompt_polystrata_model() {
+  local family title default_model
+  if polystrata_catalog_ready; then
+    if [[ "${NONINTERACTIVE:-false}" != true && -z ${POLYSTRATA_FAMILY:-} ]]; then
+      echo "    PolyStrata families (the Strata engine; the others run on PolyStrata's experimental engine):"
+      local n=0
+      while IFS='|' read -r family title; do
+        n=$((n + 1))
+        echo "      ${n}) ${family} - ${title}"
+      done < <(polystrata_menu_families)
+    fi
+  fi
+  prompt_until_valid "    Family (name or number)" POLYSTRATA_FAMILY "${POLYSTRATA_FAMILY:-qwen}" valid_polystrata_family || return 1
+  if polystrata_catalog_ready; then
+    # shellcheck disable=SC2046  # one word per family
+    POLYSTRATA_FAMILY="$(polystrata_pick "$POLYSTRATA_FAMILY" $(polystrata_catalog | cut -d'|' -f1))"
+  fi
+  [[ ! $POLYSTRATA_FAMILY =~ ^[0-9]+$ ]] || { echo "    No family has the number ${POLYSTRATA_FAMILY}." >&2; return 1; }
+  default_model="${POLYSTRATA_MODEL:-}"
+  if polystrata_catalog_ready && polystrata_family_models "$POLYSTRATA_FAMILY" >/dev/null 2>&1; then
+    [[ -n $default_model ]] || default_model="$(polystrata_family_default "$POLYSTRATA_FAMILY")"
+    echo "    Sizes: $(polystrata_menu_models "$POLYSTRATA_FAMILY" | awk -F'|' '{ sub(/^about /, "", $2); sub(/ of RAM$/, "", $2); printf "%s%d) %s (~%s RAM)", (NR > 1 ? ", " : ""), NR, $1, $2 }')"
+  elif [[ -z $default_model ]]; then
+    echo "    ${POLYSTRATA_FAMILY} is not in this installer's families.sh: name its size, or leave it blank for the family's default."
+  fi
+  prompt_until_valid "    Size (name or number)" POLYSTRATA_MODEL "$default_model" valid_polystrata_model || return 1
+  if polystrata_catalog_ready && polystrata_family_models "$POLYSTRATA_FAMILY" >/dev/null 2>&1; then
+    # shellcheck disable=SC2046  # one word per size
+    POLYSTRATA_MODEL="$(polystrata_pick "$POLYSTRATA_MODEL" $(polystrata_family_models "$POLYSTRATA_FAMILY"))"
+  fi
+}
+# prompt_polystrata_kv_cache: PolyStrata's KV cache. A Strata-engine family is
+# asked as Strata is (the same suggestion, from its GPU, context and the CT's
+# RAM; nothing at 8192 tokens or less); a family of PolyStrata's own engine is
+# asked only when it has a format beside fp16 (auto keeps fp16).
+prompt_polystrata_kv_cache() {
+  local vram rec reason engine formats ram_gb
+  [[ " ${TARGETS:-} " == *" polystrata "* ]] || return 0
+  engine="$(polystrata_engine)"
+  if [[ $engine == strata ]]; then
+    if [[ ${POLYSTRATA_CONTEXT:-} =~ ^[0-9]+$ ]] && (( POLYSTRATA_CONTEXT <= 8192 )); then return 0; fi
+    vram="$(target_vram polystrata)"
+    ram_gb="$(polystrata_model_ram_gb_safe "$POLYSTRATA_FAMILY" "${POLYSTRATA_MODEL:-}")"
+    if [[ -n $ram_gb ]] && [[ ${POLYSTRATA_CONTEXT:-65536} =~ ^[0-9]+$ ]] && (( ${POLYSTRATA_CONTEXT:-65536} >= 65536 )) &&
+       (( ${POLYSTRATA_MEMORY_MB:-65536} * 1000000000 >= 1024 * ((ram_gb + 1) * 1000000000 + ${POLYSTRATA_CONTEXT:-65536} * 13728) )); then
+      rec=int8 reason="at this context the cache is kept in the CT's RAM with only a 32K window on the GPU"
+    else
+      IFS='|' read -r rec reason <<< "$(strata_kv_recommendation "$vram")"
+    fi
+    echo
+    echo "--- PolyStrata KV cache (${POLYSTRATA_FAMILY}, the Strata engine) ---"
+    echo "    int8  8-bit keys and values: the most precise, the engine's default"
+    echo "    k8v4  8-bit keys, 4-bit values: 23% smaller, more of the model fits on the GPU"
+    echo "    q4_0  4-bit keys and values: 45% smaller, less precise on long documents"
+    echo "  polystrata: ${rec} recommended (${reason})."
+    prompt_until_valid "    KV cache (int8, k8v4 or q4_0; auto = int8)" POLYSTRATA_KV "${POLYSTRATA_KV:-$rec}" valid_polystrata_kv || return 1
+  elif [[ $engine == poly ]]; then
+    formats="$(polystrata_kv_choices "$POLYSTRATA_FAMILY")"
+    [[ $formats != 'auto fp16' ]] || return 0
+    echo
+    echo "--- PolyStrata KV cache (${POLYSTRATA_FAMILY}, PolyStrata's engine) ---"
+    echo "    auto  16-bit (fp16), the engine's default and the most precise"
+    echo "    other formats for this family: ${formats#auto fp16 } (smaller, a little less precise)"
+    prompt_until_valid "    KV cache (${formats// /, })" POLYSTRATA_KV "${POLYSTRATA_KV:-auto}" valid_polystrata_kv || return 1
+  fi
+}
+valid_polystrata_kv() {
+  polystrata_catalog_ready || { [[ $1 =~ ^(auto|int8|k8v4|q4_0|fp16|q8_0|int8k)$ ]]; return; }
+  [[ " $(polystrata_kv_choices "${POLYSTRATA_FAMILY:-qwen}") " == *" $1 "* ]]
+}
+# prompt_polystrata_message_cache: as Strata's, for a Strata-engine family only.
+prompt_polystrata_message_cache() {
+  [[ " ${TARGETS:-} " == *" polystrata "* && $(polystrata_engine) == strata ]] || return 0
+  if [[ ${POLYSTRATA_CONTEXT:-} =~ ^[0-9]+$ ]] && (( POLYSTRATA_CONTEXT <= 8192 )); then return 0; fi
+  echo
+  echo "--- PolyStrata message cache ---"
+  echo "  One more checkpoint before the last message of a long conversation (8192+"
+  echo "  tokens), for agents that rewrite their last message. Off upstream by default:"
+  echo "  it adds about 0.2 s to a fresh long request."
+  prompt_until_valid "    Message cache (true/false)" POLYSTRATA_MESSAGE_CACHE \
+    "${POLYSTRATA_MESSAGE_CACHE:-false}" valid_bool || return 1
+}
+
 # target_default_port NAME: the API port a model target serves by default
 # (Kindi keeps its own 8093; the other Strata-style targets, Colibri included,
 # use 8080).
@@ -2458,6 +2608,14 @@ run_target_provisioner() {
     [[ -z "$parallel_env" ]] || export "${parallel_env?}"
     [[ "$name" != strata || -z ${STRATA_KV:-} ]] || export STRATA_KV
     [[ "$name" != strata || -z ${STRATA_MESSAGE_CACHE:-} ]] || export STRATA_MESSAGE_CACHE
+    if [[ "$name" == polystrata ]]; then
+      local polystrata_setting
+      for polystrata_setting in POLYSTRATA_FAMILY POLYSTRATA_MODEL POLYSTRATA_KV POLYSTRATA_MESSAGE_CACHE; do
+        [[ -z ${!polystrata_setting:-} ]] || export "${polystrata_setting?}"
+      done
+      [[ -z ${POLYSTRATA_MEMORY_MB:-} ]] || export MEMORY_MB="$POLYSTRATA_MEMORY_MB"
+      [[ -z ${POLYSTRATA_ROOTFS_GB:-} ]] || export ROOTFS_GB="$POLYSTRATA_ROOTFS_GB"
+    fi
     [[ "$name" != basalt || -z ${BASALT_MODEL:-} ]] || export BASALT_MODEL
     [[ "$name" != basalt || -z ${BASALT_KV:-} ]] || export BASALT_KV
     [[ "$name" != basalt || -z ${BASALT_KV_RESIDENT:-} ]] || export BASALT_KV_RESIDENT
@@ -2942,7 +3100,7 @@ prompt_model_servers() {
   for (( i = 1; i <= MODEL_SERVER_COUNT; i++ )); do
     local var="MODEL_SERVER_${i}"
     default_addr="${!var:-}"
-    prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host, xolotl://host, avalon://host, kindi://host or colibri://host)" \
+    prompt_until_valid "  Server ${i} (IP, host:port, URL, lmstudio://host, strata://host, basalt://host, maya://host, xolotl://host, avalon://host, kindi://host, colibri://host or polystrata://host)" \
       raw "$default_addr" valid_ollama_addr || return 1
     MODEL_SERVERS+=("$(normalize_ollama_url "$raw")")
   done
@@ -3808,6 +3966,8 @@ prompt_target_contexts || exit 1
 # and its opt-in message cache.
 prompt_strata_kv_cache || exit 1
 prompt_strata_message_cache || exit 1
+prompt_polystrata_kv_cache || exit 1
+prompt_polystrata_message_cache || exit 1
 prepare_host_gpu || exit 1
 prompt_colibri_model || exit 1
 # Root SSH between the cluster's nodes, for later upgrades from any node.
@@ -4185,7 +4345,7 @@ _DEFAULTS = {
         # tool-capable. Their APIs say nothing per model, but each of these
         # servers parses "tools" and returns OpenAI tool_calls. A kind left
         # out is reported unknown. Blank: none.
-        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri",
+        "tool_kinds": "strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata",
     },
     "http": {
         # Seconds to establish a TCP connection to a backend. Short on purpose:
@@ -4292,7 +4452,7 @@ _DEFAULTS = {
         "tier_config": "",
     },
     # Sizes for exact model ids that an OpenAI-compatible server (Strata,
-    # Basalt, Maya, Xolotl, Avalon, Colibri) lists without a parameter count. Matching is by the whole
+    # Basalt, Maya, Xolotl, Avalon, Colibri, PolyStrata) lists without a parameter count. Matching is by the whole
     # id, case-insensitive, so variants and aliases stay unknown-size unless
     # given a line of their own. A blank value removes a built-in entry.
     "model_sizes": {
@@ -4323,6 +4483,35 @@ _DEFAULTS = {
         "deepseek-v4.1-flash-colibri": "552B",
         "mimo-v2.6-flash": "309B",
         "mimo-v2.6-pro": "1020B",
+        # PolyStrata (and Strata) ids, <family name>-<size>, that name no
+        # parameter count. Every Qwen3.8-Flash-Next family is the 125B model;
+        # Coder, GLM's REAP50 (pruned) and Kolibri stay unlisted.
+        "swift-1.5-iq2_xs": "125B",
+        "swift-1.5-iq3_xxs": "125B",
+        "swift-1.5-iq3_s": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq4_xs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q4_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q5_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q6_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-q8_0": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq1_m": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q2_0": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq2_xs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q2_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq3_xxs": "125B",
+        "qwen3.8-flash-next-unsloth-ud-q3_k_xl": "125B",
+        "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31": "125B",
+        "qwen3.8-flash-next-gyro-gyro-s": "125B",
+        "qwen3.8-flash-next-gyro-gyro-m": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4-nvidia": "125B",
+        "qwen3.8-flash-next-nvfp4-nvfp4-qad": "125B",
+        "glm-5.3-flash-3.0bit": "321B",
+        "glm-5.3-flash-ud-iq2_xxs": "321B",
+        "deepseek-v4-flash-ud-iq2_xxs": "284B",
+        "hy4-flash-sq-64": "220B",
+        "hy4-flash-sq-96": "220B",
+        "hy4-flash-sq-128": "220B",
     },
 }
 ROUTER_INI = os.getenv(
@@ -4679,6 +4868,8 @@ SERVER_KINDS = {
               "label": "Kindi", "openai": True},
     "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
                 "label": "Colibri", "openai": True},
+    "polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY",
+                   "label": "PolyStrata", "openai": True},
 }
 OPENAI_KINDS = frozenset(k for k, v in SERVER_KINDS.items() if v["openai"])
 # Capabilities a /v1/models entry can declare (Colibri's "capabilities") that
@@ -5354,7 +5545,7 @@ async def fetch_lmstudio_models(client: httpx.AsyncClient, server: str) -> tuple
 
 
 async def fetch_openai_models(client: httpx.AsyncClient, server: str) -> tuple:
-    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri model IDs and capabilities at /v1/models."""
+    """Read Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri or PolyStrata model IDs and capabilities at /v1/models."""
     try:
         response = await client.get(f"{server_base(server)}/v1/models",
                                     headers=backend_headers(server),
@@ -7338,6 +7529,8 @@ SERVER_KINDS = {
               "label": "Kindi", "openai": True},
     "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
                 "label": "Colibri", "openai": True},
+    "polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY",
+                   "label": "PolyStrata", "openai": True},
 }
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
              for kind, spec in SERVER_KINDS.items()}
@@ -7854,6 +8047,10 @@ PYEOF
         printf '      model: openai/%s\n' "$tag"
         printf '      api_base: %s/v1\n' "${url#colibri+}"
         printf '      api_key: none\n'
+      elif [[ "$url" == polystrata+* ]]; then
+        printf '      model: openai/%s\n' "$tag"
+        printf '      api_base: %s/v1\n' "${url#polystrata+}"
+        printf '      api_key: none\n'
       else
         printf '      model: ollama/%s\n' "$tag"
         printf '      api_base: %s\n' "$url"
@@ -8009,7 +8206,7 @@ tools_strict = false
 # OpenAI tool_calls (Colibri on every chat engine but Inkling and OLMoE, whose
 # support stays unknown). Remove a kind to report its models' tool support as
 # unknown again. Blank: none.
-tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri
+tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata
 
 [http]
 # Seconds to open a connection to a backend. This is how long a dead host can
@@ -8151,7 +8348,7 @@ tier_config =
 
 [model_sizes]
 # Sizes for exact model ids that an OpenAI-compatible server (Strata, Basalt,
-# Maya, Xolotl, Avalon, Colibri) lists without a parameter count, so the router can size-band them.
+# Maya, Xolotl, Avalon, Colibri, PolyStrata) lists without a parameter count, so the router can size-band them.
 # Matching is by the whole id, case-insensitive: variants and aliases (Strata's
 # Coder, a renamed Basalt alias) stay unknown-size unless listed here.
 # Add a line for a custom alias (e.g. the BASALT_ALIAS a target serves);
@@ -8186,6 +8383,37 @@ deepseek-v4-colibri = 284B
 deepseek-v4.1-flash-colibri = 552B
 mimo-v2.6-flash = 309B
 mimo-v2.6-pro = 1020B
+# PolyStrata (and Strata) name a model <family name>-<size>. Most of its own
+# engine's families name their parameter count (qwen3.6-35b-a3b-ud-q3_k_m,
+# ornith-1.5-122b-q8_0) and need no line; these do not. Every
+# Qwen3.8-Flash-Next family (Swift, Unsloth, Gyro, NVFP4) is the 125B model;
+# Coder (half the experts), GLM's REAP50 (pruned) and Kolibri stay unlisted.
+swift-1.5-iq2_xs = 125B
+swift-1.5-iq3_xxs = 125B
+swift-1.5-iq3_s = 125B
+qwen3.8-flash-next-unsloth-ud-iq4_xs = 125B
+qwen3.8-flash-next-unsloth-ud-q4_k_xl = 125B
+qwen3.8-flash-next-unsloth-ud-q5_k_xl = 125B
+qwen3.8-flash-next-unsloth-ud-q6_k_xl = 125B
+qwen3.8-flash-next-unsloth-q8_0 = 125B
+qwen3.8-flash-next-unsloth-ud-iq1_m = 125B
+qwen3.8-flash-next-unsloth-ud-q2_0 = 125B
+qwen3.8-flash-next-unsloth-ud-iq2_xs = 125B
+qwen3.8-flash-next-unsloth-ud-q2_k_xl = 125B
+qwen3.8-flash-next-unsloth-ud-iq3_xxs = 125B
+qwen3.8-flash-next-unsloth-ud-q3_k_xl = 125B
+qwen3.8-flash-next-unsloth-ud-iq4_xs-v31 = 125B
+qwen3.8-flash-next-gyro-gyro-s = 125B
+qwen3.8-flash-next-gyro-gyro-m = 125B
+qwen3.8-flash-next-nvfp4-nvfp4 = 125B
+qwen3.8-flash-next-nvfp4-nvfp4-nvidia = 125B
+qwen3.8-flash-next-nvfp4-nvfp4-qad = 125B
+glm-5.3-flash-3.0bit = 321B
+glm-5.3-flash-ud-iq2_xxs = 321B
+deepseek-v4-flash-ud-iq2_xxs = 284B
+hy4-flash-sq-64 = 220B
+hy4-flash-sq-96 = 220B
+hy4-flash-sq-128 = 220B
 INIEOF
 
 cat > "${REPO_DIR}/services/osr-monitor/monitor.ini" <<'INIEOF'
@@ -8196,7 +8424,7 @@ cat > "${REPO_DIR}/services/osr-monitor/monitor.ini" <<'INIEOF'
 interval_seconds = 15
 timeout_seconds = 5
 # Path appended to each Ollama backend URL for the health probe. LM Studio,
-# Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri are probed on /v1/models with
+# Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri and PolyStrata are probed on /v1/models with
 # their own keys when set, and are skipped by the keep-alive pinner. They count
 # as down while that list is empty (their engine is not running), and so does a
 # Colibri that is parked until a model is placed.
@@ -8345,9 +8573,9 @@ LITELLM_REQ="${REPO_DIR}/services/litellm-proxy/requirements.txt"
 LITELLM_LOCK="${REPO_DIR}/services/litellm-proxy/requirements.lock"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 # Default ports of the other server kinds are in kind_field (LM Studio 1234,
-# Strata/Basalt/Maya/Xolotl/Avalon/Colibri 8080, Kindi 8093); LMSTUDIO_PORT,
-# STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT, KINDI_PORT and
-# COLIBRI_PORT in the environment override them.
+# Strata/Basalt/Maya/Xolotl/Avalon/Colibri/PolyStrata 8080, Kindi 8093);
+# LMSTUDIO_PORT, STRATA_PORT, BASALT_PORT, MAYA_PORT, XOLOTL_PORT, AVALON_PORT,
+# KINDI_PORT, COLIBRI_PORT and POLYSTRATA_PORT in the environment override them.
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 SERVER_TYPE="auto"   # --type ollama|<kind>|auto for add / set-tier (see server_kinds)
 MODEL_SERVER_MAX="${MODEL_SERVER_MAX:-20}"
@@ -8411,11 +8639,15 @@ Commands:
   discover                   Ask OSR to re-poll and print the live model inventory
   add <addr> [addr...]       Add server(s). Address may be IP, host:port or a URL.
                              LM Studio, Strata, Basalt, Maya, Xolotl, Avalon,
-                             Kindi and Colibri are detected automatically, or use
-                             lmstudio://host / strata://host / basalt://host /
-                             maya://host / xolotl://host / avalon://host /
-                             kindi://host / colibri://host or --type. A Colibri
-                             started with an API key needs colibri://host.
+                             Kindi, Colibri and PolyStrata are detected
+                             automatically, or use lmstudio://host /
+                             strata://host / basalt://host / maya://host /
+                             xolotl://host / avalon://host / kindi://host /
+                             colibri://host / polystrata://host or --type. A
+                             Colibri started with an API key needs
+                             colibri://host; a PolyStrata serving a
+                             Qwen3.8-Flash-Next family answers like Strata and
+                             needs polystrata://host.
                              Detection sends no API key.
   remove <addr> [addr...]    Remove server(s) by address (or by list number)
   set-tier <tier> <addr...>  Replace a tier's servers (tier: fast|medium|large|xlarge)
@@ -8474,6 +8706,9 @@ Commands:
   set-colibri-token [token|--off]
                              Bearer token for Colibri servers with an API key
                              (stored in secrets.env)
+  set-polystrata-token [token|--off]
+                             Bearer token for PolyStrata servers with an API key
+                             (stored in secrets.env)
   set-api-key [key|--generate|--off]
                              Require "Authorization: Bearer <key>" on OSR
                              API (Open WebUI is given the same key)
@@ -8506,7 +8741,7 @@ Commands:
 
 Options:
   --tier <t[,t...]>          With 'add': also assign the new server(s) to these tiers
-  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi|colibri> With 'add' / 'set-tier': the server's API (default:
+  --type <ollama|lmstudio|strata|basalt|maya|xolotl|avalon|kindi|colibri|polystrata> With 'add' / 'set-tier': the server's API (default:
                              auto-detect by probing; ollama when --no-probe)
   --apply                    Apply + restart services after the change
   --commit[=msg]             Commit and push the change after applying
@@ -8533,6 +8768,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh add lmstudio://10.0.0.9 --tier fast --apply
     manage-model-servers.sh add 10.0.0.14:8093 --type kindi --tier xlarge --apply
     manage-model-servers.sh add colibri://10.0.0.15 --tier large --apply
+    manage-model-servers.sh add polystrata://10.0.0.16 --tier medium --apply
     manage-model-servers.sh add 10.0.0.60 --no-probe --type ollama --tier fast
     manage-model-servers.sh add 10.0.0.61 --tier large --dry-run
     manage-model-servers.sh remove 10.0.0.52 --apply
@@ -8576,6 +8812,7 @@ Examples (one or more for every command and option):
     manage-model-servers.sh set-kindi-token <token> --apply
     manage-model-servers.sh set-kindi-token --off --apply
     manage-model-servers.sh set-colibri-token <token> --apply
+    manage-model-servers.sh set-polystrata-token <token> --apply
     manage-model-servers.sh set-webhook https://mm.example.lan/hooks/abc123 --apply
     manage-model-servers.sh set-webhook --channel alerts --username osr-monitor --apply
     manage-model-servers.sh set-webhook --verify-tls false --apply
@@ -8616,7 +8853,7 @@ valid_hostname_or_ip() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
 #   port   -- default port (overridable through the <KIND>_PORT variable)
 #   openai -- 1 for Strata-style servers (models at /v1/models, LiteLLM's
 #             openai provider), 0 for LM Studio (its own API and provider)
-server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi colibri; }
+server_kinds() { printf '%s\n' lmstudio strata basalt maya xolotl avalon kindi colibri polystrata; }
 kind_field() {
   local spec key label port_var port_default openai value
   case "$1" in
@@ -8628,6 +8865,7 @@ kind_field() {
     avalon)   spec='AVALON_API_KEY|Avalon|AVALON_PORT|8080|1' ;;
     kindi)    spec='KINDI_API_KEY|Kindi|KINDI_PORT|8093|1' ;;
     colibri)  spec='COLIBRI_API_KEY|Colibri|COLIBRI_PORT|8080|1' ;;
+    polystrata) spec='POLYSTRATA_API_KEY|PolyStrata|POLYSTRATA_PORT|8080|1' ;;
     *) return 1 ;;
   esac
   IFS='|' read -r key label port_var port_default openai <<< "$spec"
@@ -8651,7 +8889,7 @@ is_server_kind() {
 }
 is_openai_kind() { is_server_kind "$1" && [[ "$(kind_field "$1" openai)" == 1 ]]; }
 openai_kinds() { local k; for k in $(server_kinds); do is_openai_kind "$k" && echo "$k"; done; return 0; }
-# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi or Colibri"
+# "Ollama, LM Studio, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri or PolyStrata"
 kind_labels() {
   local out=Ollama k label last=""
   for k in $(server_kinds); do
@@ -8773,6 +9011,14 @@ detect_server_kind() {
   # Both services identify themselves at public /health without credentials.
   if body="$(curl -fsS --max-time "$PROBE_TIMEOUT" "${base}/health" 2>/dev/null)"; then
     if [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"strata\" ]]; then
+      # PolyStrata serves through the same server. A model of its own engine
+      # (a family upstream Strata does not have; its id is <family name>-<size>)
+      # tells it apart. Its Qwen3.8-Flash-Next families answer exactly like
+      # Strata, and Qwen3.6-35B-A3B has the id Strata's own qwen36-strata
+      # gives it: those are registered as polystrata:// by name.
+      if [[ "$body" =~ \"model\"[[:space:]]*:[[:space:]]*\"(glm-5\.3-flash|deepseek-v4-flash|lfm2\.5-24b-a2b|inkling-2-mini|flint-40b-a2\.5b|kolibri-1|groot-19b-a3b-[0-9]+|clover-35b-a3b-preview|ornith-1\.5-35b-a3b|gemma-4-26b-a4b|tiel-coder-35b-a3b|minicpm-v-4\.7-35b-a3b|ornith-1\.5-122b|qwen3\.8-flash-next-gyro|qwen3\.8-flash-next-nvfp4)- ]]; then
+        echo polystrata; return 0
+      fi
       # Xolotl serves through Strata's server; its DeepSeek-V4 engine (a model
       # upstream Strata does not run) tells it apart.
       if [[ "$body" =~ \"model\"[[:space:]]*:[[:space:]]*\"deepseek-v4 ]]; then
@@ -11349,7 +11595,7 @@ cmd_set_api_key() {
 
 # Bearer token for one server kind (set-lmstudio-token, set-maya-token, ...):
 # LM Studio servers with "Require authentication" on, or Strata, Basalt, Maya,
-# Xolotl, Avalon, Kindi and Colibri servers started with an API key. One token per kind, stored in
+# Xolotl, Avalon, Kindi, Colibri and PolyStrata servers started with an API key. One token per kind, stored in
 # secrets.env (outside the repo) like the other secrets.
 cmd_set_kind_token() {
   local kind="$1" token="${2:-}" confirm_token="" key_env name noun cmd

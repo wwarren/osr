@@ -151,7 +151,7 @@ unset MATTERMOST_WEBHOOK_URL CONFIG_SOURCE BRIDGE NAMESERVER MATTERMOST_CHANNEL 
 # and restored by re-sourcing the extracted functions at the end.
 _tt="$(mktemp -d)"
 TARGETS_DIR="$_tt/targets"
-for _name in gitea mattermost ollama airllm kindi colibri llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi; do
+for _name in gitea mattermost ollama airllm kindi colibri llamacpp strata polystrata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi; do
   mkdir -p "$TARGETS_DIR/$_name"
   # The fake provisioner records what it was given: settings, flags, and
   # whether the admin token reached it (by value, compared to $EXPECT_TOKEN).
@@ -199,6 +199,9 @@ _parallel="${OLLAMA_NUM_PARALLEL:-}|${PARALLEL_SLOTS:-}|${STRATA_PARALLEL:-}|${B
   printf 'colibri-env %s|%s\n' "${COLIBRI_BACKEND:-}" "${GPU_DEVICES:-}" >> "$MOCK_LOG"
 [[ -z ${COLIBRI_MODEL_ID:-} ]] ||
   printf 'colibri-model %s\n' "$COLIBRI_MODEL_ID" >> "$MOCK_LOG"
+[[ -z ${POLYSTRATA_FAMILY:-}${POLYSTRATA_MODEL:-}${POLYSTRATA_KV:-}${POLYSTRATA_MESSAGE_CACHE:-}${POLYSTRATA_CONTEXT:-}${POLYSTRATA_PARALLEL:-} ]] ||
+  printf 'polystrata-env %s|%s|%s|%s|%s|%s\n' "${POLYSTRATA_FAMILY:-}" "${POLYSTRATA_MODEL:-}" "${POLYSTRATA_KV:-}" \
+    "${POLYSTRATA_MESSAGE_CACHE:-}" "${POLYSTRATA_CONTEXT:-}" "${POLYSTRATA_PARALLEL:-}" >> "$MOCK_LOG"
 [[ -z ${CUDA_VERSION:-}${MAYA_CUDA_VERSION:-}${XOLOTL_CUDA_VERSION:-}${AVALON_CUDA_VERSION:-} ]] ||
   printf 'cuda-env %s|%s|%s|%s\n' "${CUDA_VERSION:-}" "${MAYA_CUDA_VERSION:-}" "${XOLOTL_CUDA_VERSION:-}" "${AVALON_CUDA_VERSION:-}" >> "$MOCK_LOG"
 if [[ -n ${HF_TOKEN:-} ]]; then
@@ -210,8 +213,8 @@ done
 unset _name
 
 describe target_table
-assert_eq "lists the twenty targets in menu order" \
-  "gitea mattermost ollama airllm kindi colibri llamacpp strata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi" \
+assert_eq "lists the twenty-one targets in menu order" \
+  "gitea mattermost ollama airllm kindi colibri llamacpp strata polystrata basalt maya xolotl avalon honcho hermes openclaw deepseek-harness opencode open-terminal comfyui freellmapi" \
   "$(target_table | cut -d'|' -f1 | paste -sd' ')"
 
 describe target_field
@@ -248,6 +251,10 @@ assert_eq "Colibri has its own key kind" colibri "$(target_field colibri key)"
 assert_eq "Colibri router entry template" "colibri+http://@IP@:@PORT@" "$(target_field colibri entry)"
 assert_eq "Colibri uses an NVIDIA, AMD or Intel Arc card when given one" optional:nvidia,amd,intel "$(target_field colibri gpu)"
 assert_eq "Colibri is a model server" model "$(target_field colibri phase)"
+assert_eq "PolyStrata has its own key kind" polystrata "$(target_field polystrata key)"
+assert_eq "PolyStrata router entry template" "polystrata+http://@IP@:@PORT@" "$(target_field polystrata entry)"
+assert_eq "PolyStrata needs an NVIDIA GPU" required:nvidia "$(target_field polystrata gpu)"
+assert_eq "PolyStrata is a model server" model "$(target_field polystrata phase)"
 assert_eq "no key for Ollama" "" "$(target_field ollama key)"
 assert_fail "an unknown target" target_field nope phase
 assert_eq "Strata needs an NVIDIA GPU" required:nvidia "$(target_field strata gpu)"
@@ -732,6 +739,7 @@ assert_ok "Xolotl takes a template" target_needs_template xolotl
 assert_ok "Avalon takes a template" target_needs_template avalon
 assert_ok "Kindi takes a template" target_needs_template kindi
 assert_ok "Colibri takes a template" target_needs_template colibri
+assert_ok "PolyStrata takes a template" target_needs_template polystrata
 assert_fail "llama.cpp prompts for its own" target_needs_template llamacpp
 assert_fail "Hermes uses the router's" target_needs_template hermes
 assert_fail "OpenClaw uses the router's" target_needs_template openclaw
@@ -740,10 +748,10 @@ assert_fail "OpenCode uses the router's" target_needs_template opencode
 assert_fail "ComfyUI's community script picks its own" target_needs_template comfyui
 
 describe valid_target_selection
-for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "19" "20" "comfyui" "freellmapi" "xolotl" "avalon" "kindi" "colibri" "openclaw" "opencode"; do
+for _sel in "" none "1,10" "ollama hermes" " 2 , strata " "8" "13" "14" "17" "18" "19" "20" "21" "comfyui" "freellmapi" "xolotl" "avalon" "kindi" "colibri" "polystrata" "openclaw" "opencode"; do
   assert_ok "accepts '${_sel}'" valid_target_selection "$_sel"
 done
-for _sel in 0 21 bogus "ollama,bogus"; do
+for _sel in 0 22 bogus "ollama,bogus"; do
   assert_fail "rejects '${_sel}'" valid_target_selection "$_sel"
 done
 unset _sel
@@ -770,20 +778,21 @@ assert_fail "also when the menu would be shown" prompt_target_selection <<< $'\n
 NONINTERACTIVE=true
 NONINTERACTIVE=false; INSTALL_TARGETS=""
 _out="$(mktemp)"
-prompt_target_selection > "$_out" 2>&1 <<< $'21\n7,hermes\n'
+prompt_target_selection > "$_out" 2>&1 <<< $'22\n7,hermes\n'
 assert_eq "re-prompts until valid, then keeps the choice" "llamacpp hermes" "$TARGETS"
-assert_contains "the menu lists the model servers" "11) xolotl" "$(cat "$_out")"
-assert_contains "Avalon among them" "12) avalon" "$(cat "$_out")"
+assert_contains "the menu lists the model servers" "12) xolotl" "$(cat "$_out")"
+assert_contains "Avalon among them" "13) avalon" "$(cat "$_out")"
+assert_contains "PolyStrata follows Strata among the GPU servers" "9) polystrata" "$(sed -n '/GPU required/,$p' "$_out")"
 assert_contains "Kindi with the CPU or optional-GPU servers" "5) kindi" "$(sed -n '/CPU or optional GPU/,/GPU required/p' "$_out")"
 assert_contains "and Colibri" "6) colibri" "$(sed -n '/CPU or optional GPU/,/GPU required/p' "$_out")"
-assert_contains "the menu lists the companions" "14) hermes" "$(cat "$_out")"
-assert_contains "ComfyUI among them" "19) comfyui" "$(cat "$_out")"
-assert_contains "OpenClaw is grouped with agents" "15) openclaw" "$(cat "$_out")"
-assert_contains "DeepSeek Harness has its own menu choice" "16) deepseek-harness" "$(cat "$_out")"
-assert_contains "OpenCode follows the other agents" "17) opencode" "$(cat "$_out")"
-assert_contains "FreeLLMAPI is last, so earlier numbers stay" "20) freellmapi" "$(cat "$_out")"
+assert_contains "the menu lists the companions" "15) hermes" "$(cat "$_out")"
+assert_contains "ComfyUI among them" "20) comfyui" "$(cat "$_out")"
+assert_contains "OpenClaw is grouped with agents" "16) openclaw" "$(cat "$_out")"
+assert_contains "DeepSeek Harness has its own menu choice" "17) deepseek-harness" "$(cat "$_out")"
+assert_contains "OpenCode follows the other agents" "18) opencode" "$(cat "$_out")"
+assert_contains "FreeLLMAPI is last, so earlier numbers stay" "21) freellmapi" "$(cat "$_out")"
 assert_contains "under its own heading" "Cloud gateway (CPU): prompts leave your network; never chosen by auto." "$(cat "$_out")"
-assert_contains "and Open Terminal after them" "18) open-terminal" "$(cat "$_out")"
+assert_contains "and Open Terminal after them" "19) open-terminal" "$(cat "$_out")"
 assert_contains "memory comes before agents" "Memory infrastructure (CPU)" "$(cat "$_out")"
 assert_contains "the GPU model group is explicit" "Model servers (GPU required by default)" "$(cat "$_out")"
 assert_contains "the CPU model group is explicit" "Model servers (CPU or optional GPU)" "$(cat "$_out")"
@@ -925,6 +934,21 @@ assert_ok "40 GiB of disk is the floor" valid_colibri_rootfs_gb 40
 assert_ok "and 500 GiB fine" valid_colibri_rootfs_gb 500
 assert_fail "less is refused" valid_colibri_rootfs_gb 20
 
+describe valid_polystrata_template
+assert_ok "PolyStrata on Debian 13" valid_polystrata_template local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+assert_ok "PolyStrata on Ubuntu 24.04" valid_polystrata_template local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+assert_fail "not Ubuntu 26.04 (setup's CUDA toolkit fallback has no repository for it)" valid_polystrata_template local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst
+
+describe valid_polystrata_memory_mb
+assert_ok "16 GiB of RAM is the floor" valid_polystrata_memory_mb 16384
+assert_ok "and 128 GiB fine" valid_polystrata_memory_mb 131072
+assert_fail "less is refused" valid_polystrata_memory_mb 8192
+assert_fail "and junk" valid_polystrata_memory_mb 64G
+
+describe valid_polystrata_rootfs_gb
+assert_ok "60 GiB of disk is the floor" valid_polystrata_rootfs_gb 60
+assert_fail "less is refused" valid_polystrata_rootfs_gb 40
+
 describe host_gpu_cuda_arch
 HOST_GPU_CUDA_ARCH=120
 assert_eq "the GPU step's result first" 120 "$(host_gpu_cuda_arch)"
@@ -942,6 +966,7 @@ assert_eq "Maya on a V100: only CUDA 12 distributions" "ubuntu-24.04 ubuntu-22.0
 assert_eq "Avalon: the Ubuntu releases ROCm supports" "ubuntu-24.04 ubuntu-22.04" "$(gpu_target_template_order avalon)"
 assert_eq "Kindi: Strata's releases, Debian 13 first" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order kindi)"
 assert_eq "Colibri: the same" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order colibri)"
+assert_eq "PolyStrata: Strata's" "debian-13 ubuntu-24.04 ubuntu-22.04 debian-12" "$(gpu_target_template_order polystrata)"
 
 describe target_cuda_env
 assert_eq "Basalt on Ubuntu 26.04 uses CUDA 13.3" CUDA_VERSION=13.3 "$(target_cuda_env basalt local:vztmpl/ubuntu-26.04-standard_26.04-1_amd64.tar.zst)"
@@ -1722,6 +1747,132 @@ assert_eq "a window of 8192 or less asks nothing" "" "$(prompt_strata_message_ca
 unset STRATA_MESSAGE_CACHE STRATA_CONTEXT
 TARGETS=""
 
+# PolyStrata reads its families from targets/polystrata/families.sh. The
+# fixture TARGETS_DIR has none (a copy of the installer without the targets);
+# the real one has it.
+_real_targets="$(cd "$(dirname "${BASH_SOURCE[0]}")/../targets" && pwd)"
+_fake_targets="$TARGETS_DIR"
+_polystrata_reset() { unset -f polystrata_catalog 2>/dev/null; TARGETS_DIR="$1"; }
+
+describe polystrata_catalog_ready
+_polystrata_reset "$_fake_targets"
+assert_fail "a copy without targets/ has no catalog" polystrata_catalog_ready
+_polystrata_reset "$_real_targets"
+assert_ok "the targets' families.sh is loaded" polystrata_catalog_ready
+assert_ok "once" polystrata_catalog_ready
+
+describe polystrata_model_ram_gb_safe
+_polystrata_reset "$_fake_targets"
+assert_eq "no catalog: no estimate" "" "$(polystrata_model_ram_gb_safe glm 3.0BIT)"
+_polystrata_reset "$_real_targets"
+assert_eq "setup's RAM estimate" 96 "$(polystrata_model_ram_gb_safe glm 3.0BIT)"
+assert_eq "an unknown size: none" "" "$(polystrata_model_ram_gb_safe glm Q9)"
+
+describe polystrata_engine
+assert_eq "qwen runs on the Strata engine" strata "$(POLYSTRATA_FAMILY=qwen polystrata_engine)"
+assert_eq "gemma4 on PolyStrata's" poly "$(POLYSTRATA_FAMILY=gemma4 polystrata_engine)"
+assert_eq "a family the catalog does not list: none" "" "$(POLYSTRATA_FAMILY=hy4-flash polystrata_engine)"
+
+describe valid_polystrata_family
+assert_ok "a family name" valid_polystrata_family qwen36
+assert_ok "or a menu number" valid_polystrata_family 14
+assert_fail "not junk" valid_polystrata_family 'Qwen;x'
+
+describe valid_polystrata_model
+assert_ok "a size" valid_polystrata_model UD-Q4_K_M
+assert_ok "a blank size means the family's default" valid_polystrata_model ''
+assert_fail "a malformed size is refused" valid_polystrata_model 'Q4;x'
+
+describe polystrata_pick
+assert_eq "a number picks from the list" b "$(polystrata_pick 2 a b c)"
+assert_eq "a name is kept" b "$(polystrata_pick b a b c)"
+assert_eq "a number out of range is kept" 9 "$(polystrata_pick 9 a b c)"
+
+describe valid_polystrata_kv
+_polystrata_reset "$_fake_targets"
+assert_ok "no catalog: any value the guest knows" valid_polystrata_kv q8_0
+assert_fail "but not junk" valid_polystrata_kv q8
+_polystrata_reset "$_real_targets"
+assert_ok "gemma4 takes int8k" env POLYSTRATA_FAMILY=gemma4 bash -c "$(declare -f polystrata_catalog_ready valid_polystrata_kv); TARGETS_DIR=$_real_targets; valid_polystrata_kv int8k"
+POLYSTRATA_FAMILY=glm
+assert_fail "glm takes no q8_0" valid_polystrata_kv q8_0
+assert_ok "but auto" valid_polystrata_kv auto
+POLYSTRATA_FAMILY=qwen
+assert_ok "qwen takes k8v4" valid_polystrata_kv k8v4
+unset POLYSTRATA_FAMILY
+
+describe prompt_polystrata_model
+_polystrata_reset "$_real_targets"
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL
+prompt_polystrata_model > "$_out" 2>&1 <<< $'\n\n'
+assert_eq "Enter takes qwen" qwen "$POLYSTRATA_FAMILY"
+assert_eq "and its default size" IQ2_XS "$POLYSTRATA_MODEL"
+assert_contains "the menu numbers the families" "7) glm - GLM 5.3 Flash (32 GB card), experimental engine" "$(cat "$_out")"
+assert_contains "and the sizes, with setup's RAM" "4) IQ3_S (~62 GB RAM)" "$(cat "$_out")"
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL
+prompt_polystrata_model > "$_out" 2>&1 <<< $'14\n3\n'
+assert_eq "numbers pick the family" qwen36 "$POLYSTRATA_FAMILY"
+assert_eq "and the size" UD-Q4_K_M "$POLYSTRATA_MODEL"
+unset POLYSTRATA_MODEL
+prompt_polystrata_model > "$_out" 2>&1 <<< $'gemma4\n\n'
+assert_eq "a name picks the family" gemma4 "$POLYSTRATA_FAMILY"
+assert_eq "Enter its first size" UD-Q3_K_M "$POLYSTRATA_MODEL"
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL
+assert_fail "a family number out of range" prompt_polystrata_model <<< $'99\n'
+NONINTERACTIVE=true POLYSTRATA_FAMILY=deepseek
+prompt_polystrata_model > "$_out" 2>&1
+assert_eq "unattended: the preset family's default size" UD-IQ2_XXS "$POLYSTRATA_MODEL"
+NONINTERACTIVE=false
+_polystrata_reset "$_fake_targets"
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL
+prompt_polystrata_model > "$_out" 2>&1 <<< $'kolibri\n\n'
+assert_eq "without the catalog a blank size stays blank" "" "$POLYSTRATA_MODEL"
+assert_contains "and says the family's default is used" "leave it blank for the family's default" "$(cat "$_out")"
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL
+
+describe prompt_polystrata_kv_cache
+_polystrata_reset "$_real_targets"
+HOST_GPU_CARDS=""
+nvidia-smi() { printf '00000000:01:00.0, 16311\n'; }
+TARGETS="strata"
+assert_eq "no PolyStrata, nothing asked" "" "$(prompt_polystrata_kv_cache)"
+TARGETS="polystrata"
+POLYSTRATA_FAMILY=qwen POLYSTRATA_MODEL=IQ2_XS POLYSTRATA_CONTEXT=32768
+prompt_polystrata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "the Strata engine: Strata's suggestion for a 16 GB card" k8v4 "$POLYSTRATA_KV"
+unset POLYSTRATA_KV
+POLYSTRATA_CONTEXT=65536 POLYSTRATA_MEMORY_MB=65536
+prompt_polystrata_kv_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "at 64K the IQ2_XS cache fits a 64 GiB CT: int8" int8 "$POLYSTRATA_KV"
+unset POLYSTRATA_KV
+POLYSTRATA_CONTEXT=8192
+assert_eq "8192 tokens or less: nothing asked" "" "$(prompt_polystrata_kv_cache)"
+POLYSTRATA_FAMILY=minicpmv POLYSTRATA_MODEL=Q4_K_M POLYSTRATA_CONTEXT=65536
+prompt_polystrata_kv_cache > "$_out" 2>&1 <<< $'k8v4\nq8_0\n'
+assert_contains "PolyStrata's engine offers the family's formats" "other formats for this family: q8_0" "$(cat "$_out")"
+assert_contains "and refuses another engine's" "Not a valid value: 'k8v4'" "$(cat "$_out")"
+assert_eq "q8_0 chosen" q8_0 "$POLYSTRATA_KV"
+unset POLYSTRATA_KV
+POLYSTRATA_FAMILY=glm
+assert_eq "a family with fp16 only: nothing asked" "" "$(prompt_polystrata_kv_cache)"
+unset -f nvidia-smi
+unset POLYSTRATA_FAMILY POLYSTRATA_MODEL POLYSTRATA_CONTEXT POLYSTRATA_MEMORY_MB POLYSTRATA_KV
+
+describe prompt_polystrata_message_cache
+TARGETS="polystrata"
+POLYSTRATA_FAMILY=qwen
+prompt_polystrata_message_cache > "$_out" 2>&1 <<< $'\n'
+assert_eq "the Strata engine: Enter keeps it off" false "$POLYSTRATA_MESSAGE_CACHE"
+unset POLYSTRATA_MESSAGE_CACHE
+POLYSTRATA_FAMILY=qwen36
+assert_eq "PolyStrata's engine: not asked" "" "$(prompt_polystrata_message_cache)"
+POLYSTRATA_FAMILY=qwen POLYSTRATA_CONTEXT=8192
+assert_eq "8192 tokens or less: not asked" "" "$(prompt_polystrata_message_cache)"
+unset POLYSTRATA_FAMILY POLYSTRATA_CONTEXT POLYSTRATA_MESSAGE_CACHE
+TARGETS=""
+_polystrata_reset "$_fake_targets"
+unset _real_targets _fake_targets
+
 describe run_target_provisioner
 CT_ID=910; GATEWAY=192.0.2.1; BRIDGE=vmbr2; NAMESERVER=""; OPENWEBUI_PORT=8080
 TEMPLATE_REF=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
@@ -1827,6 +1978,19 @@ mock_reset_log
 run_target_provisioner colibri
 assert_contains "a declined download reaches it as none, so it is not suggested again" 'colibri-model none' "$(mock_calls)"
 unset COLIBRI_CT_ID COLIBRI_IP_CIDR COLIBRI_STORAGE COLIBRI_TEMPLATE COLIBRI_MEMORY_MB COLIBRI_ROOTFS_GB COLIBRI_MODEL_ID GPU_RESULT_COLIBRI
+POLYSTRATA_CT_ID=925; POLYSTRATA_IP_CIDR=192.0.2.105/24; POLYSTRATA_STORAGE=gpu-store
+POLYSTRATA_TEMPLATE=local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst
+POLYSTRATA_MEMORY_MB=131072; POLYSTRATA_ROOTFS_GB=200
+POLYSTRATA_FAMILY=qwen36 POLYSTRATA_MODEL=UD-Q4_K_M POLYSTRATA_KV=q8_0 POLYSTRATA_CONTEXT=131072 POLYSTRATA_PARALLEL=2
+mock_reset_log
+run_target_provisioner polystrata
+assert_contains "PolyStrata gets its family, size, KV cache, context and parallel slots" \
+  "polystrata-env qwen36|UD-Q4_K_M|q8_0||131072|2" "$(mock_calls)"
+assert_contains "and the RAM chosen for it" "memory-env 131072" "$(mock_calls)"
+assert_contains "and the disk" "|200|" "$(mock_calls)"
+assert_not_contains "and no Strata settings" "strata-kv" "$(mock_calls)"
+unset POLYSTRATA_CT_ID POLYSTRATA_IP_CIDR POLYSTRATA_STORAGE POLYSTRATA_TEMPLATE POLYSTRATA_MEMORY_MB POLYSTRATA_ROOTFS_GB \
+  POLYSTRATA_FAMILY POLYSTRATA_MODEL POLYSTRATA_KV POLYSTRATA_CONTEXT POLYSTRATA_PARALLEL
 mock_reset_log
 run_target_provisioner llamacpp
 assert_contains "llama.cpp without a model only gets its CT" "|no|" "$(mock_calls)"
@@ -2368,6 +2532,9 @@ assert_ok   "accepts kindi://host"       valid_ollama_addr kindi://10.0.0.14
 assert_ok   "accepts kindi+http url"     valid_ollama_addr kindi+http://h:8093
 assert_fail "rejects kindi:// junk"      valid_ollama_addr "kindi://a b"
 assert_ok   "accepts colibri://host"     valid_ollama_addr colibri://10.0.0.15
+assert_ok   "accepts polystrata://host"  valid_ollama_addr polystrata://10.0.0.16
+assert_ok   "accepts polystrata+http url" valid_ollama_addr polystrata+http://h:8080
+assert_fail "rejects polystrata:// junk" valid_ollama_addr "polystrata://a b"
 assert_ok   "accepts colibri+http url"   valid_ollama_addr colibri+http://h:8080
 assert_fail "rejects colibri:// junk"    valid_ollama_addr "colibri://a b"
 
@@ -2400,6 +2567,9 @@ assert_eq "kindi+http passes through"       "kindi+http://h:8094"    "$(normaliz
 assert_eq "KINDI_PORT sets kindi://'s port" "kindi+http://h:8100"    "$(KINDI_PORT=8100 normalize_ollama_url kindi://h)"
 assert_eq "colibri:// gets 8080"            "colibri+http://h:8080"  "$(normalize_ollama_url colibri://h)"
 assert_eq "COLIBRI_PORT sets its port"      "colibri+http://h:8000"  "$(COLIBRI_PORT=8000 normalize_ollama_url colibri://h)"
+assert_eq "polystrata:// gets 8080"         "polystrata+http://h:8080" "$(normalize_ollama_url polystrata://h)"
+assert_eq "POLYSTRATA_PORT sets its port"   "polystrata+http://h:11434" "$(POLYSTRATA_PORT=11434 normalize_ollama_url polystrata://h)"
+assert_eq "polystrata+http passes through"  "polystrata+http://h:8081" "$(normalize_ollama_url polystrata+http://h:8081/)"
 AVALON_PORT=8181
 assert_eq "AVALON_PORT sets avalon://'s port" "avalon+http://h:8181"  "$(normalize_ollama_url avalon://h)"
 unset AVALON_PORT

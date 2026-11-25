@@ -8,16 +8,19 @@ bash open-smart-router-install.sh
 ```
 
 The installer's menu offers, grouped by purpose: Gitea and Mattermost
-services; Ollama, AirLLM, Kindi, Colibri, llama.cpp, Strata, Basalt, Maya, Xolotl and
-Avalon model servers; Honcho memory; Hermes, OpenClaw, DeepSeek Harness and
+services; Ollama, AirLLM, Kindi, Colibri, llama.cpp, Strata, PolyStrata, Basalt, Maya,
+Xolotl and Avalon model servers; Honcho memory; Hermes, OpenClaw, DeepSeek Harness and
 OpenCode agents; Open Terminal and ComfyUI tools; and the FreeLLMAPI cloud
 gateway (Proxmox VE 9.1 and `skopeo` needed). Enter names or menu numbers
 (comma-separated), or Enter for none. MQTT and hcom are installed afterwards
 ([Agent coordination targets](AGENT_COORDINATION.md#agent-coordination-targets)).
 
 You enter the router's CT ID and static IP/CIDR, then a CT ID, static IP/CIDR
-and storage for each selected target (Strata, Basalt, Maya, Xolotl, Avalon,
-Kindi and Colibri also a template; Strata also its RAM, `STRATA_MEMORY_MB`, default 65536
+and storage for each selected target (Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon,
+Kindi and Colibri also a template; PolyStrata also its family and size
+(`POLYSTRATA_FAMILY`, default qwen, and `POLYSTRATA_MODEL`, default the family's,
+with setup's RAM estimate shown), its RAM, `POLYSTRATA_MEMORY_MB` (65536, at least
+16384) and disk, `POLYSTRATA_ROOTFS_GB` (160, at least 60); Strata also its RAM, `STRATA_MEMORY_MB`, default 65536
 MiB, at least 32768, shown beside the host's RAM: it holds its model in RAM,
 about 48 GB for IQ2_XS, 60 for IQ3_XXS and 62 for IQ3_S; Colibri also its RAM,
 `COLIBRI_MEMORY_MB` (65536, at least 8192), and disk, `COLIBRI_ROOTFS_GB` (160,
@@ -55,7 +58,7 @@ passwords are in `/etc/<service>-target/admin-password` in their CTs.
 | AirLLM | Chosen at prompt | Debian 12/13; Ubuntu 24.04/26.04 (Python 3.11+) |
 | llama.cpp | Debian 13 | Debian 12 for CUDA or CPU; Vulkan needs 13 |
 | Basalt, Maya, Xolotl | Debian 13 | Debian 12; Ubuntu 22.04, 24.04, 26.04 |
-| Strata | Debian 13 | Debian 12; Ubuntu 22.04/24.04 |
+| Strata, PolyStrata | Debian 13 | Debian 12; Ubuntu 22.04/24.04 |
 | Kindi | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (CUDA 10.2 runfile) |
 | Colibri | Debian 13 | Debian 12; Ubuntu 22.04/24.04 (Vulkan wants Debian 13's Mesa) |
 | Avalon | Ubuntu 24.04 | Ubuntu 22.04 (ROCm); with CUDA also Debian 12/13, Ubuntu 26.04 |
@@ -76,7 +79,7 @@ must match the loaded host driver. Ubuntu 26.04 needs an available template
 
 | Target | Requirement |
 |---|---|
-| Strata, Maya, Xolotl | NVIDIA |
+| Strata, PolyStrata, Maya, Xolotl | NVIDIA |
 | Basalt | NVIDIA Blackwell (sm_120: RTX 50 or RTX PRO Blackwell) |
 | Avalon | AMD Radeon RX 7000 (RDNA 3, ROCm) or NVIDIA RTX 20+ (CUDA); 16 GB+ VRAM, AVX2 CPU |
 | llama.cpp | NVIDIA (CUDA) or AMD/Intel (Vulkan); `BACKEND=cpu` needs none |
@@ -93,7 +96,7 @@ NVIDIA card) and Colibri each ask which card to use; Ollama, Kindi, Colibri and
 ComfyUI also offer `none` (CPU). Several targets may share a card; a single fitting card is taken
 without asking. Presets: `OLLAMA_GPU_CARD`, `LLAMACPP_GPU_CARD`,
 `AVALON_GPU_CARD`, `KINDI_GPU_CARD`, `COLIBRI_GPU_CARD`, `COMFYUI_GPU_CARD` (a PCI address such as
-`0000:03:00.0`, or `none`). Strata, Basalt, Maya, Xolotl and AirLLM are
+`0000:03:00.0`, or `none`). Strata, PolyStrata, Basalt, Maya, Xolotl and AirLLM are
 NVIDIA-only and use GPU 0 (or their `GPU_DEVICES`). Ollama and ComfyUI receive
 `GPU` (vendor) and `GPU_CARD` and keep only that card's nodes after their
 community scripts pass every card of the vendor; llama.cpp gets `BACKEND` and

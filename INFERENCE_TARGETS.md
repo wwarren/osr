@@ -10,6 +10,7 @@ settings and recovery steps.
 | [llama.cpp](targets/llamacpp/README.md) | Plain address | 11434 (monitor dashboard on 8082) | One GGUF; CUDA, Vulkan or CPU |
 | [AirLLM](targets/airllm/README.md) | Plain address | 11434 | Large disk; slow, give it its own tier |
 | [Strata](targets/strata/README.md) | `strata://` | 8080 | NVIDIA |
+| [PolyStrata](targets/polystrata/README.md) | `polystrata://` | 8080 | NVIDIA; Qwen3.8-Flash-Next on the Strata engine or 14 experimental families (GLM 5.3 Flash, DeepSeek V4 Flash, Gemma 4, Qwen3.6, Ornith, ...) on its own, chosen from a family and size menu with setup's RAM estimates; 11 to 190 GB downloads |
 | [Basalt](targets/basalt/README.md) | `basalt://` | 8080 | Blackwell (sm_120), CUDA 13 |
 | [Maya](targets/maya/README.md) | `maya://` | 8080 | NVIDIA; CUDA must suit CT and card |
 | [Xolotl](targets/xolotl/README.md) | `xolotl://` | 8080 | NVIDIA 24 GB; ~372 GB of pinned weights |
@@ -44,7 +45,7 @@ alongside the router; the last tag is the target's directory name under
 | CT | Tags |
 |---|---|
 | Router | `ai`, `ai-tools`, `osr-router`, `openwebui` |
-| Ollama, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI, FreeLLMAPI | `ai`, `ai-model`, `osr-target`, `<target>` |
+| Ollama, llama.cpp, AirLLM, Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI, FreeLLMAPI | `ai`, `ai-model`, `osr-target`, `<target>` |
 | Gitea, Mattermost, Honcho, Open Terminal, Hermes, OpenClaw, DeepSeek Harness, OpenCode, MQTT | `ai`, `ai-tools`, `osr-target`, `<target>` |
 
 `tools/upgrade-all.sh` finds CTs only by these tags (`osr-router`, and

@@ -30,6 +30,7 @@ KEY_NAMES = {
     "avalon": "AVALON_API_KEY",
     "kindi": "KINDI_API_KEY",
     "colibri": "COLIBRI_API_KEY",
+    "polystrata": "POLYSTRATA_API_KEY",
 }
 PREFIXES = {kind: kind + "+" for kind in KEY_NAMES}
 MAX_BODY = 64 * 1024 * 1024

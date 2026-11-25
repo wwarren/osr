@@ -159,7 +159,7 @@ describe upgrade_contract
 # rollback restores configuration as well as code, is health-checked, and
 # says when it failed too. The behaviour itself is exercised by each target's
 # own tests; this keeps a new or edited target from silently dropping a part.
-for name in strata basalt maya xolotl avalon kindi colibri; do
+for name in strata basalt maya xolotl avalon kindi colibri polystrata; do
   t="${ROOT}/targets/${name}/install-target.sh"
   assert_ok "${name}: stages the settings of a good install" grep -q 'stage_record "\$[A-Z_]*ETC_DIR/installed-env" settings_env' "$t"
   assert_ok "${name}: publishes installed settings durably" grep -q 'publish_record "\$env_temporary" "\$[A-Z_]*ETC_DIR/installed-env"' "$t"
@@ -339,10 +339,42 @@ assert_fail "the launcher never puts the key on a command line" grep -qE -- '--a
 assert_ok "the router knows the colibri kind" grep -q '"colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY"' "${ROOT}/services/osr-router/router.py"
 assert_ok "the installer offers the target with its key" grep -q "'colibri|model|.*|colibri+http://@IP@:@PORT@|colibri|optional:nvidia,amd,intel'" "$INSTALLER"
 for agent in hermes openclaw opencode; do
-  assert_ok "${agent} reaches colibri servers" grep -q '"kindi", "colibri")' "${ROOT}/targets/${agent}/provision-lxc.sh"
+  assert_ok "${agent} reaches colibri servers" grep -q '"kindi", "colibri"' "${ROOT}/targets/${agent}/provision-lxc.sh"
 done
 for agent in hermes openclaw opencode honcho; do
-  assert_ok "${agent} copies the Colibri key" grep -q 'KINDI_API_KEY|COLIBRI_API_KEY)' "${ROOT}/targets/${agent}/provision-lxc.sh"
+  assert_ok "${agent} copies the Colibri key" grep -q 'KINDI_API_KEY|COLIBRI_API_KEY' "${ROOT}/targets/${agent}/provision-lxc.sh"
+done
+
+describe polystrata_target
+# The PolyStrata target fetches a pinned commit, keeps its settings apart from
+# upstream's STRATA_* variables, and gives the router its own key kind.
+polystrata="${ROOT}/targets/polystrata"
+pin="$(sed -n 's/^POLYSTRATA_DEFAULT_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${polystrata}/install-target.sh")"
+assert_ok "the PolyStrata default pin is a full commit" test "${#pin}" -eq 40
+assert_eq "the provisioner pins the same commit" "$pin" \
+  "$(sed -n 's/^POLYSTRATA_DEFAULT_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${polystrata}/provision-lxc.sh")"
+assert_eq "the upstream check pins the same commit" "$pin" \
+  "$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' "${polystrata}/test-pinned-upstream.py")"
+assert_ok "the README names the tested pin" grep -q "$pin" "${polystrata}/README.md"
+for wf in .github .gitea; do
+  assert_ok "${wf} CI checks the target against the pinned upstream code" \
+    grep -q 'targets/polystrata/test-pinned-upstream.py' "${ROOT}/${wf}/workflows/tests.yml"
+done
+assert_fail "the installer sets no STRATA_ variable of its own" \
+  grep -qE '^\s*(export )?STRATA_[A-Z_]+=' "${polystrata}/install-target.sh"
+assert_ok "the unit runs the generated launcher" grep -qxF 'ExecStart=/bin/sh ${POLYSTRATA_RUN_SCRIPT}' "${polystrata}/polystrata.service"
+assert_fail "the unit names no key" grep -q 'api-key\|API_KEY' "${polystrata}/polystrata.service"
+assert_ok "the router knows the polystrata kind" grep -q '"polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY"' "${ROOT}/services/osr-router/router.py"
+assert_ok "the monitor knows it" grep -q '"polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY"' "${ROOT}/services/osr-monitor/monitor.py"
+assert_ok "the installer offers the target with its key" grep -q "'polystrata|model|.*|polystrata+http://@IP@:@PORT@|polystrata|required:nvidia'" "$INSTALLER"
+for agent in hermes openclaw opencode; do
+  assert_ok "${agent} reaches polystrata servers" grep -q '"colibri", "polystrata")' "${ROOT}/targets/${agent}/provision-lxc.sh"
+done
+for agent in hermes openclaw opencode honcho; do
+  assert_ok "${agent} copies the PolyStrata key" grep -q 'COLIBRI_API_KEY|POLYSTRATA_API_KEY)' "${ROOT}/targets/${agent}/provision-lxc.sh"
+done
+for dispatch in hermes/direct-dispatch.py honcho/direct_dispatch.py; do
+  assert_ok "${dispatch} sends PolyStrata its key" grep -q '"polystrata": "POLYSTRATA_API_KEY"' "${ROOT}/targets/${dispatch}"
 done
 
 describe venv_permissions

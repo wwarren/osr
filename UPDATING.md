@@ -25,7 +25,7 @@ settings or rollback changes:
 |---|---|---|
 | Router | `update-router-services.sh --host --no-push`, pushed once checks pass | Updater never touches `env/*.env`, tiers, `litellm_config.yaml`, ini files or secrets |
 | Open WebUI | `set-webui-version <pin> --apply` (never a downgrade) | `apply`'s snapshot and `webui.db` backup |
-| llama.cpp, AirLLM, Ollama, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say). No model question, as for every other model target; with `--colibri-model`, an interactive run asks for each Colibri CT whether to serve another model afterwards (default no), and a yes shows the model menu and runs `install-target.sh --model` after its upgrade | Each target's settings record or env files; the served Colibri model unless `--colibri-model` chooses another |
+| llama.cpp, AirLLM, Ollama, Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri, ComfyUI | Current files pushed to `/root/<target>-target-deploy`, then `install-target.sh --upgrade` (ComfyUI keeps a release newer than its pin; a llama.cpp target without the monitor dashboard gets it, as the plan and summary say). No model question, as for every other model target; with `--colibri-model`, an interactive run asks for each Colibri CT whether to serve another model afterwards (default no), and a yes shows the model menu and runs `install-target.sh --model` after its upgrade | Each target's settings record or env files; the served Colibri model unless `--colibri-model` chooses another |
 | Open Terminal | Current files pushed, installer rerun (running workspaces restart on their next request); then its Open WebUI connection is enabled for all users (needs the admin token; skipped without it) | Its recorded port, passed back; workspace limits kept by the installer; `OPEN_TERMINAL_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
 | Gitea, Mattermost | `provision-lxc.sh --reconfigure`, which re-applies the OSR setup; their community scripts install the newest release, which this repository does not pin, so the release stays as it is (reported `reapplied`) | Accounts, router token and webhook are kept by their installers |
 | Honcho, Hermes, OpenClaw, DeepSeek Harness, OpenCode | `provision-lxc.sh --reconfigure`; interactive runs use `PVE_ACCEPT_DEFAULTS=true PVE_CONFIRM=false`, unattended runs use `NONINTERACTIVE=true`. Honcho's Open WebUI connection is enabled for all users | Recorded answers; an Open WebUI admin key is requested once when needed; `HONCHO_WEBUI_ACCESS=keep`, once recorded, leaves its access alone |
@@ -87,7 +87,7 @@ MQTT's row is the CT's Mosquitto package, which follows Debian.
 | Open WebUI | `services/open-webui/requirements.txt` | PyPI `open-webui` | `set-webui-version` |
 | Ollama, llama.cpp, Honcho | the installer's (provisioner's) default | highest `vX.Y.Z` GitHub release, no pre-releases | `OLLAMA_VERSION`, `LLAMA_CPP_REF`, `HONCHO_REF` |
 | ComfyUI, Open Terminal | default tag and its reviewed commit | the same, with the commit the tag names now | `*_VERSION` and `*_COMMIT`; Open Terminal resolves a newer release's Python dependencies with pip when they differ from its lock |
-| Strata, Xolotl, Avalon, Kindi, Colibri | the tested commit | the tip of `main` | `*_COMMIT` |
+| Strata, PolyStrata, Xolotl, Avalon, Kindi, Colibri | the tested commit | the tip of `main` | `*_COMMIT` |
 | DeepSeek Harness, OpenCode | the provisioner's default | npm `latest` tag | `DSH_VERSION`, `OPENCODE_VERSION` |
 | FreeLLMAPI | the provisioner's tested release | highest `vX.Y.Z` GitHub release | `FREELLMAPI_VERSION` (its image tag) |
 | Hermes | none (stays at its commit) | `hermes update` | as `--update-hermes` |
@@ -109,7 +109,7 @@ and `--pinned` takes every pin. The latest is untested here, and a commit the
 installer checks is the one upstream names at that moment, not a reviewed one;
 the snapshot and checks still cover it. ComfyUI and Open Terminal keep a
 newer release on later runs that take the pin; Ollama, llama.cpp, Strata,
-Xolotl, Avalon, Kindi and Colibri go back to the pin then. An unreachable upstream is reported
+PolyStrata, Xolotl, Avalon, Kindi and Colibri go back to the pin then. An unreachable upstream is reported
 and the pins are used.
 
 A release you pinned yourself (`HONCHO_REF`, `DSH_VERSION`, `OPENCODE_VERSION`) is offered the
@@ -228,7 +228,7 @@ may roll back later.
 Target upgrades check readiness and restore the prior code and settings on
 failure; see each target README and the
 [upgrade contract](ARCHITECTURE.md#16-inference-targets-targets). Strata,
-Basalt, Maya, Xolotl, Avalon, Kindi and Colibri need disk for one runtime snapshot and
+PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri need disk for one runtime snapshot and
 carry their settings forward unless overridden. Interrupting an upgrade
 (Ctrl-C, closed SSH) rolls it back; after a hangup its output is in the CT's
 `/var/log/osr-install-interrupted.log`. If a model target's rollback fails too,

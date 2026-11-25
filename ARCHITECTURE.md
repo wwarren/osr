@@ -41,7 +41,7 @@ flowchart LR
     subgraph pool["Model pool (1-20 hosts)"]
         o1["Ollama / llama.cpp bridge / AirLLM<br/>:11434"]
         o2["LM Studio<br/>:1234"]
-        o3["Strata / Basalt / Maya / Xolotl / Avalon / Colibri<br/>:8080"]
+        o3["Strata / PolyStrata / Basalt / Maya / Xolotl / Avalon / Colibri<br/>:8080"]
         o4["Kindi<br/>:8093"]
     end
     term["Open Terminal LXC<br/>gateway :8000, a workspace per user"]
@@ -256,7 +256,7 @@ latest available release by default, or a version pinned in
 No listener. Every `interval_seconds` (15) it probes each distinct host in
 `MODEL_SERVERS`/`BACKEND_*` once, labelling alerts with its tiers: Ollama on
 `/api/tags`, other kinds on `/v1/models` with their token. Strata-style
-servers (Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri) count as down while that
+servers (Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri) count as down while that
 list is empty (a Colibri parked without a model does not listen at all), and
 any rejected token counts as down. It also probes LiteLLM,
 the router's `/healthz` and Open WebUI's `/health`. A state change needs
@@ -645,7 +645,7 @@ unchanged. No agent coordination API is added to the router.
 |---|---|---|
 | Gitea deploy token, Mattermost webhook | `/app/router/secrets.env` (0640 root:osr-router) | Never committed; moved out of `env/router.env` by `commit`/`apply` |
 | `ROUTER_API_KEY` (= Open WebUI `OPENAI_API_KEYS`) | `secrets.env` | Generated on new installs; `set-api-key` |
-| `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY`, `XOLOTL_API_KEY`, `AVALON_API_KEY`, `KINDI_API_KEY`, `COLIBRI_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
+| `LMSTUDIO_API_TOKEN`, `STRATA_API_KEY`, `BASALT_API_KEY`, `MAYA_API_KEY`, `XOLOTL_API_KEY`, `AVALON_API_KEY`, `KINDI_API_KEY`, `COLIBRI_API_KEY`, `POLYSTRATA_API_KEY` | `secrets.env` | `set-<kind>-token`; sent only to that kind; LiteLLM reads `os.environ/...` |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | `secrets.env` | `set-cloud-key`; never forwarded to clients |
 | Codex/Claude Code logins, gateway virtual keys | Not kept by OSR | Sent per request and passed through to the subscription gateway |
 | Target API keys | `/etc/<target>-target/api-key` (0600) in each target CT; also Xolotl's `/etc/xolotl/xolotl-ds41.json`, Avalon's `/etc/avalon/api-key`, Kindi's `/etc/kindi/kindi.conf` (0640, service group) and Colibri's `/etc/colibri-target/secrets.env` (0600, read by systemd as `COLI_API_KEY`) | Generated in the CT; never in a unit, log or the router's process list |
@@ -818,6 +818,7 @@ APIs. Ollama entries are plain base URLs; other kinds use a prefix.
 | Avalon | `avalon+http://host:8080` | `/v1/models` | `openai/` | `AVALON_API_KEY` |
 | Kindi | `kindi+http://host:8093` | `/v1/models` | `openai/` | `KINDI_API_KEY` |
 | Colibri | `colibri+http://host:8080` | `/v1/models` | `openai/` | `COLIBRI_API_KEY` |
+| PolyStrata | `polystrata+http://host:8080` | `/v1/models` | `openai/` | `POLYSTRATA_API_KEY` |
 
 ### 15.1 The kind table
 
@@ -845,7 +846,7 @@ exceeds the available context size (M tokens)". So the router counts
 `context_length / parallel` unless `[discovery] lmstudio_unified_kv = true`
 says every LM Studio host loads with the setting on.
 
-### 15.3 Strata-style servers (Strata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri)
+### 15.3 Strata-style servers (Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi, Colibri)
 
 * **Discovery:** model ID, image support (`input_modalities` or
   `architecture.input_modalities`), residency (`status`), `parameter_size` if
@@ -862,7 +863,12 @@ says every LM Studio host loads with the setting on.
   `/health` marker) by `/v1/models` (`"owned_by": "llamacpp"` and an `avalon`
   id), which answers without a key only when none is set; Kindi by `"kindi":
   "<version>"` on its public `/health`; Colibri (no `/health` marker either) by
-  `"owned_by": "colibri"` on a keyless `/v1/models`. Strata also has older fingerprints. A
+  `"owned_by": "colibri"` on a keyless `/v1/models`; PolyStrata (Strata's
+  server too) by a model id of a family only its own engine runs
+  (`gemma-4-26b-a4b-…`, `deepseek-v4-flash-…`; Xolotl's `deepseek-v4.1-flash`
+  is not one), with its own kind and key. A PolyStrata serving a
+  Qwen3.8-Flash-Next family or Qwen3.6 answers as Strata and is added as
+  `polystrata://`. Strata also has older fingerprints. A
   keyed server that cannot identify itself is added as `kind://host`.
 * **Keep-alive** is never sent.
 
@@ -881,6 +887,7 @@ creates an unprivileged CT and passes GPU devices through, and a guest-side
 | [AirLLM](targets/airllm/README.md) | Ollama API, :11434 | Disk-streamed HF model; slow, single generation |
 | [Ollama](targets/ollama/README.md) | Ollama API, :11434 | Community-script CT adopted into a hardened service |
 | [Strata](targets/strata/README.md) | `strata`, :8080 | Qwen3.8-Flash-Next |
+| [PolyStrata](targets/polystrata/README.md) | `polystrata`, :8080 | Strata's descendant: Qwen3.8-Flash-Next on the Strata engine or 14 experimental families (GLM, DeepSeek, Gemma 4, Qwen3.6, ...) on its own; family and size from `families.sh`, checked against the pinned `setup.py` |
 | [Basalt](targets/basalt/README.md) | `basalt`, :8080 | Blackwell/CUDA 13, `.basalt` pack |
 | [Maya](targets/maya/README.md) | `maya`, :8080 | GLM-5.3-Flash; CUDA chosen for CT and card |
 | [Xolotl](targets/xolotl/README.md) | `xolotl`, :8080 | DeepSeek-V4.1-Flash; pinned weights |
@@ -930,7 +937,7 @@ hangup the output goes to `/var/log/osr-install-interrupted.log`
 recorded setting, and additionally compares services, listening ports and the
 router's view of the target before and after each one.
 
-Strata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri save the last good settings and
+Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi and Colibri save the last good settings and
 reuse them unless non-empty overrides are given; an interrupted first install
 resumes its pending settings, and an existing install without a readable
 record requires explicit values. Their upgrades take an exclusive lock,
@@ -1245,15 +1252,15 @@ so a CT following the pin is not replaced) and checks it by `/api/ping`.
 * `tests/test-repo.sh` checks repository invariants: unit hardening, no secrets
   in `env/`, UTF-8, embedded copies in sync, Honcho's copy of the Hermes
   dispatcher, Maya's update switch, pinned weights and commits (Xolotl, Avalon,
-  Kindi, Colibri), LiteLLM locks and the upgrade contract.
+  Kindi, Colibri, PolyStrata), LiteLLM locks and the upgrade contract.
 * `.gitea/workflows/tests.yml` runs the suites with `--strict` (its job
   container must run as root), ShellCheck on every repository shell file and
   ruff, with separate router, bridge, LiteLLM and Open Terminal venvs and
   Node.js for DeepSeek Harness's `configure.mjs` tests.
   `.github/workflows/tests.yml` is an identical copy for GitHub Actions, where
   the suites run through `sudo`. The `strata-upstream`,
-  `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `colibri-upstream`, `freellmapi-upstream` and
-  `honcho-upstream` jobs each fetch one pinned upstream, kept separate so a
+  `maya-upstream`, `xolotl-upstream`, `avalon-upstream`, `kindi-upstream`, `colibri-upstream`, `polystrata-upstream`,
+  `freellmapi-upstream` and `honcho-upstream` jobs each fetch one pinned upstream, kept separate so a
   GitHub outage cannot hide the main results.
 * `tests/test-upgrade-all.sh` keeps `upgrade-all.sh`'s deploy file lists equal
   to what each provisioner copies and its service lists complete, and runs it

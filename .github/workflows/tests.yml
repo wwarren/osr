@@ -3,7 +3,7 @@
 # image. .github/workflows/tests.yml is the same file, for GitHub Actions;
 # tests/test-repo.sh fails when the two differ, so edit both.
 # The "test" job talks to nothing beyond PyPI. The "strata-upstream",
-# "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream", "colibri-upstream", "freellmapi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
+# "maya-upstream", "xolotl-upstream", "avalon-upstream", "kindi-upstream", "colibri-upstream", "polystrata-upstream", "freellmapi-upstream" and "honcho-upstream" jobs each fetch one pinned commit from
 # GitHub; they are separate jobs so a GitHub outage cannot hide the results of
 # the main suites.
 name: tests
@@ -234,6 +234,30 @@ jobs:
 
       - name: Pinned upstream check
         run: python targets/colibri/test-pinned-upstream.py "$RUNNER_TEMP/colibri"
+
+  # Checks targets/polystrata against PolyStrata's real code at the pinned
+  # commit (PIN in targets/polystrata/test-pinned-upstream.py): setup.py's
+  # options and choices, families.sh against upstream's families and KV cache
+  # formats, the launcher setup writes, and the /health contract.
+  polystrata-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the pinned PolyStrata commit
+        run: |
+          pin=$(sed -n 's/^PIN = "\([0-9a-f]\{40\}\)"$/\1/p' targets/polystrata/test-pinned-upstream.py)
+          [[ $pin =~ ^[0-9a-f]{40}$ ]]
+          git init -q "$RUNNER_TEMP/polystrata"
+          git -C "$RUNNER_TEMP/polystrata" fetch -q --depth 1 https://github.com/simplexai-labs/PolyStrata.git "$pin"
+          git -C "$RUNNER_TEMP/polystrata" checkout -q FETCH_HEAD
+
+      - name: Pinned upstream check
+        run: python targets/polystrata/test-pinned-upstream.py "$RUNNER_TEMP/polystrata"
 
   # Checks the FreeLLMAPI release the target pins (DEFAULT_FREELLMAPI_VERSION,
   # targets/freellmapi/upstream-commit.txt) against its source: the image's

@@ -15,7 +15,7 @@ Open Smart Router provides one OpenAI-compatible endpoint for a pool of self-hos
 | Prometheus | 127.0.0.1:9090 | Router metrics |
 | Grafana | 3000 | Authenticated metrics dashboard |
 
-Normal request path: **client or Open WebUI → Smart Router → model host**. The router supports Ollama, LM Studio, llama.cpp, AirLLM, Strata, Basalt, Maya, Xolotl, Avalon, Kindi, and Colibri. See [Deployment](DEPLOYMENT.md) for container defaults and service details, and [ARCHITECTURE.md](ARCHITECTURE.md) for the design, request flow, security model, and service layout.
+Normal request path: **client or Open WebUI → Smart Router → model host**. The router supports Ollama, LM Studio, llama.cpp, AirLLM, Strata, PolyStrata, Basalt, Maya, Xolotl, Avalon, Kindi, and Colibri. See [Deployment](DEPLOYMENT.md) for container defaults and service details, and [ARCHITECTURE.md](ARCHITECTURE.md) for the design, request flow, security model, and service layout.
 
 ## Install
 

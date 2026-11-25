@@ -1114,7 +1114,7 @@ def test_model_sizes_default_without_a_router_ini(monkeypatch, tmp_path):
                                   "qwen3.8-flash-next-iq3_s": "125B",
                                   "glm-5.3-flash": "321B", "deepseek-v4.1-flash": "552B",
                                   "qwen3.8-flash-next-avalon": "125B",
-                                  **COLIBRI_SIZES}
+                                  **COLIBRI_SIZES, **POLYSTRATA_SIZES}
 
 
 # Colibri's ids that name no size, as router.py and router.ini list them.
@@ -1127,6 +1127,30 @@ COLIBRI_SIZES = {
     "deepseek-v4.1-flash-colibri": "552B", "mimo-v2.6-flash": "309B",
     "mimo-v2.6-pro": "1020B",
 }
+
+
+# PolyStrata's (and Strata's) <family name>-<size> ids that name no size.
+POLYSTRATA_SIZES = {
+    **{f"swift-1.5-{q}": "125B" for q in ("iq2_xs", "iq3_xxs", "iq3_s")},
+    **{f"qwen3.8-flash-next-unsloth-{q}": "125B" for q in (
+        "ud-iq4_xs", "ud-q4_k_xl", "ud-q5_k_xl", "ud-q6_k_xl", "q8_0", "ud-iq1_m", "ud-q2_0",
+        "ud-iq2_xs", "ud-q2_k_xl", "ud-iq3_xxs", "ud-q3_k_xl", "ud-iq4_xs-v31")},
+    "qwen3.8-flash-next-gyro-gyro-s": "125B", "qwen3.8-flash-next-gyro-gyro-m": "125B",
+    "qwen3.8-flash-next-nvfp4-nvfp4": "125B", "qwen3.8-flash-next-nvfp4-nvfp4-nvidia": "125B",
+    "qwen3.8-flash-next-nvfp4-nvfp4-qad": "125B",
+    "glm-5.3-flash-3.0bit": "321B", "glm-5.3-flash-ud-iq2_xxs": "321B",
+    "deepseek-v4-flash-ud-iq2_xxs": "284B",
+    "hy4-flash-sq-64": "220B", "hy4-flash-sq-96": "220B", "hy4-flash-sq-128": "220B",
+}
+
+
+def test_polystrata_sizes_are_in_router_ini(monkeypatch, tmp_path):
+    """router.ini lists the same PolyStrata sizes as the built-in defaults, and
+    every PolyStrata id that names its size parses without a line."""
+    ini = (ROOT / "services/osr-router/router.ini").read_text()
+    assert all(f"\n{i} = {s}\n" in ini for i, s in POLYSTRATA_SIZES.items())
+    router = load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini"))
+    assert all(router.parse_params_billions(s) > 0 for s in POLYSTRATA_SIZES.values())
 
 
 def test_colibri_sizes_are_in_router_ini(monkeypatch, tmp_path):
@@ -1150,7 +1174,8 @@ def test_legacy_per_kind_size_keys_still_apply(monkeypatch, tmp_path):
     quants = {f"qwen3.8-flash-next-{q}": "125B" for q in ("q2_0", "iq2_xs", "iq3_xxs", "iq3_s")}
     assert router.MODEL_SIZES == {"qwen3.8-flash-next": "125B", "my-basalt": "100B", **quants,
                                   "glm-5.3-flash": "300B", "deepseek-v4.1-flash": "552B",
-                                  "qwen3.8-flash-next-avalon": "125B", **COLIBRI_SIZES}
+                                  "qwen3.8-flash-next-avalon": "125B", **COLIBRI_SIZES,
+                                  **POLYSTRATA_SIZES}
 
 
 @pytest.mark.parametrize("port", [8080, 11434])
@@ -1393,6 +1418,47 @@ def test_colibri_discovery_and_dispatch(monkeypatch):
     assert response.headers["x-router-server"] == colibri
     assert calls == [("/v1/models", "Bearer colibri-secret"),
                      ("/v1/chat/completions", "Bearer colibri-secret")]
+
+
+@pytest.mark.parametrize("model, size", [
+    ("qwen3.6-35b-a3b-ud-q3_k_m", 35),          # its id names its size
+    ("ornith-1.5-122b-q8_0", 122),
+    ("deepseek-v4-flash-ud-iq2_xxs", 284),      # from [model_sizes]
+    ("swift-1.5-iq2_xs", 125),
+])
+def test_polystrata_discovery_and_dispatch(monkeypatch, model, size):
+    """A PolyStrata server is reached with its own key (never Strata's), its
+    models are sized from their ids or [model_sizes], and it takes tools."""
+    polystrata = "polystrata+http://10.0.0.16:8080"
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, request.headers.get("authorization")))
+        if request.headers.get("authorization") != "Bearer polystrata-secret":
+            return httpx.Response(401, json={"error": {"message": "invalid api key"}})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": [
+                {"id": model, "object": "model", "owned_by": "strata", "meta": {"n_ctx": 65536}}]})
+        if request.url.path == "/v1/chat/completions":
+            return streamed(200, {"model": json.loads(request.content)["model"]})
+        return httpx.Response(404)
+
+    router = load_router(monkeypatch, MODEL_SERVERS=polystrata, STRATA_API_KEY="strata-secret",
+                         POLYSTRATA_API_KEY="polystrata-secret", ROUTER_API_KEY="client-secret")
+    router._HTTP["transport"] = httpx.MockTransport(handler)
+    with TestClient(router.app) as client:
+        models = {e["name"]: e for e in router.INVENTORY["models"]}
+        response = client.post("/v1/chat/completions",
+                               headers={"Authorization": "Bearer client-secret"},
+                               json={"model": model, "messages": [user("hi")], "tools": TOOLS})
+    assert router.server_kind(polystrata) == "polystrata"
+    assert router.server_base(polystrata) == "http://10.0.0.16:8080"
+    assert models[model]["params_b"] == size
+    assert models[model]["tools"] is True
+    assert response.status_code == 200 and response.json()["model"] == model
+    assert response.headers["x-router-server"] == polystrata
+    assert calls == [("/v1/models", "Bearer polystrata-secret"),
+                     ("/v1/chat/completions", "Bearer polystrata-secret")]
 
 
 @pytest.mark.parametrize("entry, offered, tools", [
@@ -2086,23 +2152,23 @@ def test_tool_kinds_setting(monkeypatch, tmp_path, caplog):
     """A kind left out of tool_kinds is unknown again; a name that is not a
     /v1/models kind is ignored with a warning."""
     ini = (ROOT / "services/osr-router/router.ini").read_text()
-    assert "\ntool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri\n" in ini
+    assert "\ntool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata\n" in ini
     custom = tmp_path / "router.ini"
-    custom.write_text(ini.replace("tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri",
+    custom.write_text(ini.replace("tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata",
                                   "tool_kinds = Avalon, ollama, nonsense"))
     with caplog.at_level("WARNING", logger="router"):
         router = load_router(monkeypatch, ROUTER_INI=str(custom))
     assert router.TOOL_KINDS == {"avalon"}
     assert sorted(r.getMessage() for r in caplog.records if "tool_kinds" in r.getMessage()) == [
-        "ignoring [classification] tool_kinds entry 'nonsense' (use avalon, basalt, colibri, kindi, maya, strata, xolotl)",
-        "ignoring [classification] tool_kinds entry 'ollama' (use avalon, basalt, colibri, kindi, maya, strata, xolotl)"]
+        "ignoring [classification] tool_kinds entry 'nonsense' (use avalon, basalt, colibri, kindi, maya, polystrata, strata, xolotl)",
+        "ignoring [classification] tool_kinds entry 'ollama' (use avalon, basalt, colibri, kindi, maya, polystrata, strata, xolotl)"]
     assert _openai_listing(router, "avalon+http://h:8080", [{"id": "m"}])["m"]["tools"] is True
     assert _openai_listing(router, "strata+http://h:8080", [{"id": "m"}])["m"]["tools"] is None
-    custom.write_text(ini.replace("tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri", "tool_kinds ="))
+    custom.write_text(ini.replace("tool_kinds = strata, basalt, maya, xolotl, avalon, kindi, colibri, polystrata", "tool_kinds ="))
     assert load_router(monkeypatch, ROUTER_INI=str(custom)).TOOL_KINDS == frozenset()
     # The built-in default matches router.ini, for a router.ini without the line.
     assert load_router(monkeypatch, ROUTER_INI=str(tmp_path / "missing.ini")).TOOL_KINDS == {
-        "strata", "basalt", "maya", "xolotl", "avalon", "kindi", "colibri"}
+        "strata", "basalt", "maya", "xolotl", "avalon", "kindi", "colibri", "polystrata"}
 
 
 @pytest.mark.parametrize("body,expected", [

@@ -86,7 +86,7 @@ does that unattended). Components without a repository pin ask whether to
 run their upgrade or reconfigure step (u) or keep them (k). (The router's
 row is its LiteLLM; it, AirLLM and hcom install their pins and do not offer
 the upstream release.) A commit the installer must check
-(ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi) is the one upstream
+(ComfyUI, Open Terminal, Strata, Xolotl, Avalon, Kindi, Colibri, PolyStrata) is the one upstream
 names at that moment, not one reviewed here.
 
 Everything runs from this node. CTs on other nodes are reached as root over
@@ -154,9 +154,9 @@ USAGE
 
 # Upgrade order of the tagged targets: services the others use first, Honcho
 # before the agents that use it, the broker before hcom.
-TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri
+TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri polystrata
               freellmapi comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
-MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri "
+MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri polystrata "
 
 # Services that must be active afterwards if they were active before.
 # NAME=OLD: the unit was called OLD before it was renamed; either one being
@@ -171,6 +171,7 @@ declare -A UNITS=(
     # A Colibri without a model is parked (its unit inactive by design), so its
     # unit counts only when it was active before, like every unit here.
     [colibri]='colibri'
+    [polystrata]='polystrata'
     [comfyui]='comfyui'
     # FreeLLMAPI's CT is its container image, without systemd: none here. It is
     # checked by its /api/ping instead (collect_state, http:freellmapi-ping).
@@ -196,7 +197,7 @@ declare -A UNITS=(
 declare -A GUEST_DIR=(
     [strata]=strata-target-deploy [basalt]=basalt-target-deploy [maya]=maya-target-deploy
     [xolotl]=xolotl-target-deploy [avalon]=avalon-target-deploy [kindi]=kindi-target-deploy
-    [colibri]=colibri-target-deploy
+    [colibri]=colibri-target-deploy [polystrata]=polystrata-target-deploy
     [airllm]=airllm-target-deploy [llamacpp]=llama-target-deploy [ollama]=ollama-target-deploy
     [comfyui]=comfyui-target-deploy [open-terminal]=open-terminal-deploy
 )
@@ -208,6 +209,7 @@ declare -A GUEST_FILES=(
     [avalon]='install-target.sh rocm-toolkit.sh cuda-toolkit.sh avalon.service avalon-weights.txt upstream-commit.txt'
     [kindi]='install-target.sh cuda-toolkit.sh kindi.service kindi-weights.txt upstream-commit.txt requirements-cpu.lock requirements-cuda.lock uv.lock'
     [colibri]='install-target.sh colibri.service model-select.sh'
+    [polystrata]='install-target.sh polystrata.service families.sh'
     [airllm]='install-target.sh server.py requirements.txt requirements.lock airllm.env.example airllm-ollama-api.service README.md'
     [llamacpp]='install-target.sh bridge.py requirements.txt llama-server.service llama-ollama-bridge.service llama-server.env.example bridge.env.example dashboard.py monitor.html llama-dashboard.service'
     [ollama]='install-target.sh ollama.env.example ollama-target.conf README.md'
@@ -1302,6 +1304,7 @@ declare -A UPSTREAM=(
     [avalon]='gh-branch freriadoc/Avalon main'
     [kindi]='gh-branch ahtx/kindi main'
     [colibri]='gh-branch JustVugg/colibri main'
+    [polystrata]='gh-branch simplexai-labs/PolyStrata main'
     [honcho]='gh-release plastic-labs/honcho'
     [deepseek-harness]='npm @deepseek-ai/dsh'
     [opencode]='npm @opencode/cli'
@@ -1339,6 +1342,7 @@ pinned_release() {
         open-terminal) sed -n 's/^DEFAULT_VERSION=//p' "$f" ;;
         strata) sed -n 's/^STRATA_DEFAULT_COMMIT=//p' "$f" ;;
         colibri) sed -n 's/^COLIBRI_DEFAULT_COMMIT=//p' "$f" ;;
+        polystrata) sed -n 's/^POLYSTRATA_DEFAULT_COMMIT=//p' "$f" ;;
         xolotl|avalon|kindi) cat -- "$REPO_ROOT/targets/$1/upstream-commit.txt" ;;
         honcho|opencode|freellmapi) repo_default "$1" ;;
         deepseek-harness) repo_default dsh ;;
@@ -1387,7 +1391,7 @@ case $1 in
         sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /opt/comfyui-target/current/comfyui_version.py 2>/dev/null |
             head -n 1 ;;
     open-terminal) kv /etc/open-terminal/release OPEN_TERMINAL_VERSION ;;
-    strata|basalt|xolotl|avalon|kindi|colibri) rev "/opt/$1" ;;
+    strata|basalt|xolotl|avalon|kindi|colibri|polystrata) rev "/opt/$1" ;;
     maya|honcho) tag "/opt/$1" ;;
     hermes) rev /home/hermes/.hermes/hermes-agent ;;
     deepseek-harness) json_version /opt/deepseek-harness/current/node_modules/@deepseek-ai/dsh/package.json ;;
@@ -1710,6 +1714,7 @@ decide_releases() {
             avalon) I_ENV[i]="AVALON_COMMIT=${REL_COMMIT[$t]}" ;;
             kindi) I_ENV[i]="KINDI_COMMIT=${REL_COMMIT[$t]}" ;;
             colibri) I_ENV[i]="COLIBRI_COMMIT=${REL_COMMIT[$t]}" ;;
+            polystrata) I_ENV[i]="POLYSTRATA_COMMIT=${REL_COMMIT[$t]}" ;;
         esac
     done
 }

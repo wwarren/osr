@@ -14,8 +14,8 @@ the router services as `osr-router`, plus a small local metrics stack:
 
 Normal request path: **client or Open WebUI → router :8000 → model host**.
 LiteLLM serves static tiers only when discovery is off or the inventory is
-empty. The pool can mix Ollama, LM Studio, llama.cpp, AirLLM, Strata, Basalt,
-Maya, Xolotl, Avalon, Kindi and Colibri. Optional service, model and companion CTs are
+empty. The pool can mix Ollama, LM Studio, llama.cpp, AirLLM, Strata, PolyStrata,
+Basalt, Maya, Xolotl, Avalon, Kindi and Colibri. Optional service, model and companion CTs are
 listed under [Inference targets](INFERENCE_TARGETS.md#inference-targets); standalone
 [MQTT and hcom targets](AGENT_COORDINATION.md#agent-coordination-targets) connect agents across
 containers.

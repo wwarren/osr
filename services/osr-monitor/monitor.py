@@ -200,6 +200,8 @@ SERVER_KINDS = {
               "label": "Kindi", "openai": True},
     "colibri": {"prefix": "colibri+", "key_env": "COLIBRI_API_KEY",
                 "label": "Colibri", "openai": True},
+    "polystrata": {"prefix": "polystrata+", "key_env": "POLYSTRATA_API_KEY",
+                   "label": "PolyStrata", "openai": True},
 }
 KIND_KEYS = {kind: (os.getenv(spec["key_env"]) or "").strip()
              for kind, spec in SERVER_KINDS.items()}
