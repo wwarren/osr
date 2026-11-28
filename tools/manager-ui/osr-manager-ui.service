@@ -1,0 +1,31 @@
+[Unit]
+Description=Open Smart Router manager UI (web front end for manage-model-servers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, because manage-model-servers is root-only: it edits the root-only
+# config repo and secrets.env, takes the config lock and restarts services.
+# The sandboxing below is what that still allows.
+User=root
+WorkingDirectory=/opt/osr-manager-ui
+EnvironmentFile=-/etc/osr-manager-ui/env
+Environment=PORT=80
+Environment=MMS_BIN=/usr/local/bin/manage-model-servers
+Environment=AUTH_FILE=/etc/osr-manager-ui/password
+ExecStart=/opt/node/bin/node /opt/osr-manager-ui/server.mjs
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+ProtectHome=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+# A stopped or restarted UI must not kill an apply it started half-way.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

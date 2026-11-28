@@ -158,7 +158,7 @@ TARGET_ORDER=(gitea mattermost llamacpp airllm ollama strata basalt maya xolotl 
               freellmapi comfyui open-terminal honcho hermes openclaw deepseek-harness opencode mqtt)
 MODEL_TARGETS=" llamacpp airllm ollama strata basalt maya xolotl avalon kindi colibri polystrata "
 
-# Services that must be active afterwards if they were active before.
+# Services and sockets that must be active afterwards if they were active before.
 # NAME=OLD: the unit was called OLD before it was renamed; either one being
 # active counts as NAME, so a router upgrade that renames it is no regression.
 declare -A UNITS=(
@@ -181,15 +181,14 @@ declare -A UNITS=(
     [honcho]='postgresql honcho-api honcho-deriver honcho-embedding honcho-mcp honcho-proxy honcho-gateway'
     [hermes]='hermes-gateway hermes-direct hermes-dashboard'
     [openclaw]='openclaw-gateway openclaw-direct'
-    # deepseek-harness-api and opencode-api (the Open WebUI chat endpoints) run
-    # only when they are on; a unit that was not active before is not checked
-    # afterwards.
-    [deepseek-harness]='deepseek-harness deepseek-harness-api'
+    # These chat endpoint units are optional; a unit that was not active before
+    # is not checked afterwards.
+    [deepseek-harness]='deepseek-harness deepseek-harness-api deepseek-harness-acp.socket'
     [opencode]='opencode opencode-direct opencode-api'
     [gitea]='gitea'
     [mattermost]='mattermost'
     [mqtt]='mosquitto'
-    [hcom]='osr-hcom-relay osr-hcom-mattermost'
+    [hcom]='osr-hcom-relay osr-hcom-bus.socket osr-hcom-mattermost'
 )
 
 # Targets upgraded inside their CT: the deployment directory and the files
@@ -793,7 +792,8 @@ collect_state() {
     fi
     # shellcheck disable=SC2086  # unit names are single words
     pct exec "$id" -- sh -c 'for u in "$@"; do for c in $(echo "$u" | tr = " "); do
-            systemctl is-active --quiet "$c.service" 2>/dev/null && { echo "unit:${u%%=*}"; break; }; done; done
+            case $c in *.socket|*.service) unit=$c ;; *) unit=$c.service ;; esac
+            systemctl is-active --quiet "$unit" 2>/dev/null && { echo "unit:${u%%=*}"; break; }; done; done
         if command -v ss >/dev/null 2>&1; then ss -Hltn 2>/dev/null | sed "s/^/ss: /"; fi' sh $units 2>/dev/null |
         # Ephemeral ports (such as Ollama's per-model runners) come and go by
         # themselves, and so do Open Terminal's workspaces (20000-29999).
@@ -829,6 +829,7 @@ describe_missing() {
     while IFS= read -r line; do
         case $line in
             ct:running) echo "  - the CT is not running" ;;
+            unit:*.socket) echo "  - socket ${line#unit:} is no longer active" ;;
             unit:*) echo "  - service ${line#unit:} is no longer active" ;;
             port:*) echo "  - nothing listens on TCP port ${line#port:} any more" ;;
             http:router-healthz) echo "  - the router's /healthz does not answer 200" ;;

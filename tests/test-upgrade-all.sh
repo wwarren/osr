@@ -573,7 +573,7 @@ in_tool() {
 
 describe 'router units with their pre-rename names count as the renamed ones'
 reset_mock
-state_of() { add_item "$1" "$2"; collect_state 0; }
+state_of() { add_item "$1" "$2" "${3:-}"; collect_state 0; }
 conf 280 'ai;ai-tools;osr-router;openwebui'; state 280 ollama-router ollama-monitor litellm-proxy open-webui
 before=$(in_tool state_of router 280 | grep '^unit:' | LC_ALL=C sort)
 assert_contains 'ollama-router counts as osr-router' 'unit:osr-router' "$before"
@@ -584,6 +584,24 @@ after=$(in_tool state_of router 280 | grep '^unit:' | LC_ALL=C sort)
 assert_eq 'so renaming the units in an upgrade loses nothing' "$before" "$after"
 state 280 litellm-proxy open-webui
 assert_not_contains 'neither name active: not reported' 'unit:osr-router' "$(in_tool state_of router 280)"
+
+describe 'hcom checks its bus socket as well as its services'
+reset_mock
+conf 282 'ai;ai-tools;osr-target;hermes;hcom'
+state 282 osr-hcom-relay osr-hcom-bus.socket hermes-gateway
+before=$(in_tool state_of hcom 282 target=hermes | grep '^unit:' | LC_ALL=C sort)
+assert_contains 'an active bus socket is recorded' 'unit:osr-hcom-bus.socket' "$before"
+sed -i '/^unit:osr-hcom-bus.socket$/d' "$tmp/mock/282.state"
+after=$(in_tool state_of hcom 282 target=hermes | grep '^unit:' | LC_ALL=C sort)
+assert_not_contains 'a stopped bus socket is missing' 'unit:osr-hcom-bus.socket' "$after"
+assert_contains 'the missing socket is reported' 'socket osr-hcom-bus.socket is no longer active' \
+    "$(in_tool describe_missing <<< unit:osr-hcom-bus.socket)"
+state 281 deepseek-harness deepseek-harness-api deepseek-harness-acp.socket
+before=$(in_tool state_of deepseek-harness 281 | grep '^unit:' | LC_ALL=C sort)
+assert_contains 'an active Harness ACP socket is recorded' 'unit:deepseek-harness-acp.socket' "$before"
+sed -i '/^unit:deepseek-harness-acp.socket$/d' "$tmp/mock/281.state"
+after=$(in_tool state_of deepseek-harness 281 | grep '^unit:' | LC_ALL=C sort)
+assert_not_contains 'a stopped Harness ACP socket is missing' 'unit:deepseek-harness-acp.socket' "$after"
 
 describe 'MQTT settings are read back from the broker'
 reset_mock

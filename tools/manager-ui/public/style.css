@@ -1,0 +1,57 @@
+:root {
+  --bg: #f6f7f9; --panel: #fff; --ink: #1d2330; --muted: #6b7385; --line: #e2e5eb;
+  --accent: #2f6fec; --accent-ink: #fff; --warn: #b4560b; --ok: #1d7f4e; --bad: #c0362c;
+  --term-bg: #12161f; --term-ink: #d7dce5; --term-err: #f0a35e;
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f131a; --panel: #171c25; --ink: #e5e8ee; --muted: #8a93a6; --line: #2a313d;
+    --term-bg: #0a0d12; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  padding: .7rem 1.2rem; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 650; display: flex; align-items: center; gap: .5rem; }
+.dot { width: .65rem; height: .65rem; border-radius: 50%; background: var(--accent); }
+.muted { color: var(--muted); font-weight: 400; }
+.quick { display: flex; gap: .4rem; flex-wrap: wrap; }
+main { display: grid; grid-template-columns: 250px 1fr; min-height: calc(100vh - 54px); }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
+aside { background: var(--panel); border-right: 1px solid var(--line); padding: .8rem .6rem; overflow-y: auto; }
+aside h3 { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: .9rem .5rem .3rem; }
+aside button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: .38rem .55rem;
+  border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; }
+aside button:hover { background: var(--bg); }
+aside button.active { background: var(--accent); color: var(--accent-ink); }
+.work { padding: 1.1rem 1.4rem; display: flex; flex-direction: column; gap: .8rem; min-width: 0; }
+form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.1rem; }
+h2 { margin: 0 0 .2rem; font-size: 1.1rem; }
+.cmd { margin: 0 0 .8rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; color: var(--muted); word-break: break-all; }
+.field { display: grid; gap: .25rem; margin-bottom: .7rem; }
+.field label { font-size: .85rem; color: var(--muted); }
+input[type=text], input[type=password], select { font: inherit; padding: .45rem .6rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--ink); width: 100%; max-width: 560px; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.flags { display: flex; flex-wrap: wrap; gap: .4rem 1.1rem; margin: .3rem 0 .8rem; }
+.flags label { display: flex; align-items: center; gap: .35rem; font-size: .9rem; }
+.flags .field { margin: 0; min-width: 180px; }
+.actions { display: flex; align-items: center; gap: .8rem; }
+button { font: inherit; padding: .4rem .85rem; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.warn { color: var(--warn); border-color: currentColor; }
+button.ghost { border: 0; background: none; color: var(--muted); padding: .2rem .4rem; }
+.output-head { display: flex; align-items: center; gap: .6rem; font-weight: 600; }
+.output-head .ghost { margin-left: auto; }
+.badge { font-size: .75rem; font-weight: 600; padding: .1rem .5rem; border-radius: 99px; }
+.badge.run { background: #2f6fec22; color: var(--accent); }
+.badge.ok { background: #1d7f4e22; color: var(--ok); }
+.badge.bad { background: #c0362c22; color: var(--bad); }
+pre#output { flex: 1; margin: 0; min-height: 320px; background: var(--term-bg); color: var(--term-ink);
+  border-radius: 10px; padding: .9rem 1rem; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre#output .err { color: var(--term-err); }
+pre#output .sys { color: #7fa7ff; }

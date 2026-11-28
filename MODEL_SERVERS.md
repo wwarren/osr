@@ -39,6 +39,10 @@ manage-model-servers apply [--all] | commit [message]
 manage-model-servers clear-lock [--force]
 ```
 
+The same commands are available from a browser through the optional
+[manager UI](tools/manager-ui/README.md) (Node.js 26, HTTP port 80 in the router CT:
+`pct exec <CT_ID> -- bash /app/config-repo/tools/manager-ui/install.sh`).
+
 Servers are keyed by URL, so removing one never re-points a tier. Models are
 set per (tier, server) and checked on the server first; pass full Ollama names
 without `ollama/` (e.g. `smtek/Qwen3.8-27B:Q3_K_XL-16gb`). A tier's models

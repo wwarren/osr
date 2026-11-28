@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OSR · Model servers</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="dot"></span>Open Smart Router <span class="muted">/ model servers</span></div>
+    <nav class="quick">
+      <button data-quick="status">Status</button>
+      <button data-quick="list">List</button>
+      <button data-quick="models">Models</button>
+      <button data-quick="discover">Discover</button>
+      <button data-quick="apply" class="warn">Apply</button>
+    </nav>
+  </header>
+  <main>
+    <aside id="menu" aria-label="Commands"></aside>
+    <section class="work">
+      <form id="form" autocomplete="off">
+        <h2 id="form-title">Pick a command</h2>
+        <p id="form-cmd" class="cmd"></p>
+        <div id="fields"></div>
+        <div id="flags" class="flags"></div>
+        <div class="actions">
+          <button type="submit" id="run" class="primary" disabled>Run</button>
+          <span id="busy" class="muted"></span>
+        </div>
+      </form>
+      <div class="output-head">
+        <span id="out-title">Output</span>
+        <span id="out-status" class="badge"></span>
+        <button type="button" id="clear" class="ghost">Clear</button>
+      </div>
+      <pre id="output" aria-live="polite"></pre>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
